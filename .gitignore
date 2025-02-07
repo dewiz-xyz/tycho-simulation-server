@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.node
+# Logs
+*.log
+tycho_node.log
+
+# Environment
+.env
+*.pdb 

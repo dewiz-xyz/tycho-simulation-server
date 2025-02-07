@@ -1,0 +1,25 @@
+[package]
+name = "tycho-simulation-server"
+version = "0.1.0"
+edition = "2021"
+description = "TypeScript Tycho simulation WS server"
+license = "MIT"
+repository = "https://github.com/dewiz-xyz/tycho-simulation-server"
+
+[[bin]]
+name = "tycho-price-service"
+path = "src/main.rs"
+
+[dependencies]
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", branch = "main" }
+anyhow = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+num-traits = "0.2"
+num-bigint = "0.4"
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+headers = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
