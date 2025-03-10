@@ -302,6 +302,8 @@ async fn get_amounts_out(
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
+
     let tycho_url = std::env::var("TYCHO_URL")
         .unwrap_or_else(|_| "tycho-beta.propellerheads.xyz".to_string());
     let api_key = std::env::var("TYCHO_API_KEY")
@@ -314,10 +316,10 @@ async fn main() {
     println!("Initializing price service...");
     
     let tvl_filter = ComponentFilter::with_tvl_range(tvl_threshold, tvl_threshold);
-    let all_tokens = load_all_tokens(&tycho_url, false, Some(&api_key), Chain::Ethereum).await;
+    let all_tokens = load_all_tokens(&tycho_url, false, Some(&api_key), Chain::Ethereum.into(), None, None).await;
     println!("Loaded {} tokens", all_tokens.len());
 
-    let raw_stream = ProtocolStreamBuilder::new(&tycho_url, Chain::Ethereum)
+    let raw_stream = ProtocolStreamBuilder::new(&tycho_url, Chain::Ethereum.into())
         .exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None)
         .exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None)
         .exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None)
