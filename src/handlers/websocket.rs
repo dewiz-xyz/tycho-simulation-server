@@ -3,6 +3,7 @@ use axum::extract::{
     State,
 };
 use axum::response::IntoResponse;
+use tracing::{debug, error, info};
 
 use crate::models::{
     messages::{AmountOutRequest, UpdateMessage},
@@ -18,12 +19,19 @@ pub async fn handle_ws_upgrade(
 }
 
 async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
+    debug!("New WebSocket connection established");
     let mut rx = app_state.update_tx.subscribe();
 
     // Send initial state
     if let Ok(block) = app_state.current_block.read().await.to_string().parse() {
         let states = app_state.states.read().await;
-        let _ = socket
+        debug!(
+            "Sending initial state: block={}, states={}",
+            block,
+            states.len()
+        );
+
+        let result = socket
             .send(axum::extract::ws::Message::Text(
                 serde_json::to_string(&UpdateMessage::BlockUpdate {
                     block_number: block,
@@ -34,6 +42,11 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
                 .unwrap(),
             ))
             .await;
+
+        if result.is_err() {
+            error!("Failed to send initial state");
+            return;
+        }
     }
 
     loop {
@@ -42,7 +55,7 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
                 match msg {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
                         if let Ok(req) = serde_json::from_str::<AmountOutRequest>(&text) {
-                            println!("Quote request: {} -> {} ({} amounts)",
+                            info!("Quote request: {} -> {} ({} amounts)",
                                 req.token_in,
                                 req.token_out,
                                 req.amounts.len()
@@ -51,7 +64,7 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
                             // Process quote request
                             match get_amounts_out(app_state.clone(), req.clone()).await {
                                 Ok(quotes) => {
-                                    println!("Found {} quotes", quotes.len());
+                                    info!("Found {} quotes", quotes.len());
                                     let msg = UpdateMessage::QuoteUpdate {
                                         request_id: req.request_id.unwrap_or_default(),
                                         data: quotes,
@@ -59,24 +72,36 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
                                     if socket.send(axum::extract::ws::Message::Text(
                                         serde_json::to_string(&msg).unwrap()
                                     )).await.is_err() {
-                                        println!("Failed to send quote response");
+                                        error!("Failed to send quote response");
                                         break;
                                     }
+                                    debug!("Quote response sent successfully");
                                 }
                                 Err(e) => {
-                                    println!("Error getting quotes: {}", e);
+                                    error!("Error getting quotes: {}", e);
                                 }
                             }
                         }
                     }
-                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
-                    _ => {}
+                    Some(Ok(axum::extract::ws::Message::Close(_))) => {
+                        info!("WebSocket connection closed by client");
+                        break;
+                    },
+                    None => {
+                        info!("WebSocket connection closed unexpectedly");
+                        break;
+                    },
+                    _ => {
+                        debug!("Received non-text message, ignoring");
+                    }
                 }
             }
             Ok(msg) = rx.recv() => {
+                debug!("Received broadcast update, forwarding to client");
                 if socket.send(axum::extract::ws::Message::Text(
                     serde_json::to_string(&msg).unwrap()
                 )).await.is_err() {
+                    error!("Failed to send broadcast message to client");
                     break;
                 }
             }

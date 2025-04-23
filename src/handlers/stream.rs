@@ -2,6 +2,7 @@ use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, error, info, warn};
 use tycho_simulation::protocol::{models::BlockUpdate, state::ProtocolSim};
 
 use crate::models::messages::UpdateMessage;
@@ -22,7 +23,7 @@ pub async fn process_stream(
     current_block: Arc<RwLock<u64>>,
     update_tx: broadcast::Sender<UpdateMessage>,
 ) {
-    println!("Starting stream processing...");
+    info!("Starting stream processing...");
 
     while let Some(msg) = stream.next().await {
         match msg {
@@ -34,13 +35,14 @@ pub async fn process_stream(
 
                 let new_pairs_count = update.new_pairs.len();
 
-                println!(
+                info!(
                     "Block update: {} -> {}, states: {}",
                     prev_block,
                     update.block_number,
                     update.states.len(),
                 );
 
+                debug!("Updating {} existing states", update.states.len());
                 // Update existing states
                 for (id, state) in &update.states {
                     if let Some((existing_state, _)) = states_map.get_mut(id) {
@@ -48,6 +50,7 @@ pub async fn process_stream(
                     }
                 }
 
+                debug!("Adding {} new pairs", new_pairs_count);
                 // Add new pairs
                 for (id, comp) in update.new_pairs {
                     if let Some(state) = update.states.get(&id) {
@@ -55,6 +58,10 @@ pub async fn process_stream(
                     }
                 }
 
+                debug!(
+                    "Broadcasting block update to {} clients",
+                    update_tx.receiver_count()
+                );
                 // Broadcast update
                 let _ = update_tx.send(UpdateMessage::BlockUpdate {
                     block_number: update.block_number,
@@ -64,9 +71,9 @@ pub async fn process_stream(
                 });
             }
             Err(e) => {
-                println!("Stream error: {:?}", e);
+                error!("Stream error: {:?}", e);
             }
         }
     }
-    println!("Stream ended");
+    warn!("Stream ended unexpectedly");
 }

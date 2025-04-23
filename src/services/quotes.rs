@@ -1,6 +1,7 @@
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use std::str::FromStr;
+use tracing::{debug, info, warn};
 use tycho_simulation::tycho_core::Bytes;
 
 use crate::models::{
@@ -30,7 +31,7 @@ pub async fn get_amounts_out(
         .get(&token_out_bytes)
         .ok_or_else(|| format!("Token not found: {}", token_out_address))?;
 
-    println!(
+    info!(
         "Processing quote: {} ({}) -> {} ({})",
         token_in.symbol, token_in_address, token_out.symbol, token_out_address
     );
@@ -46,6 +47,12 @@ pub async fn get_amounts_out(
 
     let states = state.states.read().await;
     let current_block = *state.current_block.read().await;
+    debug!(
+        "Current block: {}, total pools: {}",
+        current_block,
+        states.len()
+    );
+
     let mut results = Vec::new();
     let mut matching_pools = 0;
     let mut pools_with_quotes = 0;
@@ -64,16 +71,24 @@ pub async fn get_amounts_out(
 
         if pool_tokens.contains(&token_in_address) && pool_tokens.contains(&token_out_address) {
             matching_pools += 1;
+            debug!("Found matching pool: {}", id);
             let mut amounts_out = Vec::new();
             let mut gas_used = Vec::new();
 
             for amount_in in amounts_in.iter() {
                 match state.get_amount_out(amount_in.clone(), token_in, token_out) {
                     Ok(result) => {
+                        debug!(
+                            "Got quote result: amount={}, gas={}",
+                            result.amount, result.gas
+                        );
                         amounts_out.push(result.amount.to_string());
                         gas_used.push(result.gas.to_u64().unwrap_or(0));
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        debug!("Failed to get quote: {}", e);
+                        continue;
+                    }
                 }
             }
 
@@ -85,6 +100,8 @@ pub async fn get_amounts_out(
                     .next()
                     .unwrap_or("Unknown")
                     .to_string();
+
+                debug!("Adding valid quote for pool: {}", pool_name);
 
                 results.push(AmountOutResponse {
                     pool: id.clone(),
@@ -98,16 +115,18 @@ pub async fn get_amounts_out(
         }
     }
 
-    println!(
+    info!(
         "Found {} matching pools, {} with valid quotes",
         matching_pools, pools_with_quotes
     );
 
     if results.is_empty() {
-        return Err(format!(
+        let err_msg = format!(
             "No pools found for pair {}-{}",
             token_in_address, token_out_address
-        ));
+        );
+        warn!("{}", err_msg);
+        return Err(err_msg);
     }
 
     // Sort results by first amount_out (best to worst)
@@ -117,5 +136,6 @@ pub async fn get_amounts_out(
         b_amount.cmp(&a_amount)
     });
 
+    debug!("Returning {} sorted quotes", results.len());
     Ok(results)
 }

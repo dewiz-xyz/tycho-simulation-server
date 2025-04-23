@@ -1,3 +1,6 @@
+mod logging;
+pub use logging::init_logging;
+
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
