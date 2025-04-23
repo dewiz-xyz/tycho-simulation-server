@@ -42,6 +42,9 @@ Tycho Simulation Server is a Rust-based WebSocket server that interfaces with th
 
 The following environment variables can be configured in your `.env` file:
 
+- `TYCHO_URL`: Tycho API URL (default: "tycho-beta.propellerheads.xyz")
+- `TYCHO_API_KEY`: Your Tycho API key (required)
+- `TVL_THRESHOLD`: TVL threshold for filtering (default: 1000)
 - `PORT`: Server port (default: 3000)
 - `HOST`: Server host address (default: 127.0.0.1)
 
@@ -63,6 +66,15 @@ Key dependencies include:
 - `axum`: Web framework
 - `serde`: Serialization framework
 - `anyhow`: Error handling
+
+## Project Structure
+
+- `src/api`: API router and endpoint definitions
+- `src/config`: Configuration management
+- `src/handlers`: Request handlers (WebSocket, stream)
+- `src/models`: Data models and state definitions
+- `src/services`: Business logic and core functionality
+- `main.rs`: Application entry point and initialization
 
 ## License
 
