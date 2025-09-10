@@ -1,12 +1,7 @@
 use tycho_simulation::{
     evm::{
-        engine_db::tycho_db::PreCachedDB,
         protocol::{
-            filters::{balancer_pool_filter, curve_pool_filter},
             uniswap_v2::state::UniswapV2State,
-            uniswap_v3::state::UniswapV3State,
-            uniswap_v4::state::UniswapV4State,
-            vm::state::EVMPoolState,
         },
         stream::ProtocolStreamBuilder,
     },
@@ -30,22 +25,18 @@ pub async fn build_protocol_stream(
         > + Unpin
         + Send,
 > {
-    let tvl_filter = ComponentFilter::with_tvl_range(tvl_threshold, tvl_threshold);
+    // Use configured thresholds to bound component set
+    let add_tvl = tvl_threshold;
+    let keep_tvl = std::env::var("TVL_KEEP_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or((add_tvl * 0.2).max(1000.0));
+    let tvl_filter = ComponentFilter::with_tvl_range(add_tvl, keep_tvl);
 
     let stream = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum.into())
+        // Focus on Uniswap V2 to validate ingestion without tick_liquidity requirement
         .exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None)
-        .exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None)
-        .exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None)
-        .exchange::<EVMPoolState<PreCachedDB>>(
-            "vm:curve",
-            tvl_filter.clone(),
-            Some(curve_pool_filter),
-        )
-        .exchange::<EVMPoolState<PreCachedDB>>(
-            "vm:balancer_v2",
-            tvl_filter.clone(),
-            Some(balancer_pool_filter),
-        )
+        .timeout(15) // seconds
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(true)
         .set_tokens(tokens)

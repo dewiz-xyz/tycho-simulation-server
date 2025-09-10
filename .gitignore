@@ -11,6 +11,9 @@ Cargo.lock
 *.node
 # Logs
 *.log
+.cursorrules
+AGENTS.md
+CLAUDE.md
 tycho_node.log
 
 # Environment

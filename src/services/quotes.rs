@@ -53,9 +53,22 @@ pub async fn get_amounts_out(
         states.len()
     );
 
+    // Guard: service not ready yet
+    if current_block == 0 || states.is_empty() {
+        let warmup_msg = format!(
+            "Service warming up: block={}, pools={}",
+            current_block,
+            states.len()
+        );
+        warn!("{}", warmup_msg);
+        return Err(warmup_msg);
+    }
+
     let mut results = Vec::new();
-    let mut matching_pools = 0;
+    let mut matching_pools = 0; // pools whose declared tokens include both sides
+    let mut candidate_pools = 0; // pools we attempted to quote against
     let mut pools_with_quotes = 0;
+    let mut first_error: Option<String> = None; // capture first failure reason
 
     for (id, (state, comp)) in states.iter() {
         let pool_tokens: Vec<String> = comp
@@ -69,9 +82,21 @@ pub async fn get_amounts_out(
             })
             .collect();
 
-        if pool_tokens.contains(&token_in_address) && pool_tokens.contains(&token_out_address) {
-            matching_pools += 1;
-            debug!("Found matching pool: {}", id);
+        let token_info_known = !pool_tokens.is_empty();
+        let tokens_match =
+            pool_tokens.contains(&token_in_address) && pool_tokens.contains(&token_out_address);
+
+        if tokens_match || !token_info_known {
+            if tokens_match {
+                matching_pools += 1;
+                debug!("Found matching pool: {}", id);
+            } else {
+                debug!(
+                    "Pool {} has no declared tokens; attempting quote as fallback",
+                    id
+                );
+            }
+            candidate_pools += 1;
             let mut amounts_out = Vec::new();
             let mut gas_used = Vec::new();
 
@@ -86,7 +111,11 @@ pub async fn get_amounts_out(
                         gas_used.push(result.gas.to_u64().unwrap_or(0));
                     }
                     Err(e) => {
-                        debug!("Failed to get quote: {}", e);
+                        let msg = format!("{}", e);
+                        if first_error.is_none() {
+                            first_error = Some(msg.clone());
+                        }
+                        debug!("Failed to get quote: {}", msg);
                         continue;
                     }
                 }
@@ -116,17 +145,32 @@ pub async fn get_amounts_out(
     }
 
     info!(
-        "Found {} matching pools, {} with valid quotes",
-        matching_pools, pools_with_quotes
+        "Found {} matching pools, {} candidate pools, {} with valid quotes",
+        matching_pools, candidate_pools, pools_with_quotes
     );
 
     if results.is_empty() {
-        let err_msg = format!(
-            "No pools found for pair {}-{}",
-            token_in_address, token_out_address
-        );
-        warn!("{}", err_msg);
-        return Err(err_msg);
+        if matching_pools == 0 {
+            let err_msg = format!(
+                "No matching pools found for pair {}-{}",
+                token_in_address, token_out_address
+            );
+            warn!("{}", err_msg);
+            return Err(err_msg);
+        } else {
+            match &first_error {
+                Some(e) => info!(
+                    "Matched {} pools but all quotes failed for pair {}-{}; example error: {}",
+                    matching_pools, token_in_address, token_out_address, e
+                ),
+                None => info!(
+                    "Matched {} pools but all quotes failed for pair {}-{}",
+                    matching_pools, token_in_address, token_out_address
+                ),
+            }
+            // Supported edge case: return empty results so clients can handle gracefully
+            return Ok(results);
+        }
     }
 
     // Sort results by first amount_out (best to worst)

@@ -53,23 +53,34 @@ async fn main() -> anyhow::Result<()> {
         update_tx: update_tx.clone(),
     };
 
-    // Build protocol stream
-    let raw_stream = build_protocol_stream(
-        &config.tycho_url,
-        &config.api_key,
-        config.tvl_threshold,
-        all_tokens,
-    )
-    .await?;
-    info!("Protocol stream built successfully");
-
-    // Spawn stream processing task
-    let states_clone = Arc::clone(&states);
-    let current_block_clone = Arc::clone(&current_block);
-    tokio::spawn(async move {
-        process_stream(raw_stream, states_clone, current_block_clone, update_tx).await;
-    });
-    debug!("Stream processing task spawned");
+    // Build protocol stream in background and start processing
+    {
+        let cfg = config.clone();
+        let tokens_bg = all_tokens.clone();
+        let states_bg = Arc::clone(&states);
+        let current_block_bg = Arc::clone(&current_block);
+        let update_tx_bg = update_tx.clone();
+        tokio::spawn(async move {
+            info!("Building protocol stream in background...");
+            match build_protocol_stream(
+                &cfg.tycho_url,
+                &cfg.api_key,
+                cfg.tvl_threshold,
+                tokens_bg,
+            )
+            .await
+            {
+                Ok(stream) => {
+                    info!("Protocol stream built successfully (background)");
+                    process_stream(stream, states_bg, current_block_bg, update_tx_bg).await;
+                }
+                Err(e) => {
+                    error!("Protocol stream build failed: {:?}", e);
+                }
+            }
+        });
+        debug!("Stream processing task spawned (background)");
+    }
 
     // Create router and start server
     let app = create_router(app_state);

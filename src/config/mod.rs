@@ -8,7 +8,7 @@ pub fn load_config() -> AppConfig {
         std::env::var("TYCHO_URL").unwrap_or_else(|_| "tycho-beta.propellerheads.xyz".to_string());
     let api_key = std::env::var("TYCHO_API_KEY").expect("TYCHO_API_KEY must be set");
     let tvl_threshold: f64 = std::env::var("TVL_THRESHOLD")
-        .unwrap_or_else(|_| "1000".to_string())
+        .unwrap_or_else(|_| "1".to_string())
         .parse()
         .expect("Invalid TVL_THRESHOLD");
     let port = std::env::var("PORT")

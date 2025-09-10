@@ -53,11 +53,13 @@ pub async fn process_stream(
                 debug!("Adding {} new pairs", new_pairs_count);
                 // Add new pairs
                 for (id, comp) in update.new_pairs {
+                    debug!("New pair ingested: {}", id);
                     if let Some(state) = update.states.get(&id) {
                         states_map.insert(id, (state.clone(), comp));
                     }
                 }
 
+                debug!("States map size after update: {}", states_map.len());
                 debug!(
                     "Broadcasting block update to {} clients",
                     update_tx.receiver_count()
