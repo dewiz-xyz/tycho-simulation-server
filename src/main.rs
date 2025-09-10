@@ -62,13 +62,8 @@ async fn main() -> anyhow::Result<()> {
         let update_tx_bg = update_tx.clone();
         tokio::spawn(async move {
             info!("Building protocol stream in background...");
-            match build_protocol_stream(
-                &cfg.tycho_url,
-                &cfg.api_key,
-                cfg.tvl_threshold,
-                tokens_bg,
-            )
-            .await
+            match build_protocol_stream(&cfg.tycho_url, &cfg.api_key, cfg.tvl_threshold, tokens_bg)
+                .await
             {
                 Ok(stream) => {
                     info!("Protocol stream built successfully (background)");

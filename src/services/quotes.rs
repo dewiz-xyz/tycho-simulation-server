@@ -181,5 +181,15 @@ pub async fn get_amounts_out(
     });
 
     debug!("Returning {} sorted quotes", results.len());
+    // Info log summarizing the returned quotes (top entry shown for brevity)
+    let top = &results[0];
+    info!(
+        "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={}",
+        results.len(),
+        top.pool_name,
+        top.pool_address,
+        top.amounts_out.get(0).cloned().unwrap_or_else(|| "0".to_string()),
+        top.block_number
+    );
     Ok(results)
 }
