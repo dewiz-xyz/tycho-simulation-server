@@ -8,7 +8,13 @@ use tycho_simulation::protocol::{models::BlockUpdate, state::ProtocolSim};
 use crate::models::messages::UpdateMessage;
 
 pub async fn process_stream(
-    mut stream: impl futures::Stream<Item = Result<BlockUpdate, impl std::error::Error>> + Unpin + Send,
+    mut stream: impl futures::Stream<
+            Item = Result<
+                BlockUpdate,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
     states: Arc<
         RwLock<
             HashMap<
@@ -25,10 +31,14 @@ pub async fn process_stream(
 ) {
     info!("Starting stream processing...");
 
+    // Emit a one-time readiness log when pools are first ingested
+    let mut ready_logged = false;
+
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(update) => {
                 let mut states_map = states.write().await;
+                let initial_len = states_map.len();
                 let mut block = current_block.write().await;
                 let prev_block = *block;
                 *block = update.block_number;
@@ -59,7 +69,17 @@ pub async fn process_stream(
                     }
                 }
 
-                debug!("States map size after update: {}", states_map.len());
+                let new_len = states_map.len();
+                debug!("States map size after update: {}", new_len);
+
+                if !ready_logged && initial_len == 0 && new_len > 0 {
+                    info!(
+                        "Service ready: first pools ingested (states={}, block={})",
+                        new_len,
+                        *block
+                    );
+                    ready_logged = true;
+                }
                 debug!(
                     "Broadcasting block update to {} clients",
                     update_tx.receiver_count()

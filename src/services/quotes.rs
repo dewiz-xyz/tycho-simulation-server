@@ -3,6 +3,7 @@ use num_traits::cast::ToPrimitive;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 use tycho_simulation::tycho_core::Bytes;
+use tycho_simulation::protocol::state::ProtocolSim;
 
 use crate::models::{
     messages::{AmountOutRequest, AmountOutResponse},
@@ -45,20 +46,20 @@ pub async fn get_amounts_out(
         .collect();
     let amounts_in = amounts_in?;
 
-    let states = state.states.read().await;
+    let states_read = state.states.read().await;
     let current_block = *state.current_block.read().await;
     debug!(
         "Current block: {}, total pools: {}",
         current_block,
-        states.len()
+        states_read.len()
     );
 
     // Guard: service not ready yet
-    if current_block == 0 || states.is_empty() {
+    if current_block == 0 || states_read.is_empty() {
         let warmup_msg = format!(
             "Service warming up: block={}, pools={}",
             current_block,
-            states.len()
+            states_read.len()
         );
         warn!("{}", warmup_msg);
         return Err(warmup_msg);
@@ -66,81 +67,84 @@ pub async fn get_amounts_out(
 
     let mut results = Vec::new();
     let mut matching_pools = 0; // pools whose declared tokens include both sides
-    let mut candidate_pools = 0; // pools we attempted to quote against
+    // pools we attempted to quote against (set after candidate discovery)
     let mut pools_with_quotes = 0;
     let mut first_error: Option<String> = None; // capture first failure reason
 
-    for (id, (state, comp)) in states.iter() {
+    let mut candidates: Vec<(String, Box<dyn ProtocolSim>, String)> = Vec::new();
+    for (id, (pool_state, comp)) in states_read.iter() {
         let pool_tokens: Vec<String> = comp
             .tokens
             .iter()
-            .map(|t| {
-                t.address
-                    .to_string()
-                    .trim_start_matches("0x")
-                    .to_lowercase()
-            })
+            .map(|t| t.address.to_string().trim_start_matches("0x").to_lowercase())
             .collect();
 
-        let token_info_known = !pool_tokens.is_empty();
-        let tokens_match =
-            pool_tokens.contains(&token_in_address) && pool_tokens.contains(&token_out_address);
+        if !pool_tokens.is_empty()
+            && pool_tokens.contains(&token_in_address)
+            && pool_tokens.contains(&token_out_address)
+        {
+            matching_pools += 1;
+            candidates.push((
+                id.clone(),
+                pool_state.clone(),
+                comp.id.to_string(),
+            ));
+            debug!("Found matching pool: {}", id);
+        }
+    }
+    drop(states_read);
 
-        if tokens_match || !token_info_known {
-            if tokens_match {
-                matching_pools += 1;
-                debug!("Found matching pool: {}", id);
-            } else {
-                debug!(
-                    "Pool {} has no declared tokens; attempting quote as fallback",
-                    id
-                );
-            }
-            candidate_pools += 1;
-            let mut amounts_out = Vec::new();
-            let mut gas_used = Vec::new();
+    let candidate_pools = matching_pools;
+    info!(
+        "Quote candidates prepared: matching_pools={} amounts_per_pool={}",
+        matching_pools,
+        amounts_in.len()
+    );
 
-            for amount_in in amounts_in.iter() {
-                match state.get_amount_out(amount_in.clone(), token_in, token_out) {
-                    Ok(result) => {
-                        debug!(
-                            "Got quote result: amount={}, gas={}",
-                            result.amount, result.gas
-                        );
-                        amounts_out.push(result.amount.to_string());
-                        gas_used.push(result.gas.to_u64().unwrap_or(0));
+    for (id, pool_state, pool_addr) in candidates.into_iter() {
+        let mut amounts_out = Vec::new();
+        let mut gas_used = Vec::new();
+
+        for amount_in in amounts_in.iter() {
+            match pool_state.get_amount_out(amount_in.clone(), token_in, token_out) {
+                Ok(result) => {
+                    debug!(
+                        "Got quote result: amount={}, gas={}",
+                        result.amount, result.gas
+                    );
+                    amounts_out.push(result.amount.to_string());
+                    gas_used.push(result.gas.to_u64().unwrap_or(0));
+                }
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    if first_error.is_none() {
+                        first_error = Some(msg.clone());
                     }
-                    Err(e) => {
-                        let msg = format!("{}", e);
-                        if first_error.is_none() {
-                            first_error = Some(msg.clone());
-                        }
-                        debug!("Failed to get quote: {}", msg);
-                        continue;
-                    }
+                    debug!("Failed to get quote: {}", msg);
+                    continue;
                 }
             }
+        }
 
-            if !amounts_out.is_empty() {
-                pools_with_quotes += 1;
-                let pool_name = format!("{:?}", state);
-                let pool_name = pool_name
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("Unknown")
-                    .to_string();
+        if !amounts_out.is_empty() {
+            pools_with_quotes += 1;
+            let pool_name = format!("{:?}", pool_state);
+            let pool_name = pool_name
+                .split_whitespace()
+                .next()
+                .unwrap_or("Unknown")
+                .to_string();
 
-                debug!("Adding valid quote for pool: {}", pool_name);
+            debug!("Adding valid quote for pool: {}", pool_name);
 
-                results.push(AmountOutResponse {
-                    pool: id.clone(),
-                    pool_name,
-                    pool_address: comp.id.to_string(),
-                    amounts_out,
-                    gas_used,
-                    block_number: current_block,
-                });
-            }
+            results.push(AmountOutResponse {
+                pool: id.clone(),
+                pool_name,
+                pool_address: pool_addr,
+                amounts_out,
+                gas_used,
+                block_number: current_block,
+            });
         }
     }
 

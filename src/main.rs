@@ -16,7 +16,7 @@ use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
 use crate::models::state::AppState;
-use crate::services::stream_builder::build_protocol_stream;
+use crate::services::stream_builder::build_merged_streams;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,16 +61,22 @@ async fn main() -> anyhow::Result<()> {
         let current_block_bg = Arc::clone(&current_block);
         let update_tx_bg = update_tx.clone();
         tokio::spawn(async move {
-            info!("Building protocol stream in background...");
-            match build_protocol_stream(&cfg.tycho_url, &cfg.api_key, cfg.tvl_threshold, tokens_bg)
-                .await
+            info!("Starting merged protocol streams in background...");
+            match build_merged_streams(
+                &cfg.tycho_url,
+                &cfg.api_key,
+                cfg.tvl_threshold,
+                cfg.tvl_keep_threshold,
+                tokens_bg,
+            )
+            .await
             {
                 Ok(stream) => {
-                    info!("Protocol stream built successfully (background)");
+                    info!("Merged protocol streams running (background)");
                     process_stream(stream, states_bg, current_block_bg, update_tx_bg).await;
                 }
                 Err(e) => {
-                    error!("Protocol stream build failed: {:?}", e);
+                    error!("Failed to initialize merged streams: {:?}", e);
                 }
             }
         });
