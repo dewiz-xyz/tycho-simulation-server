@@ -23,7 +23,6 @@ pub fn load_config() -> AppConfig {
         .expect("Invalid PORT");
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
-
     // Create socket address from host and port
     let addr = format!("{}", host);
     // Parse the address
@@ -31,8 +30,14 @@ pub fn load_config() -> AppConfig {
 
     // Basic validation
     assert!(tvl_threshold > 0.0, "TVL_THRESHOLD must be > 0");
-    assert!(tvl_keep_ratio > 0.0 && tvl_keep_ratio <= 1.0, "TVL_KEEP_RATIO must be in (0, 1]");
-    assert!(tvl_keep_threshold > 0.0, "Derived TVL keep threshold must be > 0");
+    assert!(
+        tvl_keep_ratio > 0.0 && tvl_keep_ratio <= 1.0,
+        "TVL_KEEP_RATIO must be in (0, 1]"
+    );
+    assert!(
+        tvl_keep_threshold > 0.0,
+        "Derived TVL keep threshold must be > 0"
+    );
 
     AppConfig {
         tycho_url,

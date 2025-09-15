@@ -4,10 +4,9 @@ mod handlers;
 mod models;
 mod services;
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_core::dto::Chain, utils::load_all_tokens};
@@ -15,7 +14,8 @@ use tycho_simulation::{tycho_core::dto::Chain, utils::load_all_tokens};
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
-use crate::models::state::AppState;
+use crate::models::state::{AppState, StateStore};
+use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_merged_streams;
 
 #[tokio::main]
@@ -40,25 +40,29 @@ async fn main() -> anyhow::Result<()> {
     info!("Loaded {} tokens", all_tokens.len());
 
     // Create shared state
-    let states = Arc::new(RwLock::new(HashMap::new()));
-    let current_block = Arc::new(RwLock::new(0));
+    let chain_id: u32 = Chain::Ethereum.into();
+    let tokens = Arc::new(TokenStore::new(
+        all_tokens,
+        config.tycho_url.clone(),
+        config.api_key.clone(),
+        chain_id,
+    ));
+    let state_store = Arc::new(StateStore::new());
     let (update_tx, _) = broadcast::channel(100);
     debug!("Created shared state and broadcast channel");
 
     // Create app state
     let app_state = AppState {
-        tokens: Arc::new(all_tokens.clone()),
-        states: Arc::clone(&states),
-        current_block: Arc::clone(&current_block),
+        tokens: Arc::clone(&tokens),
+        state_store: Arc::clone(&state_store),
         update_tx: update_tx.clone(),
     };
 
     // Build protocol stream in background and start processing
     {
         let cfg = config.clone();
-        let tokens_bg = all_tokens.clone();
-        let states_bg = Arc::clone(&states);
-        let current_block_bg = Arc::clone(&current_block);
+        let tokens_bg = Arc::clone(&tokens);
+        let state_store_bg = Arc::clone(&state_store);
         let update_tx_bg = update_tx.clone();
         tokio::spawn(async move {
             info!("Starting merged protocol streams in background...");
@@ -73,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(stream) => {
                     info!("Merged protocol streams running (background)");
-                    process_stream(stream, states_bg, current_block_bg, update_tx_bg).await;
+                    process_stream(stream, state_store_bg, update_tx_bg).await;
                 }
                 Err(e) => {
                     error!("Failed to initialize merged streams: {:?}", e);

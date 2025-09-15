@@ -23,30 +23,28 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
     let mut rx = app_state.update_tx.subscribe();
 
     // Send initial state
-    if let Ok(block) = app_state.current_block.read().await.to_string().parse() {
-        let states = app_state.states.read().await;
-        debug!(
-            "Sending initial state: block={}, states={}",
-            block,
-            states.len()
-        );
+    let block = app_state.current_block().await;
+    let pool_count = app_state.total_pools().await;
+    debug!(
+        "Sending initial state: block={}, states={}",
+        block, pool_count
+    );
 
-        let result = socket
-            .send(axum::extract::ws::Message::Text(
-                serde_json::to_string(&UpdateMessage::BlockUpdate {
-                    block_number: block,
-                    states_count: states.len(),
-                    new_pairs_count: 0,
-                    removed_pairs_count: 0,
-                })
-                .unwrap(),
-            ))
-            .await;
-
-        if result.is_err() {
-            error!("Failed to send initial state");
-            return;
-        }
+    if socket
+        .send(axum::extract::ws::Message::Text(
+            serde_json::to_string(&UpdateMessage::BlockUpdate {
+                block_number: block,
+                states_count: pool_count,
+                new_pairs_count: 0,
+                removed_pairs_count: 0,
+            })
+            .unwrap(),
+        ))
+        .await
+        .is_err()
+    {
+        error!("Failed to send initial state");
+        return;
     }
 
     loop {
@@ -62,25 +60,29 @@ async fn handle_ws_connection(mut socket: WebSocket, app_state: AppState) {
                             );
 
                             // Process quote request
-                            match get_amounts_out(app_state.clone(), req.clone()).await {
-                                Ok(quotes) => {
-                                    info!("Found {} quotes", quotes.len());
-                                    let msg = UpdateMessage::QuoteUpdate {
-                                        request_id: req.request_id.unwrap_or_default(),
-                                        data: quotes,
-                                    };
-                                    if socket.send(axum::extract::ws::Message::Text(
-                                        serde_json::to_string(&msg).unwrap()
-                                    )).await.is_err() {
-                                        error!("Failed to send quote response");
-                                        break;
-                                    }
-                                    debug!("Quote response sent successfully");
-                                }
-                                Err(e) => {
-                                    error!("Error getting quotes: {}", e);
-                                }
+                            let result = get_amounts_out(app_state.clone(), req.clone()).await;
+                            info!(
+                                "Quote status={:?} pools={} responses={}",
+                                result.meta.status,
+                                result.meta.matching_pools,
+                                result.responses.len()
+                            );
+                            let msg = UpdateMessage::QuoteUpdate {
+                                request_id: req.request_id.unwrap_or_default(),
+                                data: result.responses,
+                                meta: result.meta,
+                            };
+                            if socket
+                                .send(axum::extract::ws::Message::Text(
+                                    serde_json::to_string(&msg).unwrap(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                error!("Failed to send quote response");
+                                break;
                             }
+                            debug!("Quote response sent successfully");
                         }
                     }
                     Some(Ok(axum::extract::ws::Message::Close(_))) => {
