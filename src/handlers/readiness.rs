@@ -4,7 +4,7 @@ use serde::Serialize;
 use crate::models::state::AppState;
 
 #[derive(Serialize)]
-struct ReadinessPayload {
+pub struct ReadinessPayload {
     status: &'static str,
     block: u64,
     pools: usize,

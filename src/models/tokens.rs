@@ -2,8 +2,12 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
-use tycho_simulation::{models::Token, tycho_core::Bytes, utils::load_all_tokens};
+use tracing::{info, warn};
+use tycho_simulation::{
+    models::Token,
+    tycho_core::{dto::Chain, Bytes},
+    utils::load_all_tokens,
+};
 
 /// In-memory cache of Tycho token metadata with best-effort refresh when
 /// lookups miss. Refreshes reuse the Tycho `/tokens` endpoint to cover cases
@@ -13,7 +17,7 @@ pub struct TokenStore {
     refresh_lock: Mutex<()>,
     tycho_url: String,
     api_key: String,
-    chain_id: u32,
+    chain: Chain,
 }
 
 impl TokenStore {
@@ -21,14 +25,14 @@ impl TokenStore {
         initial: HashMap<Bytes, Token>,
         tycho_url: String,
         api_key: String,
-        chain_id: u32,
+        chain: Chain,
     ) -> Self {
         TokenStore {
             tokens: RwLock::new(initial),
             refresh_lock: Mutex::new(()),
             tycho_url,
             api_key,
-            chain_id,
+            chain,
         }
     }
 
@@ -61,7 +65,7 @@ impl TokenStore {
             &self.tycho_url,
             false,
             Some(&self.api_key),
-            self.chain_id,
+            self.chain.into(),
             None,
             None,
         )
@@ -70,10 +74,5 @@ impl TokenStore {
         *self.tokens.write().await = new_tokens;
         drop(guard);
         Ok(())
-    }
-
-    pub async fn invalidate(&self) {
-        debug!("Invalidating token cache");
-        self.tokens.write().await.clear();
     }
 }

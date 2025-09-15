@@ -40,12 +40,11 @@ async fn main() -> anyhow::Result<()> {
     info!("Loaded {} tokens", all_tokens.len());
 
     // Create shared state
-    let chain_id: u32 = Chain::Ethereum.into();
     let tokens = Arc::new(TokenStore::new(
         all_tokens,
         config.tycho_url.clone(),
         config.api_key.clone(),
-        chain_id,
+        Chain::Ethereum,
     ));
     let state_store = Arc::new(StateStore::new());
     let (update_tx, _) = broadcast::channel(100);

@@ -7,7 +7,7 @@ use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tycho_simulation::{models::Token, protocol::state::ProtocolSim, tycho_core::Bytes};
 
 use crate::models::messages::{
@@ -344,7 +344,7 @@ async fn simulate_pool(
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    debug!("Pool {} quote error: {}", pool_id_for_failure, msg);
+                    debug!("Pool {} quote error: {}", pool_id, msg);
                     errors.push(msg);
                 }
             }
@@ -365,9 +365,10 @@ async fn simulate_pool(
             errors,
         }
     });
+    tokio::pin!(handle);
 
     tokio::select! {
-        res = handle => {
+        res = handle.as_mut() => {
             match res {
                 Ok(result) => Ok(result),
                 Err(join_err) => {
@@ -380,7 +381,7 @@ async fn simulate_pool(
             }
         }
         _ = sleep(timeout) => {
-            handle.abort();
+            handle.as_mut().abort();
             Err(make_failure(
                 QuoteFailureKind::Timeout,
                 format!("Quote computation timed out for pool {} ({})", pool_id_for_failure, pool_addr_for_failure),

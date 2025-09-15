@@ -214,7 +214,7 @@ impl StateStore {
             return true;
         }
         let mut rx = self.ready_tx.subscribe();
-        let mut sleep = tokio::time::sleep(wait);
+        let sleep = tokio::time::sleep(wait);
         tokio::pin!(sleep);
 
         loop {
@@ -227,7 +227,7 @@ impl StateStore {
                         return true;
                     }
                 }
-                _ = &mut sleep => {
+                _ = sleep.as_mut() => {
                     return self.is_ready();
                 }
             }
