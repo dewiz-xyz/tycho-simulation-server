@@ -8,7 +8,11 @@ use num_traits::cast::ToPrimitive;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{debug, error, info};
-use tycho_simulation::{models::Token, protocol::state::ProtocolSim, tycho_core::Bytes};
+use tycho_simulation::{
+    models::Token,
+    protocol::{models::ProtocolComponent, state::ProtocolSim},
+    tycho_core::Bytes,
+};
 
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteStatus,
@@ -205,10 +209,14 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
         let token_out_clone = token_out.clone();
         let amounts_clone = Arc::clone(&amounts_in);
         let pool_address = component.id.to_string();
+        let pool_protocol = component.protocol_system.clone();
+        let pool_name = derive_pool_name(&component);
         tasks.push(simulate_pool(
             id,
             pool_state,
             pool_address,
+            pool_name,
+            pool_protocol,
             token_in_clone,
             token_out_clone,
             amounts_clone,
@@ -230,28 +238,37 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
                         block_number: current_block,
                     });
                 } else {
-                    let message = if result.amounts_out.is_empty() {
-                        result
+                    let context = FailureContext {
+                        pool_id: &result.pool,
+                        pool_name: Some(&result.pool_name),
+                        pool_address: Some(&result.pool_address),
+                        protocol: Some(&result.protocol),
+                    };
+
+                    if result.amounts_out.is_empty() {
+                        let descriptor = format_pool_descriptor(&context);
+                        let base_error = result
                             .errors
                             .first()
                             .cloned()
-                            .unwrap_or_else(|| "Pool returned no quotes".to_string())
+                            .unwrap_or_else(|| "Pool returned no quotes".to_string());
+                        let message = format!("{}: {}", descriptor, base_error);
+                        let kind = classify_failure(&base_error);
+                        failures.push(make_failure(kind, message, Some(context)));
                     } else {
-                        format!(
-                            "Pool produced partial ladder ({} of {} steps)",
+                        let descriptor = format_pool_descriptor(&context);
+                        let message = format!(
+                            "{} produced partial ladder ({} of {} steps)",
+                            descriptor,
                             result.amounts_out.len(),
                             expected_len
-                        )
-                    };
-                    failures.push(make_failure(
-                        if result.amounts_out.is_empty() {
-                            classify_failure(&message)
-                        } else {
-                            QuoteFailureKind::InconsistentResult
-                        },
-                        message,
-                        Some(result.pool),
-                    ));
+                        );
+                        failures.push(make_failure(
+                            QuoteFailureKind::InconsistentResult,
+                            message,
+                            Some(context),
+                        ));
+                    }
                 }
             }
             Err(failure) => {
@@ -310,15 +327,25 @@ struct PoolQuoteResult {
     pool: String,
     pool_name: String,
     pool_address: String,
+    protocol: String,
     amounts_out: Vec<String>,
     gas_used: Vec<u64>,
     errors: Vec<String>,
+}
+
+struct FailureContext<'a> {
+    pool_id: &'a str,
+    pool_name: Option<&'a str>,
+    pool_address: Option<&'a str>,
+    protocol: Option<&'a str>,
 }
 
 async fn simulate_pool(
     pool_id: String,
     pool_state: Box<dyn ProtocolSim>,
     pool_address: String,
+    pool_name: String,
+    pool_protocol: String,
     token_in: Token,
     token_out: Token,
     amounts: Arc<Vec<BigUint>>,
@@ -327,6 +354,8 @@ async fn simulate_pool(
 ) -> Result<PoolQuoteResult, QuoteFailure> {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
+    let pool_name_for_failure = pool_name.clone();
+    let pool_protocol_for_failure = pool_protocol.clone();
     let token_in_clone = token_in.clone();
     let token_out_clone = token_out.clone();
     let amounts_clone = Arc::clone(&amounts);
@@ -344,22 +373,24 @@ async fn simulate_pool(
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    debug!("Pool {} quote error: {}", pool_id, msg);
+                    debug!(
+                        pool_id = %pool_id,
+                        protocol = %pool_protocol,
+                        pool_name = %pool_name,
+                        pool_address = %pool_address,
+                        "Pool quote error: {}",
+                        msg
+                    );
                     errors.push(msg);
                 }
             }
         }
 
-        let pool_name = format!("{:?}", pool_state)
-            .split_whitespace()
-            .next()
-            .unwrap_or("Unknown")
-            .to_string();
-
         PoolQuoteResult {
             pool: pool_id,
             pool_name,
             pool_address,
+            protocol: pool_protocol,
             amounts_out,
             gas_used,
             errors,
@@ -372,21 +403,32 @@ async fn simulate_pool(
             match res {
                 Ok(result) => Ok(result),
                 Err(join_err) => {
-                    Err(make_failure(
-                        QuoteFailureKind::Internal,
-                        format!("Quote computation panicked for pool {}: {}", pool_id_for_failure, join_err),
-                        Some(pool_id_for_failure),
-                    ))
+                    let context = FailureContext {
+                        pool_id: &pool_id_for_failure,
+                        pool_name: Some(pool_name_for_failure.as_str()),
+                        pool_address: Some(pool_addr_for_failure.as_str()),
+                        protocol: Some(pool_protocol_for_failure.as_str()),
+                    };
+                    let descriptor = format_pool_descriptor(&context);
+                    let message = format!(
+                        "{}: Quote computation panicked: {}",
+                        descriptor, join_err
+                    );
+                    Err(make_failure(QuoteFailureKind::Internal, message, Some(context)))
                 }
             }
         }
         _ = sleep(timeout) => {
             handle.as_mut().abort();
-            Err(make_failure(
-                QuoteFailureKind::Timeout,
-                format!("Quote computation timed out for pool {} ({})", pool_id_for_failure, pool_addr_for_failure),
-                Some(pool_id_for_failure),
-            ))
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            let message = format!("{}: Quote computation timed out", descriptor);
+            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
         }
     }
 }
@@ -406,10 +448,107 @@ fn classify_failure(message: &str) -> QuoteFailureKind {
     }
 }
 
-fn make_failure(kind: QuoteFailureKind, message: String, pool: Option<String>) -> QuoteFailure {
+fn format_pool_descriptor(context: &FailureContext<'_>) -> String {
+    let mut head = Vec::new();
+    if let Some(protocol) = context.protocol {
+        if !protocol.is_empty() {
+            head.push(protocol);
+        }
+    }
+    if let Some(name) = context.pool_name {
+        if !name.is_empty() {
+            head.push(name);
+        }
+    }
+
+    let mut label = if !head.is_empty() {
+        head.join("::")
+    } else {
+        context.pool_id.to_string()
+    };
+
+    if let Some(address) = context.pool_address {
+        if !address.is_empty() {
+            label = format!("{} [{}]", label, address);
+        }
+    }
+
+    label
+}
+
+fn decode_attribute(value: &Bytes) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut bytes = value.to_vec();
+    while matches!(bytes.last(), Some(0)) {
+        bytes.pop();
+    }
+
+    std::str::from_utf8(&bytes)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn derive_pool_name(component: &ProtocolComponent) -> String {
+    for key in ["pool_name", "name", "label"] {
+        if let Some(label) = component
+            .static_attributes
+            .get(key)
+            .and_then(decode_attribute)
+        {
+            if !label.is_empty() {
+                return label;
+            }
+        }
+    }
+
+    let symbols: Vec<&str> = component
+        .tokens
+        .iter()
+        .map(|token| token.symbol.as_str())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+
+    if !symbols.is_empty() {
+        return format!("{}::{}", component.protocol_system, symbols.join("/"));
+    }
+
+    if !component.protocol_type_name.is_empty() {
+        return format!(
+            "{}::{}",
+            component.protocol_system, component.protocol_type_name
+        );
+    }
+
+    component.protocol_system.clone()
+}
+
+fn make_failure(
+    kind: QuoteFailureKind,
+    message: String,
+    pool: Option<FailureContext<'_>>,
+) -> QuoteFailure {
+    let (pool, pool_name, pool_address, protocol) = pool.map_or_else(
+        || (None, None, None, None),
+        |context| {
+            (
+                Some(context.pool_id.to_string()),
+                context.pool_name.map(|value| value.to_string()),
+                context.pool_address.map(|value| value.to_string()),
+                context.protocol.map(|value| value.to_string()),
+            )
+        },
+    );
+
     QuoteFailure {
         kind,
         message,
         pool,
+        pool_name,
+        pool_address,
+        protocol,
     }
 }

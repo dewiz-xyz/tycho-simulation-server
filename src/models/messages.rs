@@ -51,6 +51,12 @@ pub struct QuoteFailure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
