@@ -7,6 +7,7 @@ use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tycho_simulation::{
     models::Token,
@@ -29,7 +30,8 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
     let mut failures = Vec::new();
 
     let readiness_wait = Duration::from_secs(2);
-    let simulation_timeout = Duration::from_secs(5);
+    let pool_timeout = state.pool_timeout();
+    let quote_timeout = state.quote_timeout();
 
     let mut current_block = state.current_block().await;
     let mut total_pools = state.total_pools().await;
@@ -203,6 +205,7 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
     let token_out = token_out_ref.clone();
     let expected_len = amounts_in.len();
 
+    let cancel_token = CancellationToken::new();
     let mut tasks = FuturesUnordered::new();
     for (id, (pool_state, component)) in candidates_raw.into_iter() {
         let token_in_clone = token_in.clone();
@@ -221,61 +224,88 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
             token_out_clone,
             amounts_clone,
             expected_len,
-            simulation_timeout,
+            pool_timeout,
+            cancel_token.clone(),
         ));
     }
 
-    while let Some(outcome) = tasks.next().await {
-        match outcome {
-            Ok(result) => {
-                if result.amounts_out.len() == expected_len && !result.amounts_out.is_empty() {
-                    responses.push(AmountOutResponse {
-                        pool: result.pool,
-                        pool_name: result.pool_name,
-                        pool_address: result.pool_address,
-                        amounts_out: result.amounts_out,
-                        gas_used: result.gas_used,
-                        block_number: current_block,
-                    });
-                } else {
-                    let context = FailureContext {
-                        pool_id: &result.pool,
-                        pool_name: Some(&result.pool_name),
-                        pool_address: Some(&result.pool_address),
-                        protocol: Some(&result.protocol),
-                    };
+    if !tasks.is_empty() {
+        let quote_timeout_sleep = sleep(quote_timeout);
+        tokio::pin!(quote_timeout_sleep);
 
-                    if result.amounts_out.is_empty() {
-                        let descriptor = format_pool_descriptor(&context);
-                        let base_error = result
-                            .errors
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "Pool returned no quotes".to_string());
-                        let message = format!("{}: {}", descriptor, base_error);
-                        let kind = classify_failure(&base_error);
-                        failures.push(make_failure(kind, message, Some(context)));
-                    } else {
-                        let descriptor = format_pool_descriptor(&context);
-                        let message = format!(
-                            "{} produced partial ladder ({} of {} steps)",
-                            descriptor,
-                            result.amounts_out.len(),
-                            expected_len
-                        );
-                        failures.push(make_failure(
-                            QuoteFailureKind::InconsistentResult,
-                            message,
-                            Some(context),
-                        ));
+        while !tasks.is_empty() {
+            tokio::select! {
+                _ = &mut quote_timeout_sleep => {
+                    cancel_token.cancel();
+                    let message = format!(
+                        "Quote computation timed out after {}ms",
+                        quote_timeout.as_millis()
+                    );
+                    failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
+                    meta.status = QuoteStatus::PartialFailure;
+                    break;
+                }
+                maybe_outcome = tasks.next() => {
+                    match maybe_outcome {
+                        Some(outcome) => {
+                            match outcome {
+                                Ok(result) => {
+                                    if result.amounts_out.len() == expected_len && !result.amounts_out.is_empty() {
+                                        responses.push(AmountOutResponse {
+                                            pool: result.pool,
+                                            pool_name: result.pool_name,
+                                            pool_address: result.pool_address,
+                                            amounts_out: result.amounts_out,
+                                            gas_used: result.gas_used,
+                                            block_number: current_block,
+                                        });
+                                    } else {
+                                        let context = FailureContext {
+                                            pool_id: &result.pool,
+                                            pool_name: Some(&result.pool_name),
+                                            pool_address: Some(&result.pool_address),
+                                            protocol: Some(&result.protocol),
+                                        };
+
+                                        if result.amounts_out.is_empty() {
+                                            let descriptor = format_pool_descriptor(&context);
+                                            let base_error = result
+                                                .errors
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_else(|| "Pool returned no quotes".to_string());
+                                            let message = format!("{}: {}", descriptor, base_error);
+                                            let kind = classify_failure(&base_error, true);
+                                            failures.push(make_failure(kind, message, Some(context)));
+                                        } else {
+                                            let descriptor = format_pool_descriptor(&context);
+                                            let message = format!(
+                                                "{} produced partial ladder ({} of {} steps)",
+                                                descriptor,
+                                                result.amounts_out.len(),
+                                                expected_len
+                                            );
+                                            failures.push(make_failure(
+                                                QuoteFailureKind::InconsistentResult,
+                                                message,
+                                                Some(context),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(failure) => {
+                                    failures.push(failure);
+                                }
+                            }
+                        }
+                        None => break,
                     }
                 }
             }
-            Err(failure) => {
-                failures.push(failure);
-            }
         }
     }
+
+    drop(tasks);
 
     if responses.is_empty() {
         meta.status = QuoteStatus::PartialFailure;
@@ -351,6 +381,7 @@ async fn simulate_pool(
     amounts: Arc<Vec<BigUint>>,
     expected_len: usize,
     timeout: Duration,
+    cancel_token: CancellationToken,
 ) -> Result<PoolQuoteResult, QuoteFailure> {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
@@ -418,6 +449,18 @@ async fn simulate_pool(
                 }
             }
         }
+        _ = cancel_token.cancelled() => {
+            handle.as_mut().abort();
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            let message = format!("{}: Quote computation cancelled", descriptor);
+            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+        }
         _ = sleep(timeout) => {
             handle.as_mut().abort();
             let context = FailureContext {
@@ -433,7 +476,7 @@ async fn simulate_pool(
     }
 }
 
-fn classify_failure(message: &str) -> QuoteFailureKind {
+fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("warm") {
         QuoteFailureKind::WarmUp
@@ -441,7 +484,7 @@ fn classify_failure(message: &str) -> QuoteFailureKind {
         QuoteFailureKind::Overflow
     } else if lowered.contains("timeout") {
         QuoteFailureKind::Timeout
-    } else if lowered.contains("token") {
+    } else if !from_pool && lowered.contains("token") {
         QuoteFailureKind::TokenCoverage
     } else {
         QuoteFailureKind::Simulator

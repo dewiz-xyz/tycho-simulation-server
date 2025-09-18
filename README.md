@@ -50,6 +50,8 @@ The following environment variables can be configured in your `.env` file:
 - `PORT`: Server port (default: 3000)
 - `HOST`: Server host address (default: 127.0.0.1)
 - `RUST_LOG`: Logging level (default: info, options: error, warn, info, debug, trace)
+- `QUOTE_TIMEOUT_MS`: Maximum duration in milliseconds that a quote request is allowed to run before cancelling outstanding pool simulations (default: 50)
+- `POOL_TIMEOUT_MS`: Per-pool simulation watchdog in milliseconds; each pool simulation is aborted if it exceeds this duration (default: 5)
 
 ## Usage
 

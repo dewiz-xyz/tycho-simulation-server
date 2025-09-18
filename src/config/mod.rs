@@ -39,6 +39,18 @@ pub fn load_config() -> AppConfig {
         "Derived TVL keep threshold must be > 0"
     );
 
+    let quote_timeout_ms: u64 = std::env::var("QUOTE_TIMEOUT_MS")
+        .unwrap_or_else(|_| "50".to_string())
+        .parse()
+        .expect("Invalid QUOTE_TIMEOUT_MS");
+    let pool_timeout_ms: u64 = std::env::var("POOL_TIMEOUT_MS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .expect("Invalid POOL_TIMEOUT_MS");
+
+    assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
+    assert!(pool_timeout_ms > 0, "POOL_TIMEOUT_MS must be > 0");
+
     AppConfig {
         tycho_url,
         api_key,
@@ -46,6 +58,8 @@ pub fn load_config() -> AppConfig {
         tvl_keep_threshold,
         port,
         host,
+        quote_timeout_ms,
+        pool_timeout_ms,
     }
 }
 
@@ -57,4 +71,6 @@ pub struct AppConfig {
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: String,
+    pub quote_timeout_ms: u64,
+    pub pool_timeout_ms: u64,
 }

@@ -28,3 +28,4 @@ dotenv = "0.15.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+tokio-util = "0.7"

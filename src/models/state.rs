@@ -20,6 +20,8 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub state_store: Arc<StateStore>,
     pub update_tx: broadcast::Sender<UpdateMessage>,
+    pub quote_timeout: Duration,
+    pub pool_timeout: Duration,
 }
 
 impl AppState {
@@ -37,6 +39,14 @@ impl AppState {
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
         self.state_store.wait_until_ready(wait).await
+    }
+
+    pub fn quote_timeout(&self) -> Duration {
+        self.quote_timeout
+    }
+
+    pub fn pool_timeout(&self) -> Duration {
+        self.pool_timeout
     }
 }
 

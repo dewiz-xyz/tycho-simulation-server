@@ -6,6 +6,7 @@ mod services;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
@@ -51,10 +52,15 @@ async fn main() -> anyhow::Result<()> {
     debug!("Created shared state and broadcast channel");
 
     // Create app state
+    let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
+    let pool_timeout = Duration::from_millis(config.pool_timeout_ms);
+
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
         update_tx: update_tx.clone(),
+        quote_timeout,
+        pool_timeout,
     };
 
     // Build protocol stream in background and start processing
