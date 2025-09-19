@@ -45,10 +45,13 @@ The following environment variables can be configured in your `.env` file:
 
 - `TYCHO_URL`: Tycho API URL (default: "tycho-beta.propellerheads.xyz")
 - `TYCHO_API_KEY`: Your Tycho API key (required)
-- `TVL_THRESHOLD`: TVL threshold for filtering (default: 1000)
+- `TVL_THRESHOLD`: TVL add threshold for filtering, denominated in the chain's native token. Default if unset: 300.
+- `TVL_KEEP_RATIO`: Ratio used to compute the remove/keep threshold as a fraction of `TVL_THRESHOLD` (i.e., `remove = TVL_THRESHOLD * TVL_KEEP_RATIO`). Default if unset: 0.2. The derived keep threshold is clamped to be no greater than `TVL_THRESHOLD`.
 - `PORT`: Server port (default: 3000)
 - `HOST`: Server host address (default: 127.0.0.1)
 - `RUST_LOG`: Logging level (default: info, options: error, warn, info, debug, trace)
+- `QUOTE_TIMEOUT_MS`: Maximum duration in milliseconds that a quote request is allowed to run before cancelling outstanding pool simulations (default: 50)
+- `POOL_TIMEOUT_MS`: Per-pool simulation watchdog in milliseconds; each pool simulation is aborted if it exceeds this duration (default: 5)
 
 ## Usage
 
