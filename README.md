@@ -52,6 +52,26 @@ The following environment variables can be configured in your `.env` file:
 - `RUST_LOG`: Logging level (default: info, options: error, warn, info, debug, trace)
 - `QUOTE_TIMEOUT_MS`: Maximum duration in milliseconds that a quote request is allowed to run before cancelling outstanding pool simulations (default: 50)
 - `POOL_TIMEOUT_MS`: Per-pool simulation watchdog in milliseconds; each pool simulation is aborted if it exceeds this duration (default: 5)
+- `CANCELLATION_TTL_SECS`: Duration in seconds to keep canceled auction entries per WebSocket connection to suppress late updates (default: 10)
+- `ENABLE_AUCTION_CANCELLATION`: Feature gate to enable/disable auction-aware cancellation (default: true)
+
+## WebSocket Protocol
+
+Inbound (client → server):
+- Tagged messages (required):
+  - `{"type":"QuoteAmountOut","data":{ request_id: string, auction_id?: string, token_in: string, token_out: string, amounts: string[] }}`
+  - `{"type":"CancelAuctionRequests","data":{ auction_id: string }}`
+
+Outbound (server → client):
+- Block updates: `{"type":"BlockUpdate","data":{ block_number, states_count, new_pairs_count, removed_pairs_count }}`
+- Quote updates: `{"type":"QuoteUpdate","data":{ request_id: string, data: AmountOutResponse[], meta: QuoteMeta }}` where `meta` optionally includes `auction_id`.
+- Cancel acknowledgment: `{"type":"CancelAck","data":{ auction_id: string, canceled_count: number }}`
+
+Cancellation semantics:
+- Each WebSocket connection tracks pending quotes by `auction_id`.
+- On `CancelAuctionRequests`, pending quotes for that `auction_id` are aborted and a `CancelAck` is sent with `canceled_count`.
+- Late `QuoteUpdate`s for a canceled `auction_id` are dropped silently for `CANCELLATION_TTL_SECS` (default 10 seconds).
+- Requests without `auction_id` are never canceled and always emit updates.
 
 ## Usage
 

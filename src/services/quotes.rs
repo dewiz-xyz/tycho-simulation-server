@@ -25,7 +25,11 @@ pub struct QuoteComputation {
     pub meta: QuoteMeta,
 }
 
-pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> QuoteComputation {
+pub async fn get_amounts_out(
+    state: AppState,
+    request: AmountOutRequest,
+    cancel: Option<CancellationToken>,
+) -> QuoteComputation {
     let mut responses = Vec::new();
     let mut failures = Vec::new();
 
@@ -42,8 +46,18 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: Some(total_pools),
+        auction_id: request.auction_id.clone(),
         failures: Vec::new(),
     };
+
+    if cancel
+        .as_ref()
+        .map(|token| token.is_cancelled())
+        .unwrap_or(false)
+    {
+        meta.status = QuoteStatus::PartialFailure;
+        return QuoteComputation { responses, meta };
+    }
 
     let token_in_address = request.token_in.trim_start_matches("0x").to_lowercase();
     let token_out_address = request.token_out.trim_start_matches("0x").to_lowercase();
@@ -205,7 +219,10 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
     let token_out = token_out_ref.clone();
     let expected_len = amounts_in.len();
 
-    let cancel_token = CancellationToken::new();
+    let cancel_token = cancel
+        .as_ref()
+        .map(CancellationToken::child_token)
+        .unwrap_or_default();
     let mut tasks = FuturesUnordered::new();
     for (id, (pool_state, component)) in candidates_raw.into_iter() {
         let token_in_clone = token_in.clone();
@@ -242,6 +259,10 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
                         quote_timeout.as_millis()
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
+                    meta.status = QuoteStatus::PartialFailure;
+                    break;
+                }
+                _ = cancel_token.cancelled() => {
                     meta.status = QuoteStatus::PartialFailure;
                     break;
                 }
@@ -338,7 +359,7 @@ pub async fn get_amounts_out(state: AppState, request: AmountOutRequest) -> Quot
             top.pool_name,
             top.pool_address,
             top.amounts_out
-                .get(0)
+                .first()
                 .cloned()
                 .unwrap_or_else(|| "0".to_string()),
             top.block_number
@@ -370,6 +391,7 @@ struct FailureContext<'a> {
     protocol: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn simulate_pool(
     pool_id: String,
     pool_state: Box<dyn ProtocolSim>,

@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // Create app state
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout = Duration::from_millis(config.pool_timeout_ms);
+    let cancellation_ttl = Duration::from_secs(config.cancellation_ttl_secs);
 
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
@@ -61,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
         update_tx: update_tx.clone(),
         quote_timeout,
         pool_timeout,
+        cancellation_ttl,
+        auction_cancellation_enabled: config.auction_cancellation_enabled,
     };
 
     // Build protocol stream in background and start processing

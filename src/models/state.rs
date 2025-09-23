@@ -22,6 +22,8 @@ pub struct AppState {
     pub update_tx: broadcast::Sender<UpdateMessage>,
     pub quote_timeout: Duration,
     pub pool_timeout: Duration,
+    pub cancellation_ttl: Duration,
+    pub auction_cancellation_enabled: bool,
 }
 
 impl AppState {
@@ -48,8 +50,17 @@ impl AppState {
     pub fn pool_timeout(&self) -> Duration {
         self.pool_timeout
     }
+
+    pub fn cancellation_ttl(&self) -> Duration {
+        self.cancellation_ttl
+    }
+
+    pub fn auction_cancellation_enabled(&self) -> bool {
+        self.auction_cancellation_enabled
+    }
 }
 
+#[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
 struct ProtocolShard {
     states: Arc<RwLock<HashMap<String, (Box<dyn ProtocolSim>, ProtocolComponent)>>>,
