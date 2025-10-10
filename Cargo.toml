@@ -12,7 +12,7 @@ name = "tycho-price-service"
 path = "src/main.rs"
 
 [dependencies]
-tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.94.0" }
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.180.3" }
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
