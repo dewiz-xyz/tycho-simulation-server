@@ -413,12 +413,24 @@ async fn simulate_pool(
     let token_out_clone = token_out.clone();
     let amounts_clone = Arc::clone(&amounts);
 
+    let cancel_token_clone = cancel_token.clone();
     let handle = spawn_blocking(move || {
         let mut amounts_out = Vec::with_capacity(expected_len);
         let mut gas_used = Vec::with_capacity(expected_len);
         let mut errors = Vec::new();
 
         for amount_in in amounts_clone.iter() {
+            if cancel_token_clone.is_cancelled() {
+                debug!(
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    "Pool quote cancelled before completion"
+                );
+                errors.push("Cancelled".to_string());
+                break;
+            }
             match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
                 Ok(result) => {
                     amounts_out.push(result.amount.to_string());
@@ -547,7 +559,7 @@ fn decode_attribute(value: &Bytes) -> Option<String> {
     }
 
     let mut bytes = value.to_vec();
-    while matches!(bytes.last(), Some(0)) {
+    while matches!(bytes.last(), Some(&0)) {
         bytes.pop();
     }
 

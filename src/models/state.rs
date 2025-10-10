@@ -199,9 +199,17 @@ impl StateStore {
 
         let total_pairs = self.total_states().await;
 
+        let mut broadcast_value = None;
         if total_pairs > 0 && !self.ready.load(Ordering::Acquire) {
             self.ready.store(true, Ordering::Release);
-            let _ = self.ready_tx.send(true);
+            broadcast_value = Some(true);
+        } else if total_pairs == 0 && self.ready.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Release);
+            broadcast_value = Some(false);
+        }
+
+        if let Some(value) = broadcast_value {
+            let _ = self.ready_tx.send(value);
         }
 
         UpdateMetrics {
