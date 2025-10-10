@@ -8182,7 +8182,6 @@ name = "tycho-simulation-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "axum-extra",
  "dotenv",
@@ -8190,7 +8189,6 @@ dependencies = [
  "headers",
  "num-bigint",
  "num-traits",
- "reqwest 0.12.23",
  "serde",
  "serde_json",
  "tokio",

@@ -128,6 +128,7 @@ impl StateStore {
     }
 
     pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
+        // EVM feeds always return a block number
         let block_number = update.block_number_or_timestamp;
         {
             let mut guard = self.block_number.write().await;
