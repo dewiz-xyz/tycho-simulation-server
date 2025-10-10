@@ -110,7 +110,13 @@ pub async fn get_amounts_out(
         meta.total_pools = Some(total_pools);
     }
 
-    let token_in_ref = match state.tokens.ensure(&token_in_bytes).await {
+    // Concurrently fetch token_in and token_out metadata
+    let (token_in_res, token_out_res) = tokio::join!(
+        state.tokens.ensure(&token_in_bytes),
+        state.tokens.ensure(&token_out_bytes)
+    );
+
+    let token_in_ref = match token_in_res {
         Ok(Some(token)) => token,
         Ok(None) => {
             failures.push(make_failure(
@@ -135,7 +141,7 @@ pub async fn get_amounts_out(
         }
     };
 
-    let token_out_ref = match state.tokens.ensure(&token_out_bytes).await {
+    let token_out_ref = match token_out_res {
         Ok(Some(token)) => token,
         Ok(None) => {
             failures.push(make_failure(
@@ -432,8 +438,25 @@ async fn simulate_pool(
             }
             match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
                 Ok(result) => {
-                    amounts_out.push(result.amount.to_string());
-                    gas_used.push(result.gas.to_u64().unwrap_or(0));
+                    if let Some(gas_u64) = result.gas.to_u64() {
+                        amounts_out.push(result.amount.to_string());
+                        gas_used.push(gas_u64);
+                    } else {
+                        let msg = "no gas reported".to_string();
+                        debug!(
+                            pool_id = %pool_id,
+                            protocol = %pool_protocol,
+                            pool_name = %pool_name,
+                            pool_address = %pool_address,
+                            "Pool quote error: {}",
+                            msg
+                        );
+                        // Do not return results with no gas: mark as error and discard
+                        errors.push(msg);
+                        amounts_out.clear();
+                        gas_used.clear();
+                        break;
+                    }
                 }
                 Err(e) => {
                     let msg = e.to_string();
