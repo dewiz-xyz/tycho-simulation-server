@@ -6,11 +6,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{debug, warn};
 use tycho_simulation::{
-    protocol::{
-        models::{BlockUpdate, ProtocolComponent},
-        state::ProtocolSim,
-    },
-    tycho_common::Bytes,
+    protocol::models::{ProtocolComponent, Update},
+    tycho_common::{simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use super::{messages::UpdateMessage, protocol::ProtocolKind, tokens::TokenStore};
@@ -130,8 +127,8 @@ impl StateStore {
         }
     }
 
-    pub async fn apply_update(&self, mut update: BlockUpdate) -> UpdateMetrics {
-        let block_number = update.block_number;
+    pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
+        let block_number = update.block_number_or_timestamp;
         {
             let mut guard = self.block_number.write().await;
             *guard = block_number;

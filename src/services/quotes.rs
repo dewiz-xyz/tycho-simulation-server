@@ -10,9 +10,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tycho_simulation::{
-    models::Token,
-    protocol::{models::ProtocolComponent, state::ProtocolSim},
-    tycho_common::Bytes,
+    protocol::models::ProtocolComponent,
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::messages::{

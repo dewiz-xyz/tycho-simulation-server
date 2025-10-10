@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use tycho_simulation::protocol::models::BlockUpdate;
+use tycho_simulation::protocol::models::Update as TychoUpdate;
 
 use crate::models::{
     messages::UpdateMessage,
@@ -12,7 +12,7 @@ use crate::models::{
 
 pub async fn process_stream(
     mut stream: impl futures::Stream<
-            Item = Result<BlockUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
+            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
         > + Unpin
         + Send,
     state_store: Arc<StateStore>,

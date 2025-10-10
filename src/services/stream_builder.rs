@@ -45,7 +45,7 @@ pub async fn build_merged_streams(
 ) -> Result<
     impl futures::Stream<
             Item = Result<
-                tycho_simulation::protocol::models::BlockUpdate,
+                tycho_simulation::protocol::models::Update,
                 Box<dyn std::error::Error + Send + Sync + 'static>,
             >,
         > + Unpin
@@ -64,7 +64,7 @@ pub async fn build_merged_streams(
     let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
 
     let mut builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
-        .timeout(15)
+        .latency_buffer(15)
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(true);
 
