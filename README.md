@@ -86,7 +86,7 @@ The server will start on the configured host and port.
 ## Dependencies
 
 Key dependencies include:
-- `tycho-simulation`: Core simulation engine
+- `tycho-simulation` (Tycho Client v0.94.0): Core simulation engine. See the [client stream builder docs](https://github.com/propeller-heads/tycho-simulation/blob/main/src/evm/stream.rs#L1) for details on the upgraded API and supervisor behaviour that enable upcoming hook support.
 - `tokio`: Async runtime
 - `axum`: Web framework
 - `serde`: Serialization framework

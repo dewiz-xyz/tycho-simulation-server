@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
-use tycho_simulation::{tycho_core::dto::Chain, utils::load_all_tokens};
+use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         &config.tycho_url,
         false,
         Some(&config.api_key),
-        Chain::Ethereum.into(),
+        Chain::Ethereum,
         None,
         None,
     )

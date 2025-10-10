@@ -12,7 +12,7 @@ use tracing::{debug, error, info};
 use tycho_simulation::{
     models::Token,
     protocol::{models::ProtocolComponent, state::ProtocolSim},
-    tycho_core::Bytes,
+    tycho_common::Bytes,
 };
 
 use crate::models::messages::{

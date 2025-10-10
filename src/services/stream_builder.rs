@@ -17,7 +17,7 @@ use tycho_simulation::{
         stream::ProtocolStreamBuilder,
     },
     tycho_client::feed::{component_tracker::ComponentFilter, synchronizer::ComponentWithState},
-    tycho_core::dto::Chain,
+    tycho_common::models::Chain,
 };
 
 use crate::models::tokens::TokenStore;
@@ -63,7 +63,7 @@ pub async fn build_merged_streams(
     );
     let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
 
-    let mut builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum.into())
+    let mut builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
         .timeout(15)
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(true);

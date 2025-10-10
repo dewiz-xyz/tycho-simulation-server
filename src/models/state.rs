@@ -10,7 +10,7 @@ use tycho_simulation::{
         models::{BlockUpdate, ProtocolComponent},
         state::ProtocolSim,
     },
-    tycho_core::Bytes,
+    tycho_common::Bytes,
 };
 
 use super::{messages::UpdateMessage, protocol::ProtocolKind, tokens::TokenStore};

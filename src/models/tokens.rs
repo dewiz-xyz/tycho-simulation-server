@@ -5,7 +5,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use tycho_simulation::{
     models::Token,
-    tycho_core::{dto::Chain, Bytes},
+    tycho_common::{models::Chain, Bytes},
     utils::load_all_tokens,
 };
 
@@ -65,7 +65,7 @@ impl TokenStore {
             &self.tycho_url,
             false,
             Some(&self.api_key),
-            self.chain.into(),
+            self.chain,
             None,
             None,
         )
