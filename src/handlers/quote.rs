@@ -1,4 +1,4 @@
-use axum::{extract::State, Json};
+use axum::{extract::{State, Query}, Json};
 use tracing::info;
 
 use crate::{
@@ -9,9 +9,9 @@ use crate::{
     services::quotes::get_amounts_out,
 };
 
-pub async fn post_quote(
+pub async fn get_quote(
     State(state): State<AppState>,
-    Json(request): Json<AmountOutRequest>,
+    Query(request): Query<AmountOutRequest>,
 ) -> Json<QuoteResult> {
     info!(
         request_id = request.request_id.as_str(),

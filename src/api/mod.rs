@@ -1,14 +1,12 @@
-use axum::{
-    routing::{get, post},
-    Router,
-};
+use axum::routing::get;
+use axum::Router;
 
-use crate::handlers::{quote::post_quote, readiness::status};
+use crate::handlers::{quote::get_quote, readiness::status};
 use crate::models::state::AppState;
 
 pub fn create_router(app_state: AppState) -> Router {
     Router::new()
-        .route("/quote", post(post_quote))
+        .route("/quote", get(get_quote))
         .route("/status", get(status))
         .with_state(app_state)
 }
