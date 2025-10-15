@@ -7,7 +7,6 @@ mod services;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
@@ -48,22 +47,17 @@ async fn main() -> anyhow::Result<()> {
         Chain::Ethereum,
     ));
     let state_store = Arc::new(StateStore::new());
-    let (update_tx, _) = broadcast::channel(100);
-    debug!("Created shared state and broadcast channel");
+    debug!("Created shared state");
 
     // Create app state
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout = Duration::from_millis(config.pool_timeout_ms);
-    let cancellation_ttl = Duration::from_secs(config.cancellation_ttl_secs);
 
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
-        update_tx: update_tx.clone(),
         quote_timeout,
         pool_timeout,
-        cancellation_ttl,
-        auction_cancellation_enabled: config.auction_cancellation_enabled,
     };
 
     // Build protocol stream in background and start processing
@@ -71,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&state_store);
-        let update_tx_bg = update_tx.clone();
         tokio::spawn(async move {
             info!("Starting merged protocol streams in background...");
             match build_merged_streams(
@@ -85,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(stream) => {
                     info!("Merged protocol streams running (background)");
-                    process_stream(stream, state_store_bg, update_tx_bg).await;
+                    process_stream(stream, state_store_bg).await;
                 }
                 Err(e) => {
                     error!("Failed to initialize merged streams: {:?}", e);
@@ -102,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let ip_addr: IpAddr = config.host.parse().expect("Invalid host address");
     let addr = SocketAddr::from((ip_addr, config.port));
 
-    info!("Starting WebSocket server on {}", addr);
+    info!("Starting HTTP server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
         error!("Failed to bind to address: {}", e);
