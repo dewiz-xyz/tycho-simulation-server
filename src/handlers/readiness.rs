@@ -4,19 +4,19 @@ use serde::Serialize;
 use crate::models::state::AppState;
 
 #[derive(Serialize)]
-pub struct ReadinessPayload {
+pub struct StatusPayload {
     status: &'static str,
     block: u64,
     pools: usize,
 }
 
-pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadinessPayload>) {
+pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
     let block = state.current_block().await;
     let pools = state.total_pools().await;
     if state.is_ready() {
         (
             StatusCode::OK,
-            Json(ReadinessPayload {
+            Json(StatusPayload {
                 status: "ready",
                 block,
                 pools,
@@ -25,7 +25,7 @@ pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Readi
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessPayload {
+            Json(StatusPayload {
                 status: "warming_up",
                 block,
                 pools,
