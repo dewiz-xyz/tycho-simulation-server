@@ -1,4 +1,4 @@
-use axum::{extract::{State, Query}, Json};
+use axum::{extract::State, Json};
 use tracing::info;
 
 use crate::{
@@ -9,16 +9,16 @@ use crate::{
     services::quotes::get_amounts_out,
 };
 
-pub async fn get_quote(
+pub async fn simulate(
     State(state): State<AppState>,
-    Query(request): Query<AmountOutRequest>,
+    Json(request): Json<AmountOutRequest>,
 ) -> Json<QuoteResult> {
     info!(
         request_id = request.request_id.as_str(),
         token_in = request.token_in.as_str(),
         token_out = request.token_out.as_str(),
         amounts = request.amounts.len(),
-        "Received quote request"
+        "Received simulate request"
     );
 
     let computation = get_amounts_out(state, request.clone(), None).await;
@@ -28,7 +28,7 @@ pub async fn get_quote(
         status = ?computation.meta.status,
         responses = computation.responses.len(),
         failures = computation.meta.failures.len(),
-        "Quote computation completed"
+        "Simulate computation completed"
     );
 
     Json(QuoteResult {

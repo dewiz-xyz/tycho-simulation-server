@@ -9,7 +9,7 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 ## Features
 
 - Background ingestion of Tycho protocol streams with TVL-based filtering.
-- `GET /quote` endpoint that returns laddered amount-out simulations with rich metadata.
+- `POST /simulate` endpoint that returns laddered amount-out simulated quotes with rich metadata.
 - `GET /status` endpoint for readiness polling (block height, pool count).
 - Structured logging with `tracing`.
 - Fully asynchronous execution with Tokio.
@@ -52,12 +52,19 @@ The following environment variables are read at startup:
 
 ## HTTP API
 
-### `GET /quote`
+### `POST /simulate`
 
-Query parameters:
+JSON body:
 
 ```bash
-curl "http://localhost:3000/quote?request_id=req-123&token_in=0x6b175474e89094c44da98b954eedeac495271d0f&token_out=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&amounts=1000000000000000000&amounts=5000000000000000000"
+curl -X POST "http://localhost:3000/simulate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "request_id": "req-123",
+    "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
+    "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "amounts": ["1000000000000000000", "5000000000000000000"]
+  }'
 ```
 
 Response body:
