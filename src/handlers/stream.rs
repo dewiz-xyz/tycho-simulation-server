@@ -1,14 +1,10 @@
 use std::sync::Arc;
 
 use futures::stream::StreamExt;
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tycho_simulation::protocol::models::Update as TychoUpdate;
 
-use crate::models::{
-    messages::UpdateMessage,
-    state::{StateStore, UpdateMetrics},
-};
+use crate::models::state::{StateStore, UpdateMetrics};
 
 pub async fn process_stream(
     mut stream: impl futures::Stream<
@@ -16,7 +12,6 @@ pub async fn process_stream(
         > + Unpin
         + Send,
     state_store: Arc<StateStore>,
-    update_tx: broadcast::Sender<UpdateMessage>,
 ) {
     info!("Starting stream processing...");
 
@@ -50,16 +45,9 @@ pub async fn process_stream(
                 }
 
                 debug!(
-                    "Broadcasting block update to {} clients",
-                    update_tx.receiver_count()
+                    "State updated: total_pairs={} updated_states={} new_pairs={} removed_pairs={}",
+                    total_pairs, updated_states, new_pairs, removed_pairs
                 );
-
-                let _ = update_tx.send(UpdateMessage::BlockUpdate {
-                    block_number,
-                    states_count: updated_states,
-                    new_pairs_count: new_pairs,
-                    removed_pairs_count: removed_pairs,
-                });
             }
             Err(e) => {
                 error!("Stream error: {:?}", e);
