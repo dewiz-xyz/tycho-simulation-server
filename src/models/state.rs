@@ -3,27 +3,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, watch, RwLock};
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, warn};
 use tycho_simulation::{
-    protocol::{
-        models::{BlockUpdate, ProtocolComponent},
-        state::ProtocolSim,
-    },
-    tycho_core::Bytes,
+    protocol::models::{ProtocolComponent, Update},
+    tycho_common::{simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
-use super::{messages::UpdateMessage, protocol::ProtocolKind, tokens::TokenStore};
+use super::{protocol::ProtocolKind, tokens::TokenStore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub state_store: Arc<StateStore>,
-    pub update_tx: broadcast::Sender<UpdateMessage>,
     pub quote_timeout: Duration,
     pub pool_timeout: Duration,
-    pub cancellation_ttl: Duration,
-    pub auction_cancellation_enabled: bool,
 }
 
 impl AppState {
@@ -49,14 +43,6 @@ impl AppState {
 
     pub fn pool_timeout(&self) -> Duration {
         self.pool_timeout
-    }
-
-    pub fn cancellation_ttl(&self) -> Duration {
-        self.cancellation_ttl
-    }
-
-    pub fn auction_cancellation_enabled(&self) -> bool {
-        self.auction_cancellation_enabled
     }
 }
 
@@ -130,8 +116,9 @@ impl StateStore {
         }
     }
 
-    pub async fn apply_update(&self, mut update: BlockUpdate) -> UpdateMetrics {
-        let block_number = update.block_number;
+    pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
+        // EVM feeds always return a block number
+        let block_number = update.block_number_or_timestamp;
         {
             let mut guard = self.block_number.write().await;
             *guard = block_number;
@@ -199,9 +186,17 @@ impl StateStore {
 
         let total_pairs = self.total_states().await;
 
+        let mut broadcast_value = None;
         if total_pairs > 0 && !self.ready.load(Ordering::Acquire) {
             self.ready.store(true, Ordering::Release);
-            let _ = self.ready_tx.send(true);
+            broadcast_value = Some(true);
+        } else if total_pairs == 0 && self.ready.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Release);
+            broadcast_value = Some(false);
+        }
+
+        if let Some(value) = broadcast_value {
+            let _ = self.ready_tx.send(value);
         }
 
         UpdateMetrics {

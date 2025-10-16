@@ -47,21 +47,8 @@ pub fn load_config() -> AppConfig {
         .unwrap_or_else(|_| "5".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_MS");
-    let cancellation_ttl_secs: u64 = std::env::var("CANCELLATION_TTL_SECS")
-        .unwrap_or_else(|_| "10".to_string())
-        .parse()
-        .expect("Invalid CANCELLATION_TTL_SECS");
-    let auction_cancellation_enabled = std::env::var("ENABLE_AUCTION_CANCELLATION")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse()
-        .unwrap_or(true);
-
     assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
     assert!(pool_timeout_ms > 0, "POOL_TIMEOUT_MS must be > 0");
-    assert!(
-        cancellation_ttl_secs > 0,
-        "CANCELLATION_TTL_SECS must be > 0"
-    );
 
     AppConfig {
         tycho_url,
@@ -72,8 +59,6 @@ pub fn load_config() -> AppConfig {
         host,
         quote_timeout_ms,
         pool_timeout_ms,
-        cancellation_ttl_secs,
-        auction_cancellation_enabled,
     }
 }
 
@@ -87,6 +72,4 @@ pub struct AppConfig {
     pub host: String,
     pub quote_timeout_ms: u64,
     pub pool_timeout_ms: u64,
-    pub cancellation_ttl_secs: u64,
-    pub auction_cancellation_enabled: bool,
 }

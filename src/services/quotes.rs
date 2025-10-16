@@ -10,9 +10,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tycho_simulation::{
-    models::Token,
-    protocol::{models::ProtocolComponent, state::ProtocolSim},
-    tycho_core::Bytes,
+    protocol::models::ProtocolComponent,
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::messages::{
@@ -111,7 +110,13 @@ pub async fn get_amounts_out(
         meta.total_pools = Some(total_pools);
     }
 
-    let token_in_ref = match state.tokens.ensure(&token_in_bytes).await {
+    // Concurrently fetch token_in and token_out metadata
+    let (token_in_res, token_out_res) = tokio::join!(
+        state.tokens.ensure(&token_in_bytes),
+        state.tokens.ensure(&token_out_bytes)
+    );
+
+    let token_in_ref = match token_in_res {
         Ok(Some(token)) => token,
         Ok(None) => {
             failures.push(make_failure(
@@ -136,7 +141,7 @@ pub async fn get_amounts_out(
         }
     };
 
-    let token_out_ref = match state.tokens.ensure(&token_out_bytes).await {
+    let token_out_ref = match token_out_res {
         Ok(Some(token)) => token,
         Ok(None) => {
             failures.push(make_failure(
@@ -413,16 +418,45 @@ async fn simulate_pool(
     let token_out_clone = token_out.clone();
     let amounts_clone = Arc::clone(&amounts);
 
+    let cancel_token_clone = cancel_token.clone();
     let handle = spawn_blocking(move || {
         let mut amounts_out = Vec::with_capacity(expected_len);
         let mut gas_used = Vec::with_capacity(expected_len);
         let mut errors = Vec::new();
 
         for amount_in in amounts_clone.iter() {
+            if cancel_token_clone.is_cancelled() {
+                debug!(
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    "Pool quote cancelled before completion"
+                );
+                errors.push("Cancelled".to_string());
+                break;
+            }
             match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
                 Ok(result) => {
-                    amounts_out.push(result.amount.to_string());
-                    gas_used.push(result.gas.to_u64().unwrap_or(0));
+                    if let Some(gas_u64) = result.gas.to_u64() {
+                        amounts_out.push(result.amount.to_string());
+                        gas_used.push(gas_u64);
+                    } else {
+                        let msg = "no gas reported".to_string();
+                        debug!(
+                            pool_id = %pool_id,
+                            protocol = %pool_protocol,
+                            pool_name = %pool_name,
+                            pool_address = %pool_address,
+                            "Pool quote error: {}",
+                            msg
+                        );
+                        // Do not return results with no gas: mark as error and discard
+                        errors.push(msg);
+                        amounts_out.clear();
+                        gas_used.clear();
+                        break;
+                    }
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -547,7 +581,7 @@ fn decode_attribute(value: &Bytes) -> Option<String> {
     }
 
     let mut bytes = value.to_vec();
-    while matches!(bytes.last(), Some(0)) {
+    while matches!(bytes.last(), Some(&0)) {
         bytes.pop();
     }
 

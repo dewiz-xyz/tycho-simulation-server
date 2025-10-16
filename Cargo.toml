@@ -2,8 +2,8 @@
 name = "tycho-simulation-server"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85.0"
-description = "TypeScript Tycho simulation WS server"
+rust-version = "1.89.0"
+description = "Tycho simulation HTTP quote service"
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/tycho-simulation-server"
 
@@ -12,16 +12,13 @@ name = "tycho-price-service"
 path = "src/main.rs"
 
 [dependencies]
-tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", rev = "0c9ca78dacd39c8fbc7a64192b7b51ebe5fcf536" }
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.180.3" }
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 num-traits = "0.2"
 num-bigint = "0.4"
-axum = { version = "0.7", features = ["ws"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-headers = "0.4"
+axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenv = "0.15.0"
