@@ -37,7 +37,7 @@ export class PipelineStack extends cdk.Stack {
         },
       ),
       installCommands: ["npm i -g aws-cdk"],
-      commands: ["npm ci", "npm run build", "npx cdk synth"],
+      commands: ["npm ci", "npx cdk synth"],
       rolePolicyStatements: [
         new iam.PolicyStatement({
           actions: ["ssm:GetParameter"],
