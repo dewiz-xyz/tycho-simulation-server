@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "CommonJS",
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@common/*": ["src/common/*"],
+      "@modules/*": ["src/modules/*"],
+      "@src/*": ["src/*"]
+    },
+    "moduleResolution": "Node",
+    "outDir": "build",
+    "importsNotUsedAsValues": "remove",
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "noPropertyAccessFromIndexSignature": false,
+    "skipLibCheck": true,
+    "exactOptionalPropertyTypes": false,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "ignoreDeprecations": "5.0"
+  },
+  "exclude": ["node_modules"],
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
