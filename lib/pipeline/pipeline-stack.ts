@@ -71,7 +71,7 @@ export class PipelineStack extends cdk.Stack {
     
 // Production / Mainnet properties
     pipeline.addStage(
-      new AppServiceStage(this, "tycho-simulator-testnet", {
+      new AppServiceStage(this, "tycho-simulator-mainnet", {
         env: { account: mainnet_id, region: "eu-central-1" },
         serviceName: "tycho-simulator",
         environment: "mainnet",
