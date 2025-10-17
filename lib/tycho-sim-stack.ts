@@ -158,7 +158,7 @@ export class AppServiceStack extends cdk.Stack {
       ttl: cdk.Duration.minutes(10),
     });
     new cdk.CfnOutput(this, "ServiceUrlOut", {
-      value: `ws${props.certificateArn ? "s" : ""}://${fargate.loadBalancer.loadBalancerDnsName}`,
+      value: `http${props.certificateArn ? "s" : ""}://${fargate.loadBalancer.loadBalancerDnsName}`,
       exportName: `${props.serviceName}-ServiceURL`,
     });
   }
