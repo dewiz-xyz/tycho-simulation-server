@@ -1,4 +1,4 @@
-FROM rust:1.85.1-bookworm AS builder
+FROM public.ecr.aws/docker/library/rust:1.85.1-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
@@ -10,7 +10,7 @@ COPY . .
 RUN cargo build --release
 
 
-FROM debian:bookworm-slim AS runner
+FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ca-certificates openssl && rm -rf /var/lib/apt/lists/*
 
