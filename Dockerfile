@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/rust:1.85.1-bookworm AS builder
+FROM public.ecr.aws/docker/library/rust:1.90-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
