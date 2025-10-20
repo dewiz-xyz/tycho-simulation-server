@@ -4,6 +4,7 @@ import { Construct } from "constructs";
 import { AppServiceStack, AppServiceStackProps } from "../tycho-sim-stack";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as codebuild from "aws-cdk-lib/aws-codebuild";
 
 class AppServiceStage extends cdk.Stage {
   constructor(scope: Construct, id: string, props: AppServiceStackProps) {
@@ -25,8 +26,11 @@ export class PipelineStack extends cdk.Stack {
       this,
       "/cicd/testnet_account_id",
     );
-    
-    const mainnet_id = ssm.StringParameter.valueFromLookup(this, '/cicd/mainnet_account_id')
+
+    const mainnet_id = ssm.StringParameter.valueFromLookup(
+      this,
+      "/cicd/mainnet_account_id",
+    );
 
     const synth = new pipelines.CodeBuildStep("Synth", {
       input: pipelines.CodePipelineSource.connection(
@@ -52,9 +56,14 @@ export class PipelineStack extends cdk.Stack {
       pipelineName: "tycho-sim-pipeline",
       crossAccountKeys: true,
       synth,
+      assetPublishingCodeBuildDefaults: {
+        buildEnvironment: {
+          buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_ARM_3,
+        },
+      },
     });
 
-// Staging / Testnet properties 
+    // Staging / Testnet properties
     pipeline.addStage(
       new AppServiceStage(this, "tycho-simulator-testnet", {
         env: { account: testnet_id, region: "eu-central-1" },
@@ -68,8 +77,7 @@ export class PipelineStack extends cdk.Stack {
       }),
     );
 
-    
-// Production / Mainnet properties
+    // Production / Mainnet properties
     pipeline.addStage(
       new AppServiceStage(this, "tycho-simulator-mainnet", {
         env: { account: mainnet_id, region: "eu-central-1" },
