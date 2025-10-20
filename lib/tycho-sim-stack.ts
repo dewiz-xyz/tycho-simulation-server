@@ -9,7 +9,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
-import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
+import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
 
 export interface AppServiceStackProps extends cdk.StackProps {
   serviceName: string;
@@ -123,10 +123,10 @@ export class AppServiceStack extends cdk.Stack {
             TYCHO_API_KEY: ecs.Secret.fromSsmParameter(tychoAuthParam),
           },
         },
-      runtimePlatform: { 
-        cpuArchitecture: ecs.CpuArchitecture.ARM64,
-        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-      },
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.ARM64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
       },
     );
 
