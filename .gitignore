@@ -17,4 +17,10 @@ tycho_node.log
 
 # Environment
 .env
-*.pdb 
+*.pdb
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo 
