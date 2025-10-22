@@ -47,8 +47,20 @@ pub fn load_config() -> AppConfig {
         .unwrap_or_else(|_| "5".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_MS");
+    let request_timeout_ms: u64 = std::env::var("REQUEST_TIMEOUT_MS")
+        .unwrap_or_else(|_| "1800".to_string())
+        .parse()
+        .expect("Invalid REQUEST_TIMEOUT_MS");
     assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
     assert!(pool_timeout_ms > 0, "POOL_TIMEOUT_MS must be > 0");
+    let token_refresh_timeout_ms: u64 = std::env::var("TOKEN_REFRESH_TIMEOUT_MS")
+        .unwrap_or_else(|_| "200".to_string())
+        .parse()
+        .expect("Invalid TOKEN_REFRESH_TIMEOUT_MS");
+    assert!(
+        token_refresh_timeout_ms > 0,
+        "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
+    );
 
     AppConfig {
         tycho_url,
@@ -59,6 +71,8 @@ pub fn load_config() -> AppConfig {
         host,
         quote_timeout_ms,
         pool_timeout_ms,
+        request_timeout_ms,
+        token_refresh_timeout_ms,
     }
 }
 
@@ -72,4 +86,6 @@ pub struct AppConfig {
     pub host: String,
     pub quote_timeout_ms: u64,
     pub pool_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub token_refresh_timeout_ms: u64,
 }
