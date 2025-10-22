@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
@@ -8,7 +8,7 @@ use num_traits::cast::ToPrimitive;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
@@ -18,6 +18,7 @@ use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteStatus,
 };
 use crate::models::state::AppState;
+use crate::models::tokens::TokenStoreError;
 
 pub struct QuoteComputation {
     pub responses: Vec<AmountOutResponse>,
@@ -128,14 +129,24 @@ pub async fn get_amounts_out(
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
-        Err(err) => {
-            error!("Failed to refresh token cache: {err}");
+        Err(TokenStoreError::RefreshTimeout(duration)) => {
+            let timeout_ms = duration.as_millis() as u64;
+            warn!(
+                request_id = request.request_id.as_str(),
+                auction_id = request.auction_id.as_deref(),
+                token = ?token_in_address,
+                timeout_ms,
+                "Token metadata refresh timed out"
+            );
             failures.push(make_failure(
-                QuoteFailureKind::Internal,
-                format!("Failed to resolve token {}", token_in_address),
+                QuoteFailureKind::TokenCoverage,
+                format!(
+                    "Token metadata refresh timed out after {}ms: {}",
+                    timeout_ms, token_in_address
+                ),
                 None,
             ));
-            meta.status = QuoteStatus::InternalError;
+            meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
@@ -153,14 +164,24 @@ pub async fn get_amounts_out(
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
-        Err(err) => {
-            error!("Failed to refresh token cache: {err}");
+        Err(TokenStoreError::RefreshTimeout(duration)) => {
+            let timeout_ms = duration.as_millis() as u64;
+            warn!(
+                request_id = request.request_id.as_str(),
+                auction_id = request.auction_id.as_deref(),
+                token = ?token_out_address,
+                timeout_ms,
+                "Token metadata refresh timed out"
+            );
             failures.push(make_failure(
-                QuoteFailureKind::Internal,
-                format!("Failed to resolve token {}", token_out_address),
+                QuoteFailureKind::TokenCoverage,
+                format!(
+                    "Token metadata refresh timed out after {}ms: {}",
+                    timeout_ms, token_out_address
+                ),
                 None,
             ));
-            meta.status = QuoteStatus::InternalError;
+            meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
@@ -199,6 +220,9 @@ pub async fn get_amounts_out(
 
     meta.matching_pools = candidates_raw.len();
     meta.candidate_pools = candidates_raw.len();
+
+    // Reserve capacity for failures to avoid repeated reallocations under heavy error scenarios
+    failures.reserve(candidates_raw.len());
 
     if candidates_raw.is_empty() {
         failures.push(make_failure(
@@ -276,7 +300,49 @@ pub async fn get_amounts_out(
                         Some(outcome) => {
                             match outcome {
                                 Ok(result) => {
-                                    if result.amounts_out.len() == expected_len && !result.amounts_out.is_empty() {
+                                    // Classify before moving fields to avoid clones
+                                    let had_timeout = result.timed_out;
+                                    let is_partial = result.amounts_out.len() < expected_len;
+                                    if !result.errors.is_empty() || is_partial {
+                                        let context = FailureContext {
+                                            pool_id: &result.pool,
+                                            pool_name: Some(&result.pool_name),
+                                            pool_address: Some(&result.pool_address),
+                                            protocol: Some(&result.protocol),
+                                        };
+                                        let descriptor = format_pool_descriptor(&context);
+                                        let message = if had_timeout {
+                                            format!(
+                                                "{}: Quote computation timed out (partial ladder {} of {} steps)",
+                                                descriptor,
+                                                result.amounts_out.len(),
+                                                expected_len
+                                            )
+                                        } else if result.amounts_out.is_empty() {
+                                            let base_error = result
+                                                .errors
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_else(|| "Pool returned no quotes".to_string());
+                                            format!("{}: {}", descriptor, base_error)
+                                        } else {
+                                            format!(
+                                                "{} produced partial ladder ({} of {} steps)",
+                                                descriptor,
+                                                result.amounts_out.len(),
+                                                expected_len
+                                            )
+                                        };
+                                        let kind = if had_timeout {
+                                            QuoteFailureKind::Timeout
+                                        } else if result.amounts_out.is_empty() {
+                                            classify_failure(&message, true)
+                                        } else {
+                                            QuoteFailureKind::InconsistentResult
+                                        };
+                                        failures.push(make_failure(kind, message, Some(context)));
+                                    }
+                                    if !result.amounts_out.is_empty() {
                                         responses.push(AmountOutResponse {
                                             pool: result.pool,
                                             pool_name: result.pool_name,
@@ -285,41 +351,12 @@ pub async fn get_amounts_out(
                                             gas_used: result.gas_used,
                                             block_number: current_block,
                                         });
-                                    } else {
-                                        let context = FailureContext {
-                                            pool_id: &result.pool,
-                                            pool_name: Some(&result.pool_name),
-                                            pool_address: Some(&result.pool_address),
-                                            protocol: Some(&result.protocol),
-                                        };
-
-                                        if result.amounts_out.is_empty() {
-                                            let descriptor = format_pool_descriptor(&context);
-                                            let base_error = result
-                                                .errors
-                                                .first()
-                                                .cloned()
-                                                .unwrap_or_else(|| "Pool returned no quotes".to_string());
-                                            let message = format!("{}: {}", descriptor, base_error);
-                                            let kind = classify_failure(&base_error, true);
-                                            failures.push(make_failure(kind, message, Some(context)));
-                                        } else {
-                                            let descriptor = format_pool_descriptor(&context);
-                                            let message = format!(
-                                                "{} produced partial ladder ({} of {} steps)",
-                                                descriptor,
-                                                result.amounts_out.len(),
-                                                expected_len
-                                            );
-                                            failures.push(make_failure(
-                                                QuoteFailureKind::InconsistentResult,
-                                                message,
-                                                Some(context),
-                                            ));
-                                        }
                                     }
                                 }
                                 Err(failure) => {
+                                    if matches!(failure.kind, QuoteFailureKind::Internal) {
+                                        meta.status = QuoteStatus::InternalError;
+                                    }
                                     failures.push(failure);
                                 }
                             }
@@ -334,7 +371,9 @@ pub async fn get_amounts_out(
     drop(tasks);
 
     if responses.is_empty() {
-        meta.status = QuoteStatus::PartialFailure;
+        if matches!(meta.status, QuoteStatus::Ready) {
+            meta.status = QuoteStatus::PartialFailure;
+        }
         if failures.is_empty() {
             failures.push(make_failure(
                 QuoteFailureKind::Simulator,
@@ -370,7 +409,7 @@ pub async fn get_amounts_out(
             top.block_number
         );
 
-        if !failures.is_empty() {
+        if !failures.is_empty() && matches!(meta.status, QuoteStatus::Ready) {
             meta.status = QuoteStatus::PartialFailure;
         }
     }
@@ -387,6 +426,7 @@ struct PoolQuoteResult {
     amounts_out: Vec<String>,
     gas_used: Vec<u64>,
     errors: Vec<String>,
+    timed_out: bool,
 }
 
 struct FailureContext<'a> {
@@ -419,14 +459,18 @@ async fn simulate_pool(
     let amounts_clone = Arc::clone(&amounts);
 
     let cancel_token_clone = cancel_token.clone();
+    // Note: `abort()` does not forcibly stop `spawn_blocking`; deadline and cancel checks below are the true escape paths.
     let handle = spawn_blocking(move || {
         let mut amounts_out = Vec::with_capacity(expected_len);
         let mut gas_used = Vec::with_capacity(expected_len);
         let mut errors = Vec::new();
+        let mut timed_out = false;
+        let deadline = Instant::now() + timeout;
 
         for amount_in in amounts_clone.iter() {
             if cancel_token_clone.is_cancelled() {
                 debug!(
+                    scope = "pool_timeout",
                     pool_id = %pool_id,
                     protocol = %pool_protocol,
                     pool_name = %pool_name,
@@ -434,6 +478,20 @@ async fn simulate_pool(
                     "Pool quote cancelled before completion"
                 );
                 errors.push("Cancelled".to_string());
+                break;
+            }
+            if Instant::now() >= deadline {
+                debug!(
+                    scope = "pool_timeout",
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Pool quote exceeded deadline before completion"
+                );
+                errors.push(format!("Timed out after {}ms", timeout.as_millis()));
+                timed_out = true;
                 break;
             }
             match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
@@ -444,6 +502,7 @@ async fn simulate_pool(
                     } else {
                         let msg = "no gas reported".to_string();
                         debug!(
+                            scope = "pool_timeout",
                             pool_id = %pool_id,
                             protocol = %pool_protocol,
                             pool_name = %pool_name,
@@ -461,6 +520,7 @@ async fn simulate_pool(
                 Err(e) => {
                     let msg = e.to_string();
                     debug!(
+                        scope = "pool_timeout",
                         pool_id = %pool_id,
                         protocol = %pool_protocol,
                         pool_name = %pool_name,
@@ -470,6 +530,23 @@ async fn simulate_pool(
                     );
                     errors.push(msg);
                 }
+            }
+
+            if Instant::now() >= deadline {
+                debug!(
+                    scope = "pool_timeout",
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Pool quote deadline reached after ladder step"
+                );
+                if errors.is_empty() {
+                    errors.push(format!("Timed out after {}ms", timeout.as_millis()));
+                }
+                timed_out = true;
+                break;
             }
         }
 
@@ -481,6 +558,7 @@ async fn simulate_pool(
             amounts_out,
             gas_used,
             errors,
+            timed_out,
         }
     });
     tokio::pin!(handle);
@@ -534,7 +612,10 @@ async fn simulate_pool(
 
 fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
     let lowered = message.to_ascii_lowercase();
-    if lowered.contains("warm") {
+    if lowered.contains("cancelled") || lowered.contains("canceled") {
+        // Treat cancellations as timeout-equivalent for downstream semantics
+        QuoteFailureKind::Timeout
+    } else if lowered.contains("warm") {
         QuoteFailureKind::WarmUp
     } else if lowered.contains("overflow") {
         QuoteFailureKind::Overflow
