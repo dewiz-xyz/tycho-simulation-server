@@ -49,6 +49,8 @@ The following environment variables are read at startup:
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `50`)
 - `POOL_TIMEOUT_MS` – Per-pool watchdog in milliseconds (default: `5`)
+- `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `1800`)
+- `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `200`)
 
 ## HTTP API
 
@@ -94,6 +96,11 @@ Response body:
 ```
 
 `QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`.
+
+Timeout behavior:
+- Handler-level timeout returns `200 OK` with `PartialFailure`, includes `request_id`, `block_number`, `total_pools`, and a `Timeout` failure.
+- Router-level timeout (rare fallback, applied only to `/simulate`) returns `200 OK` with `PartialFailure`, `request_id` may be empty, `block_number` is `0`, and `total_pools` is unset. Logs include `scope="router_timeout"`.
+  - `/status` is not subject to router-level timeouts.
 
 ### `GET /status`
 
