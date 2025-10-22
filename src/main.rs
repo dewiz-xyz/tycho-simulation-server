@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         config.tycho_url.clone(),
         config.api_key.clone(),
         Chain::Ethereum,
+        Duration::from_millis(config.token_refresh_timeout_ms),
     ));
     let state_store = Arc::new(StateStore::new());
     debug!("Created shared state");
@@ -52,12 +53,14 @@ async fn main() -> anyhow::Result<()> {
     // Create app state
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout = Duration::from_millis(config.pool_timeout_ms);
+    let request_timeout = Duration::from_millis(config.request_timeout_ms);
 
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
         quote_timeout,
         pool_timeout,
+        request_timeout,
     };
 
     // Build protocol stream in background and start processing
