@@ -139,8 +139,8 @@ export class AppServiceStack extends cdk.Stack {
     });
 
     const scaling = fargate.service.autoScaleTaskCount({
-      minCapacity: 1,
-      maxCapacity: 2,
+      minCapacity: 7,
+      maxCapacity: 12,
     });
     scaling.scaleOnCpuUtilization("CpuScaling", {
       targetUtilizationPercent: 60,
