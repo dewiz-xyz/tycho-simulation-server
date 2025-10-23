@@ -9,6 +9,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
+import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 
 export interface AppServiceStackProps extends cdk.StackProps {
   serviceName: string;
@@ -74,6 +75,7 @@ export class AppServiceStack extends cdk.Stack {
 
     const image = ecs.ContainerImage.fromAsset(path.join(__dirname, ".."), {
       file: "Dockerfile",
+      platform: ecr_assets.Platform.LINUX_ARM64,
     });
 
     const tychoAuthParam =
@@ -121,6 +123,10 @@ export class AppServiceStack extends cdk.Stack {
             TYCHO_API_KEY: ecs.Secret.fromSsmParameter(tychoAuthParam),
           },
         },
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.ARM64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
       },
     );
 
@@ -133,8 +139,8 @@ export class AppServiceStack extends cdk.Stack {
     });
 
     const scaling = fargate.service.autoScaleTaskCount({
-      minCapacity: 1,
-      maxCapacity: 2,
+      minCapacity: 7,
+      maxCapacity: 12,
     });
     scaling.scaleOnCpuUtilization("CpuScaling", {
       targetUtilizationPercent: 60,
