@@ -47,7 +47,7 @@ The following environment variables are read at startup:
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
 - `RUST_LOG` – Logging filter (default: `info`)
-- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `50`)
+- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `75`)
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `5`)
 - `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `25`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `1800`)

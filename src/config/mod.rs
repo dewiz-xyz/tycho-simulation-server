@@ -40,7 +40,7 @@ pub fn load_config() -> AppConfig {
     );
 
     let quote_timeout_ms: u64 = std::env::var("QUOTE_TIMEOUT_MS")
-        .unwrap_or_else(|_| "50".to_string())
+        .unwrap_or_else(|_| "75".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
     // Dual pool timeouts with backward compatibility
