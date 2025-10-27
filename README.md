@@ -48,7 +48,8 @@ The following environment variables are read at startup:
 - `HOST` – Bind address (default: `127.0.0.1`)
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `50`)
-- `POOL_TIMEOUT_MS` – Per-pool watchdog in milliseconds (default: `5`)
+- `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `5`)
+- `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `25`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `1800`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `200`)
 
