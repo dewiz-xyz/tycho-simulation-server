@@ -43,16 +43,28 @@ pub fn load_config() -> AppConfig {
         .unwrap_or_else(|_| "50".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
-    let pool_timeout_ms: u64 = std::env::var("POOL_TIMEOUT_MS")
-        .unwrap_or_else(|_| "5".to_string())
-        .parse()
-        .expect("Invalid POOL_TIMEOUT_MS");
+    // Dual pool timeouts with backward compatibility
+    let pool_timeout_native_ms_env = std::env::var("POOL_TIMEOUT_NATIVE_MS").ok();
+    let pool_timeout_vm_ms_env = std::env::var("POOL_TIMEOUT_VM_MS").ok();
+    let pool_timeout_ms_legacy = std::env::var("POOL_TIMEOUT_MS").ok();
+
+    let pool_timeout_native_ms: u64 = match (pool_timeout_native_ms_env, pool_timeout_ms_legacy) {
+        (Some(val), _) => val.parse().expect("Invalid POOL_TIMEOUT_NATIVE_MS"),
+        (None, Some(legacy)) => legacy.parse().expect("Invalid POOL_TIMEOUT_MS"),
+        (None, None) => 5,
+    };
+    let pool_timeout_vm_ms: u64 = match pool_timeout_vm_ms_env {
+        Some(val) => val.parse().expect("Invalid POOL_TIMEOUT_VM_MS"),
+        None => 25,
+    };
+
     let request_timeout_ms: u64 = std::env::var("REQUEST_TIMEOUT_MS")
         .unwrap_or_else(|_| "1800".to_string())
         .parse()
         .expect("Invalid REQUEST_TIMEOUT_MS");
     assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
-    assert!(pool_timeout_ms > 0, "POOL_TIMEOUT_MS must be > 0");
+    assert!(pool_timeout_native_ms > 0, "POOL_TIMEOUT_NATIVE_MS must be > 0");
+    assert!(pool_timeout_vm_ms > 0, "POOL_TIMEOUT_VM_MS must be > 0");
     let token_refresh_timeout_ms: u64 = std::env::var("TOKEN_REFRESH_TIMEOUT_MS")
         .unwrap_or_else(|_| "200".to_string())
         .parse()
@@ -70,7 +82,8 @@ pub fn load_config() -> AppConfig {
         port,
         host,
         quote_timeout_ms,
-        pool_timeout_ms,
+        pool_timeout_native_ms,
+        pool_timeout_vm_ms,
         request_timeout_ms,
         token_refresh_timeout_ms,
     }
@@ -85,7 +98,8 @@ pub struct AppConfig {
     pub port: u16,
     pub host: String,
     pub quote_timeout_ms: u64,
-    pub pool_timeout_ms: u64,
+    pub pool_timeout_native_ms: u64,
+    pub pool_timeout_vm_ms: u64,
     pub request_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
 }
