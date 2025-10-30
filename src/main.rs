@@ -52,14 +52,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Create app state
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
-    let pool_timeout = Duration::from_millis(config.pool_timeout_ms);
+    let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
+    let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
 
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
         quote_timeout,
-        pool_timeout,
+        pool_timeout_native,
+        pool_timeout_vm,
         request_timeout,
     };
 

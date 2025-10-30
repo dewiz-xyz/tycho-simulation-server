@@ -34,7 +34,6 @@ pub async fn get_amounts_out(
     let mut failures = Vec::new();
 
     let readiness_wait = Duration::from_secs(2);
-    let pool_timeout = state.pool_timeout();
     let quote_timeout = state.quote_timeout();
 
     let mut current_block = state.current_block().await;
@@ -260,6 +259,12 @@ pub async fn get_amounts_out(
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
+        let is_vm = pool_protocol.starts_with("vm:");
+        let timeout_for_pool = if is_vm {
+            state.pool_timeout_vm()
+        } else {
+            state.pool_timeout_native()
+        };
         tasks.push(simulate_pool(
             id,
             pool_state,
@@ -270,7 +275,7 @@ pub async fn get_amounts_out(
             token_out_clone,
             amounts_clone,
             expected_len,
-            pool_timeout,
+            timeout_for_pool,
             cancel_token.clone(),
         ));
     }

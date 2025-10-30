@@ -17,7 +17,8 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub state_store: Arc<StateStore>,
     pub quote_timeout: Duration,
-    pub pool_timeout: Duration,
+    pub pool_timeout_native: Duration,
+    pub pool_timeout_vm: Duration,
     pub request_timeout: Duration,
 }
 
@@ -42,8 +43,12 @@ impl AppState {
         self.quote_timeout
     }
 
-    pub fn pool_timeout(&self) -> Duration {
-        self.pool_timeout
+    pub fn pool_timeout_native(&self) -> Duration {
+        self.pool_timeout_native
+    }
+
+    pub fn pool_timeout_vm(&self) -> Duration {
+        self.pool_timeout_vm
     }
 
     pub fn request_timeout(&self) -> Duration {
