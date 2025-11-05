@@ -113,6 +113,7 @@ export class AppServiceStack extends cdk.Stack {
             TVL_THRESHOLD: props.tycho_tvl,
             TYCHO_URL: props.tycho_url,
             HOST: "0.0.0.0",
+            RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
             RUST_LOG: "info",
           },
           logDriver: ecs.LogDriver.awsLogs({

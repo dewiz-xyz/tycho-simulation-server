@@ -72,7 +72,7 @@ export class PipelineStack extends cdk.Stack {
         publicLoadBalancer: false,
         cpu: 1024,
         memoryMiB: 2048,
-        tycho_tvl: "100",
+        tycho_tvl: "50",
         tycho_url: "tycho-beta.propellerheads.xyz",
       }),
     );
@@ -86,7 +86,7 @@ export class PipelineStack extends cdk.Stack {
         publicLoadBalancer: false,
         cpu: 512,
         memoryMiB: 1024,
-        tycho_tvl: "100",
+        tycho_tvl: "50",
         tycho_url: "tycho-beta.propellerheads.xyz",
       }),
     );
