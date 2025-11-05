@@ -1,6 +1,7 @@
 use std::fmt;
 
 use tycho_simulation::protocol::models::ProtocolComponent;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {
@@ -8,14 +9,26 @@ pub enum ProtocolKind {
     UniswapV3,
     UniswapV4,
     Curve,
+    PancakeswapV2,
+    PancakeswapV3,
+    EkuboV2,
+    SushiswapV2,
+    MaverickV2,
+    BalancerV2
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 4] = [
+    pub const ALL: [ProtocolKind; 10] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
         ProtocolKind::Curve,
+        ProtocolKind::PancakeswapV2,
+        ProtocolKind::PancakeswapV3,
+        ProtocolKind::EkuboV2,
+        ProtocolKind::SushiswapV2,
+        ProtocolKind::MaverickV2,
+        ProtocolKind::BalancerV2
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -24,6 +37,12 @@ impl ProtocolKind {
             ProtocolKind::UniswapV3 => "uniswap_v3",
             ProtocolKind::UniswapV4 => "uniswap_v4",
             ProtocolKind::Curve => "curve",
+            ProtocolKind::PancakeswapV2 => "pancakeswap_v2",
+            ProtocolKind::PancakeswapV3 => "pancakeswap_v3",
+            ProtocolKind::EkuboV2 => "ekubo_v2",
+            ProtocolKind::SushiswapV2 => "sushiswap_v2",
+            ProtocolKind::MaverickV2 => "maverick_v2",
+            ProtocolKind::BalancerV2 => "balancer_v2",
         }
     }
 
@@ -36,6 +55,12 @@ impl ProtocolKind {
             "uniswap_v3" | "uniswapv3" => return Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => return Some(ProtocolKind::UniswapV4),
             "curve" | "curve_pool" | "curvefinance" => return Some(ProtocolKind::Curve),
+            "pancakeswap_v2" | "pancakeswapv2" => return Some(ProtocolKind::PancakeswapV2),
+            "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
+            "ekubo_v2" | "ekubov2" => return Some(ProtocolKind::EkuboV2),
+            "sushiswap_v2" | "sushiswapv2" => return Some(ProtocolKind::SushiswapV2),
+            "maverick_v2" | "maverickv2" => return Some(ProtocolKind::MaverickV2),
+            "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
             _ => {}
         }
 
@@ -44,6 +69,12 @@ impl ProtocolKind {
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
             "curve" | "curvefinance" => Some(ProtocolKind::Curve),
+            "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
+            "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
+            "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
+            "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
+            "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
+            "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             _ => None,
         }
     }

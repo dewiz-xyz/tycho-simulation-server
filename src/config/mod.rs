@@ -8,7 +8,7 @@ pub fn load_config() -> AppConfig {
         std::env::var("TYCHO_URL").unwrap_or_else(|_| "tycho-beta.propellerheads.xyz".to_string());
     let api_key = std::env::var("TYCHO_API_KEY").expect("TYCHO_API_KEY must be set");
     let tvl_threshold: f64 = std::env::var("TVL_THRESHOLD")
-        .unwrap_or_else(|_| "300".to_string())
+        .unwrap_or_else(|_| "100".to_string())
         .parse()
         .expect("Invalid TVL_THRESHOLD");
     // Keep/remove ratio: defaults to 20% of add threshold; clamp to <= add
@@ -51,7 +51,7 @@ pub fn load_config() -> AppConfig {
     let pool_timeout_native_ms: u64 = match (pool_timeout_native_ms_env, pool_timeout_ms_legacy) {
         (Some(val), _) => val.parse().expect("Invalid POOL_TIMEOUT_NATIVE_MS"),
         (None, Some(legacy)) => legacy.parse().expect("Invalid POOL_TIMEOUT_MS"),
-        (None, None) => 10,
+        (None, None) => 20,
     };
     let pool_timeout_vm_ms: u64 = match pool_timeout_vm_ms_env {
         Some(val) => val.parse().expect("Invalid POOL_TIMEOUT_VM_MS"),

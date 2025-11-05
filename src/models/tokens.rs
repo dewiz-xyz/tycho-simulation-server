@@ -80,7 +80,16 @@ impl TokenStore {
         );
 
         let new_tokens = match timeout(self.refresh_timeout, fetch_future).await {
-            Ok(tokens) => tokens,
+            Ok(Ok(tokens)) => tokens,
+            Ok(Err(e)) => {
+                warn!(
+                    scope = "token_refresh_error",
+                    error = ?e,
+                    "Token refresh failed"
+                );
+                drop(guard);
+                return Err(TokenStoreError::RefreshTimeout(self.refresh_timeout));
+            }
             Err(_) => {
                 warn!(
                     scope = "token_refresh_timeout",

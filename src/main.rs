@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         None,
         None,
     )
-    .await;
+    .await?;
     info!("Loaded {} tokens", all_tokens.len());
 
     // Create shared state

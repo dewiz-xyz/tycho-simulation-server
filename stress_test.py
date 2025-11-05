@@ -45,8 +45,8 @@ SERVER_URL = "http://localhost:3000"
 ENDPOINT = f"{SERVER_URL}/simulate"
 
 # Test configuration
-NUM_REQUESTS = 3000  # Reduced from 1000 to avoid "too many open files" error
-MAX_CONCURRENT = 200  # Target concurrent requests
+NUM_REQUESTS = 2000  # Reduced from 1000 to avoid "too many open files" error
+MAX_CONCURRENT = 400  # Target concurrent requests
 
 class StressTestResults:
     def __init__(self):

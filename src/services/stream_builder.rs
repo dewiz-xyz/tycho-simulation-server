@@ -8,15 +8,17 @@ use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
-            filters::{curve_pool_filter, uniswap_v4_pool_with_hook_filter},
+            filters::{curve_pool_filter, balancer_v2_pool_filter, uniswap_v4_euler_hook_pool_filter},
             uniswap_v2::state::UniswapV2State,
+            pancakeswap_v2::state::PancakeswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
+            ekubo::state::EkuboState,
             vm::state::EVMPoolState,
         },
         stream::ProtocolStreamBuilder,
     },
-    tycho_client::feed::{component_tracker::ComponentFilter, synchronizer::ComponentWithState},
+    tycho_client::feed::{component_tracker::ComponentFilter},
     tycho_common::models::Chain,
 };
 
@@ -26,15 +28,7 @@ static UNISWAP_V4_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_FILTERED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_LOGGED: AtomicBool = AtomicBool::new(false);
 
-fn uniswap_v4_filter_with_stats(component: &ComponentWithState) -> bool {
-    if uniswap_v4_pool_with_hook_filter(component) {
-        UNISWAP_V4_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-        true
-    } else {
-        UNISWAP_V4_FILTERED.fetch_add(1, Ordering::Relaxed);
-        false
-    }
-}
+
 
 pub async fn build_merged_streams(
     tycho_url: &str,
@@ -69,17 +63,26 @@ pub async fn build_merged_streams(
         .skip_state_decode_failures(true);
 
     builder = builder.exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None);
+    builder = builder.exchange::<UniswapV2State>("sushiswap_v2", tvl_filter.clone(), None);
+    builder = builder.exchange::<PancakeswapV2State>("pancakeswap_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV4State>(
-        "uniswap_v4",
-        tvl_filter.clone(),
-        Some(uniswap_v4_filter_with_stats),
-    );
+    builder = builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None);
+    builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
+    builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
         "vm:curve",
-        tvl_filter,
+        tvl_filter.clone(),
         Some(curve_pool_filter),
     );
+    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
+        "vm:balancer_v2",
+        tvl_filter.clone(),
+        Some(balancer_v2_pool_filter),
+    );
+
+    // COMING SOON!
+    // builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), Some(uniswap_v4_pool_with_euler_hook_filter));
+    // builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
