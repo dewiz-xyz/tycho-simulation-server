@@ -40,7 +40,7 @@ pub fn load_config() -> AppConfig {
     );
 
     let quote_timeout_ms: u64 = std::env::var("QUOTE_TIMEOUT_MS")
-        .unwrap_or_else(|_| "75".to_string())
+        .unwrap_or_else(|_| "150".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
     // Dual pool timeouts with backward compatibility
@@ -51,15 +51,15 @@ pub fn load_config() -> AppConfig {
     let pool_timeout_native_ms: u64 = match (pool_timeout_native_ms_env, pool_timeout_ms_legacy) {
         (Some(val), _) => val.parse().expect("Invalid POOL_TIMEOUT_NATIVE_MS"),
         (None, Some(legacy)) => legacy.parse().expect("Invalid POOL_TIMEOUT_MS"),
-        (None, None) => 5,
+        (None, None) => 10,
     };
     let pool_timeout_vm_ms: u64 = match pool_timeout_vm_ms_env {
         Some(val) => val.parse().expect("Invalid POOL_TIMEOUT_VM_MS"),
-        None => 25,
+        None => 150,
     };
 
     let request_timeout_ms: u64 = std::env::var("REQUEST_TIMEOUT_MS")
-        .unwrap_or_else(|_| "1800".to_string())
+        .unwrap_or_else(|_| "4000".to_string())
         .parse()
         .expect("Invalid REQUEST_TIMEOUT_MS");
     assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
