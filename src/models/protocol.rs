@@ -1,7 +1,6 @@
 use std::fmt;
 
 use tycho_simulation::protocol::models::ProtocolComponent;
-use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {

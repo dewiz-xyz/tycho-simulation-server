@@ -238,9 +238,13 @@ pub async fn get_amounts_out(
     }
 
     info!(
-        "Quote candidates prepared: matching_pools={} amounts_per_pool={}",
+        "Quote candidates prepared: matching_pools={} amounts_per_pool={}, {} ({}) -> {} ({})",
         meta.matching_pools,
-        amounts_in.len()
+        amounts_in.len(),
+        token_in_ref.symbol,
+         token_in_address,
+          token_out_ref.symbol,
+           token_out_address
     );
 
     let token_in = token_in_ref.clone();
