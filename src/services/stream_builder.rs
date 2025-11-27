@@ -8,7 +8,7 @@ use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
-            filters::{curve_pool_filter, balancer_v2_pool_filter, uniswap_v4_euler_hook_pool_filter},
+            filters::{curve_pool_filter, balancer_v2_pool_filter},
             uniswap_v2::state::UniswapV2State,
             pancakeswap_v2::state::PancakeswapV2State,
             uniswap_v3::state::UniswapV3State,
