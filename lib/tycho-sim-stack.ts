@@ -118,7 +118,7 @@ export class AppServiceStack extends cdk.Stack {
             REQUEST_TIMEOUT_MS: "4000",
             HOST: "0.0.0.0",
             RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
-            RUST_LOG: "info",
+            RUST_LOG: "debug",
           },
           logDriver: ecs.LogDriver.awsLogs({
             streamPrefix: props.serviceName,
