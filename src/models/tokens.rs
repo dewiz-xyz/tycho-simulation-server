@@ -74,6 +74,7 @@ impl TokenStore {
             &self.tycho_url,
             false,
             Some(&self.api_key),
+            true,
             self.chain,
             None,
             None,

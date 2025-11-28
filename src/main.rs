@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         &config.tycho_url,
         false,
         Some(&config.api_key),
+        true,
         Chain::Ethereum,
         None,
         None,
