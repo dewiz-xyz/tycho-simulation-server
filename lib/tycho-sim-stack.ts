@@ -112,6 +112,10 @@ export class AppServiceStack extends cdk.Stack {
           environment: {
             TVL_THRESHOLD: props.tycho_tvl,
             TYCHO_URL: props.tycho_url,
+            QUOTE_TIMEOUT_MS: "150",
+            POOL_TIMEOUT_NATIVE_MS: "20",
+            POOL_TIMEOUT_VM_MS: "150",
+            REQUEST_TIMEOUT_MS: "4000",
             HOST: "0.0.0.0",
             RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
             RUST_LOG: "info",
