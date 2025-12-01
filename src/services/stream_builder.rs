@@ -74,11 +74,11 @@ pub async fn build_merged_streams(
         tvl_filter.clone(),
         Some(curve_pool_filter),
     );
-    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-        "vm:balancer_v2",
-        tvl_filter.clone(),
-        Some(balancer_v2_pool_filter),
-    );
+    // builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
+    //     "vm:balancer_v2",
+    //     tvl_filter.clone(),
+    //     Some(balancer_v2_pool_filter),
+    // );
 
     // COMING SOON!
     // builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), Some(uniswap_v4_pool_with_euler_hook_filter));
