@@ -36,7 +36,7 @@ impl TokenStore {
         fetch_timeout: Duration,
     ) -> Self {
         let client = ClientBuilder::new()
-            .connect_timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_millis(750))
             .pool_idle_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(1)
             .tcp_nodelay(true)
