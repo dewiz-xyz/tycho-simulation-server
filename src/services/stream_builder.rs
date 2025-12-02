@@ -8,17 +8,14 @@ use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
-            filters::{curve_pool_filter, balancer_v2_pool_filter},
-            uniswap_v2::state::UniswapV2State,
-            pancakeswap_v2::state::PancakeswapV2State,
-            uniswap_v3::state::UniswapV3State,
-            uniswap_v4::state::UniswapV4State,
-            ekubo::state::EkuboState,
+            ekubo::state::EkuboState, filters::curve_pool_filter,
+            pancakeswap_v2::state::PancakeswapV2State, uniswap_v2::state::UniswapV2State,
+            uniswap_v3::state::UniswapV3State, uniswap_v4::state::UniswapV4State,
             vm::state::EVMPoolState,
         },
         stream::ProtocolStreamBuilder,
     },
-    tycho_client::feed::{component_tracker::ComponentFilter},
+    tycho_client::feed::component_tracker::ComponentFilter,
     tycho_common::models::Chain,
 };
 
@@ -27,8 +24,6 @@ use crate::models::tokens::TokenStore;
 static UNISWAP_V4_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_FILTERED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_LOGGED: AtomicBool = AtomicBool::new(false);
-
-
 
 pub async fn build_merged_streams(
     tycho_url: &str,
