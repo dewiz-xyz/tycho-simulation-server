@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::{header, Client};
 use tokio::sync::{Mutex, RwLock};
-use tracing::warn;
+use tracing::{info, warn};
 use tycho_simulation::tycho_common::{
     dto::{TokensRequestBody, TokensRequestResponse},
     models::{token::Token, Chain},
@@ -31,6 +31,14 @@ impl TokenStore {
         chain: Chain,
         fetch_timeout: Duration,
     ) -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(2)
+            .tcp_nodelay(true)
+            .build()
+            .expect("failed to build HTTP client");
+
         TokenStore {
             tokens: RwLock::new(initial),
             fetch_lock: Mutex::new(()),
@@ -38,7 +46,7 @@ impl TokenStore {
             api_key,
             chain,
             fetch_timeout,
-            client: Client::new(),
+            client,
         }
     }
 
@@ -83,6 +91,8 @@ impl TokenStore {
             "Fetching single token from Tycho RPC - this should be rare"
         );
 
+        let start = Instant::now();
+
         let body = TokensRequestBody {
             token_addresses: Some(vec![address.clone()]),
             chain: self.chain.into(),
@@ -100,6 +110,16 @@ impl TokenStore {
             .send()
             .await
             .map_err(|err| {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                warn!(
+                    scope = "token_single_fetch",
+                    token_address = %address,
+                    elapsed_ms,
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    error = %err,
+                    "Token fetch request failed before response"
+                );
                 if err.is_timeout() {
                     TokenStoreError::FetchTimeout(self.fetch_timeout)
                 } else {
@@ -108,6 +128,14 @@ impl TokenStore {
             })?;
 
         if !response.status().is_success() {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            warn!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                status = %response.status(),
+                elapsed_ms,
+                "Token fetch returned non-success status"
+            );
             return Err(TokenStoreError::RequestFailed(format!(
                 "Tycho RPC returned status {} when fetching token {}",
                 response.status(),
@@ -119,6 +147,14 @@ impl TokenStore {
             .json::<TokensRequestResponse>()
             .await
             .map_err(|err| {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            warn!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                error = %err,
+                "Failed to decode token response"
+            );
             TokenStoreError::RequestFailed(format!("Failed to parse token response: {}", err))
         })?;
 
@@ -133,8 +169,22 @@ impl TokenStore {
                 .await
                 .entry(token.address.clone())
                 .or_insert_with(|| token.clone());
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            info!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                "Token fetch succeeded"
+            );
             Ok(Some(token))
         } else {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            warn!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                "Token response contained no matching token"
+            );
             Ok(None)
         }
     }

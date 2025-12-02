@@ -51,7 +51,7 @@ The following environment variables are read at startup:
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `5`)
 - `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `25`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `1800`)
-- `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `200`)
+- `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
 
 ## HTTP API
 
