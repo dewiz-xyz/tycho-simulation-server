@@ -13,7 +13,7 @@ pub enum ProtocolKind {
     EkuboV2,
     SushiswapV2,
     MaverickV2,
-    BalancerV2
+    BalancerV2,
 }
 
 impl ProtocolKind {
@@ -27,7 +27,7 @@ impl ProtocolKind {
         ProtocolKind::EkuboV2,
         ProtocolKind::SushiswapV2,
         ProtocolKind::MaverickV2,
-        ProtocolKind::BalancerV2
+        ProtocolKind::BalancerV2,
     ];
 
     pub fn as_str(&self) -> &'static str {

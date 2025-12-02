@@ -128,21 +128,38 @@ pub async fn get_amounts_out(
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
-        Err(TokenStoreError::RefreshTimeout(duration)) => {
+        Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
             warn!(
                 request_id = request.request_id.as_str(),
                 auction_id = request.auction_id.as_deref(),
                 token = ?token_in_address,
                 timeout_ms,
-                "Token metadata refresh timed out"
+                "Token metadata fetch timed out"
             );
             failures.push(make_failure(
                 QuoteFailureKind::TokenCoverage,
                 format!(
-                    "Token metadata refresh timed out after {}ms: {}",
+                    "Token metadata fetch timed out after {}ms: {}",
                     timeout_ms, token_in_address
                 ),
+                None,
+            ));
+            meta.status = QuoteStatus::TokenMissing;
+            meta.failures = failures;
+            return QuoteComputation { responses, meta };
+        }
+        Err(TokenStoreError::RequestFailed(message)) => {
+            warn!(
+                request_id = request.request_id.as_str(),
+                auction_id = request.auction_id.as_deref(),
+                token = ?token_in_address,
+                error = %message,
+                "Token metadata fetch failed"
+            );
+            failures.push(make_failure(
+                QuoteFailureKind::TokenCoverage,
+                format!("Token metadata fetch failed: {}", message),
                 None,
             ));
             meta.status = QuoteStatus::TokenMissing;
@@ -163,21 +180,38 @@ pub async fn get_amounts_out(
             meta.failures = failures;
             return QuoteComputation { responses, meta };
         }
-        Err(TokenStoreError::RefreshTimeout(duration)) => {
+        Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
             warn!(
                 request_id = request.request_id.as_str(),
                 auction_id = request.auction_id.as_deref(),
                 token = ?token_out_address,
                 timeout_ms,
-                "Token metadata refresh timed out"
+                "Token metadata fetch timed out"
             );
             failures.push(make_failure(
                 QuoteFailureKind::TokenCoverage,
                 format!(
-                    "Token metadata refresh timed out after {}ms: {}",
+                    "Token metadata fetch timed out after {}ms: {}",
                     timeout_ms, token_out_address
                 ),
+                None,
+            ));
+            meta.status = QuoteStatus::TokenMissing;
+            meta.failures = failures;
+            return QuoteComputation { responses, meta };
+        }
+        Err(TokenStoreError::RequestFailed(message)) => {
+            warn!(
+                request_id = request.request_id.as_str(),
+                auction_id = request.auction_id.as_deref(),
+                token = ?token_out_address,
+                error = %message,
+                "Token metadata fetch failed"
+            );
+            failures.push(make_failure(
+                QuoteFailureKind::TokenCoverage,
+                format!("Token metadata fetch failed: {}", message),
                 None,
             ));
             meta.status = QuoteStatus::TokenMissing;
@@ -242,9 +276,9 @@ pub async fn get_amounts_out(
         meta.matching_pools,
         amounts_in.len(),
         token_in_ref.symbol,
-         token_in_address,
-          token_out_ref.symbol,
-           token_out_address
+        token_in_address,
+        token_out_ref.symbol,
+        token_out_address
     );
 
     let token_in = token_in_ref.clone();

@@ -63,7 +63,10 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid REQUEST_TIMEOUT_MS");
     assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
-    assert!(pool_timeout_native_ms > 0, "POOL_TIMEOUT_NATIVE_MS must be > 0");
+    assert!(
+        pool_timeout_native_ms > 0,
+        "POOL_TIMEOUT_NATIVE_MS must be > 0"
+    );
     assert!(pool_timeout_vm_ms > 0, "POOL_TIMEOUT_VM_MS must be > 0");
     let token_refresh_timeout_ms: u64 = std::env::var("TOKEN_REFRESH_TIMEOUT_MS")
         .unwrap_or_else(|_| "200".to_string())

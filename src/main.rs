@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         Chain::Ethereum,
         Duration::from_millis(config.token_refresh_timeout_ms),
     ));
-    let state_store = Arc::new(StateStore::new());
+    let state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
     debug!("Created shared state");
 
     // Create app state

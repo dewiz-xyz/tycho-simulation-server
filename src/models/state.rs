@@ -7,7 +7,7 @@ use tokio::sync::{watch, RwLock};
 use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
-    tycho_common::{simulation::protocol_sim::ProtocolSim, Bytes},
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use super::{protocol::ProtocolKind, tokens::TokenStore};
@@ -103,6 +103,7 @@ pub struct UpdateMetrics {
 }
 
 pub struct StateStore {
+    tokens: Arc<TokenStore>,
     shards: HashMap<ProtocolKind, ProtocolShard>,
     id_to_kind: RwLock<HashMap<String, ProtocolKind>>,
     block_number: RwLock<u64>,
@@ -111,13 +112,14 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    pub fn new() -> Self {
+    pub fn new(tokens: Arc<TokenStore>) -> Self {
         let mut shards = HashMap::new();
         for kind in ProtocolKind::ALL {
             shards.insert(kind, ProtocolShard::default());
         }
         let (ready_tx, _) = watch::channel(false);
         StateStore {
+            tokens,
             shards,
             id_to_kind: RwLock::new(HashMap::new()),
             block_number: RwLock::new(0),
@@ -135,6 +137,7 @@ impl StateStore {
         }
 
         let mut new_pairs_count = 0;
+        let mut tokens_to_cache: Vec<Token> = Vec::new();
         for (id, component) in update.new_pairs.into_iter() {
             match ProtocolKind::from_component(&component) {
                 Some(kind) => {
@@ -142,6 +145,7 @@ impl StateStore {
                     if let Some(state) = state {
                         self.id_to_kind.write().await.insert(id.clone(), kind);
                         if let Some(shard) = self.shards.get(&kind) {
+                            tokens_to_cache.extend(component.tokens.iter().cloned());
                             shard.insert_new(id.clone(), state, component).await;
                             new_pairs_count += 1;
                         }
@@ -156,6 +160,10 @@ impl StateStore {
                     );
                 }
             }
+        }
+
+        if !tokens_to_cache.is_empty() {
+            self.tokens.insert_batch(tokens_to_cache.into_iter()).await;
         }
 
         let mut updated_states = 0;

@@ -1,28 +1,26 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use reqwest::{header, Client};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::timeout;
-use tracing::{info, warn};
-use tycho_simulation::{
-    tycho_common::{
-        models::{token::Token, Chain},
-        Bytes,
-    },
-    utils::load_all_tokens,
+use tracing::warn;
+use tycho_simulation::tycho_common::{
+    dto::{TokensRequestBody, TokensRequestResponse},
+    models::{token::Token, Chain},
+    Bytes,
 };
 
-/// In-memory cache of Tycho token metadata with best-effort refresh when
-/// lookups miss. Refreshes reuse the Tycho `/tokens` endpoint to cover cases
-/// where the initial snapshot lacked assets requested by the solver.
+/// In-memory cache of Tycho token metadata that prefers updates from the stream and
+/// falls back to a single token fetch from the Tycho RPC when a miss occurs.
 pub struct TokenStore {
     tokens: RwLock<HashMap<Bytes, Token>>,
-    refresh_lock: Mutex<()>,
+    fetch_lock: Mutex<()>,
     tycho_url: String,
     api_key: String,
     chain: Chain,
-    refresh_timeout: Duration,
+    fetch_timeout: Duration,
+    client: Client,
 }
 
 impl TokenStore {
@@ -31,15 +29,16 @@ impl TokenStore {
         tycho_url: String,
         api_key: String,
         chain: Chain,
-        refresh_timeout: Duration,
+        fetch_timeout: Duration,
     ) -> Self {
         TokenStore {
             tokens: RwLock::new(initial),
-            refresh_lock: Mutex::new(()),
+            fetch_lock: Mutex::new(()),
             tycho_url,
             api_key,
             chain,
-            refresh_timeout,
+            fetch_timeout,
+            client: Client::new(),
         }
     }
 
@@ -51,84 +50,117 @@ impl TokenStore {
         self.tokens.read().await.get(address).cloned()
     }
 
-    /// Ensure the token metadata exists. If missing, trigger a refresh of the
-    /// Tycho token list and attempt to resolve again.
+    /// Ensure the token metadata exists. If missing, fetch just that token via
+    /// the Tycho RPC instead of refreshing the full list.
     pub async fn ensure(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
         if let Some(token) = self.get(address).await {
             return Ok(Some(token));
         }
 
-        warn!(
-            "Token {} missing from cache; refreshing from Tycho",
-            address
-        );
-        self.refresh().await?;
-        Ok(self.get(address).await)
+        self.fetch_token(address).await
     }
 
-    async fn refresh(&self) -> Result<(), TokenStoreError> {
-        let guard = self.refresh_lock.lock().await;
-        let start = Instant::now();
+    /// Merge a batch of tokens into the in-memory cache. Existing entries are
+    /// left untouched to preserve any richer metadata already present.
+    pub async fn insert_batch(&self, tokens: impl IntoIterator<Item = Token>) {
+        let mut guard = self.tokens.write().await;
+        for token in tokens {
+            guard.entry(token.address.clone()).or_insert(token);
+        }
+    }
 
-        let fetch_future = load_all_tokens(
-            &self.tycho_url,
-            false,
-            Some(&self.api_key),
-            true,
-            self.chain,
-            None,
-            None,
+    async fn fetch_token(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
+        let _guard = self.fetch_lock.lock().await;
+
+        // Another task may have populated the cache while we were waiting.
+        if let Some(token) = self.tokens.read().await.get(address).cloned() {
+            return Ok(Some(token));
+        }
+
+        warn!(
+            scope = "token_single_fetch",
+            token_address = %address,
+            "Fetching single token from Tycho RPC - this should be rare"
         );
 
-        let new_tokens = match timeout(self.refresh_timeout, fetch_future).await {
-            Ok(Ok(tokens)) => tokens,
-            Ok(Err(e)) => {
-                warn!(
-                    scope = "token_refresh_error",
-                    error = ?e,
-                    "Token refresh failed"
-                );
-                drop(guard);
-                return Err(TokenStoreError::RefreshTimeout(self.refresh_timeout));
-            }
-            Err(_) => {
-                warn!(
-                    scope = "token_refresh_timeout",
-                    timeout_ms = self.refresh_timeout.as_millis() as u64,
-                    "Token refresh timed out"
-                );
-                drop(guard);
-                return Err(TokenStoreError::RefreshTimeout(self.refresh_timeout));
-            }
+        let body = TokensRequestBody {
+            token_addresses: Some(vec![address.clone()]),
+            chain: self.chain.into(),
+            ..Default::default()
         };
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        info!(
-            duration_ms = elapsed_ms,
-            total = new_tokens.len(),
-            "Token cache refreshed"
-        );
-        *self.tokens.write().await = new_tokens;
-        drop(guard);
-        Ok(())
+        let url = format!("{}/v1/tokens", self.rpc_base_url());
+
+        let response = self
+            .client
+            .post(url)
+            .header(header::AUTHORIZATION, self.api_key.clone())
+            .json(&body)
+            .timeout(self.fetch_timeout)
+            .send()
+            .await
+            .map_err(|err| {
+                if err.is_timeout() {
+                    TokenStoreError::FetchTimeout(self.fetch_timeout)
+                } else {
+                    TokenStoreError::RequestFailed(err.to_string())
+                }
+            })?;
+
+        if !response.status().is_success() {
+            return Err(TokenStoreError::RequestFailed(format!(
+                "Tycho RPC returned status {} when fetching token {}",
+                response.status(),
+                address
+            )));
+        }
+
+        let TokensRequestResponse { tokens, .. } = response
+            .json::<TokensRequestResponse>()
+            .await
+            .map_err(|err| {
+            TokenStoreError::RequestFailed(format!("Failed to parse token response: {}", err))
+        })?;
+
+        let maybe_token = tokens
+            .into_iter()
+            .find(|token| token.address == *address)
+            .and_then(|token| Token::try_from(token).ok());
+
+        if let Some(token) = maybe_token {
+            self.tokens
+                .write()
+                .await
+                .entry(token.address.clone())
+                .or_insert_with(|| token.clone());
+            Ok(Some(token))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn rpc_base_url(&self) -> String {
+        if self.tycho_url.starts_with("http://") || self.tycho_url.starts_with("https://") {
+            self.tycho_url.trim_end_matches('/').to_string()
+        } else {
+            format!("https://{}", self.tycho_url.trim_end_matches('/'))
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum TokenStoreError {
-    RefreshTimeout(Duration),
+    FetchTimeout(Duration),
+    RequestFailed(String),
 }
 
 impl fmt::Display for TokenStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenStoreError::RefreshTimeout(duration) => {
-                write!(
-                    f,
-                    "token refresh timed out after {} ms",
-                    duration.as_millis()
-                )
+            TokenStoreError::FetchTimeout(duration) => {
+                write!(f, "token fetch timed out after {} ms", duration.as_millis())
             }
+            TokenStoreError::RequestFailed(message) => write!(f, "token fetch failed: {}", message),
         }
     }
 }
