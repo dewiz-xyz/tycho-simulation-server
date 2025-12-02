@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use reqwest::{header, Client};
-use tokio::sync::{Mutex, RwLock};
+use reqwest::{header, Client, ClientBuilder};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 use tycho_simulation::tycho_common::{
     dto::{TokensRequestBody, TokensRequestResponse},
@@ -16,6 +16,7 @@ use tycho_simulation::tycho_common::{
 pub struct TokenStore {
     tokens: RwLock<HashMap<Bytes, Token>>,
     fetch_lock: Mutex<()>,
+    fetch_semaphore: Semaphore,
     tycho_url: String,
     api_key: String,
     chain: Chain,
@@ -31,10 +32,10 @@ impl TokenStore {
         chain: Chain,
         fetch_timeout: Duration,
     ) -> Self {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .pool_idle_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(2)
+        let client = ClientBuilder::new()
+            .connect_timeout(Duration::from_millis(300))
+            .pool_idle_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(1)
             .tcp_nodelay(true)
             .build()
             .expect("failed to build HTTP client");
@@ -42,6 +43,7 @@ impl TokenStore {
         TokenStore {
             tokens: RwLock::new(initial),
             fetch_lock: Mutex::new(()),
+            fetch_semaphore: Semaphore::new(16),
             tycho_url,
             api_key,
             chain,
@@ -79,6 +81,7 @@ impl TokenStore {
 
     async fn fetch_token(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
         let _guard = self.fetch_lock.lock().await;
+        let _permit = self.fetch_semaphore.acquire().await.unwrap();
 
         // Another task may have populated the cache while we were waiting.
         if let Some(token) = self.tokens.read().await.get(address).cloned() {
