@@ -81,8 +81,8 @@ pub async fn build_merged_streams(
     // );
 
     // COMING SOON!
-    // builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), Some(uniswap_v4_pool_with_euler_hook_filter));
-    // builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
+    builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), None);
+    builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
