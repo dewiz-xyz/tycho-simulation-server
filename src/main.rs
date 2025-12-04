@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         Some(&config.api_key),
         true,
         Chain::Ethereum,
-        Some(10),
+        Some(50),
         None,
     )
     .await?;
