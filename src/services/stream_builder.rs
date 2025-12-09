@@ -64,11 +64,11 @@ pub async fn build_merged_streams(
     builder = builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
     builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-        "vm:curve",
-        tvl_filter.clone(),
-        Some(curve_pool_filter),
-    );
+    // builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
+    //     "vm:curve",
+    //     tvl_filter.clone(),
+    //     Some(curve_pool_filter),
+    // );
     // builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
     //     "vm:balancer_v2",
     //     tvl_filter.clone(),
