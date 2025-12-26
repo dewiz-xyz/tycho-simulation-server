@@ -53,7 +53,7 @@ impl ProtocolKind {
             "uniswap_v2" | "uniswapv2" => return Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => return Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => return Some(ProtocolKind::UniswapV4),
-            "curve" | "curve_pool" | "curvefinance" => return Some(ProtocolKind::Curve),
+            "curve_pool" => return Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => return Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => return Some(ProtocolKind::EkuboV2),
@@ -67,7 +67,7 @@ impl ProtocolKind {
             "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
-            "curve" | "curvefinance" => Some(ProtocolKind::Curve),
+            "vm:curve" => Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
@@ -87,4 +87,34 @@ impl fmt::Display for ProtocolKind {
 
 fn normalize_proto_name(name: &str) -> String {
     name.to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tycho_simulation::tycho_common::models::{token::Token, Chain};
+    use tycho_simulation::tycho_common::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn recognizes_vm_curve_component() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "vm:curve".to_string(),
+            "curve_pool".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::Curve)
+        );
+    }
 }
