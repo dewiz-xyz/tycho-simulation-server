@@ -7,6 +7,7 @@ mod services;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
@@ -14,7 +15,7 @@ use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
-use crate::models::state::{AppState, StateStore};
+use crate::models::state::{AppState, QuoteMetrics, StateStore};
 use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_merged_streams;
 
@@ -57,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
     let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
 
+    let native_sim_concurrency = config.global_native_sim_concurrency;
+    let vm_sim_concurrency = config.global_vm_sim_concurrency;
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
@@ -64,7 +67,19 @@ async fn main() -> anyhow::Result<()> {
         pool_timeout_native,
         pool_timeout_vm,
         request_timeout,
+        native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
+        vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        native_sim_concurrency,
+        vm_sim_concurrency,
+        metrics: Arc::new(QuoteMetrics::default()),
     };
+
+    info!(
+        native_sim_concurrency,
+        vm_sim_concurrency,
+        enable_vm_pools = config.enable_vm_pools,
+        "Initialized simulation concurrency limits"
+    );
 
     // Build protocol stream in background and start processing
     {
@@ -79,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.tvl_threshold,
                 cfg.tvl_keep_threshold,
                 tokens_bg,
+                cfg.enable_vm_pools,
             )
             .await
             {
