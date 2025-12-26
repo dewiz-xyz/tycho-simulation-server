@@ -15,7 +15,7 @@ use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
-use crate::models::state::{AppState, QuoteMetrics, StateStore};
+use crate::models::state::{AppState, StateStore};
 use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_merged_streams;
 
@@ -69,9 +69,6 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
-        native_sim_concurrency,
-        vm_sim_concurrency,
-        metrics: Arc::new(QuoteMetrics::default()),
     };
 
     info!(

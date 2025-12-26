@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +22,6 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
-    pub native_sim_concurrency: usize,
-    pub vm_sim_concurrency: usize,
-    pub metrics: Arc<QuoteMetrics>,
 }
 
 impl AppState {
@@ -66,67 +63,6 @@ impl AppState {
 
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
-    }
-
-    pub fn native_sim_concurrency(&self) -> usize {
-        self.native_sim_concurrency
-    }
-
-    pub fn vm_sim_concurrency(&self) -> usize {
-        self.vm_sim_concurrency
-    }
-
-    pub fn metrics(&self) -> Arc<QuoteMetrics> {
-        Arc::clone(&self.metrics)
-    }
-}
-
-#[derive(Default)]
-pub struct QuoteMetrics {
-    skipped_native: AtomicU64,
-    skipped_vm: AtomicU64,
-    pool_timeout_native: AtomicU64,
-    pool_timeout_vm: AtomicU64,
-    quote_timeout: AtomicU64,
-}
-
-pub struct MetricsSnapshot {
-    pub skipped_native: u64,
-    pub skipped_vm: u64,
-    pub pool_timeout_native: u64,
-    pub pool_timeout_vm: u64,
-    pub quote_timeout: u64,
-}
-
-impl QuoteMetrics {
-    pub fn record_skip(&self, is_vm: bool) {
-        if is_vm {
-            self.skipped_vm.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.skipped_native.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub fn record_pool_timeout(&self, is_vm: bool) {
-        if is_vm {
-            self.pool_timeout_vm.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.pool_timeout_native.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub fn record_quote_timeout(&self) {
-        self.quote_timeout.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> MetricsSnapshot {
-        MetricsSnapshot {
-            skipped_native: self.skipped_native.load(Ordering::Relaxed),
-            skipped_vm: self.skipped_vm.load(Ordering::Relaxed),
-            pool_timeout_native: self.pool_timeout_native.load(Ordering::Relaxed),
-            pool_timeout_vm: self.pool_timeout_vm.load(Ordering::Relaxed),
-            quote_timeout: self.quote_timeout.load(Ordering::Relaxed),
-        }
     }
 }
 
@@ -215,6 +151,9 @@ impl StateStore {
             *guard = block_number;
         }
 
+        let mut index_additions: Vec<(Bytes, String)> = Vec::new();
+        let mut index_removals: Vec<(Bytes, String)> = Vec::new();
+
         let mut new_pairs_count = 0;
         let mut tokens_to_cache: Vec<Token> = Vec::new();
         for (id, component) in update.new_pairs.into_iter() {
@@ -226,10 +165,12 @@ impl StateStore {
                         self.id_to_kind.write().await.insert(id.clone(), kind);
                         if let Some(shard) = self.shards.get(&kind) {
                             tokens_to_cache.extend(component.tokens.iter().cloned());
+                            for token in component.tokens.iter() {
+                                index_additions.push((token.address.clone(), id.clone()));
+                            }
                             shard
                                 .insert_new(id.clone(), Arc::from(state), Arc::clone(&component))
                                 .await;
-                            self.add_to_index(&id, component.as_ref()).await;
                             new_pairs_count += 1;
                         }
                     } else {
@@ -267,6 +208,10 @@ impl StateStore {
 
         let mut removed_pairs_count = 0;
         for (id, component) in update.removed_pairs.into_iter() {
+            for token in component.tokens.iter() {
+                index_removals.push((token.address.clone(), id.clone()));
+            }
+
             let removed_kind = {
                 let mut guard = self.id_to_kind.write().await;
                 guard.remove(&id)
@@ -277,14 +222,17 @@ impl StateStore {
                     shard.remove(&id).await;
                     removed_pairs_count += 1;
                 }
-                self.remove_from_index(&id, &component).await;
             } else {
                 debug!(
                     "received removal for unknown pair {} ({})",
                     id, component.protocol_type_name
                 );
-                self.remove_from_index(&id, &component).await;
             }
+        }
+
+        if !index_additions.is_empty() || !index_removals.is_empty() {
+            let mut index = self.token_index.write().await;
+            apply_token_index_changes(&mut index, index_additions, index_removals);
         }
 
         let total_pairs = self.total_states().await;
@@ -413,27 +361,109 @@ impl StateStore {
 
         result
     }
+}
 
-    async fn add_to_index(&self, id: &str, component: &ProtocolComponent) {
-        let pool_id = id.to_string();
-        let mut index = self.token_index.write().await;
-        for token in &component.tokens {
-            index
-                .entry(token.address.clone())
-                .or_insert_with(HashSet::new)
-                .insert(pool_id.clone());
-        }
+fn apply_token_index_changes(
+    index: &mut HashMap<Bytes, HashSet<String>>,
+    index_additions: Vec<(Bytes, String)>,
+    index_removals: Vec<(Bytes, String)>,
+) {
+    for (token, id) in index_additions {
+        index.entry(token).or_default().insert(id);
     }
 
-    async fn remove_from_index(&self, id: &str, component: &ProtocolComponent) {
-        let mut index = self.token_index.write().await;
-        for token in &component.tokens {
-            if let Some(ids) = index.get_mut(&token.address) {
-                ids.remove(id);
-                if ids.is_empty() {
-                    index.remove(&token.address);
+    for (token, id) in index_removals {
+        if let Some(set) = index.get_mut(&token) {
+            set.remove(&id);
+            if set.is_empty() {
+                index.remove(&token);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn token(address: &str) -> Bytes {
+        Bytes::from_str(address.trim_start_matches("0x")).expect("valid token address")
+    }
+
+    #[test]
+    fn apply_token_index_changes_additions_and_removals() {
+        let mut index: HashMap<Bytes, HashSet<String>> = HashMap::new();
+
+        let token_a = token("0x0000000000000000000000000000000000000001");
+        let token_b = token("0x0000000000000000000000000000000000000002");
+
+        apply_token_index_changes(
+            &mut index,
+            vec![
+                (token_a.clone(), "pool1".to_string()),
+                (token_a.clone(), "pool2".to_string()),
+                (token_b.clone(), "pool1".to_string()),
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            index.get(&token_a).unwrap(),
+            &HashSet::from(["pool1".to_string(), "pool2".to_string()])
+        );
+        assert_eq!(
+            index.get(&token_b).unwrap(),
+            &HashSet::from(["pool1".to_string()])
+        );
+
+        apply_token_index_changes(
+            &mut index,
+            vec![],
+            vec![
+                (token_a.clone(), "pool1".to_string()),
+                (token_b.clone(), "pool1".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            index.get(&token_a).unwrap(),
+            &HashSet::from(["pool2".to_string()])
+        );
+        assert!(!index.contains_key(&token_b));
+    }
+
+    #[test]
+    fn apply_token_index_changes_matches_sequential_application() {
+        let token_a = token("0x0000000000000000000000000000000000000003");
+        let token_b = token("0x0000000000000000000000000000000000000004");
+
+        let additions = vec![
+            (token_a.clone(), "pool1".to_string()),
+            (token_a.clone(), "pool2".to_string()),
+            (token_b.clone(), "pool2".to_string()),
+        ];
+        let removals = vec![
+            (token_a.clone(), "pool1".to_string()),
+            (token_b.clone(), "pool2".to_string()),
+        ];
+
+        let mut batched: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        apply_token_index_changes(&mut batched, additions.clone(), removals.clone());
+
+        let mut sequential: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        for (token, id) in additions {
+            sequential.entry(token).or_default().insert(id);
+        }
+        for (token, id) in removals {
+            if let Some(set) = sequential.get_mut(&token) {
+                set.remove(&id);
+                if set.is_empty() {
+                    sequential.remove(&token);
                 }
             }
         }
+
+        assert_eq!(batched, sequential);
     }
 }

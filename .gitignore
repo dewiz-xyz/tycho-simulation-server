@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Node.js
+node_modules/
+
 # IDE
 .idea/
 .vscode/

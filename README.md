@@ -56,6 +56,8 @@ The following environment variables are read at startup:
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`, clamped to `256`)
 - `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`, clamped to `256`)
 
+Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
+
 ## HTTP API
 
 ### `POST /simulate`

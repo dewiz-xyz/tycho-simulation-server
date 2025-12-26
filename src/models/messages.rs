@@ -39,6 +39,7 @@ pub enum QuoteFailureKind {
     TokenValidation,
     TokenCoverage,
     Timeout,
+    ConcurrencyLimit,
     Overflow,
     Simulator,
     NoPools,

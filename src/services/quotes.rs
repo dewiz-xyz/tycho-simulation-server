@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use tokio::task::spawn_blocking;
-use tokio::time::{sleep_until, Instant as TokioInstant};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
@@ -21,9 +21,21 @@ use crate::models::messages::{
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
 
+// Per-request scheduling metrics (logged once by the handler).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuoteMetrics {
+    pub scheduled_native_pools: usize,
+    pub scheduled_vm_pools: usize,
+    pub skipped_native_concurrency: usize,
+    pub skipped_vm_concurrency: usize,
+    pub skipped_native_deadline: usize,
+    pub skipped_vm_deadline: usize,
+}
+
 pub struct QuoteComputation {
     pub responses: Vec<AmountOutResponse>,
     pub meta: QuoteMeta,
+    pub metrics: QuoteMetrics,
 }
 
 pub async fn get_amounts_out(
@@ -33,6 +45,7 @@ pub async fn get_amounts_out(
 ) -> QuoteComputation {
     let mut responses = Vec::new();
     let mut failures = Vec::new();
+    let mut metrics = QuoteMetrics::default();
 
     let readiness_wait = Duration::from_secs(2);
     let quote_timeout = state.quote_timeout();
@@ -56,7 +69,11 @@ pub async fn get_amounts_out(
         .unwrap_or(false)
     {
         meta.status = QuoteStatus::PartialFailure;
-        return QuoteComputation { responses, meta };
+        return QuoteComputation {
+            responses,
+            meta,
+            metrics,
+        };
     }
 
     let token_in_address = request.token_in.trim_start_matches("0x").to_lowercase();
@@ -72,7 +89,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::InvalidRequest;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
     };
 
@@ -86,7 +107,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::InvalidRequest;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
     };
 
@@ -103,7 +128,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::WarmingUp;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
         current_block = state.current_block().await;
         total_pools = state.total_pools().await;
@@ -127,7 +156,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
         Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
@@ -148,7 +181,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
         Err(TokenStoreError::RequestFailed(message)) => {
             warn!(
@@ -165,7 +202,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
     };
 
@@ -179,7 +220,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
         Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
@@ -200,7 +245,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
         Err(TokenStoreError::RequestFailed(message)) => {
             warn!(
@@ -217,7 +266,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::TokenMissing;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
     };
 
@@ -241,7 +294,11 @@ pub async fn get_amounts_out(
             ));
             meta.status = QuoteStatus::InvalidRequest;
             meta.failures = failures;
-            return QuoteComputation { responses, meta };
+            return QuoteComputation {
+                responses,
+                meta,
+                metrics,
+            };
         }
     };
 
@@ -281,7 +338,11 @@ pub async fn get_amounts_out(
         ));
         meta.status = QuoteStatus::NoLiquidity;
         meta.failures = failures;
-        return QuoteComputation { responses, meta };
+        return QuoteComputation {
+            responses,
+            meta,
+            metrics,
+        };
     }
 
     info!(
@@ -297,17 +358,6 @@ pub async fn get_amounts_out(
     let token_in = Arc::new(token_in_ref);
     let token_out = Arc::new(token_out_ref);
     let expected_len = amounts_in.len();
-    let metrics = state.metrics();
-    let mut skipped_native = 0u64;
-    let mut skipped_vm = 0u64;
-    let mut pool_timeout_native = 0u64;
-    let mut pool_timeout_vm = 0u64;
-    let mut quote_timed_out = false;
-    let mut quote_deadline_reached = false;
-    let mut native_queue_delay = TimingStats::default();
-    let mut vm_queue_delay = TimingStats::default();
-    let mut native_compute = TimingStats::default();
-    let mut vm_compute = TimingStats::default();
 
     let cancel_token = cancel
         .as_ref()
@@ -316,29 +366,53 @@ pub async fn get_amounts_out(
     let mut tasks = FuturesUnordered::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
+    // Stable scheduling to reduce jitter under contention
+    native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Native first
     for (id, pool_state, component) in native_candidates.into_iter() {
         if cancel_token.is_cancelled() {
             break;
         }
-        if Instant::now() >= quote_deadline {
-            quote_deadline_reached = true;
-            break;
+
+        let now = Instant::now();
+        let proposed_deadline = now + state.pool_timeout_native();
+        let pool_deadline = if proposed_deadline <= quote_deadline {
+            proposed_deadline
+        } else {
+            quote_deadline
+        };
+
+        if pool_deadline <= now {
+            metrics.skipped_native_deadline += 1;
+            continue;
         }
 
         let permit = match native_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => {
-                skipped_native += 1;
-                metrics.record_skip(false);
+            Err(TryAcquireError::NoPermits) => {
+                metrics.skipped_native_concurrency += 1;
                 continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                failures.push(make_failure(
+                    QuoteFailureKind::Internal,
+                    "Native pool semaphore closed".to_string(),
+                    None,
+                ));
+                meta.status = QuoteStatus::InternalError;
+                break;
             }
         };
 
-        let scheduled_at = Instant::now();
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
-        let timeout_for_pool = state.pool_timeout_native();
+
+        let pool_cancel = cancel_token.child_token();
+        metrics.scheduled_native_pools += 1;
+
         tasks.push(simulate_pool(
             id,
             pool_state,
@@ -349,59 +423,76 @@ pub async fn get_amounts_out(
             Arc::clone(&token_out),
             Arc::clone(&amounts_in),
             expected_len,
-            timeout_for_pool,
-            scheduled_at,
-            cancel_token.clone(),
+            pool_deadline,
+            pool_cancel,
             permit,
-            false,
         ));
     }
 
-    if !quote_deadline_reached {
-        for (id, pool_state, component) in vm_candidates.into_iter() {
-            if cancel_token.is_cancelled() {
-                break;
-            }
-            if Instant::now() >= quote_deadline {
-                quote_deadline_reached = true;
-                break;
-            }
-
-            let permit = match vm_semaphore.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    skipped_vm += 1;
-                    metrics.record_skip(true);
-                    continue;
-                }
-            };
-
-            let scheduled_at = Instant::now();
-            let pool_address = component.id.to_string();
-            let pool_protocol = component.protocol_system.clone();
-            let pool_name = derive_pool_name(&component);
-            let timeout_for_pool = state.pool_timeout_vm();
-            tasks.push(simulate_pool(
-                id,
-                pool_state,
-                pool_address,
-                pool_name,
-                pool_protocol,
-                Arc::clone(&token_in),
-                Arc::clone(&token_out),
-                Arc::clone(&amounts_in),
-                expected_len,
-                timeout_for_pool,
-                scheduled_at,
-                cancel_token.clone(),
-                permit,
-                true,
-            ));
+    // VM second
+    for (id, pool_state, component) in vm_candidates.into_iter() {
+        if cancel_token.is_cancelled() {
+            break;
         }
+
+        let now = Instant::now();
+        let proposed_deadline = now + state.pool_timeout_vm();
+        let pool_deadline = if proposed_deadline <= quote_deadline {
+            proposed_deadline
+        } else {
+            quote_deadline
+        };
+
+        if pool_deadline <= now {
+            metrics.skipped_vm_deadline += 1;
+            continue;
+        }
+
+        let permit = match vm_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                metrics.skipped_vm_concurrency += 1;
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                failures.push(make_failure(
+                    QuoteFailureKind::Internal,
+                    "VM pool semaphore closed".to_string(),
+                    None,
+                ));
+                meta.status = QuoteStatus::InternalError;
+                break;
+            }
+        };
+
+        let pool_address = component.id.to_string();
+        let pool_protocol = component.protocol_system.clone();
+        let pool_name = derive_pool_name(&component);
+
+        let pool_cancel = cancel_token.child_token();
+        metrics.scheduled_vm_pools += 1;
+
+        tasks.push(simulate_pool(
+            id,
+            pool_state,
+            pool_address,
+            pool_name,
+            pool_protocol,
+            Arc::clone(&token_in),
+            Arc::clone(&token_out),
+            Arc::clone(&amounts_in),
+            expected_len,
+            pool_deadline,
+            pool_cancel,
+            permit,
+        ));
     }
 
     if !tasks.is_empty() {
-        let quote_timeout_sleep = sleep_until(TokioInstant::from_std(quote_deadline));
+        let remaining = quote_deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_millis(0));
+        let quote_timeout_sleep = sleep(remaining);
         tokio::pin!(quote_timeout_sleep);
 
         while !tasks.is_empty() {
@@ -413,8 +504,6 @@ pub async fn get_amounts_out(
                         quote_timeout.as_millis()
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
-                    quote_timed_out = true;
-                    metrics.record_quote_timeout();
                     meta.status = QuoteStatus::PartialFailure;
                     break;
                 }
@@ -427,22 +516,6 @@ pub async fn get_amounts_out(
                         Some(outcome) => {
                             match outcome {
                                 Ok(result) => {
-                                    if result.timed_out {
-                                        if result.is_vm {
-                                            pool_timeout_vm += 1;
-                                            metrics.record_pool_timeout(true);
-                                        } else {
-                                            pool_timeout_native += 1;
-                                            metrics.record_pool_timeout(false);
-                                        }
-                                    }
-                                    if result.is_vm {
-                                        vm_queue_delay.record(result.queue_delay_ms);
-                                        vm_compute.record(result.compute_ms);
-                                    } else {
-                                        native_queue_delay.record(result.queue_delay_ms);
-                                        native_compute.record(result.compute_ms);
-                                    }
                                     // Classify before moving fields to avoid clones
                                     let had_timeout = result.timed_out;
                                     let is_partial = result.amounts_out.len() < expected_len;
@@ -513,12 +586,23 @@ pub async fn get_amounts_out(
 
     drop(tasks);
 
-    if quote_deadline_reached && !quote_timed_out {
-        let message = format!(
-            "Quote scheduling stopped at deadline after {}ms",
-            quote_timeout.as_millis()
-        );
-        failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
+    // Record scheduling skips as a single aggregated failure to avoid bloating responses
+    if metrics.skipped_native_concurrency > 0
+        || metrics.skipped_vm_concurrency > 0
+        || metrics.skipped_native_deadline > 0
+        || metrics.skipped_vm_deadline > 0
+    {
+        failures.push(make_failure(
+            QuoteFailureKind::ConcurrencyLimit,
+            format!(
+                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                metrics.skipped_native_concurrency,
+                metrics.skipped_vm_concurrency,
+                metrics.skipped_native_deadline,
+                metrics.skipped_vm_deadline
+            ),
+            None,
+        ));
         if matches!(meta.status, QuoteStatus::Ready) {
             meta.status = QuoteStatus::PartialFailure;
         }
@@ -529,23 +613,11 @@ pub async fn get_amounts_out(
             meta.status = QuoteStatus::PartialFailure;
         }
         if failures.is_empty() {
-            let skipped_total = skipped_native + skipped_vm;
-            if skipped_total > 0 {
-                failures.push(make_failure(
-                    QuoteFailureKind::Timeout,
-                    format!(
-                        "All pools skipped due to saturation (native_skipped={}, vm_skipped={})",
-                        skipped_native, skipped_vm
-                    ),
-                    None,
-                ));
-            } else {
-                failures.push(make_failure(
-                    QuoteFailureKind::Simulator,
-                    "All pools returned zero amounts".to_string(),
-                    None,
-                ));
-            }
+            failures.push(make_failure(
+                QuoteFailureKind::Simulator,
+                "All pools returned zero amounts".to_string(),
+                None,
+            ));
         }
     } else {
         responses.sort_by(|a, b| {
@@ -580,71 +652,12 @@ pub async fn get_amounts_out(
         }
     }
 
-    if (skipped_native + skipped_vm) > 0 && matches!(meta.status, QuoteStatus::Ready) {
-        meta.status = QuoteStatus::PartialFailure;
-    }
-
-    let native_queue_summary = native_queue_delay.summarize();
-    let vm_queue_summary = vm_queue_delay.summarize();
-    let native_compute_summary = native_compute.summarize();
-    let vm_compute_summary = vm_compute.summarize();
-    let native_in_flight = state
-        .native_sim_concurrency()
-        .saturating_sub(native_semaphore.available_permits());
-    let vm_in_flight = state
-        .vm_sim_concurrency()
-        .saturating_sub(vm_semaphore.available_permits());
-    let metrics_snapshot = metrics.snapshot();
-
-    info!(
-        scope = "quote_metrics",
-        request_id = request.request_id.as_str(),
-        auction_id = request.auction_id.as_deref(),
-        status = ?meta.status,
-        responses = responses.len(),
-        failures = failures.len(),
-        skipped_native,
-        skipped_vm,
-        pool_timeout_native,
-        pool_timeout_vm,
-        quote_timeout = quote_timed_out,
-        quote_deadline_reached,
-        native_in_flight,
-        vm_in_flight,
-        native_queue_count = native_queue_summary.as_ref().map(|summary| summary.count).unwrap_or(0),
-        native_queue_p50_ms = native_queue_summary.as_ref().map(|summary| summary.p50).unwrap_or(0),
-        native_queue_p95_ms = native_queue_summary.as_ref().map(|summary| summary.p95).unwrap_or(0),
-        native_queue_min_ms = native_queue_summary.as_ref().map(|summary| summary.min).unwrap_or(0),
-        native_queue_max_ms = native_queue_summary.as_ref().map(|summary| summary.max).unwrap_or(0),
-        native_queue_avg_ms = native_queue_summary.as_ref().map(|summary| summary.avg).unwrap_or(0),
-        native_compute_count = native_compute_summary.as_ref().map(|summary| summary.count).unwrap_or(0),
-        native_compute_p50_ms = native_compute_summary.as_ref().map(|summary| summary.p50).unwrap_or(0),
-        native_compute_p95_ms = native_compute_summary.as_ref().map(|summary| summary.p95).unwrap_or(0),
-        native_compute_min_ms = native_compute_summary.as_ref().map(|summary| summary.min).unwrap_or(0),
-        native_compute_max_ms = native_compute_summary.as_ref().map(|summary| summary.max).unwrap_or(0),
-        native_compute_avg_ms = native_compute_summary.as_ref().map(|summary| summary.avg).unwrap_or(0),
-        vm_queue_count = vm_queue_summary.as_ref().map(|summary| summary.count).unwrap_or(0),
-        vm_queue_p50_ms = vm_queue_summary.as_ref().map(|summary| summary.p50).unwrap_or(0),
-        vm_queue_p95_ms = vm_queue_summary.as_ref().map(|summary| summary.p95).unwrap_or(0),
-        vm_queue_min_ms = vm_queue_summary.as_ref().map(|summary| summary.min).unwrap_or(0),
-        vm_queue_max_ms = vm_queue_summary.as_ref().map(|summary| summary.max).unwrap_or(0),
-        vm_queue_avg_ms = vm_queue_summary.as_ref().map(|summary| summary.avg).unwrap_or(0),
-        vm_compute_count = vm_compute_summary.as_ref().map(|summary| summary.count).unwrap_or(0),
-        vm_compute_p50_ms = vm_compute_summary.as_ref().map(|summary| summary.p50).unwrap_or(0),
-        vm_compute_p95_ms = vm_compute_summary.as_ref().map(|summary| summary.p95).unwrap_or(0),
-        vm_compute_min_ms = vm_compute_summary.as_ref().map(|summary| summary.min).unwrap_or(0),
-        vm_compute_max_ms = vm_compute_summary.as_ref().map(|summary| summary.max).unwrap_or(0),
-        vm_compute_avg_ms = vm_compute_summary.as_ref().map(|summary| summary.avg).unwrap_or(0),
-        total_skipped_native = metrics_snapshot.skipped_native,
-        total_skipped_vm = metrics_snapshot.skipped_vm,
-        total_pool_timeout_native = metrics_snapshot.pool_timeout_native,
-        total_pool_timeout_vm = metrics_snapshot.pool_timeout_vm,
-        total_quote_timeout = metrics_snapshot.quote_timeout,
-        "Quote metrics"
-    );
-
     meta.failures = failures;
-    QuoteComputation { responses, meta }
+    QuoteComputation {
+        responses,
+        meta,
+        metrics,
+    }
 }
 
 struct PoolQuoteResult {
@@ -652,13 +665,10 @@ struct PoolQuoteResult {
     pool_name: String,
     pool_address: String,
     protocol: String,
-    is_vm: bool,
     amounts_out: Vec<String>,
     gas_used: Vec<u64>,
     errors: Vec<String>,
     timed_out: bool,
-    queue_delay_ms: u64,
-    compute_ms: u64,
 }
 
 struct FailureContext<'a> {
@@ -666,58 +676,6 @@ struct FailureContext<'a> {
     pool_name: Option<&'a str>,
     pool_address: Option<&'a str>,
     protocol: Option<&'a str>,
-}
-
-#[derive(Default)]
-struct TimingStats {
-    values: Vec<u64>,
-}
-
-struct TimingSummary {
-    count: usize,
-    min: u64,
-    max: u64,
-    avg: u64,
-    p50: u64,
-    p95: u64,
-}
-
-impl TimingStats {
-    fn record(&mut self, value: u64) {
-        self.values.push(value);
-    }
-
-    fn summarize(&mut self) -> Option<TimingSummary> {
-        if self.values.is_empty() {
-            return None;
-        }
-
-        self.values.sort_unstable();
-        let count = self.values.len();
-        let min = self.values[0];
-        let max = self.values[count - 1];
-        let sum: u128 = self.values.iter().map(|value| *value as u128).sum();
-        let avg = (sum / count as u128) as u64;
-        let p50 = percentile(&self.values, 50);
-        let p95 = percentile(&self.values, 95);
-
-        Some(TimingSummary {
-            count,
-            min,
-            max,
-            avg,
-            p50,
-            p95,
-        })
-    }
-}
-
-fn percentile(sorted: &[u64], pct: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = (sorted.len() - 1) * pct / 100;
-    sorted[idx]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -731,11 +689,9 @@ async fn simulate_pool(
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
     expected_len: usize,
-    timeout: Duration,
-    scheduled_at: Instant,
+    deadline: Instant,
     cancel_token: CancellationToken,
     permit: OwnedSemaphorePermit,
-    is_vm: bool,
 ) -> Result<PoolQuoteResult, QuoteFailure> {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
@@ -746,18 +702,16 @@ async fn simulate_pool(
     let amounts_clone = Arc::clone(&amounts);
 
     let cancel_token_clone = cancel_token.clone();
+    let sleep_duration = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::from_millis(0));
     let handle = spawn_blocking(move || {
         // Hold the permit until the blocking work exits.
         let _permit = permit;
-        let compute_started_at = Instant::now();
-        let queue_delay_ms = compute_started_at
-            .saturating_duration_since(scheduled_at)
-            .as_millis() as u64;
         let mut amounts_out = Vec::with_capacity(expected_len);
         let mut gas_used = Vec::with_capacity(expected_len);
         let mut errors = Vec::new();
         let mut timed_out = false;
-        let deadline = scheduled_at + timeout;
 
         for amount_in in amounts_clone.iter() {
             if cancel_token_clone.is_cancelled() {
@@ -779,10 +733,9 @@ async fn simulate_pool(
                     protocol = %pool_protocol,
                     pool_name = %pool_name,
                     pool_address = %pool_address,
-                    timeout_ms = timeout.as_millis() as u64,
                     "Pool quote exceeded deadline before completion"
                 );
-                errors.push(format!("Timed out after {}ms", timeout.as_millis()));
+                errors.push("Timed out".to_string());
                 timed_out = true;
                 break;
             }
@@ -831,30 +784,25 @@ async fn simulate_pool(
                     protocol = %pool_protocol,
                     pool_name = %pool_name,
                     pool_address = %pool_address,
-                    timeout_ms = timeout.as_millis() as u64,
                     "Pool quote deadline reached after ladder step"
                 );
                 if errors.is_empty() {
-                    errors.push(format!("Timed out after {}ms", timeout.as_millis()));
+                    errors.push("Timed out".to_string());
                 }
                 timed_out = true;
                 break;
             }
         }
 
-        let compute_ms = compute_started_at.elapsed().as_millis() as u64;
         PoolQuoteResult {
             pool: pool_id,
             pool_name,
             pool_address,
             protocol: pool_protocol,
-            is_vm,
             amounts_out,
             gas_used,
             errors,
             timed_out,
-            queue_delay_ms,
-            compute_ms,
         }
     });
     tokio::pin!(handle);
@@ -880,6 +828,8 @@ async fn simulate_pool(
             }
         }
         _ = cancel_token.cancelled() => {
+            cancel_token.cancel();
+            handle.as_mut().abort();
             let context = FailureContext {
                 pool_id: &pool_id_for_failure,
                 pool_name: Some(pool_name_for_failure.as_str()),
@@ -888,6 +838,19 @@ async fn simulate_pool(
             };
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation cancelled", descriptor);
+            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+        }
+        _ = sleep(sleep_duration) => {
+            cancel_token.cancel();
+            handle.as_mut().abort();
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            let message = format!("{}: Quote computation timed out", descriptor);
             Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
         }
     }
