@@ -42,16 +42,19 @@ The following environment variables are read at startup:
 
 - `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
-- `TVL_THRESHOLD` – Minimum TVL (in native units) for adding a pool to the stream (default: `300`)
+- `TVL_THRESHOLD` – Minimum TVL (in native units) for adding a pool to the stream (default: `100`)
 - `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep/remove pools (default: `0.2`)
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
 - `RUST_LOG` – Logging filter (default: `info`)
-- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `75`)
-- `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `5`)
-- `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `25`)
-- `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `1800`)
+- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
+- `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
+- `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `150`)
+- `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
+- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
+- `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`, clamped to `256`)
+- `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`, clamped to `256`)
 
 ## HTTP API
 
