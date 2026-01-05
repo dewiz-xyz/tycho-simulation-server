@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Python
+__pycache__/
+
 # Node.js
 node_modules/
 
