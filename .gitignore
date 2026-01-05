@@ -9,11 +9,15 @@ node_modules/
 .idea/
 .vscode/
 .cursor/
+.codex/
+.claude/
 *.swp
 *.swo
 *.node
 # Logs
+logs/
 *.log
+.tycho-sim-server.pid
 .cursorrules
 AGENTS.md
 CLAUDE.md
