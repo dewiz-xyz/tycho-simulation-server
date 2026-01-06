@@ -14,10 +14,12 @@ pub enum ProtocolKind {
     SushiswapV2,
     MaverickV2,
     BalancerV2,
+    FluidV1,
+    Rocketpool,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 10] = [
+    pub const ALL: [ProtocolKind; 12] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -28,6 +30,8 @@ impl ProtocolKind {
         ProtocolKind::SushiswapV2,
         ProtocolKind::MaverickV2,
         ProtocolKind::BalancerV2,
+        ProtocolKind::FluidV1,
+        ProtocolKind::Rocketpool,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -42,6 +46,8 @@ impl ProtocolKind {
             ProtocolKind::SushiswapV2 => "sushiswap_v2",
             ProtocolKind::MaverickV2 => "maverick_v2",
             ProtocolKind::BalancerV2 => "balancer_v2",
+            ProtocolKind::FluidV1 => "fluid_v1",
+            ProtocolKind::Rocketpool => "rocketpool",
         }
     }
 
@@ -60,6 +66,8 @@ impl ProtocolKind {
             "sushiswap_v2" | "sushiswapv2" => return Some(ProtocolKind::SushiswapV2),
             "maverick_v2" | "maverickv2" => return Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
+            "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
+            "rocketpool" => return Some(ProtocolKind::Rocketpool),
             _ => {}
         }
 
@@ -74,6 +82,8 @@ impl ProtocolKind {
             "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
             "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
+            "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
+            "rocketpool" => Some(ProtocolKind::Rocketpool),
             _ => None,
         }
     }
