@@ -71,6 +71,7 @@ fi
 repo="$(cd "$repo" && pwd)"
 status_url="${base_url%/}/status"
 simulate_url="${base_url%/}/simulate"
+encode_url="${base_url%/}/encode"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 started_by_me="false"
@@ -95,6 +96,9 @@ echo "Waiting for readiness..."
 
 echo "Smoke testing /simulate..."
 python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status ready
+
+echo "Encode smoke testing..."
+python3 "$script_dir/encode_smoke.py" --encode-url "$encode_url" --simulate-url "$simulate_url" --repo "$repo"
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
