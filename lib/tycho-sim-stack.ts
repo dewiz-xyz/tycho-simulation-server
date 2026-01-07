@@ -116,6 +116,7 @@ export class AppServiceStack extends cdk.Stack {
             POOL_TIMEOUT_NATIVE_MS: "150",
             POOL_TIMEOUT_VM_MS: "1500",
             REQUEST_TIMEOUT_MS: "4000",
+            ENABLE_VM_POOLS: "true",
             HOST: "0.0.0.0",
             RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
             RUST_LOG: "info",
