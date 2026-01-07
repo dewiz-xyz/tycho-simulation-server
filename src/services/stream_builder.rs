@@ -10,13 +10,13 @@ use tycho_simulation::{
         protocol::{
             ekubo::state::EkuboState,
             filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
+            fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
+            rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
             vm::state::EVMPoolState,
-            fluid::FluidV1,
-            rocketpool::state::RocketpoolState,
         },
         stream::ProtocolStreamBuilder,
     },
@@ -71,7 +71,11 @@ pub async fn build_merged_streams(
     builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), None);
     builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<FluidV1>("fluid_v1", tvl_filter.clone(), Some(fluid_v1_paused_pools_filter));
+    builder = builder.exchange::<FluidV1>(
+        "fluid_v1",
+        tvl_filter.clone(),
+        Some(fluid_v1_paused_pools_filter),
+    );
     builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
 
     if enable_vm_pools {

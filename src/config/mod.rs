@@ -76,13 +76,12 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
 
-    let max_sim_concurrency = 256usize;
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
 
-    let default_native = (cpu_count.saturating_mul(4)).clamp(1, max_sim_concurrency);
-    let default_vm = cpu_count.clamp(1, max_sim_concurrency);
+    let default_native = (cpu_count.saturating_mul(4)).max(1);
+    let default_vm = cpu_count.max(1);
 
     let global_native_sim_concurrency: usize = std::env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
         .ok()
@@ -92,12 +91,12 @@ pub fn load_config() -> AppConfig {
                 .expect("Invalid GLOBAL_NATIVE_SIM_CONCURRENCY")
         })
         .unwrap_or(default_native)
-        .clamp(1, max_sim_concurrency);
+        .max(1);
     let global_vm_sim_concurrency: usize = std::env::var("GLOBAL_VM_SIM_CONCURRENCY")
         .ok()
         .map(|value| value.parse().expect("Invalid GLOBAL_VM_SIM_CONCURRENCY"))
         .unwrap_or(default_vm)
-        .clamp(1, max_sim_concurrency);
+        .max(1);
 
     AppConfig {
         tycho_url,
