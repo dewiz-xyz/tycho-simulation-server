@@ -14,10 +14,12 @@ pub enum ProtocolKind {
     SushiswapV2,
     MaverickV2,
     BalancerV2,
+    FluidV1,
+    Rocketpool,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 10] = [
+    pub const ALL: [ProtocolKind; 12] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -28,6 +30,8 @@ impl ProtocolKind {
         ProtocolKind::SushiswapV2,
         ProtocolKind::MaverickV2,
         ProtocolKind::BalancerV2,
+        ProtocolKind::FluidV1,
+        ProtocolKind::Rocketpool,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -42,6 +46,8 @@ impl ProtocolKind {
             ProtocolKind::SushiswapV2 => "sushiswap_v2",
             ProtocolKind::MaverickV2 => "maverick_v2",
             ProtocolKind::BalancerV2 => "balancer_v2",
+            ProtocolKind::FluidV1 => "fluid_v1",
+            ProtocolKind::Rocketpool => "rocketpool",
         }
     }
 
@@ -53,13 +59,15 @@ impl ProtocolKind {
             "uniswap_v2" | "uniswapv2" => return Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => return Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => return Some(ProtocolKind::UniswapV4),
-            "curve" | "curve_pool" | "curvefinance" => return Some(ProtocolKind::Curve),
+            "curve_pool" => return Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => return Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => return Some(ProtocolKind::EkuboV2),
             "sushiswap_v2" | "sushiswapv2" => return Some(ProtocolKind::SushiswapV2),
             "maverick_v2" | "maverickv2" => return Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
+            "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
+            "rocketpool" => return Some(ProtocolKind::Rocketpool),
             _ => {}
         }
 
@@ -67,13 +75,15 @@ impl ProtocolKind {
             "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
             "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
-            "curve" | "curvefinance" => Some(ProtocolKind::Curve),
+            "vm:curve" => Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
             "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
             "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
+            "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
+            "rocketpool" => Some(ProtocolKind::Rocketpool),
             _ => None,
         }
     }
@@ -87,4 +97,34 @@ impl fmt::Display for ProtocolKind {
 
 fn normalize_proto_name(name: &str) -> String {
     name.to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tycho_simulation::tycho_common::models::{token::Token, Chain};
+    use tycho_simulation::tycho_common::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn recognizes_vm_curve_component() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "vm:curve".to_string(),
+            "curve_pool".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::Curve)
+        );
+    }
 }

@@ -43,20 +43,14 @@ pub fn load_config() -> AppConfig {
         .unwrap_or_else(|_| "150".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
-    // Dual pool timeouts with backward compatibility
-    let pool_timeout_native_ms_env = std::env::var("POOL_TIMEOUT_NATIVE_MS").ok();
-    let pool_timeout_vm_ms_env = std::env::var("POOL_TIMEOUT_VM_MS").ok();
-    let pool_timeout_ms_legacy = std::env::var("POOL_TIMEOUT_MS").ok();
-
-    let pool_timeout_native_ms: u64 = match (pool_timeout_native_ms_env, pool_timeout_ms_legacy) {
-        (Some(val), _) => val.parse().expect("Invalid POOL_TIMEOUT_NATIVE_MS"),
-        (None, Some(legacy)) => legacy.parse().expect("Invalid POOL_TIMEOUT_MS"),
-        (None, None) => 20,
-    };
-    let pool_timeout_vm_ms: u64 = match pool_timeout_vm_ms_env {
-        Some(val) => val.parse().expect("Invalid POOL_TIMEOUT_VM_MS"),
-        None => 150,
-    };
+    let pool_timeout_native_ms: u64 = std::env::var("POOL_TIMEOUT_NATIVE_MS")
+        .unwrap_or_else(|_| "20".to_string())
+        .parse()
+        .expect("Invalid POOL_TIMEOUT_NATIVE_MS");
+    let pool_timeout_vm_ms: u64 = std::env::var("POOL_TIMEOUT_VM_MS")
+        .unwrap_or_else(|_| "150".to_string())
+        .parse()
+        .expect("Invalid POOL_TIMEOUT_VM_MS");
 
     let request_timeout_ms: u64 = std::env::var("REQUEST_TIMEOUT_MS")
         .unwrap_or_else(|_| "4000".to_string())
@@ -77,6 +71,34 @@ pub fn load_config() -> AppConfig {
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
     );
 
+    let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse()
+        .expect("Invalid ENABLE_VM_POOLS");
+
+    let max_sim_concurrency = 256usize;
+    let cpu_count = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+
+    let default_native = (cpu_count.saturating_mul(4)).clamp(1, max_sim_concurrency);
+    let default_vm = cpu_count.clamp(1, max_sim_concurrency);
+
+    let global_native_sim_concurrency: usize = std::env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("Invalid GLOBAL_NATIVE_SIM_CONCURRENCY")
+        })
+        .unwrap_or(default_native)
+        .clamp(1, max_sim_concurrency);
+    let global_vm_sim_concurrency: usize = std::env::var("GLOBAL_VM_SIM_CONCURRENCY")
+        .ok()
+        .map(|value| value.parse().expect("Invalid GLOBAL_VM_SIM_CONCURRENCY"))
+        .unwrap_or(default_vm)
+        .clamp(1, max_sim_concurrency);
+
     AppConfig {
         tycho_url,
         api_key,
@@ -89,6 +111,9 @@ pub fn load_config() -> AppConfig {
         pool_timeout_vm_ms,
         request_timeout_ms,
         token_refresh_timeout_ms,
+        enable_vm_pools,
+        global_native_sim_concurrency,
+        global_vm_sim_concurrency,
     }
 }
 
@@ -105,4 +130,7 @@ pub struct AppConfig {
     pub pool_timeout_vm_ms: u64,
     pub request_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
+    pub enable_vm_pools: bool,
+    pub global_native_sim_concurrency: usize,
+    pub global_vm_sim_concurrency: usize,
 }

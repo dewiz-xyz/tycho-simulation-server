@@ -106,6 +106,12 @@ pub async fn simulate(
             status = ?computation.meta.status,
             responses = computation.responses.len(),
             failures = computation.meta.failures.len(),
+            scheduled_native_pools = computation.metrics.scheduled_native_pools,
+            scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
+            skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
+            skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
+            skipped_native_deadline = computation.metrics.skipped_native_deadline,
+            skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
             "Simulate computation completed with timeout"
         );
     } else {
@@ -117,6 +123,12 @@ pub async fn simulate(
             status = ?computation.meta.status,
             responses = computation.responses.len(),
             failures = computation.meta.failures.len(),
+            scheduled_native_pools = computation.metrics.scheduled_native_pools,
+            scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
+            skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
+            skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
+            skipped_native_deadline = computation.metrics.skipped_native_deadline,
+            skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
             "Simulate computation completed"
         );
     }

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
@@ -20,6 +20,8 @@ pub struct AppState {
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
     pub request_timeout: Duration,
+    pub native_sim_semaphore: Arc<Semaphore>,
+    pub vm_sim_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -54,26 +56,36 @@ impl AppState {
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
+
+    pub fn native_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.native_sim_semaphore)
+    }
+
+    pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.vm_sim_semaphore)
+    }
 }
+
+pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
 
 #[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
 struct ProtocolShard {
-    states: Arc<RwLock<HashMap<String, (Box<dyn ProtocolSim>, ProtocolComponent)>>>,
+    states: Arc<RwLock<HashMap<String, PoolEntry>>>,
 }
 
 impl ProtocolShard {
     async fn insert_new(
         &self,
         id: String,
-        state: Box<dyn ProtocolSim>,
-        component: ProtocolComponent,
+        state: Arc<dyn ProtocolSim>,
+        component: Arc<ProtocolComponent>,
     ) {
         let mut guard = self.states.write().await;
         guard.insert(id, (state, component));
     }
 
-    async fn update_state(&self, id: &str, state: Box<dyn ProtocolSim>) -> bool {
+    async fn update_state(&self, id: &str, state: Arc<dyn ProtocolSim>) -> bool {
         let mut guard = self.states.write().await;
         if let Some((existing_state, _)) = guard.get_mut(id) {
             *existing_state = state;
@@ -83,7 +95,7 @@ impl ProtocolShard {
         }
     }
 
-    async fn remove(&self, id: &str) -> Option<(Box<dyn ProtocolSim>, ProtocolComponent)> {
+    async fn remove(&self, id: &str) -> Option<PoolEntry> {
         let mut guard = self.states.write().await;
         guard.remove(id)
     }
@@ -106,6 +118,8 @@ pub struct StateStore {
     tokens: Arc<TokenStore>,
     shards: HashMap<ProtocolKind, ProtocolShard>,
     id_to_kind: RwLock<HashMap<String, ProtocolKind>>,
+    // Token -> pool id index to avoid scanning all pools on each quote.
+    token_index: RwLock<HashMap<Bytes, HashSet<String>>>,
     block_number: RwLock<u64>,
     ready: AtomicBool,
     ready_tx: watch::Sender<bool>,
@@ -122,6 +136,7 @@ impl StateStore {
             tokens,
             shards,
             id_to_kind: RwLock::new(HashMap::new()),
+            token_index: RwLock::new(HashMap::new()),
             block_number: RwLock::new(0),
             ready: AtomicBool::new(false),
             ready_tx,
@@ -136,6 +151,9 @@ impl StateStore {
             *guard = block_number;
         }
 
+        let mut index_additions: Vec<(Bytes, String)> = Vec::new();
+        let mut index_removals: Vec<(Bytes, String)> = Vec::new();
+
         let mut new_pairs_count = 0;
         let mut tokens_to_cache: Vec<Token> = Vec::new();
         for (id, component) in update.new_pairs.into_iter() {
@@ -143,10 +161,16 @@ impl StateStore {
                 Some(kind) => {
                     let state = update.states.remove(&id);
                     if let Some(state) = state {
+                        let component = Arc::new(component);
                         self.id_to_kind.write().await.insert(id.clone(), kind);
                         if let Some(shard) = self.shards.get(&kind) {
                             tokens_to_cache.extend(component.tokens.iter().cloned());
-                            shard.insert_new(id.clone(), state, component).await;
+                            for token in component.tokens.iter() {
+                                index_additions.push((token.address.clone(), id.clone()));
+                            }
+                            shard
+                                .insert_new(id.clone(), Arc::from(state), Arc::clone(&component))
+                                .await;
                             new_pairs_count += 1;
                         }
                     } else {
@@ -171,7 +195,7 @@ impl StateStore {
             let kind_opt = { self.id_to_kind.read().await.get(&id).copied() };
             if let Some(kind) = kind_opt {
                 if let Some(shard) = self.shards.get(&kind) {
-                    if shard.update_state(&id, state).await {
+                    if shard.update_state(&id, Arc::from(state)).await {
                         updated_states += 1;
                     } else {
                         warn!("state missing in shard for id {}", id);
@@ -184,6 +208,10 @@ impl StateStore {
 
         let mut removed_pairs_count = 0;
         for (id, component) in update.removed_pairs.into_iter() {
+            for token in component.tokens.iter() {
+                index_removals.push((token.address.clone(), id.clone()));
+            }
+
             let removed_kind = {
                 let mut guard = self.id_to_kind.write().await;
                 guard.remove(&id)
@@ -200,6 +228,11 @@ impl StateStore {
                     id, component.protocol_type_name
                 );
             }
+        }
+
+        if !index_additions.is_empty() || !index_removals.is_empty() {
+            let mut index = self.token_index.write().await;
+            apply_token_index_changes(&mut index, index_additions, index_removals);
         }
 
         let total_pairs = self.total_states().await;
@@ -268,31 +301,169 @@ impl StateStore {
         }
     }
 
-    pub async fn matching_pools_by_addresses(
+    pub(crate) async fn matching_pools_by_addresses(
         &self,
         token_in: &Bytes,
         token_out: &Bytes,
-    ) -> Vec<(String, (Box<dyn ProtocolSim>, ProtocolComponent))> {
-        let mut result = Vec::new();
-        for shard in self.shards.values() {
-            let guard = shard.states.read().await;
-            for (id, (state, component)) in guard.iter() {
-                let has_in = component
-                    .tokens
-                    .iter()
-                    .any(|token| &token.address == token_in);
-                if !has_in {
-                    continue;
-                }
-                if component
-                    .tokens
-                    .iter()
-                    .any(|token| &token.address == token_out)
-                {
-                    result.push((id.clone(), (state.clone(), component.clone())));
+    ) -> Vec<(String, PoolEntry)> {
+        let (token_in_ids, token_out_ids) = {
+            let index = self.token_index.read().await;
+            let token_in_ids = index.get(token_in).cloned();
+            let token_out_ids = index.get(token_out).cloned();
+            (token_in_ids, token_out_ids)
+        };
+
+        let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
+            return Vec::new();
+        };
+
+        let (smaller, larger) = if token_in_ids.len() <= token_out_ids.len() {
+            (token_in_ids, token_out_ids)
+        } else {
+            (token_out_ids, token_in_ids)
+        };
+
+        let mut candidate_ids = Vec::with_capacity(smaller.len());
+        for id in smaller {
+            if larger.contains(&id) {
+                candidate_ids.push(id);
+            }
+        }
+
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let id_kinds: Vec<(String, ProtocolKind)> = {
+            let guard = self.id_to_kind.read().await;
+            candidate_ids
+                .iter()
+                .filter_map(|id| guard.get(id).copied().map(|kind| (id.clone(), kind)))
+                .collect()
+        };
+
+        let mut by_kind: HashMap<ProtocolKind, Vec<String>> = HashMap::new();
+        for (id, kind) in id_kinds {
+            by_kind.entry(kind).or_default().push(id);
+        }
+
+        let mut result = Vec::with_capacity(candidate_ids.len());
+        for (kind, ids) in by_kind {
+            if let Some(shard) = self.shards.get(&kind) {
+                let guard = shard.states.read().await;
+                for id in ids {
+                    if let Some((state, component)) = guard.get(&id) {
+                        result.push((id, (Arc::clone(state), Arc::clone(component))));
+                    }
                 }
             }
         }
+
         result
+    }
+}
+
+fn apply_token_index_changes(
+    index: &mut HashMap<Bytes, HashSet<String>>,
+    index_additions: Vec<(Bytes, String)>,
+    index_removals: Vec<(Bytes, String)>,
+) {
+    for (token, id) in index_additions {
+        index.entry(token).or_default().insert(id);
+    }
+
+    for (token, id) in index_removals {
+        if let Some(set) = index.get_mut(&token) {
+            set.remove(&id);
+            if set.is_empty() {
+                index.remove(&token);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn token(address: &str) -> Bytes {
+        Bytes::from_str(address.trim_start_matches("0x")).expect("valid token address")
+    }
+
+    #[test]
+    fn apply_token_index_changes_additions_and_removals() {
+        let mut index: HashMap<Bytes, HashSet<String>> = HashMap::new();
+
+        let token_a = token("0x0000000000000000000000000000000000000001");
+        let token_b = token("0x0000000000000000000000000000000000000002");
+
+        apply_token_index_changes(
+            &mut index,
+            vec![
+                (token_a.clone(), "pool1".to_string()),
+                (token_a.clone(), "pool2".to_string()),
+                (token_b.clone(), "pool1".to_string()),
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            index.get(&token_a).unwrap(),
+            &HashSet::from(["pool1".to_string(), "pool2".to_string()])
+        );
+        assert_eq!(
+            index.get(&token_b).unwrap(),
+            &HashSet::from(["pool1".to_string()])
+        );
+
+        apply_token_index_changes(
+            &mut index,
+            vec![],
+            vec![
+                (token_a.clone(), "pool1".to_string()),
+                (token_b.clone(), "pool1".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            index.get(&token_a).unwrap(),
+            &HashSet::from(["pool2".to_string()])
+        );
+        assert!(!index.contains_key(&token_b));
+    }
+
+    #[test]
+    fn apply_token_index_changes_matches_sequential_application() {
+        let token_a = token("0x0000000000000000000000000000000000000003");
+        let token_b = token("0x0000000000000000000000000000000000000004");
+
+        let additions = vec![
+            (token_a.clone(), "pool1".to_string()),
+            (token_a.clone(), "pool2".to_string()),
+            (token_b.clone(), "pool2".to_string()),
+        ];
+        let removals = vec![
+            (token_a.clone(), "pool1".to_string()),
+            (token_b.clone(), "pool2".to_string()),
+        ];
+
+        let mut batched: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        apply_token_index_changes(&mut batched, additions.clone(), removals.clone());
+
+        let mut sequential: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        for (token, id) in additions {
+            sequential.entry(token).or_default().insert(id);
+        }
+        for (token, id) in removals {
+            if let Some(set) = sequential.get_mut(&token) {
+                set.remove(&id);
+                if set.is_empty() {
+                    sequential.remove(&token);
+                }
+            }
+        }
+
+        assert_eq!(batched, sequential);
     }
 }
