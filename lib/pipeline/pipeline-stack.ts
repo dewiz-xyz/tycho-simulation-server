@@ -72,7 +72,7 @@ export class PipelineStack extends cdk.Stack {
         publicLoadBalancer: false,
         cpu: 2048,
         memoryMiB: 4096,
-        desiredCount: 7,
+        desiredCount: 15,
         tycho_tvl: "10",
         tycho_url: "tycho-beta.propellerheads.xyz",
       }),
