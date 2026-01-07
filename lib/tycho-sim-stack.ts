@@ -114,7 +114,7 @@ export class AppServiceStack extends cdk.Stack {
             TYCHO_URL: props.tycho_url,
             QUOTE_TIMEOUT_MS: "4000",
             POOL_TIMEOUT_NATIVE_MS: "150",
-            POOL_TIMEOUT_VM_MS: "500",
+            POOL_TIMEOUT_VM_MS: "1000",
             REQUEST_TIMEOUT_MS: "4000",
             GLOBAL_NATIVE_SIM_CONCURRENCY: "8000",
             GLOBAL_VM_SIM_CONCURRENCY: "4000",
