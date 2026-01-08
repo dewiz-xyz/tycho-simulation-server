@@ -116,10 +116,8 @@ export class AppServiceStack extends cdk.Stack {
             POOL_TIMEOUT_NATIVE_MS: "150",
             POOL_TIMEOUT_VM_MS: "500",
             REQUEST_TIMEOUT_MS: "4000",
-            GLOBAL_NATIVE_SIM_CONCURRENCY: "18",
-            GLOBAL_VM_SIM_CONCURRENCY: "4",
-            TOKIO_WORKER_THREADS: "4",
-            TOKIO_BLOCKING_THREADS: "16",
+            GLOBAL_NATIVE_SIM_CONCURRENCY: "256",
+            GLOBAL_VM_SIM_CONCURRENCY: "128",
             ENABLE_VM_POOLS: "true",
             HOST: "0.0.0.0",
             RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
@@ -149,8 +147,8 @@ export class AppServiceStack extends cdk.Stack {
     });
 
     const scaling = fargate.service.autoScaleTaskCount({
-      minCapacity: 30,
-      maxCapacity: 60,
+      minCapacity: 10,
+      maxCapacity: 50,
     });
     scaling.scaleOnCpuUtilization("CpuScaling", {
       targetUtilizationPercent: 60,
