@@ -9,7 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
@@ -274,7 +274,7 @@ pub async fn get_amounts_out(
         }
     };
 
-    info!(
+    debug!(
         "Processing quote: {} ({}) -> {} ({})",
         token_in_ref.symbol, token_in_address, token_out_ref.symbol, token_out_address
     );
@@ -345,7 +345,7 @@ pub async fn get_amounts_out(
         };
     }
 
-    info!(
+    debug!(
         "Quote candidates prepared: matching_pools={} amounts_per_pool={}, {} ({}) -> {} ({})",
         meta.matching_pools,
         amounts_in.len(),
@@ -635,7 +635,7 @@ pub async fn get_amounts_out(
         });
 
         let top = &responses[0];
-        info!(
+        debug!(
             "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={}",
             responses.len(),
             top.pool_name,

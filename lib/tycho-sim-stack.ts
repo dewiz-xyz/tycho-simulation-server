@@ -112,7 +112,7 @@ export class AppServiceStack extends cdk.Stack {
           environment: {
             TVL_THRESHOLD: props.tycho_tvl,
             TYCHO_URL: props.tycho_url,
-            QUOTE_TIMEOUT_MS: "3500",
+            QUOTE_TIMEOUT_MS: "4000",
             POOL_TIMEOUT_NATIVE_MS: "50",
             POOL_TIMEOUT_VM_MS: "500",
             REQUEST_TIMEOUT_MS: "4000",
