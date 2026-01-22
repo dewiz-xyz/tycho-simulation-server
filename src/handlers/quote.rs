@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use axum::{extract::State, Json};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::{
     models::{
@@ -21,7 +21,7 @@ pub async fn simulate(
     let started_at = Instant::now();
     let auction_id = request.auction_id.as_deref();
 
-    info!(
+    debug!(
         request_id = request.request_id.as_str(),
         auction_id,
         token_in = request.token_in.as_str(),
@@ -115,7 +115,7 @@ pub async fn simulate(
             "Simulate computation completed with timeout"
         );
     } else {
-        info!(
+        debug!(
             scope = "handler_timeout",
             request_id = request.request_id.as_str(),
             auction_id,
