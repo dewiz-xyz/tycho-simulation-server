@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use alloy_primitives::Keccak256;
 use alloy_sol_types::SolValue;
@@ -11,7 +10,7 @@ use num_bigint::BigUint;
 use num_traits::{CheckedSub, One, ToPrimitive, Zero};
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::warn;
 use tycho_execution::encoding::{errors::EncodingError, evm::utils::bytes_to_address};
 use tycho_execution::encoding::{
     evm::{encoder_builders::TychoRouterEncoderBuilder, utils::biguint_to_u256},
@@ -169,15 +168,12 @@ struct CallDataPayload {
     target: Bytes,
     value: BigUint,
     calldata: Vec<u8>,
-    swap_bytes_len: usize,
 }
 
 pub async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
 ) -> Result<RouteEncodeResponse, EncodeError> {
-    let profiling_enabled = encode_profile_enabled();
-    let total_timer = Instant::now();
     let chain = validate_chain(request.chain_id)?;
     validate_slippage(request.slippage_bps, request.per_pool_slippage_bps.as_ref())?;
 
@@ -186,31 +182,9 @@ pub async fn encode_route(
     let amount_in = parse_amount(&request.amount_in)?;
     let router_address = parse_address(&request.tycho_router_address)?;
 
-    let normalize_timer = Instant::now();
     let normalized = normalize_route(&request, &token_in, &token_out, &amount_in)?;
-    if profiling_enabled {
-        info!(
-            request_id = request.request_id.as_deref().unwrap_or(""),
-            segments = normalized.segments.len(),
-            elapsed_ms = normalize_timer.elapsed().as_millis() as u64,
-            "encode_profile: normalize"
-        );
-    }
-
-    let resim_timer = Instant::now();
     let resimulated =
         resimulate_route(&state, &request, &normalized, chain, &token_in, &token_out).await?;
-    if profiling_enabled {
-        info!(
-            request_id = request.request_id.as_deref().unwrap_or(""),
-            segments = resimulated.segments.len(),
-            swaps = count_resimulated_swaps(&resimulated),
-            elapsed_ms = resim_timer.elapsed().as_millis() as u64,
-            "encode_profile: resimulate"
-        );
-    }
-
-    let build_timer = Instant::now();
     let encoder = build_encoder(chain, router_address.clone())?;
     let calls = build_execution_calls(
         &request,
@@ -219,14 +193,6 @@ pub async fn encode_route(
         &resimulated,
         encoder.as_ref(),
     )?;
-    if profiling_enabled {
-        info!(
-            request_id = request.request_id.as_deref().unwrap_or(""),
-            calls = calls.len(),
-            elapsed_ms = build_timer.elapsed().as_millis() as u64,
-            "encode_profile: build_calls"
-        );
-    }
 
     let normalized_route = build_normalized_route_response(&resimulated);
     let totals = RouteTotals {
@@ -245,15 +211,6 @@ pub async fn encode_route(
     };
 
     let debug = build_debug(&state, &request, &calls).await;
-
-    if profiling_enabled {
-        info!(
-            request_id = request.request_id.as_deref().unwrap_or(""),
-            calls = calls.len(),
-            elapsed_ms = total_timer.elapsed().as_millis() as u64,
-            "encode_profile: total"
-        );
-    }
 
     Ok(RouteEncodeResponse {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -277,27 +234,6 @@ fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
         )));
     }
     Ok(chain)
-}
-
-fn encode_profile_enabled() -> bool {
-    match env::var("ENCODE_PROFILE") {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
-        Err(_) => false,
-    }
-}
-
-fn count_resimulated_swaps(route: &ResimulatedRouteInternal) -> usize {
-    route
-        .segments
-        .iter()
-        .map(|segment| {
-            segment
-                .hops
-                .iter()
-                .map(|hop| hop.swaps.len())
-                .sum::<usize>()
-        })
-        .sum()
 }
 
 fn validate_slippage(
@@ -834,10 +770,7 @@ where
         &ResimulatedHopInternal,
     ) -> Result<CallDataPayload, EncodeError>,
 {
-    let profiling_enabled = encode_profile_enabled();
     let mut calls = Vec::new();
-    let mut total_calldata_bytes: usize = 0;
-    let mut total_swap_bytes: usize = 0;
     let mut index: u32 = 0;
 
     for (segment_index, segment) in resimulated.segments.iter().enumerate() {
@@ -846,13 +779,6 @@ where
                 let calldata_payload = build_call(swap, hop)?;
                 let approvals =
                     build_approvals(&swap.token_in, &calldata_payload.target, &swap.amount_in);
-
-                if profiling_enabled {
-                    total_calldata_bytes =
-                        total_calldata_bytes.saturating_add(calldata_payload.calldata.len());
-                    total_swap_bytes =
-                        total_swap_bytes.saturating_add(calldata_payload.swap_bytes_len);
-                }
 
                 calls.push(ExecutionCall {
                     index,
@@ -872,13 +798,6 @@ where
                 index = index.saturating_add(1);
             }
         }
-    }
-
-    if profiling_enabled {
-        info!(
-            calls = calls.len(),
-            total_calldata_bytes, total_swap_bytes, "encode_profile: calls_payload"
-        );
     }
 
     Ok(calls)
@@ -980,7 +899,6 @@ fn encode_single_swap_call(
             BigUint::zero()
         },
         calldata,
-        swap_bytes_len: encoded_solution.swaps.len(),
     })
 }
 
@@ -1678,7 +1596,6 @@ mod tests {
                 target: Bytes::from_str("0x0000000000000000000000000000000000000005").unwrap(),
                 value: BigUint::zero(),
                 calldata: vec![0x01],
-                swap_bytes_len: 1,
             })
         })
         .unwrap();
