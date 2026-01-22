@@ -59,6 +59,11 @@ Latency percentiles:
 python3 scripts/latency_percentiles.py --suite core --requests 200 --concurrency 8
 ```
 
+Failure profiling (status + failure kind histogram):
+```bash
+python3 scripts/failure_profile.py --suite core --requests 500 --concurrency 50 --out logs/failure_profile.json
+```
+
 ## Output
 
 - Coverage report: `logs/coverage_sweep.json`

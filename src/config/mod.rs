@@ -40,15 +40,15 @@ pub fn load_config() -> AppConfig {
     );
 
     let quote_timeout_ms: u64 = std::env::var("QUOTE_TIMEOUT_MS")
-        .unwrap_or_else(|_| "150".to_string())
+        .unwrap_or_else(|_| "800".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
     let pool_timeout_native_ms: u64 = std::env::var("POOL_TIMEOUT_NATIVE_MS")
-        .unwrap_or_else(|_| "20".to_string())
+        .unwrap_or_else(|_| "120".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_NATIVE_MS");
     let pool_timeout_vm_ms: u64 = std::env::var("POOL_TIMEOUT_VM_MS")
-        .unwrap_or_else(|_| "150".to_string())
+        .unwrap_or_else(|_| "600".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_VM_MS");
 
@@ -81,7 +81,7 @@ pub fn load_config() -> AppConfig {
         .unwrap_or(1);
 
     let default_native = (cpu_count.saturating_mul(4)).max(1);
-    let default_vm = cpu_count.max(1);
+    let default_vm = (cpu_count.saturating_mul(2)).max(1);
 
     let global_native_sim_concurrency: usize = std::env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
         .ok()

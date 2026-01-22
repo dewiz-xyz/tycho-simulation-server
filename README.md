@@ -47,16 +47,16 @@ The following environment variables are read at startup:
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
 - `RUST_LOG` – Logging filter (default: `info`)
-- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
-- `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
-- `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `150`)
+- `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `800`)
+- `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `120`)
+- `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `600`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
-- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
+- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `true`)
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
-- `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`)
+- `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `2 * num_cpus`)
 
-Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
+Note: pools wait for available permits up to their per-pool deadline. If the deadline elapses before scheduling, pools are dropped and reported as a `timeout` failure with aggregated skipped counts.
 
 ## HTTP API
 

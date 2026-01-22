@@ -1,11 +1,12 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
-use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +31,29 @@ pub struct QuoteMetrics {
     pub skipped_vm_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+}
+
+#[derive(Default)]
+struct ScheduleCounters {
+    scheduled_native: AtomicUsize,
+    scheduled_vm: AtomicUsize,
+    skipped_native_concurrency: AtomicUsize,
+    skipped_vm_concurrency: AtomicUsize,
+    skipped_native_deadline: AtomicUsize,
+    skipped_vm_deadline: AtomicUsize,
+}
+
+impl ScheduleCounters {
+    fn snapshot(&self) -> QuoteMetrics {
+        QuoteMetrics {
+            scheduled_native_pools: self.scheduled_native.load(Ordering::Relaxed),
+            scheduled_vm_pools: self.scheduled_vm.load(Ordering::Relaxed),
+            skipped_native_concurrency: self.skipped_native_concurrency.load(Ordering::Relaxed),
+            skipped_vm_concurrency: self.skipped_vm_concurrency.load(Ordering::Relaxed),
+            skipped_native_deadline: self.skipped_native_deadline.load(Ordering::Relaxed),
+            skipped_vm_deadline: self.skipped_vm_deadline.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub struct QuoteComputation {
@@ -366,6 +390,7 @@ pub async fn get_amounts_out(
     let mut tasks = FuturesUnordered::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
+    let counters = Arc::new(ScheduleCounters::default());
     // Stable scheduling to reduce jitter under contention
     native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
     vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -385,35 +410,21 @@ pub async fn get_amounts_out(
         };
 
         if pool_deadline <= now {
-            metrics.skipped_native_deadline += 1;
+            counters
+                .skipped_native_deadline
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         }
-
-        let permit = match native_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_native_concurrency += 1;
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "Native pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
-                break;
-            }
-        };
 
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
 
         let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_native_pools += 1;
+        let counters = Arc::clone(&counters);
+        let semaphore = native_semaphore.clone();
 
-        tasks.push(simulate_pool(
+        tasks.push(schedule_pool(
             id,
             pool_state,
             pool_address,
@@ -425,7 +436,9 @@ pub async fn get_amounts_out(
             expected_len,
             pool_deadline,
             pool_cancel,
-            permit,
+            semaphore,
+            counters,
+            false,
         ));
     }
 
@@ -444,35 +457,19 @@ pub async fn get_amounts_out(
         };
 
         if pool_deadline <= now {
-            metrics.skipped_vm_deadline += 1;
+            counters.skipped_vm_deadline.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-
-        let permit = match vm_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_vm_concurrency += 1;
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "VM pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
-                break;
-            }
-        };
 
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
 
         let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_vm_pools += 1;
+        let counters = Arc::clone(&counters);
+        let semaphore = vm_semaphore.clone();
 
-        tasks.push(simulate_pool(
+        tasks.push(schedule_pool(
             id,
             pool_state,
             pool_address,
@@ -484,7 +481,9 @@ pub async fn get_amounts_out(
             expected_len,
             pool_deadline,
             pool_cancel,
-            permit,
+            semaphore,
+            counters,
+            true,
         ));
     }
 
@@ -515,7 +514,7 @@ pub async fn get_amounts_out(
                     match maybe_outcome {
                         Some(outcome) => {
                             match outcome {
-                                Ok(result) => {
+                                Ok(Some(result)) => {
                                     // Classify before moving fields to avoid clones
                                     let had_timeout = result.timed_out;
                                     let is_partial = result.amounts_out.len() < expected_len;
@@ -569,6 +568,7 @@ pub async fn get_amounts_out(
                                         });
                                     }
                                 }
+                                Ok(None) => {}
                                 Err(failure) => {
                                     if matches!(failure.kind, QuoteFailureKind::Internal) {
                                         meta.status = QuoteStatus::InternalError;
@@ -585,6 +585,7 @@ pub async fn get_amounts_out(
     }
 
     drop(tasks);
+    metrics = counters.snapshot();
 
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
     if metrics.skipped_native_concurrency > 0
@@ -593,9 +594,9 @@ pub async fn get_amounts_out(
         || metrics.skipped_vm_deadline > 0
     {
         failures.push(make_failure(
-            QuoteFailureKind::ConcurrencyLimit,
+            QuoteFailureKind::Timeout,
             format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                "Skipped pools due to scheduling deadlines: native_wait_timeout={} vm_wait_timeout={} native_deadline={} vm_deadline={}",
                 metrics.skipped_native_concurrency,
                 metrics.skipped_vm_concurrency,
                 metrics.skipped_native_deadline,
@@ -852,6 +853,104 @@ async fn simulate_pool(
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation timed out", descriptor);
             Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn schedule_pool(
+    pool_id: String,
+    pool_state: Arc<dyn ProtocolSim>,
+    pool_address: String,
+    pool_name: String,
+    pool_protocol: String,
+    token_in: Arc<Token>,
+    token_out: Arc<Token>,
+    amounts: Arc<Vec<BigUint>>,
+    expected_len: usize,
+    deadline: Instant,
+    cancel_token: CancellationToken,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    counters: Arc<ScheduleCounters>,
+    is_vm: bool,
+) -> Result<Option<PoolQuoteResult>, QuoteFailure> {
+    if cancel_token.is_cancelled() {
+        return Ok(None);
+    }
+
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::from_millis(0));
+    if remaining.is_zero() {
+        if is_vm {
+            counters.skipped_vm_deadline.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters
+                .skipped_native_deadline
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return Ok(None);
+    }
+
+    let acquire = semaphore.acquire_owned();
+    tokio::pin!(acquire);
+    let wait_sleep = sleep(remaining);
+    tokio::pin!(wait_sleep);
+
+    tokio::select! {
+        permit = &mut acquire => {
+            let permit = match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let context = FailureContext {
+                        pool_id: &pool_id,
+                        pool_name: Some(&pool_name),
+                        pool_address: Some(&pool_address),
+                        protocol: Some(&pool_protocol),
+                    };
+                    let descriptor = format_pool_descriptor(&context);
+                    let message = format!("{}: Simulation semaphore closed", descriptor);
+                    return Err(make_failure(QuoteFailureKind::Internal, message, Some(context)));
+                }
+            };
+
+            if is_vm {
+                counters.scheduled_vm.fetch_add(1, Ordering::Relaxed);
+            } else {
+                counters.scheduled_native.fetch_add(1, Ordering::Relaxed);
+            }
+
+            simulate_pool(
+                pool_id,
+                pool_state,
+                pool_address,
+                pool_name,
+                pool_protocol,
+                token_in,
+                token_out,
+                amounts,
+                expected_len,
+                deadline,
+                cancel_token,
+                permit,
+            )
+            .await
+            .map(Some)
+        }
+        _ = cancel_token.cancelled() => {
+            Ok(None)
+        }
+        _ = &mut wait_sleep => {
+            if is_vm {
+                counters
+                    .skipped_vm_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                counters
+                    .skipped_native_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None)
         }
     }
 }

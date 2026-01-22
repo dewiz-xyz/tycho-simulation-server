@@ -39,6 +39,8 @@ pub enum QuoteFailureKind {
     TokenValidation,
     TokenCoverage,
     Timeout,
+    #[allow(dead_code)]
+    // Kept for backwards compatibility with existing clients.
     ConcurrencyLimit,
     Overflow,
     Simulator,
