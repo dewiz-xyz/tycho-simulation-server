@@ -112,10 +112,13 @@ export class AppServiceStack extends cdk.Stack {
           environment: {
             TVL_THRESHOLD: props.tycho_tvl,
             TYCHO_URL: props.tycho_url,
-            QUOTE_TIMEOUT_MS: "3000",
-            POOL_TIMEOUT_NATIVE_MS: "150",
-            POOL_TIMEOUT_VM_MS: "1500",
-            REQUEST_TIMEOUT_MS: "4000",
+            QUOTE_TIMEOUT_MS: "4000",
+            POOL_TIMEOUT_NATIVE_MS: "250",
+            POOL_TIMEOUT_VM_MS: "1000",
+            REQUEST_TIMEOUT_MS: "4500",
+            GLOBAL_NATIVE_SIM_CONCURRENCY: "400",
+            GLOBAL_VM_SIM_CONCURRENCY: "200",
+            ENABLE_VM_POOLS: "true",
             HOST: "0.0.0.0",
             RPC_URL: "https://eth-mainnet.g.alchemy.com/v2/xBPCeSqiMPLZMbtinEx_K",
             RUST_LOG: "info",
@@ -144,8 +147,8 @@ export class AppServiceStack extends cdk.Stack {
     });
 
     const scaling = fargate.service.autoScaleTaskCount({
-      minCapacity: 7,
-      maxCapacity: 12,
+      minCapacity: 10,
+      maxCapacity: 50,
     });
     scaling.scaleOnCpuUtilization("CpuScaling", {
       targetUtilizationPercent: 60,

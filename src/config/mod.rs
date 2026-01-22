@@ -112,7 +112,6 @@ pub fn load_config() -> AppConfig {
         .map(|value| value.parse().expect("Invalid GLOBAL_VM_SIM_CONCURRENCY"))
         .unwrap_or(default_vm)
         .clamp(1, max_sim_concurrency);
-
     AppConfig {
         tycho_url,
         api_key,

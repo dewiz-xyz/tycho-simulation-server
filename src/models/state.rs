@@ -58,7 +58,6 @@ impl AppState {
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
-
     pub fn native_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.native_sim_semaphore)
     }
@@ -84,7 +83,6 @@ pub struct EncodeState {
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-
 #[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
 struct ProtocolShard {

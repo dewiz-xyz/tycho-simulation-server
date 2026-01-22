@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::{header, Client, ClientBuilder};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use tycho_simulation::tycho_common::{
     dto::{TokensRequestBody, TokensRequestResponse},
     models::{token::Token, Chain},
@@ -219,7 +219,7 @@ impl TokenStore {
                     .entry(token.address.clone())
                     .or_insert_with(|| token.clone());
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                info!(
+                debug!(
                     scope = "token_single_fetch",
                     token_address = %address,
                     elapsed_ms,
