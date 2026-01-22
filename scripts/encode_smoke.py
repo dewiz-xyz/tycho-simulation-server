@@ -111,6 +111,8 @@ def main() -> int:
     parser.add_argument("--simulate-url", default="http://localhost:3000/simulate")
     parser.add_argument("--repo", default=".")
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
+    parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -118,6 +120,10 @@ def main() -> int:
     repo = Path(args.repo)
     settlement = load_env_value(repo, "COW_SETTLEMENT_CONTRACT") or DEFAULT_SETTLEMENT
     tycho_router = load_env_value(repo, "TYCHO_ROUTER_ADDRESS") or DEFAULT_TYCHO_ROUTER
+    allowed_statuses = {status.strip() for status in args.allow_status.split(",") if status.strip()}
+    if not allowed_statuses:
+        print("Error: --allow-status produced no values", file=sys.stderr)
+        return 2
 
     dai = TOKENS.get("DAI")
     usdc = TOKENS.get("USDC")
@@ -145,9 +151,14 @@ def main() -> int:
         print(f"[FAIL] simulate HTTP {status}")
         return 1
 
-    status_value = response.get("meta", {}).get("status")
-    if status_value != "ready":
-        print(f"[FAIL] simulate dai->usdc expected ready, got {status_value}")
+    meta = response.get("meta", {})
+    status_value = meta.get("status") if isinstance(meta, dict) else None
+    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
+    if status_value not in allowed_statuses:
+        print(f"[FAIL] simulate dai->usdc expected {sorted(allowed_statuses)}, got {status_value}")
+        return 1
+    if failures_list and not args.allow_failures:
+        print(f"[FAIL] simulate dai->usdc had {len(failures_list)} failures")
         return 1
 
     pool_first = select_pool(response, "simulate dai->usdc")
@@ -172,9 +183,14 @@ def main() -> int:
         print(f"[FAIL] simulate second hop HTTP {status}")
         return 1
 
-    status_value = response_second.get("meta", {}).get("status")
-    if status_value != "ready":
-        print(f"[FAIL] simulate usdc->usdt expected ready, got {status_value}")
+    meta = response_second.get("meta", {})
+    status_value = meta.get("status") if isinstance(meta, dict) else None
+    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
+    if status_value not in allowed_statuses:
+        print(f"[FAIL] simulate usdc->usdt expected {sorted(allowed_statuses)}, got {status_value}")
+        return 1
+    if failures_list and not args.allow_failures:
+        print(f"[FAIL] simulate usdc->usdt had {len(failures_list)} failures")
         return 1
 
     pool_second = select_pool(response_second, "simulate usdc->usdt")

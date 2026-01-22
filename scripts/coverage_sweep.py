@@ -44,6 +44,11 @@ def main() -> int:
     parser.add_argument("--amounts", help="Comma-separated amounts in wei")
     parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
     parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
+    parser.add_argument(
+        "--allow-no-pools",
+        action="store_true",
+        help="Allow no_liquidity responses that only report no_pools failures",
+    )
     parser.add_argument("--expect-protocols", help="Comma-separated protocol names expected in pool_name")
     parser.add_argument("--out", help="Write JSON report to this path")
     parser.add_argument("--timeout", type=float, default=15.0)
@@ -99,6 +104,7 @@ def main() -> int:
     failure_kinds: Counter[str] = Counter()
 
     failures = 0
+    allowed_no_pools = 0
 
     for idx, pair in enumerate(pairs, start=1):
         amounts = amounts_override or default_amounts_for_token(pair.token_in)
@@ -168,11 +174,36 @@ def main() -> int:
             continue
 
         if failures_list and not args.allow_failures:
-            failures += 1
-            report["requests"].append(
-                {"pair": asdict(pair), "elapsed_s": elapsed, "meta": meta, "error": "meta_failures"}
-            )
-            continue
+            if args.allow_no_pools and status == "no_liquidity":
+                only_no_pools = all(
+                    isinstance(item, dict) and item.get("kind") == "no_pools"
+                    for item in failures_list
+                )
+                if only_no_pools:
+                    allowed_no_pools += 1
+                    failures_list = []
+                else:
+                    failures += 1
+                    report["requests"].append(
+                        {
+                            "pair": asdict(pair),
+                            "elapsed_s": elapsed,
+                            "meta": meta,
+                            "error": "meta_failures",
+                        }
+                    )
+                    continue
+            else:
+                failures += 1
+                report["requests"].append(
+                    {
+                        "pair": asdict(pair),
+                        "elapsed_s": elapsed,
+                        "meta": meta,
+                        "error": "meta_failures",
+                    }
+                )
+                continue
 
         data = response_json.get("data", [])
         pool_count = len(data) if isinstance(data, list) else 0
@@ -215,6 +246,7 @@ def main() -> int:
         "failures": failures,
         "meta_statuses": dict(meta_statuses),
         "failure_kinds": dict(failure_kinds),
+        "allowed_no_pools": allowed_no_pools,
         "unique_pools": len(pools_seen),
         "observed_protocols": observed_protocols,
         "protocol_counts": dict(pool_protocols),
@@ -228,8 +260,13 @@ def main() -> int:
     print("=====================")
     print(f"Pairs: {len(pairs)}")
     print(f"Failures: {failures}")
+    if allowed_no_pools:
+        print(f"Allowed no_pools: {allowed_no_pools}")
     print(f"Unique pools observed: {len(pools_seen)}")
     print(f"Protocols observed: {', '.join(observed_protocols) if observed_protocols else '(none)'}")
+    if meta_statuses:
+        status_summary = ", ".join(f"{status}={count}" for status, count in meta_statuses.items())
+        print(f"Meta statuses: {status_summary}")
 
     if pool_protocols:
         print("\nTop protocols by pool appearances (top 10):")
