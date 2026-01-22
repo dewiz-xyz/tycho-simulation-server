@@ -927,19 +927,29 @@ fn encode_single_swap_calldata(
     encode_function_call(&encoded_solution.function_signature, calldata_args)
 }
 
+const EXPECTED_SINGLE_SWAP_SIGNATURE: &str =
+    "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
+
 fn ensure_single_swap_signature(encoded_solution: &EncodedSolution) -> Result<(), EncodeError> {
     let signature = encoded_solution.function_signature.as_str();
-    if encoded_solution.permit.is_some() || signature.contains("Permit2") {
+    let normalized_signature: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if encoded_solution.permit.is_some()
+        || normalized_signature.contains("Permit2")
+        || normalized_signature.contains("permit2")
+    {
         return Err(EncodeError::encoding(
             "Permit2 encodings are not supported for singleSwap calls",
         ));
     }
-    if !signature.contains("singleSwap") {
+
+    if normalized_signature != EXPECTED_SINGLE_SWAP_SIGNATURE {
         return Err(EncodeError::encoding(format!(
             "Unsupported Tycho function signature: {}",
             signature
         )));
     }
+
     Ok(())
 }
 
@@ -1686,6 +1696,46 @@ mod tests {
         match encode_single_swap_call(Chain::Ethereum, &router, &encoder, &request, &swap) {
             Err(err) => assert_eq!(err.kind(), EncodeErrorKind::Encoding),
             Ok(_) => panic!("permit2 should be rejected"),
+        }
+    }
+
+    #[test]
+    fn encode_single_swap_call_rejects_unknown_signature() {
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
+        let encoder = MockTychoEncoder::new(
+            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes32)",
+            router.clone(),
+        );
+
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "10".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: format_address(&router),
+            slippage_bps: 25,
+            per_pool_slippage_bps: None,
+            segments: Vec::new(),
+            enable_tenderly_sim: None,
+            request_id: None,
+        };
+
+        let swap = ResimulatedSwapInternal {
+            pool: pool_ref("p1"),
+            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+            token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+            split_bps: 10_000,
+            amount_in: BigUint::from(10u32),
+            expected_amount_out: BigUint::from(9u32),
+            min_amount_out: BigUint::from(8u32),
+            pool_state: Arc::new(MockProtocolSim {}),
+            component: Arc::new(dummy_component()),
+        };
+
+        match encode_single_swap_call(Chain::Ethereum, &router, &encoder, &request, &swap) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::Encoding),
+            Ok(_) => panic!("unknown signature should be rejected"),
         }
     }
 
