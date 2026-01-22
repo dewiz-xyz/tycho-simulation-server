@@ -65,7 +65,11 @@ async fn handle_encode_timeout_error(err: BoxError, timeout_ms: u64) -> Response
             scope = "router_timeout",
             timeout_ms, "Encode request timed out at router boundary: {}", err
         );
-        return (StatusCode::OK, Json(encode_router_timeout_result())).into_response();
+        return (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(encode_router_timeout_result()),
+        )
+            .into_response();
     }
 
     warn!(scope = "router_timeout", "Unhandled service error: {}", err);

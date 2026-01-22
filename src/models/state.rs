@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{debug, warn};
-use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
@@ -23,7 +22,6 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
-    pub encode_state: Arc<EncodeState>,
 }
 
 impl AppState {
@@ -66,20 +64,9 @@ impl AppState {
         Arc::clone(&self.vm_sim_semaphore)
     }
 
-    pub fn encode_state(&self) -> Arc<EncodeState> {
-        Arc::clone(&self.encode_state)
-    }
-
     pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         self.state_store.pool_by_id(id).await
     }
-}
-
-#[derive(Clone)]
-pub struct EncodeState {
-    pub cow_settlement_contract: Option<Bytes>,
-    pub transfer_from_encoder: Arc<dyn TychoEncoder>,
-    pub none_encoder: Arc<dyn TychoEncoder>,
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);

@@ -1,10 +1,6 @@
 mod logging;
 pub use logging::init_logging;
 
-use std::str::FromStr;
-
-use tycho_simulation::tycho_common::Bytes;
-
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
@@ -26,16 +22,6 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid PORT");
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-
-    let cow_settlement_contract = std::env::var("COW_SETTLEMENT_CONTRACT").ok().map(|value| {
-        let trimmed = value.trim();
-        let bytes = Bytes::from_str(trimmed).expect("Invalid COW_SETTLEMENT_CONTRACT");
-        assert!(
-            bytes.len() == 20,
-            "COW_SETTLEMENT_CONTRACT must be a 20-byte address"
-        );
-        bytes
-    });
 
     // Create socket address from host and port
     let addr = host.to_string();
@@ -119,7 +105,6 @@ pub fn load_config() -> AppConfig {
         tvl_keep_threshold,
         port,
         host,
-        cow_settlement_contract,
         quote_timeout_ms,
         pool_timeout_native_ms,
         pool_timeout_vm_ms,
@@ -139,7 +124,6 @@ pub struct AppConfig {
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: String,
-    pub cow_settlement_contract: Option<Bytes>,
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,
