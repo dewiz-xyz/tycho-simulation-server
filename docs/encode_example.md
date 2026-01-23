@@ -5,8 +5,8 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
 ## How this was built
 
 - Call `/simulate` for each hop to pick candidate pools.
-- Build a `RouteEncodeRequest` with `segments[] → hops[] → swaps[]`.
-- POST to `/encode`, which re-simulates each pool swap and fills expected/min amounts.
+- Build a `RouteEncodeRequest` with `segments[] → hops[] → swaps[]`, including `amountIn` and `minAmountOut` per pool swap.
+- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, and fills expected amounts.
 
 ## Request body (shape)
 
@@ -18,9 +18,10 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
   "amountIn": "1000000000000000000",
   "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
   "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-  "slippageBps": 25,
+  "swapKind": "MultiSwap",
   "segments": [
     {
+      "kind": "MultiSwap",
       "shareBps": 10000,
       "hops": [
         {
@@ -34,7 +35,9 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
               },
               "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
               "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-              "splitBps": 10000
+              "splitBps": 10000,
+              "amountIn": "1000000000000000000",
+              "minAmountOut": "1000250"
             }
           ]
         },
@@ -49,7 +52,9 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
               },
               "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
               "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-              "splitBps": 10000
+              "splitBps": 10000,
+              "amountIn": "1000250",
+              "minAmountOut": "9974710"
             }
           ]
         }
@@ -69,9 +74,11 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
   "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
+  "swapKind": "MultiSwap",
   "normalizedRoute": {
     "segments": [
       {
+        "kind": "MultiSwap",
         "shareBps": 10000,
         "amountIn": "1000000000000000000",
         "expectedAmountOut": "9999709",
@@ -173,6 +180,11 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
       "expectedAmountOut": "9999709"
     }
   ],
+  "calldata": {
+    "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+    "value": "0",
+    "data": "0x..."
+  },
   "totals": {
     "expectedAmountOut": "9999709",
     "minAmountOut": "9974710"
@@ -180,8 +192,7 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
   "debug": {
     "requestId": "encode-example-1",
     "resimulation": {
-      "blockNumber": 24200000,
-      "tychoStateTag": "latest"
+      "blockNumber": 24200000
     }
   }
 }
@@ -191,4 +202,6 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
 
 - `calls[]` are emitted in **segment → hop → swap** order.
 - Each call is a Tycho `singleSwap` with per-swap approvals for ERC20 inputs.
-- `minAmountOut` is enforced to be non-zero for all swaps.
+- `calldata` is a single Tycho router transaction for the full route (ready to send).
+- `minAmountOut` is supplied by the client and enforced to be non-zero for all swaps.
+- `/encode` fails if any resimulated `expectedAmountOut < minAmountOut`.

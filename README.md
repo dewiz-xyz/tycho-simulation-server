@@ -48,6 +48,7 @@ The following environment variables are read at startup:
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
 - `COW_SETTLEMENT_CONTRACT` – Default settlement address for `scripts/encode_smoke.py` (optional)
+- `TYCHO_ROUTER_ADDRESS` – Default router address for `scripts/encode_smoke.py` (optional)
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
@@ -110,20 +111,22 @@ Response body:
 `QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`.
 
 Timeout behavior:
-- `/simulate` handler-level timeouts return `200 OK` with `PartialFailure`, including a `Timeout` failure.
-- `/simulate` router-level timeouts return `200 OK` with `PartialFailure`. Logs include `scope="router_timeout"`.
-- `/encode` timeouts return `408 Request Timeout` with `{ error, request_id }`.
+- `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
+- `/simulate` router-level timeouts return `200 OK` with `partial_failure`. Logs include `scope="router_timeout"`.
+- `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
   - `/status` is not subject to router-level timeouts.
 
 ### `POST /encode`
 
-`POST /encode` builds Tycho single-swap calldata for a client-provided route. It **re-simulates** each pool swap to fill expected/min amounts before encoding.
+`POST /encode` builds Tycho single-swap calldata for a client-provided route. It **re-simulates** each pool swap and hard-fails if any swap cannot meet the client-supplied `minAmountOut`.
 
 Notes:
 - The request shape follows `RouteEncodeRequest` (camelCase fields).
 - `settlementAddress` and `tychoRouterAddress` are required.
-- The response is `RouteEncodeResponse` with `schemaVersion`, `normalizedRoute`, `calls`, and `totals`.
-- Errors return 4xx/5xx with `{ error, request_id }`.
+- `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
+- Every pool swap must include `amountIn` and `minAmountOut` (already slippage-adjusted by the client).
+- The response is `RouteEncodeResponse` with `schemaVersion`, `normalizedRoute`, `calls`, `calldata`, and `totals`.
+- Errors return 4xx/5xx with `{ error, requestId }`.
 
 Example request (shape only):
 
@@ -137,9 +140,10 @@ curl -X POST "http://localhost:3000/encode" \
     "amountIn": "1000000000000000000",
     "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
     "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-    "slippageBps": 25,
+    "swapKind": "SimpleSwap",
     "segments": [
       {
+        "kind": "SimpleSwap",
         "shareBps": 10000,
         "hops": [
           {
@@ -150,7 +154,9 @@ curl -X POST "http://localhost:3000/encode" \
                 "pool": { "protocol": "uniswap_v3", "componentId": "pool-id" },
                 "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
                 "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-                "splitBps": 10000
+                "splitBps": 10000,
+                "amountIn": "1000000000000000000",
+                "minAmountOut": "1000000"
               }
             ]
           }
@@ -161,7 +167,7 @@ curl -X POST "http://localhost:3000/encode" \
   }'
 ```
 
-The response includes `calls[]` entries with `target`, `value`, `calldata`, `approvals`, and hop metadata.
+The response includes `calls[]` entries with `target`, `value`, `calldata`, `approvals`, and hop metadata, plus a top-level `calldata` transaction payload ready for the Tycho router.
 
 ### `GET /status`
 
