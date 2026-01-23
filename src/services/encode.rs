@@ -7,7 +7,7 @@ use alloy_primitives::Keccak256;
 use alloy_sol_types::SolValue;
 use axum::http::StatusCode;
 use num_bigint::BigUint;
-use num_traits::{CheckedSub, One, ToPrimitive, Zero};
+use num_traits::{ToPrimitive, Zero};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -28,8 +28,8 @@ use tycho_simulation::{
 
 use crate::models::messages::{
     Approval, ExecutionCall, ExecutionCallKind, Hop, NormalizedRoute, PoolRef, PoolSwap,
-    PoolSwapDraft, ResimulationDebug, RouteDebug, RouteEncodeRequest, RouteEncodeResponse,
-    RouteTotals, Segment, SegmentDraft, TenderlyDebug,
+    PoolSwapDraft, ResimulationDebug, RouteCalldata, RouteDebug, RouteEncodeRequest,
+    RouteEncodeResponse, RouteTotals, Segment, SegmentDraft, SwapKind, TenderlyDebug,
 };
 use crate::models::state::AppState;
 
@@ -112,6 +112,7 @@ struct NormalizedRouteInternal {
 }
 
 struct NormalizedSegmentInternal {
+    kind: SwapKind,
     share_bps: u32,
     amount_in: BigUint,
     hops: Vec<NormalizedHopInternal>,
@@ -120,6 +121,8 @@ struct NormalizedSegmentInternal {
 struct NormalizedHopInternal {
     token_in: Bytes,
     token_out: Bytes,
+    amount_in: BigUint,
+    min_amount_out: BigUint,
     swaps: Vec<NormalizedSwapDraftInternal>,
 }
 
@@ -128,7 +131,8 @@ struct NormalizedSwapDraftInternal {
     token_in: Bytes,
     token_out: Bytes,
     split_bps: Option<u32>,
-    amount_in: Option<BigUint>,
+    amount_in: BigUint,
+    min_amount_out: BigUint,
 }
 
 struct ResimulatedRouteInternal {
@@ -136,6 +140,7 @@ struct ResimulatedRouteInternal {
 }
 
 struct ResimulatedSegmentInternal {
+    kind: SwapKind,
     share_bps: u32,
     amount_in: BigUint,
     expected_amount_out: BigUint,
@@ -170,12 +175,27 @@ struct CallDataPayload {
     calldata: Vec<u8>,
 }
 
+struct SplitStats {
+    total_amount: BigUint,
+    count: usize,
+    last_index: usize,
+}
+
+struct RouteContext<'a> {
+    request: &'a RouteEncodeRequest,
+    chain: Chain,
+    token_in: &'a Bytes,
+    token_out: &'a Bytes,
+    amount_in: &'a BigUint,
+    router_address: &'a Bytes,
+}
+
 pub async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
 ) -> Result<RouteEncodeResponse, EncodeError> {
     let chain = validate_chain(request.chain_id)?;
-    validate_slippage(request.slippage_bps, request.per_pool_slippage_bps.as_ref())?;
+    validate_swap_kinds(&request)?;
 
     let token_in = parse_address(&request.token_in)?;
     let token_out = parse_address(&request.token_out)?;
@@ -183,8 +203,7 @@ pub async fn encode_route(
     let router_address = parse_address(&request.tycho_router_address)?;
 
     let normalized = normalize_route(&request, &token_in, &token_out, &amount_in)?;
-    let resimulated =
-        resimulate_route(&state, &request, &normalized, chain, &token_in, &token_out).await?;
+    let resimulated = resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
     let encoder = build_encoder(chain, router_address.clone())?;
     let calls = build_execution_calls(
         &request,
@@ -193,21 +212,22 @@ pub async fn encode_route(
         &resimulated,
         encoder.as_ref(),
     )?;
+    let (expected_total, min_total) = compute_totals(&resimulated);
+    let route_context = RouteContext {
+        request: &request,
+        chain,
+        token_in: &token_in,
+        token_out: &token_out,
+        amount_in: &amount_in,
+        router_address: &router_address,
+    };
+    let calldata =
+        build_route_calldata_tx(&route_context, &resimulated, encoder.as_ref(), &min_total)?;
 
     let normalized_route = build_normalized_route_response(&resimulated);
     let totals = RouteTotals {
-        expected_amount_out: resimulated
-            .segments
-            .iter()
-            .fold(BigUint::zero(), |acc, seg| {
-                acc + seg.expected_amount_out.clone()
-            })
-            .to_str_radix(10),
-        min_amount_out: resimulated
-            .segments
-            .iter()
-            .fold(BigUint::zero(), |acc, seg| acc + seg.min_amount_out.clone())
-            .to_str_radix(10),
+        expected_amount_out: expected_total.to_str_radix(10),
+        min_amount_out: min_total.to_str_radix(10),
     };
 
     let debug = build_debug(&state, &request, &calls).await;
@@ -218,11 +238,23 @@ pub async fn encode_route(
         token_in: format_address(&token_in),
         token_out: format_address(&token_out),
         amount_in: amount_in.to_str_radix(10),
+        swap_kind: request.swap_kind,
         normalized_route,
         calls,
+        calldata,
         totals,
         debug,
     })
+}
+
+fn compute_totals(resimulated: &ResimulatedRouteInternal) -> (BigUint, BigUint) {
+    let mut expected_total = BigUint::zero();
+    let mut min_total = BigUint::zero();
+    for segment in &resimulated.segments {
+        expected_total += segment.expected_amount_out.clone();
+        min_total += segment.min_amount_out.clone();
+    }
+    (expected_total, min_total)
 }
 
 fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
@@ -236,23 +268,52 @@ fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
     Ok(chain)
 }
 
-fn validate_slippage(
-    slippage_bps: u32,
-    per_pool: Option<&HashMap<String, u32>>,
-) -> Result<(), EncodeError> {
-    if slippage_bps > BPS_DENOMINATOR {
-        return Err(EncodeError::invalid("slippageBps must be <= 10000"));
+fn infer_route_kind(segments: &[SegmentDraft]) -> SwapKind {
+    if segments.len() > 1 {
+        return SwapKind::MegaSwap;
     }
-    if let Some(per_pool) = per_pool {
-        for (pool, bps) in per_pool {
-            if *bps > BPS_DENOMINATOR {
-                return Err(EncodeError::invalid(format!(
-                    "perPoolSlippageBps for {} must be <= 10000",
-                    pool
-                )));
-            }
+    let hops_len = segments
+        .first()
+        .map(|segment| segment.hops.len())
+        .unwrap_or(0);
+    if hops_len > 1 {
+        SwapKind::MultiSwap
+    } else {
+        SwapKind::SimpleSwap
+    }
+}
+
+fn infer_segment_kind(segment: &SegmentDraft) -> SwapKind {
+    if segment.hops.len() > 1 {
+        SwapKind::MultiSwap
+    } else {
+        SwapKind::SimpleSwap
+    }
+}
+
+fn validate_swap_kinds(request: &RouteEncodeRequest) -> Result<(), EncodeError> {
+    if request.segments.is_empty() {
+        return Err(EncodeError::invalid("segments must not be empty"));
+    }
+
+    let expected_route_kind = infer_route_kind(&request.segments);
+    if request.swap_kind != expected_route_kind {
+        return Err(EncodeError::invalid(format!(
+            "swapKind mismatch: expected {:?}",
+            expected_route_kind
+        )));
+    }
+
+    for (index, segment) in request.segments.iter().enumerate() {
+        let expected_segment_kind = infer_segment_kind(segment);
+        if segment.kind != expected_segment_kind {
+            return Err(EncodeError::invalid(format!(
+                "segment[{}].kind mismatch: expected {:?}",
+                index, expected_segment_kind
+            )));
         }
     }
+
     Ok(())
 }
 
@@ -265,34 +326,20 @@ fn normalize_route(
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
     }
+    if total_amount_in.is_zero() {
+        return Err(EncodeError::invalid("amountIn must be > 0"));
+    }
 
-    let mut remainder_index: Option<usize> = None;
     let mut share_sum: u32 = 0;
+    let mut allocated = BigUint::zero();
     let mut normalized_segments = Vec::with_capacity(request.segments.len());
 
     for (segment_index, segment) in request.segments.iter().enumerate() {
         validate_segment_shape(segment, segment_index)?;
 
-        let is_remainder = segment.is_remainder.unwrap_or(false);
-        if is_remainder {
-            if remainder_index.is_some() {
-                return Err(EncodeError::invalid(
-                    "Only one segment can be marked as remainder",
-                ));
-            }
-            remainder_index = Some(segment_index);
-        } else {
-            let share_bps = segment.share_bps.ok_or_else(|| {
-                EncodeError::invalid("shareBps required for non-remainder segment")
-            })?;
-            if share_bps == 0 || share_bps > BPS_DENOMINATOR {
-                return Err(EncodeError::invalid("shareBps must be 1..10000"));
-            }
-            share_sum = share_sum.saturating_add(share_bps);
-            if share_sum > BPS_DENOMINATOR {
-                return Err(EncodeError::invalid(
-                    "Sum of segment shareBps must be <= 10000",
-                ));
+        if let Some(share_bps) = segment.share_bps {
+            if share_bps > BPS_DENOMINATOR {
+                return Err(EncodeError::invalid("shareBps must be <= 10000"));
             }
         }
 
@@ -304,43 +351,59 @@ fn normalize_route(
             .map(normalize_hop)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let first_hop = hops.first().ok_or_else(|| {
+            EncodeError::invalid(format!("segment[{}].hops must not be empty", segment_index))
+        })?;
+        let segment_amount_in = first_hop.amount_in.clone();
+        if segment_amount_in.is_zero() {
+            return Err(EncodeError::invalid(format!(
+                "segment[{}] amountIn must be > 0",
+                segment_index
+            )));
+        }
+
+        for hop_index in 1..hops.len() {
+            let prev_min = hops[hop_index - 1].min_amount_out.clone();
+            let hop_amount_in = hops[hop_index].amount_in.clone();
+            if hop_amount_in > prev_min {
+                return Err(EncodeError::invalid(format!(
+                    "segment[{}].hop[{}] amountIn exceeds previous hop minAmountOut",
+                    segment_index, hop_index
+                )));
+            }
+        }
+
+        let share_bps = if segment_index == request.segments.len() - 1 {
+            BPS_DENOMINATOR.saturating_sub(share_sum)
+        } else {
+            let share = mul_bps_reverse(&segment_amount_in, total_amount_in);
+            share_sum = share_sum.saturating_add(share);
+            share
+        };
+
+        if let Some(request_share) = segment.share_bps {
+            if abs_diff_u32(request_share, share_bps) > 1 {
+                return Err(EncodeError::invalid(format!(
+                    "segment[{}] shareBps inconsistent with amountIn",
+                    segment_index
+                )));
+            }
+        }
+
+        allocated += segment_amount_in.clone();
+
         normalized_segments.push(NormalizedSegmentInternal {
-            share_bps: segment.share_bps.unwrap_or(0),
-            amount_in: BigUint::zero(),
+            kind: segment.kind,
+            share_bps,
+            amount_in: segment_amount_in,
             hops,
         });
     }
 
-    if remainder_index.is_none() && share_sum < BPS_DENOMINATOR {
-        warn!(
-            request_id = request.request_id.as_deref().unwrap_or(""),
-            share_sum, "Segments do not allocate full amountIn; remainder is unallocated"
-        );
-    }
-
-    let mut allocated = BigUint::zero();
-    for (index, segment) in normalized_segments.iter_mut().enumerate() {
-        if Some(index) == remainder_index {
-            continue;
-        }
-        if segment.share_bps == 0 {
-            return Err(EncodeError::invalid(
-                "shareBps must be set for non-remainder segments",
-            ));
-        }
-        segment.amount_in = mul_bps(total_amount_in, segment.share_bps);
-        allocated += segment.amount_in.clone();
-    }
-
-    if let Some(index) = remainder_index {
-        let remainder_share = BPS_DENOMINATOR.saturating_sub(share_sum);
-        let segment = normalized_segments
-            .get_mut(index)
-            .ok_or_else(|| EncodeError::internal("Remainder segment index out of bounds"))?;
-        segment.share_bps = remainder_share;
-        segment.amount_in = total_amount_in
-            .checked_sub(&allocated)
-            .ok_or_else(|| EncodeError::invalid("Segment allocation underflow"))?;
+    if allocated != *total_amount_in {
+        return Err(EncodeError::invalid(
+            "sum of segment amountIn does not match request amountIn",
+        ));
     }
 
     Ok(NormalizedRouteInternal {
@@ -413,9 +476,21 @@ fn normalize_hop(
         .map(|swap| normalize_swap(swap, &token_in, &token_out))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let mut hop_amount_in = BigUint::zero();
+    let mut hop_min_out = BigUint::zero();
+    for swap in &swaps {
+        hop_amount_in += swap.amount_in.clone();
+        hop_min_out += swap.min_amount_out.clone();
+    }
+    if hop_amount_in.is_zero() {
+        return Err(EncodeError::invalid("hop amountIn must be > 0"));
+    }
+
     Ok(NormalizedHopInternal {
         token_in,
         token_out,
+        amount_in: hop_amount_in,
+        min_amount_out: hop_min_out,
         swaps,
     })
 }
@@ -438,21 +513,19 @@ fn normalize_swap(
         ));
     }
 
-    if swap.split_bps.is_none() && swap.amount_in.is_none() {
-        return Err(EncodeError::invalid(
-            "swap must specify splitBps or amountIn",
-        ));
-    }
     if let Some(split) = swap.split_bps {
         if split > BPS_DENOMINATOR {
             return Err(EncodeError::invalid("swap splitBps must be <= 10000"));
         }
     }
-    let amount_in = if let Some(amount) = &swap.amount_in {
-        Some(parse_amount(amount)?)
-    } else {
-        None
-    };
+    let amount_in = parse_amount(&swap.amount_in)?;
+    if amount_in.is_zero() {
+        return Err(EncodeError::invalid("swap amountIn must be > 0"));
+    }
+    let min_amount_out = parse_amount(&swap.min_amount_out)?;
+    if min_amount_out.is_zero() {
+        return Err(EncodeError::invalid("swap minAmountOut must be > 0"));
+    }
 
     Ok(NormalizedSwapDraftInternal {
         pool: swap.pool.clone(),
@@ -460,12 +533,12 @@ fn normalize_swap(
         token_out,
         split_bps: swap.split_bps,
         amount_in,
+        min_amount_out,
     })
 }
 
 async fn resimulate_route(
     state: &AppState,
-    request: &RouteEncodeRequest,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
     request_token_in: &Bytes,
@@ -477,13 +550,13 @@ async fn resimulate_route(
 
     let mut resim_segments = Vec::with_capacity(normalized.segments.len());
     for (segment_index, segment) in normalized.segments.iter().enumerate() {
-        let mut hop_amount_in = segment.amount_in.clone();
         let mut resim_hops = Vec::with_capacity(segment.hops.len());
 
         for (hop_index, hop) in segment.hops.iter().enumerate() {
+            let hop_amount_in = hop.amount_in.clone();
             if hop_amount_in.is_zero() {
                 return Err(EncodeError::invalid(format!(
-                    "segment[{}].hop[{}] amountIn is zero after allocation",
+                    "segment[{}].hop[{}] amountIn is zero",
                     segment_index, hop_index
                 )));
             }
@@ -532,15 +605,10 @@ async fn resimulate_route(
                     )));
                 }
 
-                let slippage_bps = request
-                    .per_pool_slippage_bps
-                    .as_ref()
-                    .and_then(|per_pool| per_pool.get(&allocated.pool.component_id).cloned())
-                    .unwrap_or(request.slippage_bps);
-                let min_out = apply_slippage(&expected_out, slippage_bps);
-                if min_out.is_zero() {
-                    return Err(EncodeError::invalid(format!(
-                        "Pool {} minAmountOut is zero",
+                let min_out = allocated.min_amount_out.clone();
+                if expected_out < min_out {
+                    return Err(EncodeError::simulation(format!(
+                        "Pool {} expectedAmountOut below minAmountOut",
                         allocated.pool.component_id
                     )));
                 }
@@ -573,7 +641,6 @@ async fn resimulate_route(
                 min_amount_out: hop_min.clone(),
                 swaps: swap_results,
             };
-            hop_amount_in = hop_expected;
             resim_hops.push(resim_hop);
         }
 
@@ -582,6 +649,7 @@ async fn resimulate_route(
             .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
 
         resim_segments.push(ResimulatedSegmentInternal {
+            kind: segment.kind,
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.clone(),
             expected_amount_out: last_hop.expected_amount_out.clone(),
@@ -607,6 +675,7 @@ struct AllocatedSwap {
     token_out: Bytes,
     split_bps: u32,
     amount_in: BigUint,
+    min_amount_out: BigUint,
 }
 
 fn allocate_swaps(
@@ -620,116 +689,46 @@ fn allocate_swaps(
         return Err(EncodeError::invalid("hop amountIn must be > 0"));
     }
 
-    let has_split = swaps.iter().any(|swap| swap.split_bps.is_some());
-    let mut computed_splits = Vec::with_capacity(swaps.len());
-
-    if has_split {
-        let mut sum_splits: u32 = 0;
-        for swap in swaps {
-            let split = if let Some(split) = swap.split_bps {
-                split
-            } else if let Some(amount_in) = &swap.amount_in {
-                mul_bps_reverse(amount_in, &hop_amount_in)
-            } else {
-                0
-            };
-            if split > BPS_DENOMINATOR {
-                return Err(EncodeError::invalid("swap splitBps must be <= 10000"));
-            }
-            sum_splits = sum_splits.saturating_add(split);
-            computed_splits.push(split);
-        }
-        if sum_splits > BPS_DENOMINATOR {
-            return Err(EncodeError::invalid(
-                "sum of splitBps for hop exceeds 10000",
-            ));
-        }
-
-        let mut allocations = Vec::with_capacity(swaps.len());
-        let mut allocated_amount = BigUint::zero();
-        for (index, swap) in swaps.iter().enumerate() {
-            let split = computed_splits[index];
-            let amount_in = if index == swaps.len() - 1 {
-                // Keep rounding deterministic by pushing remainder into the last swap.
-                hop_amount_in
-                    .checked_sub(&allocated_amount)
-                    .ok_or_else(|| EncodeError::invalid("swap allocation underflow"))?
-            } else {
-                let amount = mul_bps(&hop_amount_in, split);
-                allocated_amount += amount.clone();
-                amount
-            };
-
-            if let Some(expected) = &swap.amount_in {
-                let diff = abs_diff(expected, &amount_in);
-                if diff > BigUint::one() {
-                    return Err(EncodeError::invalid(
-                        "swap amountIn inconsistent with splitBps",
-                    ));
-                }
-            }
-
-            allocations.push(AllocatedSwap {
-                pool: swap.pool.clone(),
-                token_in: swap.token_in.clone(),
-                token_out: swap.token_out.clone(),
-                split_bps: split,
-                amount_in,
-            });
-        }
-        return Ok(allocations);
-    }
-
     let mut sum_amounts = BigUint::zero();
     for swap in swaps {
-        let amount = swap.amount_in.clone().ok_or_else(|| {
-            EncodeError::invalid("swap amountIn required when splitBps not provided")
-        })?;
-        sum_amounts += amount;
+        sum_amounts += swap.amount_in.clone();
     }
-    if sum_amounts > hop_amount_in {
+    if sum_amounts != hop_amount_in {
         return Err(EncodeError::invalid(
-            "sum of swap amountIn exceeds hop amountIn",
+            "sum of swap amountIn does not match hop amountIn",
         ));
     }
 
     let mut allocations = Vec::with_capacity(swaps.len());
-    let mut allocated_amount = BigUint::zero();
     let mut split_sum: u32 = 0;
     for (index, swap) in swaps.iter().enumerate() {
-        let mut amount_in = swap
-            .amount_in
-            .clone()
-            .ok_or_else(|| EncodeError::invalid("swap amountIn required"))?;
-        if index == swaps.len() - 1 {
-            // If amounts don't cover the hop, assign the remainder to the last swap.
-            let remainder = hop_amount_in
-                .checked_sub(&sum_amounts)
-                .ok_or_else(|| EncodeError::invalid("swap allocation underflow"))?;
-            amount_in += remainder;
-        }
         let split = if index == swaps.len() - 1 {
             BPS_DENOMINATOR.saturating_sub(split_sum)
         } else {
-            let split = mul_bps_reverse(&amount_in, &hop_amount_in);
+            let split = mul_bps_reverse(&swap.amount_in, &hop_amount_in);
             split_sum = split_sum.saturating_add(split);
             split
         };
 
-        allocated_amount += amount_in.clone();
+        if let Some(requested) = swap.split_bps {
+            if requested > BPS_DENOMINATOR {
+                return Err(EncodeError::invalid("swap splitBps must be <= 10000"));
+            }
+            if abs_diff_u32(requested, split) > 1 {
+                return Err(EncodeError::invalid(
+                    "swap splitBps inconsistent with amountIn",
+                ));
+            }
+        }
+
         allocations.push(AllocatedSwap {
             pool: swap.pool.clone(),
             token_in: swap.token_in.clone(),
             token_out: swap.token_out.clone(),
             split_bps: split,
-            amount_in,
+            amount_in: swap.amount_in.clone(),
+            min_amount_out: swap.min_amount_out.clone(),
         });
-    }
-
-    if allocated_amount != hop_amount_in {
-        return Err(EncodeError::invalid(
-            "swap allocation did not consume full hop amountIn",
-        ));
     }
 
     Ok(allocations)
@@ -758,6 +757,243 @@ fn build_execution_calls(
     build_execution_calls_with(resimulated, |swap, _hop| {
         encode_single_swap_call(chain, router_address, encoder, request, swap)
     })
+}
+
+fn build_route_calldata_tx(
+    context: &RouteContext<'_>,
+    resimulated: &ResimulatedRouteInternal,
+    encoder: &dyn TychoEncoder,
+    min_amount_out: &BigUint,
+) -> Result<RouteCalldata, EncodeError> {
+    let native_address = context.chain.native_token().address;
+    let wrapped_address = context.chain.wrapped_native_token().address;
+    let is_wrap = context.token_in == &native_address;
+    let is_unwrap = context.token_out == &native_address;
+    if is_wrap && is_unwrap {
+        return Err(EncodeError::invalid(
+            "Native-to-native swaps are not supported",
+        ));
+    }
+
+    let swaps = build_route_swaps(
+        resimulated,
+        is_wrap,
+        is_unwrap,
+        &native_address,
+        &wrapped_address,
+    )?;
+    let sender = parse_address(&context.request.settlement_address)?;
+    let receiver = sender.clone();
+    let native_action = if is_wrap {
+        Some(NativeAction::Wrap)
+    } else if is_unwrap {
+        Some(NativeAction::Unwrap)
+    } else {
+        None
+    };
+
+    let solution = Solution {
+        sender,
+        receiver: receiver.clone(),
+        given_token: context.token_in.clone(),
+        given_amount: context.amount_in.clone(),
+        checked_token: context.token_out.clone(),
+        exact_out: false,
+        checked_amount: min_amount_out.clone(),
+        swaps,
+        native_action,
+    };
+
+    let encoded_solution = encoder
+        .encode_solutions(vec![solution.clone()])
+        .map_err(|err| EncodeError::encoding(format!("Route encoding failed: {}", err)))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| EncodeError::encoding("Route encoding returned no solutions"))?;
+
+    if encoded_solution.permit.is_some()
+        || encoded_solution.function_signature.contains("Permit2")
+        || encoded_solution.function_signature.contains("permit2")
+    {
+        return Err(EncodeError::encoding(
+            "Permit2 encodings are not supported for route calldata",
+        ));
+    }
+
+    if &encoded_solution.interacting_with != context.router_address {
+        return Err(EncodeError::encoding(
+            "Encoded router address does not match request tychoRouterAddress",
+        ));
+    }
+
+    let calldata =
+        encode_route_calldata(&encoded_solution, &solution, &receiver, is_wrap, is_unwrap)?;
+    let value = if is_wrap {
+        context.amount_in.clone()
+    } else {
+        BigUint::zero()
+    };
+
+    Ok(RouteCalldata {
+        target: format_address(&encoded_solution.interacting_with),
+        value: value.to_str_radix(10),
+        data: format_calldata(&calldata),
+    })
+}
+
+fn build_route_swaps(
+    resimulated: &ResimulatedRouteInternal,
+    is_wrap: bool,
+    is_unwrap: bool,
+    native_address: &Bytes,
+    wrapped_address: &Bytes,
+) -> Result<Vec<Swap>, EncodeError> {
+    let mut ordered_swaps = Vec::new();
+    for segment in &resimulated.segments {
+        for hop in &segment.hops {
+            for swap in &hop.swaps {
+                ordered_swaps.push(swap);
+            }
+        }
+    }
+
+    let mut split_stats: HashMap<Bytes, SplitStats> = HashMap::new();
+    for (index, swap) in ordered_swaps.iter().enumerate() {
+        let entry = split_stats
+            .entry(swap.token_in.clone())
+            .or_insert_with(|| SplitStats {
+                total_amount: BigUint::zero(),
+                count: 0,
+                last_index: index,
+            });
+        entry.total_amount += swap.amount_in.clone();
+        entry.count += 1;
+        entry.last_index = index;
+    }
+
+    let mut swaps = Vec::with_capacity(ordered_swaps.len());
+    for (index, swap) in ordered_swaps.iter().enumerate() {
+        let stats = split_stats
+            .get(&swap.token_in)
+            .ok_or_else(|| EncodeError::internal("Missing split stats for swap tokenIn"))?;
+        // Tycho split validation requires exactly one remainder (split=0) per tokenIn, and it must
+        // be the last occurrence in order.
+        let is_remainder = stats.count == 1 || stats.last_index == index;
+        let split = compute_split_fraction(
+            &swap.amount_in,
+            &stats.total_amount,
+            is_remainder,
+            stats.count,
+            &swap.token_in,
+        )?;
+        let swap_token_in = if is_wrap && swap.token_in == *native_address {
+            wrapped_address.clone()
+        } else {
+            swap.token_in.clone()
+        };
+        let swap_token_out = if is_unwrap && swap.token_out == *native_address {
+            wrapped_address.clone()
+        } else {
+            swap.token_out.clone()
+        };
+        let common_component: CommonProtocolComponent = swap.component.as_ref().clone().into();
+        let swap_data = Swap::new(
+            common_component,
+            swap_token_in,
+            swap_token_out,
+            split,
+            None,
+            Some(Arc::clone(&swap.pool_state)),
+            None,
+        );
+        swaps.push(swap_data);
+    }
+
+    Ok(swaps)
+}
+
+fn compute_split_fraction(
+    amount_in: &BigUint,
+    total_in: &BigUint,
+    is_remainder: bool,
+    count: usize,
+    token_in: &Bytes,
+) -> Result<f64, EncodeError> {
+    if count <= 1 || is_remainder {
+        return Ok(0.0);
+    }
+
+    let amount_in = amount_in.to_f64().ok_or_else(|| {
+        EncodeError::invalid("Failed to convert swap amountIn for split calculation")
+    })?;
+    let total_in = total_in.to_f64().ok_or_else(|| {
+        EncodeError::invalid("Failed to convert tokenIn total amount for split calculation")
+    })?;
+    if total_in <= 0.0 {
+        return Err(EncodeError::invalid(
+            "TokenIn total amount must be positive for split calculation",
+        ));
+    }
+    let split = amount_in / total_in;
+    if split <= 0.0 || split >= 1.0 {
+        return Err(EncodeError::invalid(format!(
+            "Invalid split ratio for tokenIn {}",
+            format_address(token_in)
+        )));
+    }
+    Ok(split)
+}
+
+fn encode_route_calldata(
+    encoded_solution: &EncodedSolution,
+    solution: &Solution,
+    receiver: &Bytes,
+    is_wrap: bool,
+    is_unwrap: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    let signature = encoded_solution.function_signature.as_str();
+    if signature.contains("Permit2") || signature.contains("permit2") {
+        return Err(EncodeError::encoding(
+            "Permit2 encodings are not supported for route calldata",
+        ));
+    }
+    let is_transfer_from_allowed = !is_wrap;
+
+    let calldata_args = if signature.contains("splitSwap") {
+        (
+            biguint_to_u256(&solution.given_amount),
+            bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
+            bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
+            biguint_to_u256(&solution.checked_amount),
+            is_wrap,
+            is_unwrap,
+            alloy_primitives::U256::from(encoded_solution.n_tokens),
+            bytes_to_address(receiver).map_err(map_encoding_error)?,
+            is_transfer_from_allowed,
+            encoded_solution.swaps.clone(),
+        )
+            .abi_encode()
+    } else if signature.contains("singleSwap") || signature.contains("sequentialSwap") {
+        (
+            biguint_to_u256(&solution.given_amount),
+            bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
+            bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
+            biguint_to_u256(&solution.checked_amount),
+            is_wrap,
+            is_unwrap,
+            bytes_to_address(receiver).map_err(map_encoding_error)?,
+            is_transfer_from_allowed,
+            encoded_solution.swaps.clone(),
+        )
+            .abi_encode()
+    } else {
+        return Err(EncodeError::encoding(format!(
+            "Unsupported Tycho function signature: {}",
+            signature
+        )));
+    };
+
+    encode_function_call(signature, calldata_args)
 }
 
 fn build_execution_calls_with<F>(
@@ -1006,6 +1242,7 @@ fn build_normalized_route_response(resimulated: &ResimulatedRouteInternal) -> No
         .segments
         .iter()
         .map(|segment| Segment {
+            kind: segment.kind,
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.to_str_radix(10),
             expected_amount_out: segment.expected_amount_out.to_str_radix(10),
@@ -1142,10 +1379,6 @@ fn map_swap_token(address: &Bytes, chain: Chain) -> Bytes {
     }
 }
 
-fn mul_bps(amount: &BigUint, bps: u32) -> BigUint {
-    (amount * BigUint::from(bps)) / BigUint::from(BPS_DENOMINATOR)
-}
-
 fn mul_bps_reverse(amount: &BigUint, total: &BigUint) -> u32 {
     if total.is_zero() {
         return 0;
@@ -1153,11 +1386,6 @@ fn mul_bps_reverse(amount: &BigUint, total: &BigUint) -> u32 {
     let numerator = amount * BigUint::from(BPS_DENOMINATOR);
     let result = numerator / total;
     result.to_u32().unwrap_or(0)
-}
-
-fn apply_slippage(amount: &BigUint, slippage_bps: u32) -> BigUint {
-    let safe_bps = BPS_DENOMINATOR.saturating_sub(slippage_bps);
-    mul_bps(amount, safe_bps)
 }
 
 struct TenderlyConfig {
@@ -1303,12 +1531,8 @@ fn string_or_number(value: &Value) -> Option<String> {
     }
 }
 
-fn abs_diff(a: &BigUint, b: &BigUint) -> BigUint {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
+fn abs_diff_u32(a: u32, b: u32) -> u32 {
+    a.abs_diff(b)
 }
 
 struct TokenCache<'a> {
@@ -1358,7 +1582,38 @@ mod tests {
     }
 
     #[test]
-    fn allocate_swaps_split_remainder() {
+    fn allocate_swaps_computes_split_from_amounts() {
+        let hop_amount = BigUint::from(100u32);
+        let swaps = vec![
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p1"),
+                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+                split_bps: None,
+                amount_in: BigUint::from(30u32),
+                min_amount_out: BigUint::from(20u32),
+            },
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p2"),
+                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+                split_bps: None,
+                amount_in: BigUint::from(70u32),
+                min_amount_out: BigUint::from(60u32),
+            },
+        ];
+
+        let allocated = allocate_swaps(hop_amount, &swaps).expect("allocates");
+        assert_eq!(allocated.len(), 2);
+        assert_eq!(allocated[0].amount_in, BigUint::from(30u32));
+        assert_eq!(allocated[1].amount_in, BigUint::from(70u32));
+        assert_eq!(allocated[0].split_bps, 3000);
+        assert_eq!(allocated[1].split_bps, 7000);
+        assert_eq!(allocated[1].min_amount_out, BigUint::from(60u32));
+    }
+
+    #[test]
+    fn allocate_swaps_rejects_split_mismatch() {
         let hop_amount = BigUint::from(100u32);
         let swaps = vec![
             NormalizedSwapDraftInternal {
@@ -1366,52 +1621,27 @@ mod tests {
                 token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
                 token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
                 split_bps: Some(5000),
-                amount_in: None,
+                amount_in: BigUint::from(30u32),
+                min_amount_out: BigUint::from(20u32),
             },
             NormalizedSwapDraftInternal {
                 pool: pool_ref("p2"),
                 token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
                 token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: Some(0),
-                amount_in: None,
+                split_bps: Some(5000),
+                amount_in: BigUint::from(70u32),
+                min_amount_out: BigUint::from(60u32),
             },
         ];
 
-        let allocated = allocate_swaps(hop_amount, &swaps).expect("allocates");
-        assert_eq!(allocated.len(), 2);
-        assert_eq!(allocated[0].amount_in, BigUint::from(50u32));
-        assert_eq!(allocated[1].amount_in, BigUint::from(50u32));
+        match allocate_swaps(hop_amount, &swaps) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
+            Ok(_) => panic!("split mismatch should be rejected"),
+        }
     }
 
     #[test]
-    fn allocate_swaps_amount_in_remainder() {
-        let hop_amount = BigUint::from(100u32);
-        let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: None,
-                amount_in: Some(BigUint::from(30u32)),
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: None,
-                amount_in: Some(BigUint::from(30u32)),
-            },
-        ];
-
-        let allocated = allocate_swaps(hop_amount, &swaps).expect("allocates");
-        assert_eq!(allocated[0].amount_in, BigUint::from(30u32));
-        assert_eq!(allocated[1].amount_in, BigUint::from(70u32));
-        assert_eq!(allocated[0].split_bps, 3000);
-        assert_eq!(allocated[1].split_bps, 7000);
-    }
-
-    #[test]
-    fn normalize_segment_remainder_allocates() {
+    fn normalize_route_computes_share_from_amounts() {
         let request = RouteEncodeRequest {
             chain_id: 1,
             token_in: "0x0000000000000000000000000000000000000001".to_string(),
@@ -1419,10 +1649,10 @@ mod tests {
             amount_in: "100".to_string(),
             settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
             tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-            slippage_bps: 25,
-            per_pool_slippage_bps: None,
+            swap_kind: SwapKind::MegaSwap,
             segments: vec![
                 SegmentDraft {
+                    kind: SwapKind::SimpleSwap,
                     share_bps: Some(2000),
                     is_remainder: None,
                     hops: vec![HopDraft {
@@ -1433,14 +1663,15 @@ mod tests {
                             token_in: "0x0000000000000000000000000000000000000001".to_string(),
                             token_out: "0x0000000000000000000000000000000000000002".to_string(),
                             split_bps: Some(10000),
-                            amount_in: None,
-                            amount_out: None,
+                            amount_in: "20".to_string(),
+                            min_amount_out: "19".to_string(),
                         }],
                     }],
                 },
                 SegmentDraft {
+                    kind: SwapKind::SimpleSwap,
                     share_bps: None,
-                    is_remainder: Some(true),
+                    is_remainder: None,
                     hops: vec![HopDraft {
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
@@ -1449,8 +1680,8 @@ mod tests {
                             token_in: "0x0000000000000000000000000000000000000001".to_string(),
                             token_out: "0x0000000000000000000000000000000000000002".to_string(),
                             split_bps: Some(10000),
-                            amount_in: None,
-                            amount_out: None,
+                            amount_in: "80".to_string(),
+                            min_amount_out: "75".to_string(),
                         }],
                     }],
                 },
@@ -1465,8 +1696,121 @@ mod tests {
 
         let normalized = normalize_route(&request, &token_in, &token_out, &amount_in).unwrap();
         assert_eq!(normalized.segments.len(), 2);
+        assert_eq!(normalized.segments[0].share_bps, 2000);
+        assert_eq!(normalized.segments[1].share_bps, 8000);
         assert_eq!(normalized.segments[0].amount_in, BigUint::from(20u32));
         assert_eq!(normalized.segments[1].amount_in, BigUint::from(80u32));
+    }
+
+    #[test]
+    fn normalize_route_rejects_hop_min_solvency() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "100".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::MultiSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::MultiSwap,
+                share_bps: Some(10000),
+                is_remainder: None,
+                hops: vec![
+                    HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000003".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p1"),
+                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000003".to_string(),
+                            split_bps: Some(10000),
+                            amount_in: "100".to_string(),
+                            min_amount_out: "50".to_string(),
+                        }],
+                    },
+                    HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000003".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p2"),
+                            token_in: "0x0000000000000000000000000000000000000003".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                            split_bps: Some(10000),
+                            amount_in: "60".to_string(),
+                            min_amount_out: "59".to_string(),
+                        }],
+                    },
+                ],
+            }],
+            enable_tenderly_sim: None,
+            request_id: None,
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+
+        match normalize_route(&request, &token_in, &token_out, &amount_in) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
+            Ok(_) => panic!("hop solvency should be rejected"),
+        }
+    }
+
+    #[test]
+    fn validate_swap_kinds_rejects_route_mismatch() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "100".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: vec![
+                SegmentDraft {
+                    kind: SwapKind::SimpleSwap,
+                    share_bps: Some(5000),
+                    is_remainder: None,
+                    hops: vec![HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p1"),
+                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                            split_bps: Some(10000),
+                            amount_in: "50".to_string(),
+                            min_amount_out: "49".to_string(),
+                        }],
+                    }],
+                },
+                SegmentDraft {
+                    kind: SwapKind::SimpleSwap,
+                    share_bps: Some(5000),
+                    is_remainder: None,
+                    hops: vec![HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p2"),
+                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                            split_bps: Some(10000),
+                            amount_in: "50".to_string(),
+                            min_amount_out: "49".to_string(),
+                        }],
+                    }],
+                },
+            ],
+            enable_tenderly_sim: None,
+            request_id: None,
+        };
+
+        match validate_swap_kinds(&request) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
+            Ok(_) => panic!("swapKind mismatch should be rejected"),
+        }
     }
 
     #[test]
@@ -1474,6 +1818,7 @@ mod tests {
         let resimulated = ResimulatedRouteInternal {
             segments: vec![
                 ResimulatedSegmentInternal {
+                    kind: SwapKind::SimpleSwap,
                     share_bps: 2000,
                     amount_in: BigUint::from(20u32),
                     expected_amount_out: BigUint::from(2u32),
@@ -1525,6 +1870,7 @@ mod tests {
                     }],
                 },
                 ResimulatedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
                     share_bps: 6000,
                     amount_in: BigUint::from(60u32),
                     expected_amount_out: BigUint::from(6u32),
@@ -1557,6 +1903,7 @@ mod tests {
                     ],
                 },
                 ResimulatedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
                     share_bps: 2000,
                     amount_in: BigUint::from(20u32),
                     expected_amount_out: BigUint::from(2u32),
@@ -1628,8 +1975,7 @@ mod tests {
             amount_in: "10".to_string(),
             settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
             tycho_router_address: format_address(&router),
-            slippage_bps: 25,
-            per_pool_slippage_bps: None,
+            swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
             enable_tenderly_sim: None,
             request_id: None,
@@ -1673,8 +2019,7 @@ mod tests {
             amount_in: "10".to_string(),
             settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
             tycho_router_address: format_address(&router),
-            slippage_bps: 25,
-            per_pool_slippage_bps: None,
+            swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
             enable_tenderly_sim: None,
             request_id: None,
@@ -1713,8 +2058,7 @@ mod tests {
             amount_in: "10".to_string(),
             settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
             tycho_router_address: format_address(&router),
-            slippage_bps: 25,
-            per_pool_slippage_bps: None,
+            swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
             enable_tenderly_sim: None,
             request_id: None,
@@ -1736,6 +2080,151 @@ mod tests {
             Err(err) => assert_eq!(err.kind(), EncodeErrorKind::Encoding),
             Ok(_) => panic!("unknown signature should be rejected"),
         }
+    }
+
+    #[test]
+    fn build_route_calldata_tx_encodes_router_call() {
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
+        let encoder = MockTychoEncoder::new(
+            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
+            router.clone(),
+        );
+
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "10".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: format_address(&router),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: Vec::new(),
+            enable_tenderly_sim: None,
+            request_id: None,
+        };
+
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                expected_amount_out: BigUint::from(9u32),
+                min_amount_out: BigUint::from(8u32),
+                hops: vec![ResimulatedHopInternal {
+                    token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
+                        .unwrap(),
+                    token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
+                        .unwrap(),
+                    amount_in: BigUint::from(10u32),
+                    expected_amount_out: BigUint::from(9u32),
+                    min_amount_out: BigUint::from(8u32),
+                    swaps: vec![ResimulatedSwapInternal {
+                        pool: pool_ref("p1"),
+                        token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
+                            .unwrap(),
+                        token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
+                            .unwrap(),
+                        split_bps: 10_000,
+                        amount_in: BigUint::from(10u32),
+                        expected_amount_out: BigUint::from(9u32),
+                        min_amount_out: BigUint::from(8u32),
+                        pool_state: Arc::new(MockProtocolSim {}),
+                        component: Arc::new(dummy_component()),
+                    }],
+                }],
+            }],
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+
+        let context = RouteContext {
+            request: &request,
+            chain: Chain::Ethereum,
+            token_in: &token_in,
+            token_out: &token_out,
+            amount_in: &amount_in,
+            router_address: &router,
+        };
+
+        let calldata =
+            build_route_calldata_tx(&context, &resimulated, &encoder, &BigUint::from(8u32))
+                .unwrap();
+
+        assert_eq!(calldata.target, format_address(&router));
+        assert_eq!(calldata.value, "0");
+        let selector = function_selector(
+            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
+        )
+        .unwrap();
+        let expected_prefix = format!("0x{}", alloy_primitives::hex::encode(selector));
+        assert!(
+            calldata.data.starts_with(&expected_prefix),
+            "route calldata should start with selector"
+        );
+    }
+
+    #[test]
+    fn build_route_swaps_sets_remainder_split_last() {
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 10_000,
+                amount_in: BigUint::from(100u32),
+                expected_amount_out: BigUint::from(90u32),
+                min_amount_out: BigUint::from(80u32),
+                hops: vec![ResimulatedHopInternal {
+                    token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
+                        .unwrap(),
+                    token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
+                        .unwrap(),
+                    amount_in: BigUint::from(100u32),
+                    expected_amount_out: BigUint::from(90u32),
+                    min_amount_out: BigUint::from(80u32),
+                    swaps: vec![
+                        ResimulatedSwapInternal {
+                            pool: pool_ref("p1"),
+                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
+                                .unwrap(),
+                            token_out: Bytes::from_str(
+                                "0x0000000000000000000000000000000000000002",
+                            )
+                            .unwrap(),
+                            split_bps: 3_000,
+                            amount_in: BigUint::from(30u32),
+                            expected_amount_out: BigUint::from(27u32),
+                            min_amount_out: BigUint::from(25u32),
+                            pool_state: Arc::new(MockProtocolSim {}),
+                            component: Arc::new(dummy_component()),
+                        },
+                        ResimulatedSwapInternal {
+                            pool: pool_ref("p2"),
+                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
+                                .unwrap(),
+                            token_out: Bytes::from_str(
+                                "0x0000000000000000000000000000000000000002",
+                            )
+                            .unwrap(),
+                            split_bps: 7_000,
+                            amount_in: BigUint::from(70u32),
+                            expected_amount_out: BigUint::from(63u32),
+                            min_amount_out: BigUint::from(55u32),
+                            pool_state: Arc::new(MockProtocolSim {}),
+                            component: Arc::new(dummy_component()),
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let native = Chain::Ethereum.native_token().address;
+        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let swaps = build_route_swaps(&resimulated, false, false, &native, &wrapped).unwrap();
+
+        assert_eq!(swaps.len(), 2);
+        assert!(swaps[0].split > 0.0);
+        assert_eq!(swaps[1].split, 0.0);
     }
 
     fn dummy_swap(id: &str) -> ResimulatedSwapInternal {

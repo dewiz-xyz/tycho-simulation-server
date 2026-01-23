@@ -93,21 +93,19 @@ pub struct PoolRef {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PoolSwapDraft {
     pub pool: PoolRef,
     pub token_in: String,
     pub token_out: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_bps: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount_in: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount_out: Option<String>,
+    pub amount_in: String,
+    pub min_amount_out: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HopDraft {
     pub token_in: String,
     pub token_out: String,
@@ -115,8 +113,9 @@ pub struct HopDraft {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SegmentDraft {
+    pub kind: SwapKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_bps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,8 +123,17 @@ pub struct SegmentDraft {
     pub hops: Vec<HopDraft>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::enum_variant_names)]
+pub enum SwapKind {
+    SimpleSwap,
+    MultiSwap,
+    MegaSwap,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouteEncodeRequest {
     pub chain_id: u64,
     pub token_in: String,
@@ -133,9 +141,7 @@ pub struct RouteEncodeRequest {
     pub amount_in: String,
     pub settlement_address: String,
     pub tycho_router_address: String,
-    pub slippage_bps: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub per_pool_slippage_bps: Option<std::collections::HashMap<String, u32>>,
+    pub swap_kind: SwapKind,
     pub segments: Vec<SegmentDraft>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_tenderly_sim: Option<bool>,
@@ -203,6 +209,7 @@ pub struct Hop {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
+    pub kind: SwapKind,
     pub share_bps: u32,
     pub amount_in: String,
     pub expected_amount_out: String,
@@ -260,11 +267,21 @@ pub struct RouteEncodeResponse {
     pub token_in: String,
     pub token_out: String,
     pub amount_in: String,
+    pub swap_kind: SwapKind,
     pub normalized_route: NormalizedRoute,
     pub calls: Vec<ExecutionCall>,
+    pub calldata: RouteCalldata,
     pub totals: RouteTotals,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<RouteDebug>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteCalldata {
+    pub target: String,
+    pub value: String,
+    pub data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
