@@ -22,6 +22,7 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
 }
 
 impl AppState {

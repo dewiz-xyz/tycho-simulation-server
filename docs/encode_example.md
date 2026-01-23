@@ -6,7 +6,7 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 - Call `/simulate` for each hop to pick candidate pools.
 - Build a `RouteEncodeRequest` with `segments[] → hops[] → swaps[]`, including `amountIn` and `minAmountOut` per pool swap.
-- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, fills expected amounts, and returns settlement `interactions[]` (approve reset → approve amount → router call).
+- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, fills expected amounts, and returns settlement `interactions[]` (approve amount → router call; approve reset is prepended for tokens that require it).
 
 ## Request body (shape)
 
@@ -137,12 +137,6 @@ This document shows the **latest** `/encode` schema. The values are representati
       "calldata": "0x095ea7b3..."
     },
     {
-      "kind": "ERC20_APPROVE",
-      "target": "0x6b175474e89094c44da98b954eedeac495271d0f",
-      "value": "0",
-      "calldata": "0x095ea7b3..."
-    },
-    {
       "kind": "CALL",
       "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
       "value": "0",
@@ -164,7 +158,7 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 ## Notes
 
-- `interactions[]` are emitted in order: approve(0) → approve(amountIn) → router call.
+- `interactions[]` are emitted in order: approve(amountIn) → router call; for reset-allowance tokens an approve(0) is prepended.
 - The settlement encoding expects ERC20 `tokenIn`/`tokenOut` (use wrapped native tokens for ETH).
 - `minAmountOut` is supplied by the client and enforced to be non-zero for all swaps.
 - `/encode` fails if any resimulated `expectedAmountOut < minAmountOut`.

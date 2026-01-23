@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        reset_allowance_tokens: Arc::new(config.reset_allowance_tokens.clone()),
     };
 
     info!(

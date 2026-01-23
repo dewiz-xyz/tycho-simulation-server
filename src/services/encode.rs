@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -216,7 +216,10 @@ pub async fn encode_route(
     };
     let router_call =
         build_route_calldata_tx(&route_context, &resimulated, encoder.as_ref(), &min_total)?;
-    let interactions = build_settlement_interactions(&token_in, &amount_in, router_call)?;
+    let reset_approval =
+        should_reset_allowance(&state.reset_allowance_tokens, request.chain_id, &token_in);
+    let interactions =
+        build_settlement_interactions(&token_in, &amount_in, router_call, reset_approval)?;
 
     let normalized_route = build_normalized_route_response(&resimulated);
     let totals = RouteTotals {
@@ -268,10 +271,21 @@ fn ensure_erc20_tokens(
     let native = chain.native_token().address;
     if *token_in == native || *token_out == native {
         return Err(EncodeError::invalid(
-            "Native tokenIn/tokenOut not supported for settlement encoding; use wrapped native token instead",
+            "tokenIn/tokenOut must be ERC20 addresses; use wrapped native token instead",
         ));
     }
     Ok(())
+}
+
+fn should_reset_allowance(
+    reset_allowance_tokens: &HashMap<u64, HashSet<Bytes>>,
+    chain_id: u64,
+    token_in: &Bytes,
+) -> bool {
+    reset_allowance_tokens
+        .get(&chain_id)
+        .map(|tokens| tokens.contains(token_in))
+        .unwrap_or(false)
 }
 
 fn infer_route_kind(segments: &[SegmentDraft]) -> SwapKind {
@@ -839,10 +853,17 @@ fn build_settlement_interactions(
     token_in: &Bytes,
     amount_in: &BigUint,
     router_call: CallDataPayload,
+    reset_approval: bool,
 ) -> Result<Vec<Interaction>, EncodeError> {
-    // Reset-then-approve is required for allowance-reset tokens like USDT.
-    let reset_approval =
-        build_erc20_approve_interaction(token_in, &router_call.target, &BigUint::zero())?;
+    let mut interactions = Vec::with_capacity(if reset_approval { 3 } else { 2 });
+    if reset_approval {
+        // Reset-then-approve is required for allowance-reset tokens like USDT.
+        interactions.push(build_erc20_approve_interaction(
+            token_in,
+            &router_call.target,
+            &BigUint::zero(),
+        )?);
+    }
     let set_approval = build_erc20_approve_interaction(token_in, &router_call.target, amount_in)?;
     let router_interaction = Interaction {
         kind: InteractionKind::Call,
@@ -850,8 +871,9 @@ fn build_settlement_interactions(
         value: router_call.value.to_str_radix(10),
         calldata: format_calldata(&router_call.calldata),
     };
-
-    Ok(vec![reset_approval, set_approval, router_interaction])
+    interactions.push(set_approval);
+    interactions.push(router_interaction);
+    Ok(interactions)
 }
 
 const ERC20_APPROVE_SIGNATURE: &str = "approve(address,uint256)";
@@ -1656,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn build_settlement_interactions_orders_approvals_then_router_call() {
+    fn build_settlement_interactions_with_reset_approval() {
         let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
         let router = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
         let amount_in = BigUint::from(10u32);
@@ -1667,7 +1689,7 @@ mod tests {
         };
 
         let interactions =
-            build_settlement_interactions(&token_in, &amount_in, router_call).unwrap();
+            build_settlement_interactions(&token_in, &amount_in, router_call, true).unwrap();
 
         assert_eq!(interactions.len(), 3);
         assert_eq!(interactions[0].kind, InteractionKind::Erc20Approve);
@@ -1690,6 +1712,27 @@ mod tests {
             interactions[2].calldata,
             format_calldata(&[0x11, 0x22, 0x33])
         );
+    }
+
+    #[test]
+    fn build_settlement_interactions_without_reset_approval() {
+        let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let amount_in = BigUint::from(10u32);
+        let router_call = CallDataPayload {
+            target: router.clone(),
+            value: BigUint::zero(),
+            calldata: vec![0xaa, 0xbb, 0xcc],
+        };
+
+        let interactions =
+            build_settlement_interactions(&token_in, &amount_in, router_call, false).unwrap();
+
+        assert_eq!(interactions.len(), 2);
+        assert_eq!(interactions[0].kind, InteractionKind::Erc20Approve);
+        assert_eq!(interactions[1].kind, InteractionKind::Call);
+        assert_eq!(interactions[0].target, format_address(&token_in));
+        assert_eq!(interactions[1].target, format_address(&router));
     }
 
     #[test]

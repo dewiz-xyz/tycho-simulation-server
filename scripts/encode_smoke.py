@@ -81,7 +81,7 @@ def protocol_from_pool_name(pool_name: str) -> str:
     return "unknown"
 
 
-def validate_encode_response(response: dict, expected_router: str) -> None:
+def validate_encode_response(response: dict, expected_router: str) -> int:
     if response.get("swapKind") != "MultiSwap":
         raise AssertionError("swapKind mismatch")
     token_in = response.get("tokenIn")
@@ -93,8 +93,24 @@ def validate_encode_response(response: dict, expected_router: str) -> None:
     if segments[0].get("kind") != "MultiSwap":
         raise AssertionError("segment kind mismatch")
     interactions = response.get("interactions")
-    if not isinstance(interactions, list) or len(interactions) != 3:
+    if not isinstance(interactions, list) or len(interactions) not in (2, 3):
         raise AssertionError("interactions length mismatch")
+
+    if len(interactions) == 2:
+        approval, router = interactions
+        if approval.get("kind") != "ERC20_APPROVE":
+            raise AssertionError("approval interaction missing")
+        if router.get("kind") != "CALL":
+            raise AssertionError("router call interaction missing")
+        assert_hex(approval.get("target", ""), "interaction target")
+        assert_hex(router.get("target", ""), "interaction target")
+        assert_hex(approval.get("calldata", ""), "interaction calldata")
+        assert_hex(router.get("calldata", ""), "interaction calldata")
+        if approval.get("target", "").lower() != token_in.lower():
+            raise AssertionError("approval target mismatch (tokenIn)")
+        if router.get("target", "").lower() != expected_router.lower():
+            raise AssertionError("router interaction target mismatch")
+        return 2
 
     first, second, third = interactions
     if first.get("kind") != "ERC20_APPROVE" or second.get("kind") != "ERC20_APPROVE":
@@ -115,6 +131,32 @@ def validate_encode_response(response: dict, expected_router: str) -> None:
         raise AssertionError("approval target mismatch (tokenIn)")
     if third.get("target", "").lower() != expected_router.lower():
         raise AssertionError("router interaction target mismatch")
+    return 3
+
+
+def validate_pool_ordering(response: dict, pool_first: dict, pool_second: dict) -> None:
+    normalized = response.get("normalizedRoute", {})
+    segments = normalized.get("segments")
+    if not isinstance(segments, list) or len(segments) != 1:
+        raise AssertionError("normalizedRoute segments length mismatch")
+
+    hops = segments[0].get("hops")
+    if not isinstance(hops, list) or len(hops) != 2:
+        raise AssertionError("normalizedRoute hops length mismatch")
+
+    first_swaps = hops[0].get("swaps")
+    second_swaps = hops[1].get("swaps")
+    if not isinstance(first_swaps, list) or not first_swaps:
+        raise AssertionError("normalizedRoute first hop swaps missing")
+    if not isinstance(second_swaps, list) or not second_swaps:
+        raise AssertionError("normalizedRoute second hop swaps missing")
+
+    first_pool = first_swaps[0].get("pool", {}).get("componentId")
+    second_pool = second_swaps[0].get("pool", {}).get("componentId")
+    if first_pool != pool_first["pool"]:
+        raise AssertionError("normalizedRoute first hop pool mismatch")
+    if second_pool != pool_second["pool"]:
+        raise AssertionError("normalizedRoute second hop pool mismatch")
 
 
 def main() -> int:
@@ -291,7 +333,8 @@ def main() -> int:
         return 1
 
     try:
-        validate_encode_response(encode_response, tycho_router)
+        interactions_len = validate_encode_response(encode_response, tycho_router)
+        validate_pool_ordering(encode_response, pool_first, pool_second)
     except AssertionError as exc:
         print(f"[FAIL] encode response validation failed: {exc}")
         return 1
@@ -299,7 +342,7 @@ def main() -> int:
     if args.verbose:
         print(json.dumps(encode_response, indent=2))
 
-    print(f"[OK] encode route {elapsed:.3f}s interactions=3")
+    print(f"[OK] encode route {elapsed:.3f}s interactions={interactions_len}")
     return 0
 
 
