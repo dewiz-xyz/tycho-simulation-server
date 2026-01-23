@@ -17,6 +17,7 @@ from presets import TOKENS, default_amounts_for_token
 
 DEFAULT_SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
 DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
+DEFAULT_SLIPPAGE_BPS = 25
 
 
 def request_json(url: str, payload: dict, timeout: float) -> tuple[int, dict, float]:
@@ -56,6 +57,12 @@ def assert_hex(value: str, label: str) -> None:
         raise AssertionError(f"{label} must be even-length hex")
 
 
+def apply_slippage(amount: str | int, bps: int) -> str:
+    value = int(amount)
+    safe_bps = 10_000 - bps
+    return str((value * safe_bps) // 10_000)
+
+
 def select_pool(response: dict, label: str) -> dict:
     data = response.get("data")
     if not isinstance(data, list) or not data:
@@ -78,9 +85,18 @@ def validate_encode_response(
     response: dict,
     pool_first: str,
     pool_second: str,
+    expected_router: str,
 ) -> None:
     if response.get("schemaVersion") != "2026-01-22":
         raise AssertionError("schemaVersion mismatch")
+    if response.get("swapKind") != "MultiSwap":
+        raise AssertionError("swapKind mismatch")
+    normalized = response.get("normalizedRoute", {})
+    segments = normalized.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise AssertionError("normalizedRoute segments missing")
+    if segments[0].get("kind") != "MultiSwap":
+        raise AssertionError("segment kind mismatch")
     calls = response.get("calls")
     if not isinstance(calls, list) or len(calls) != 2:
         raise AssertionError("calls length mismatch")
@@ -103,6 +119,17 @@ def validate_encode_response(
             raise AssertionError("approvals missing")
         assert_hex(approvals[0].get("token", ""), "approval token")
         assert_hex(approvals[0].get("spender", ""), "approval spender")
+
+    route_calldata = response.get("calldata")
+    if not isinstance(route_calldata, dict):
+        raise AssertionError("route calldata missing")
+    assert_hex(route_calldata.get("target", ""), "route calldata target")
+    assert_hex(route_calldata.get("data", ""), "route calldata data")
+    value = route_calldata.get("value")
+    if not isinstance(value, str) or not value.isdigit():
+        raise AssertionError("route calldata value must be a decimal string")
+    if route_calldata.get("target", "").lower() != expected_router.lower():
+        raise AssertionError("route calldata target mismatch")
 
 
 def main() -> int:
@@ -164,11 +191,12 @@ def main() -> int:
     pool_first = select_pool(response, "simulate dai->usdc")
 
     hop_amounts_out = pool_first["amounts_out"]
+    hop_amounts_in = [apply_slippage(value, DEFAULT_SLIPPAGE_BPS) for value in hop_amounts_out]
     simulate_payload_second = {
         "request_id": f"encode-smoke-hop-{uuid.uuid4().hex[:8]}",
         "token_in": usdc,
         "token_out": usdt,
-        "amounts": hop_amounts_out,
+        "amounts": hop_amounts_in,
     }
 
     try:
@@ -198,6 +226,15 @@ def main() -> int:
     protocol_first = protocol_from_pool_name(pool_first.get("pool_name", ""))
     protocol_second = protocol_from_pool_name(pool_second.get("pool_name", ""))
 
+    min_out_first = hop_amounts_in[0]
+    if int(min_out_first) <= 0:
+        print("[FAIL] computed minAmountOut for first hop is zero", file=sys.stderr)
+        return 1
+    min_out_second = apply_slippage(pool_second["amounts_out"][0], DEFAULT_SLIPPAGE_BPS)
+    if int(min_out_second) <= 0:
+        print("[FAIL] computed minAmountOut for second hop is zero", file=sys.stderr)
+        return 1
+
     encode_request = {
         "chainId": 1,
         "tokenIn": dai,
@@ -205,9 +242,10 @@ def main() -> int:
         "amountIn": amounts[0],
         "settlementAddress": settlement,
         "tychoRouterAddress": tycho_router,
-        "slippageBps": 25,
+        "swapKind": "MultiSwap",
         "segments": [
             {
+                "kind": "MultiSwap",
                 "shareBps": 10_000,
                 "hops": [
                     {
@@ -223,6 +261,8 @@ def main() -> int:
                                 "tokenIn": dai,
                                 "tokenOut": usdc,
                                 "splitBps": 10_000,
+                                "amountIn": amounts[0],
+                                "minAmountOut": min_out_first,
                             }
                         ],
                     },
@@ -239,6 +279,8 @@ def main() -> int:
                                 "tokenIn": usdc,
                                 "tokenOut": usdt,
                                 "splitBps": 10_000,
+                                "amountIn": min_out_first,
+                                "minAmountOut": min_out_second,
                             }
                         ],
                     },
@@ -268,6 +310,7 @@ def main() -> int:
             encode_response,
             pool_first["pool"],
             pool_second["pool"],
+            tycho_router,
         )
     except AssertionError as exc:
         print(f"[FAIL] encode response validation failed: {exc}")
