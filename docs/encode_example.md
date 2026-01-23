@@ -6,7 +6,7 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 - Call `/simulate` for each hop to pick candidate pools.
 - Build a `RouteEncodeRequest` with `segments[] → hops[] → swaps[]`, including `amountIn` and `minAmountOut` per pool swap.
-- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, and fills expected amounts.
+- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, fills expected amounts, and returns settlement `interactions[]` (approve reset → approve amount → router call).
 
 ## Request body (shape)
 
@@ -69,7 +69,6 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 ```json
 {
-  "schemaVersion": "latest",
   "chainId": 1,
   "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
@@ -130,61 +129,26 @@ This document shows the **latest** `/encode` schema. The values are representati
       }
     ]
   },
-  "calls": [
+  "interactions": [
     {
-      "index": 0,
-      "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+      "kind": "ERC20_APPROVE",
+      "target": "0x6b175474e89094c44da98b954eedeac495271d0f",
       "value": "0",
-      "calldata": "0x...",
-      "approvals": [
-        {
-          "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-          "spender": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-          "amount": "1000000000000000000"
-        }
-      ],
-      "kind": "TYCHO_SINGLE_SWAP",
-      "hopPath": "segment[0].hop[0]",
-      "pool": {
-        "protocol": "uniswap_v3",
-        "componentId": "pool-dai-usdc"
-      },
-      "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
-      "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-      "amountIn": "1000000000000000000",
-      "minAmountOut": "1000250",
-      "expectedAmountOut": "1000500"
+      "calldata": "0x095ea7b3..."
     },
     {
-      "index": 1,
+      "kind": "ERC20_APPROVE",
+      "target": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "value": "0",
+      "calldata": "0x095ea7b3..."
+    },
+    {
+      "kind": "CALL",
       "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
       "value": "0",
-      "calldata": "0x...",
-      "approvals": [
-        {
-          "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-          "spender": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-          "amount": "1000500"
-        }
-      ],
-      "kind": "TYCHO_SINGLE_SWAP",
-      "hopPath": "segment[0].hop[1]",
-      "pool": {
-        "protocol": "uniswap_v3",
-        "componentId": "pool-usdc-usdt"
-      },
-      "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-      "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-      "amountIn": "1000500",
-      "minAmountOut": "9974710",
-      "expectedAmountOut": "9999709"
+      "calldata": "0x..."
     }
   ],
-  "calldata": {
-    "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-    "value": "0",
-    "data": "0x..."
-  },
   "totals": {
     "expectedAmountOut": "9999709",
     "minAmountOut": "9974710"
@@ -200,8 +164,7 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 ## Notes
 
-- `calls[]` are emitted in **segment → hop → swap** order.
-- Each call is a Tycho `singleSwap` with per-swap approvals for ERC20 inputs.
-- `calldata` is a single Tycho router transaction for the full route (ready to send).
+- `interactions[]` are emitted in order: approve(0) → approve(amountIn) → router call.
+- The settlement encoding expects ERC20 `tokenIn`/`tokenOut` (use wrapped native tokens for ETH).
 - `minAmountOut` is supplied by the client and enforced to be non-zero for all swaps.
 - `/encode` fails if any resimulated `expectedAmountOut < minAmountOut`.

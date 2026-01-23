@@ -57,7 +57,7 @@ pub async fn encode(
             info!(
                 request_id,
                 latency_ms,
-                calls = response.calls.len(),
+                interactions = response.interactions.len(),
                 "Encode request completed"
             );
             Json::<RouteEncodeResponse>(response).into_response()

@@ -21,6 +21,8 @@ Options:
   --allow-partial    Allow partial_failure responses (and their failures)
   --stop             Stop server when done (only if started by this script)
   -h, --help         Show this help
+
+Tip: For mainnet variability, use --allow-partial --allow-no-liquidity for local runs.
 USAGE
 }
 

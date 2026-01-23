@@ -81,55 +81,40 @@ def protocol_from_pool_name(pool_name: str) -> str:
     return "unknown"
 
 
-def validate_encode_response(
-    response: dict,
-    pool_first: str,
-    pool_second: str,
-    expected_router: str,
-) -> None:
-    if response.get("schemaVersion") != "latest":
-        raise AssertionError("schemaVersion mismatch")
+def validate_encode_response(response: dict, expected_router: str) -> None:
     if response.get("swapKind") != "MultiSwap":
         raise AssertionError("swapKind mismatch")
+    token_in = response.get("tokenIn")
+    assert_hex(token_in, "tokenIn")
     normalized = response.get("normalizedRoute", {})
     segments = normalized.get("segments")
     if not isinstance(segments, list) or not segments:
         raise AssertionError("normalizedRoute segments missing")
     if segments[0].get("kind") != "MultiSwap":
         raise AssertionError("segment kind mismatch")
-    calls = response.get("calls")
-    if not isinstance(calls, list) or len(calls) != 2:
-        raise AssertionError("calls length mismatch")
+    interactions = response.get("interactions")
+    if not isinstance(interactions, list) or len(interactions) != 3:
+        raise AssertionError("interactions length mismatch")
 
-    expected_hops = [pool_first, pool_second]
-    for idx, call in enumerate(calls):
-        assert_hex(call.get("target", ""), "call target")
-        assert_hex(call.get("calldata", ""), "call calldata")
-        if call.get("kind") != "TYCHO_SINGLE_SWAP":
-            raise AssertionError("call kind mismatch")
-        if call.get("hopPath") != f"segment[0].hop[{idx}]":
-            raise AssertionError("hopPath mismatch")
-        pool = call.get("pool", {})
-        if pool.get("componentId") != expected_hops[idx]:
-            raise AssertionError("pool componentId mismatch")
-        if call.get("minAmountOut") in ("0", 0, None):
-            raise AssertionError("minAmountOut must be non-zero")
-        approvals = call.get("approvals", [])
-        if not isinstance(approvals, list) or not approvals:
-            raise AssertionError("approvals missing")
-        assert_hex(approvals[0].get("token", ""), "approval token")
-        assert_hex(approvals[0].get("spender", ""), "approval spender")
+    first, second, third = interactions
+    if first.get("kind") != "ERC20_APPROVE" or second.get("kind") != "ERC20_APPROVE":
+        raise AssertionError("approval interactions missing or misordered")
+    if third.get("kind") != "CALL":
+        raise AssertionError("router call interaction missing")
 
-    route_calldata = response.get("calldata")
-    if not isinstance(route_calldata, dict):
-        raise AssertionError("route calldata missing")
-    assert_hex(route_calldata.get("target", ""), "route calldata target")
-    assert_hex(route_calldata.get("data", ""), "route calldata data")
-    value = route_calldata.get("value")
-    if not isinstance(value, str) or not value.isdigit():
-        raise AssertionError("route calldata value must be a decimal string")
-    if route_calldata.get("target", "").lower() != expected_router.lower():
-        raise AssertionError("route calldata target mismatch")
+    assert_hex(first.get("target", ""), "interaction target")
+    assert_hex(second.get("target", ""), "interaction target")
+    assert_hex(third.get("target", ""), "interaction target")
+    assert_hex(first.get("calldata", ""), "interaction calldata")
+    assert_hex(second.get("calldata", ""), "interaction calldata")
+    assert_hex(third.get("calldata", ""), "interaction calldata")
+
+    if first.get("target", "").lower() != token_in.lower():
+        raise AssertionError("approval target mismatch (tokenIn)")
+    if second.get("target", "").lower() != token_in.lower():
+        raise AssertionError("approval target mismatch (tokenIn)")
+    if third.get("target", "").lower() != expected_router.lower():
+        raise AssertionError("router interaction target mismatch")
 
 
 def main() -> int:
@@ -306,12 +291,7 @@ def main() -> int:
         return 1
 
     try:
-        validate_encode_response(
-            encode_response,
-            pool_first["pool"],
-            pool_second["pool"],
-            tycho_router,
-        )
+        validate_encode_response(encode_response, tycho_router)
     except AssertionError as exc:
         print(f"[FAIL] encode response validation failed: {exc}")
         return 1
@@ -319,7 +299,7 @@ def main() -> int:
     if args.verbose:
         print(json.dumps(encode_response, indent=2))
 
-    print(f"[OK] encode route {elapsed:.3f}s calls=2")
+    print(f"[OK] encode route {elapsed:.3f}s interactions=3")
     return 0
 
 

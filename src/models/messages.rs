@@ -149,38 +149,21 @@ pub struct RouteEncodeRequest {
     pub request_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Approval {
-    pub token: String,
-    pub spender: String,
-    pub amount: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reset_to_zero: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub enum ExecutionCallKind {
-    #[serde(rename = "TYCHO_SINGLE_SWAP")]
-    TychoSingleSwap,
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionKind {
+    #[serde(rename = "ERC20_APPROVE")]
+    Erc20Approve,
+    #[serde(rename = "CALL")]
+    Call,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecutionCall {
-    pub index: u32,
+pub struct Interaction {
+    pub kind: InteractionKind,
     pub target: String,
     pub value: String,
     pub calldata: String,
-    pub approvals: Vec<Approval>,
-    pub kind: ExecutionCallKind,
-    pub hop_path: String,
-    pub pool: PoolRef,
-    pub token_in: String,
-    pub token_out: String,
-    pub amount_in: String,
-    pub min_amount_out: String,
-    pub expected_amount_out: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -262,26 +245,16 @@ pub struct NormalizedRoute {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteEncodeResponse {
-    pub schema_version: String,
     pub chain_id: u64,
     pub token_in: String,
     pub token_out: String,
     pub amount_in: String,
     pub swap_kind: SwapKind,
     pub normalized_route: NormalizedRoute,
-    pub calls: Vec<ExecutionCall>,
-    pub calldata: RouteCalldata,
+    pub interactions: Vec<Interaction>,
     pub totals: RouteTotals,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<RouteDebug>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RouteCalldata {
-    pub target: String,
-    pub value: String,
-    pub data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -27,13 +27,12 @@ use tycho_simulation::{
 };
 
 use crate::models::messages::{
-    Approval, ExecutionCall, ExecutionCallKind, Hop, NormalizedRoute, PoolRef, PoolSwap,
-    PoolSwapDraft, ResimulationDebug, RouteCalldata, RouteDebug, RouteEncodeRequest,
-    RouteEncodeResponse, RouteTotals, Segment, SegmentDraft, SwapKind, TenderlyDebug,
+    Hop, Interaction, InteractionKind, NormalizedRoute, PoolRef, PoolSwap, PoolSwapDraft,
+    ResimulationDebug, RouteDebug, RouteEncodeRequest, RouteEncodeResponse, RouteTotals, Segment,
+    SegmentDraft, SwapKind, TenderlyDebug,
 };
 use crate::models::state::AppState;
 
-const SCHEMA_VERSION: &str = "latest";
 const BPS_DENOMINATOR: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,17 +200,11 @@ pub async fn encode_route(
     let token_out = parse_address(&request.token_out)?;
     let amount_in = parse_amount(&request.amount_in)?;
     let router_address = parse_address(&request.tycho_router_address)?;
+    ensure_erc20_tokens(chain, &token_in, &token_out)?;
 
     let normalized = normalize_route(&request, &token_in, &token_out, &amount_in)?;
     let resimulated = resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
     let encoder = build_encoder(chain, router_address.clone())?;
-    let calls = build_execution_calls(
-        &request,
-        chain,
-        &router_address,
-        &resimulated,
-        encoder.as_ref(),
-    )?;
     let (expected_total, min_total) = compute_totals(&resimulated);
     let route_context = RouteContext {
         request: &request,
@@ -221,8 +214,9 @@ pub async fn encode_route(
         amount_in: &amount_in,
         router_address: &router_address,
     };
-    let calldata =
+    let router_call =
         build_route_calldata_tx(&route_context, &resimulated, encoder.as_ref(), &min_total)?;
+    let interactions = build_settlement_interactions(&token_in, &amount_in, router_call)?;
 
     let normalized_route = build_normalized_route_response(&resimulated);
     let totals = RouteTotals {
@@ -230,18 +224,16 @@ pub async fn encode_route(
         min_amount_out: min_total.to_str_radix(10),
     };
 
-    let debug = build_debug(&state, &request, &calls).await;
+    let debug = build_debug(&state, &request, &interactions).await;
 
     Ok(RouteEncodeResponse {
-        schema_version: SCHEMA_VERSION.to_string(),
         chain_id: request.chain_id,
         token_in: format_address(&token_in),
         token_out: format_address(&token_out),
         amount_in: amount_in.to_str_radix(10),
         swap_kind: request.swap_kind,
         normalized_route,
-        calls,
-        calldata,
+        interactions,
         totals,
         debug,
     })
@@ -266,6 +258,20 @@ fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
         )));
     }
     Ok(chain)
+}
+
+fn ensure_erc20_tokens(
+    chain: Chain,
+    token_in: &Bytes,
+    token_out: &Bytes,
+) -> Result<(), EncodeError> {
+    let native = chain.native_token().address;
+    if *token_in == native || *token_out == native {
+        return Err(EncodeError::invalid(
+            "Native tokenIn/tokenOut not supported for settlement encoding; use wrapped native token instead",
+        ));
+    }
+    Ok(())
 }
 
 fn infer_route_kind(segments: &[SegmentDraft]) -> SwapKind {
@@ -747,24 +753,12 @@ fn build_encoder(
         .map_err(|err| EncodeError::encoding(format!("Failed to build Tycho encoder: {}", err)))
 }
 
-fn build_execution_calls(
-    request: &RouteEncodeRequest,
-    chain: Chain,
-    router_address: &Bytes,
-    resimulated: &ResimulatedRouteInternal,
-    encoder: &dyn TychoEncoder,
-) -> Result<Vec<ExecutionCall>, EncodeError> {
-    build_execution_calls_with(resimulated, |swap, _hop| {
-        encode_single_swap_call(chain, router_address, encoder, request, swap)
-    })
-}
-
 fn build_route_calldata_tx(
     context: &RouteContext<'_>,
     resimulated: &ResimulatedRouteInternal,
     encoder: &dyn TychoEncoder,
     min_amount_out: &BigUint,
-) -> Result<RouteCalldata, EncodeError> {
+) -> Result<CallDataPayload, EncodeError> {
     let native_address = context.chain.native_token().address;
     let wrapped_address = context.chain.wrapped_native_token().address;
     let is_wrap = context.token_in == &native_address;
@@ -834,11 +828,56 @@ fn build_route_calldata_tx(
         BigUint::zero()
     };
 
-    Ok(RouteCalldata {
-        target: format_address(&encoded_solution.interacting_with),
-        value: value.to_str_radix(10),
-        data: format_calldata(&calldata),
+    Ok(CallDataPayload {
+        target: encoded_solution.interacting_with,
+        value,
+        calldata,
     })
+}
+
+fn build_settlement_interactions(
+    token_in: &Bytes,
+    amount_in: &BigUint,
+    router_call: CallDataPayload,
+) -> Result<Vec<Interaction>, EncodeError> {
+    // Reset-then-approve is required for allowance-reset tokens like USDT.
+    let reset_approval =
+        build_erc20_approve_interaction(token_in, &router_call.target, &BigUint::zero())?;
+    let set_approval = build_erc20_approve_interaction(token_in, &router_call.target, amount_in)?;
+    let router_interaction = Interaction {
+        kind: InteractionKind::Call,
+        target: format_address(&router_call.target),
+        value: router_call.value.to_str_radix(10),
+        calldata: format_calldata(&router_call.calldata),
+    };
+
+    Ok(vec![reset_approval, set_approval, router_interaction])
+}
+
+const ERC20_APPROVE_SIGNATURE: &str = "approve(address,uint256)";
+
+fn build_erc20_approve_interaction(
+    token: &Bytes,
+    spender: &Bytes,
+    amount: &BigUint,
+) -> Result<Interaction, EncodeError> {
+    let calldata = encode_erc20_approve_calldata(spender, amount)?;
+    Ok(Interaction {
+        kind: InteractionKind::Erc20Approve,
+        target: format_address(token),
+        value: "0".to_string(),
+        calldata: format_calldata(&calldata),
+    })
+}
+
+fn encode_erc20_approve_calldata(
+    spender: &Bytes,
+    amount: &BigUint,
+) -> Result<Vec<u8>, EncodeError> {
+    let spender = bytes_to_address(spender).map_err(map_encoding_error)?;
+    let amount = biguint_to_u256(amount);
+    let calldata_args = (spender, amount).abi_encode();
+    encode_function_call(ERC20_APPROVE_SIGNATURE, calldata_args)
 }
 
 fn build_route_swaps(
@@ -996,198 +1035,6 @@ fn encode_route_calldata(
     encode_function_call(signature, calldata_args)
 }
 
-fn build_execution_calls_with<F>(
-    resimulated: &ResimulatedRouteInternal,
-    mut build_call: F,
-) -> Result<Vec<ExecutionCall>, EncodeError>
-where
-    F: FnMut(
-        &ResimulatedSwapInternal,
-        &ResimulatedHopInternal,
-    ) -> Result<CallDataPayload, EncodeError>,
-{
-    let mut calls = Vec::new();
-    let mut index: u32 = 0;
-
-    for (segment_index, segment) in resimulated.segments.iter().enumerate() {
-        for (hop_index, hop) in segment.hops.iter().enumerate() {
-            for swap in &hop.swaps {
-                let calldata_payload = build_call(swap, hop)?;
-                let approvals =
-                    build_approvals(&swap.token_in, &calldata_payload.target, &swap.amount_in);
-
-                calls.push(ExecutionCall {
-                    index,
-                    target: format_address(&calldata_payload.target),
-                    value: calldata_payload.value.to_str_radix(10),
-                    calldata: format_calldata(&calldata_payload.calldata),
-                    approvals,
-                    kind: ExecutionCallKind::TychoSingleSwap,
-                    hop_path: format!("segment[{}].hop[{}]", segment_index, hop_index),
-                    pool: swap.pool.clone(),
-                    token_in: format_address(&swap.token_in),
-                    token_out: format_address(&swap.token_out),
-                    amount_in: swap.amount_in.to_str_radix(10),
-                    min_amount_out: swap.min_amount_out.to_str_radix(10),
-                    expected_amount_out: swap.expected_amount_out.to_str_radix(10),
-                });
-                index = index.saturating_add(1);
-            }
-        }
-    }
-
-    Ok(calls)
-}
-
-fn encode_single_swap_call(
-    chain: Chain,
-    router_address: &Bytes,
-    encoder: &dyn TychoEncoder,
-    request: &RouteEncodeRequest,
-    swap: &ResimulatedSwapInternal,
-) -> Result<CallDataPayload, EncodeError> {
-    let native_address = chain.native_token().address;
-    let wrapped_address = chain.wrapped_native_token().address;
-    let is_wrap = swap.token_in == native_address;
-    let is_unwrap = swap.token_out == native_address;
-    if is_wrap && is_unwrap {
-        return Err(EncodeError::invalid(
-            "Native-to-native swaps are not supported",
-        ));
-    }
-
-    // TychoRouter wraps/unwraps native ETH, but pool swap data expects WETH.
-    let swap_token_in = if is_wrap {
-        wrapped_address.clone()
-    } else {
-        swap.token_in.clone()
-    };
-    let swap_token_out = if is_unwrap {
-        wrapped_address.clone()
-    } else {
-        swap.token_out.clone()
-    };
-
-    let common_component: CommonProtocolComponent = swap.component.as_ref().clone().into();
-    let swap_data = Swap::new(
-        common_component,
-        swap_token_in.clone(),
-        swap_token_out.clone(),
-        0.0,
-        None,
-        Some(Arc::clone(&swap.pool_state)),
-        None,
-    );
-
-    let native_action = if is_wrap {
-        Some(NativeAction::Wrap)
-    } else if is_unwrap {
-        Some(NativeAction::Unwrap)
-    } else {
-        None
-    };
-
-    let sender = parse_address(&request.settlement_address)?;
-    let receiver = sender.clone();
-
-    let solution = Solution {
-        sender,
-        receiver: receiver.clone(),
-        given_token: swap.token_in.clone(),
-        given_amount: swap.amount_in.clone(),
-        checked_token: swap.token_out.clone(),
-        exact_out: false,
-        checked_amount: swap.min_amount_out.clone(),
-        swaps: vec![swap_data],
-        native_action,
-    };
-
-    let encoded_solution = encoder
-        .encode_solutions(vec![solution.clone()])
-        .map_err(|err| EncodeError::encoding(format!("Swap encoding failed: {}", err)))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| EncodeError::encoding("Swap encoding returned no solutions"))?;
-
-    ensure_single_swap_signature(&encoded_solution)?;
-
-    if &encoded_solution.interacting_with != router_address {
-        return Err(EncodeError::encoding(
-            "Encoded router address does not match request tychoRouterAddress",
-        ));
-    }
-
-    let is_transfer_from_allowed = !is_wrap;
-    let calldata = encode_single_swap_calldata(
-        &encoded_solution,
-        swap,
-        &receiver,
-        is_wrap,
-        is_unwrap,
-        is_transfer_from_allowed,
-    )?;
-
-    Ok(CallDataPayload {
-        target: encoded_solution.interacting_with,
-        value: if is_wrap {
-            swap.amount_in.clone()
-        } else {
-            BigUint::zero()
-        },
-        calldata,
-    })
-}
-
-fn encode_single_swap_calldata(
-    encoded_solution: &EncodedSolution,
-    swap: &ResimulatedSwapInternal,
-    receiver: &Bytes,
-    is_wrap: bool,
-    is_unwrap: bool,
-    is_transfer_from_allowed: bool,
-) -> Result<Vec<u8>, EncodeError> {
-    let calldata_args = (
-        biguint_to_u256(&swap.amount_in),
-        bytes_to_address(&swap.token_in).map_err(map_encoding_error)?,
-        bytes_to_address(&swap.token_out).map_err(map_encoding_error)?,
-        biguint_to_u256(&swap.min_amount_out),
-        is_wrap,
-        is_unwrap,
-        bytes_to_address(receiver).map_err(map_encoding_error)?,
-        is_transfer_from_allowed,
-        encoded_solution.swaps.clone(),
-    )
-        .abi_encode();
-
-    encode_function_call(&encoded_solution.function_signature, calldata_args)
-}
-
-const EXPECTED_SINGLE_SWAP_SIGNATURE: &str =
-    "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
-
-fn ensure_single_swap_signature(encoded_solution: &EncodedSolution) -> Result<(), EncodeError> {
-    let signature = encoded_solution.function_signature.as_str();
-    let normalized_signature: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
-
-    if encoded_solution.permit.is_some()
-        || normalized_signature.contains("Permit2")
-        || normalized_signature.contains("permit2")
-    {
-        return Err(EncodeError::encoding(
-            "Permit2 encodings are not supported for singleSwap calls",
-        ));
-    }
-
-    if normalized_signature != EXPECTED_SINGLE_SWAP_SIGNATURE {
-        return Err(EncodeError::encoding(format!(
-            "Unsupported Tycho function signature: {}",
-            signature
-        )));
-    }
-
-    Ok(())
-}
-
 fn encode_function_call(
     signature: &str,
     mut encoded_args: Vec<u8>,
@@ -1223,18 +1070,6 @@ fn function_selector(signature: &str) -> Result<[u8; 4], EncodeError> {
 
 fn map_encoding_error(err: EncodingError) -> EncodeError {
     EncodeError::encoding(format!("Tycho encoding error: {err}"))
-}
-
-fn build_approvals(token_in: &Bytes, spender: &Bytes, amount_in: &BigUint) -> Vec<Approval> {
-    if is_native(token_in) {
-        return Vec::new();
-    }
-    vec![Approval {
-        token: format_address(token_in),
-        spender: format_address(spender),
-        amount: amount_in.to_str_radix(10),
-        reset_to_zero: None,
-    }]
 }
 
 fn build_normalized_route_response(resimulated: &ResimulatedRouteInternal) -> NormalizedRoute {
@@ -1279,7 +1114,7 @@ fn build_normalized_route_response(resimulated: &ResimulatedRouteInternal) -> No
 async fn build_debug(
     state: &AppState,
     request: &RouteEncodeRequest,
-    calls: &[ExecutionCall],
+    interactions: &[Interaction],
 ) -> Option<RouteDebug> {
     let mut debug = RouteDebug {
         request_id: request.request_id.clone(),
@@ -1295,7 +1130,7 @@ async fn build_debug(
 
     if request.enable_tenderly_sim.unwrap_or(false) {
         match TenderlyConfig::from_env() {
-            Some(config) => match simulate_tenderly_bundle(request, calls, &config).await {
+            Some(config) => match simulate_tenderly_bundle(request, interactions, &config).await {
                 Ok(tenderly) => {
                     debug.tenderly = Some(tenderly);
                 }
@@ -1367,10 +1202,6 @@ fn format_calldata(data: &[u8]) -> String {
     format_0x_hex(&format!("{bytes:x}"))
 }
 
-fn is_native(address: &Bytes) -> bool {
-    *address == Chain::Ethereum.native_token().address
-}
-
 fn map_swap_token(address: &Bytes, chain: Chain) -> Bytes {
     if *address == chain.native_token().address {
         chain.wrapped_native_token().address
@@ -1419,28 +1250,28 @@ impl TenderlyConfig {
 
 async fn simulate_tenderly_bundle(
     request: &RouteEncodeRequest,
-    calls: &[ExecutionCall],
+    interactions: &[Interaction],
     config: &TenderlyConfig,
 ) -> Result<TenderlyDebug, EncodeError> {
-    if calls.is_empty() {
+    if interactions.is_empty() {
         return Ok(TenderlyDebug {
             simulation_url: None,
             simulation_id: None,
         });
     }
 
-    let simulations: Vec<Value> = calls
+    let simulations: Vec<Value> = interactions
         .iter()
-        .map(|call| {
-            let value_json = tenderly_value_json(&call.value)?;
+        .map(|interaction| {
+            let value_json = tenderly_value_json(&interaction.value)?;
             Ok(json!({
                 "network_id": request.chain_id.to_string(),
                 "save": true,
                 "save_if_fails": true,
                 "simulation_type": config.simulation_type,
                 "from": request.settlement_address,
-                "to": call.target,
-                "input": call.calldata,
+                "to": interaction.target,
+                "input": interaction.calldata,
                 "gas": config.gas,
                 "gas_price": 0,
                 "value": value_json,
@@ -1814,272 +1645,51 @@ mod tests {
     }
 
     #[test]
-    fn build_calls_ordering_for_mega_route() {
-        let resimulated = ResimulatedRouteInternal {
-            segments: vec![
-                ResimulatedSegmentInternal {
-                    kind: SwapKind::SimpleSwap,
-                    share_bps: 2000,
-                    amount_in: BigUint::from(20u32),
-                    expected_amount_out: BigUint::from(2u32),
-                    min_amount_out: BigUint::from(1u32),
-                    hops: vec![ResimulatedHopInternal {
-                        token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
-                            .unwrap(),
-                        token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
-                            .unwrap(),
-                        amount_in: BigUint::from(20u32),
-                        expected_amount_out: BigUint::from(2u32),
-                        min_amount_out: BigUint::from(1u32),
-                        swaps: vec![
-                            ResimulatedSwapInternal {
-                                pool: pool_ref("p1"),
-                                token_in: Bytes::from_str(
-                                    "0x0000000000000000000000000000000000000001",
-                                )
-                                .unwrap(),
-                                token_out: Bytes::from_str(
-                                    "0x0000000000000000000000000000000000000002",
-                                )
-                                .unwrap(),
-                                split_bps: 5000,
-                                amount_in: BigUint::from(10u32),
-                                expected_amount_out: BigUint::from(1u32),
-                                min_amount_out: BigUint::from(1u32),
-                                pool_state: Arc::new(MockProtocolSim {}),
-                                component: Arc::new(dummy_component()),
-                            },
-                            ResimulatedSwapInternal {
-                                pool: pool_ref("p2"),
-                                token_in: Bytes::from_str(
-                                    "0x0000000000000000000000000000000000000001",
-                                )
-                                .unwrap(),
-                                token_out: Bytes::from_str(
-                                    "0x0000000000000000000000000000000000000002",
-                                )
-                                .unwrap(),
-                                split_bps: 5000,
-                                amount_in: BigUint::from(10u32),
-                                expected_amount_out: BigUint::from(1u32),
-                                min_amount_out: BigUint::from(1u32),
-                                pool_state: Arc::new(MockProtocolSim {}),
-                                component: Arc::new(dummy_component()),
-                            },
-                        ],
-                    }],
-                },
-                ResimulatedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
-                    share_bps: 6000,
-                    amount_in: BigUint::from(60u32),
-                    expected_amount_out: BigUint::from(6u32),
-                    min_amount_out: BigUint::from(5u32),
-                    hops: vec![
-                        ResimulatedHopInternal {
-                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
-                                .unwrap(),
-                            token_out: Bytes::from_str(
-                                "0x0000000000000000000000000000000000000003",
-                            )
-                            .unwrap(),
-                            amount_in: BigUint::from(60u32),
-                            expected_amount_out: BigUint::from(3u32),
-                            min_amount_out: BigUint::from(2u32),
-                            swaps: vec![dummy_swap("p3"), dummy_swap("p4")],
-                        },
-                        ResimulatedHopInternal {
-                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000003")
-                                .unwrap(),
-                            token_out: Bytes::from_str(
-                                "0x0000000000000000000000000000000000000002",
-                            )
-                            .unwrap(),
-                            amount_in: BigUint::from(3u32),
-                            expected_amount_out: BigUint::from(3u32),
-                            min_amount_out: BigUint::from(3u32),
-                            swaps: vec![dummy_swap("p5"), dummy_swap("p6")],
-                        },
-                    ],
-                },
-                ResimulatedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
-                    share_bps: 2000,
-                    amount_in: BigUint::from(20u32),
-                    expected_amount_out: BigUint::from(2u32),
-                    min_amount_out: BigUint::from(1u32),
-                    hops: vec![
-                        ResimulatedHopInternal {
-                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
-                                .unwrap(),
-                            token_out: Bytes::from_str(
-                                "0x0000000000000000000000000000000000000004",
-                            )
-                            .unwrap(),
-                            amount_in: BigUint::from(20u32),
-                            expected_amount_out: BigUint::from(2u32),
-                            min_amount_out: BigUint::from(1u32),
-                            swaps: vec![dummy_swap("p7"), dummy_swap("p8")],
-                        },
-                        ResimulatedHopInternal {
-                            token_in: Bytes::from_str("0x0000000000000000000000000000000000000004")
-                                .unwrap(),
-                            token_out: Bytes::from_str(
-                                "0x0000000000000000000000000000000000000002",
-                            )
-                            .unwrap(),
-                            amount_in: BigUint::from(2u32),
-                            expected_amount_out: BigUint::from(2u32),
-                            min_amount_out: BigUint::from(1u32),
-                            swaps: vec![dummy_swap("p9"), dummy_swap("p10")],
-                        },
-                    ],
-                },
-            ],
-        };
+    fn ensure_erc20_tokens_rejects_native() {
+        let native = Chain::Ethereum.native_token().address;
+        let erc20 = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
 
-        let calls = build_execution_calls_with(&resimulated, |_swap, _hop| {
-            Ok(CallDataPayload {
-                target: Bytes::from_str("0x0000000000000000000000000000000000000005").unwrap(),
-                value: BigUint::zero(),
-                calldata: vec![0x01],
-            })
-        })
-        .unwrap();
-
-        assert_eq!(calls.len(), 10);
-        assert_eq!(calls[0].hop_path, "segment[0].hop[0]");
-        assert_eq!(calls[1].hop_path, "segment[0].hop[0]");
-        assert_eq!(calls[2].hop_path, "segment[1].hop[0]");
-        assert_eq!(calls[3].hop_path, "segment[1].hop[0]");
-        assert_eq!(calls[4].hop_path, "segment[1].hop[1]");
-        assert_eq!(calls[5].hop_path, "segment[1].hop[1]");
-        assert_eq!(calls[6].hop_path, "segment[2].hop[0]");
-        assert_eq!(calls[7].hop_path, "segment[2].hop[0]");
-        assert_eq!(calls[8].hop_path, "segment[2].hop[1]");
-        assert_eq!(calls[9].hop_path, "segment[2].hop[1]");
-    }
-
-    #[test]
-    fn encode_single_swap_call_sets_value_for_native() {
-        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
-        let encoder = MockTychoEncoder::new(
-            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
-            router.clone(),
-        );
-
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000000".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: format_address(&router),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            enable_tenderly_sim: None,
-            request_id: None,
-        };
-
-        let swap = ResimulatedSwapInternal {
-            pool: pool_ref("p1"),
-            token_in: Chain::Ethereum.native_token().address,
-            token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-            split_bps: 10_000,
-            amount_in: BigUint::from(10u32),
-            expected_amount_out: BigUint::from(9u32),
-            min_amount_out: BigUint::from(8u32),
-            pool_state: Arc::new(MockProtocolSim {}),
-            component: Arc::new(dummy_component()),
-        };
-
-        let payload =
-            encode_single_swap_call(Chain::Ethereum, &router, &encoder, &request, &swap).unwrap();
-
-        assert_eq!(payload.value, BigUint::from(10u32));
-        let selector = function_selector(
-            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
-        )
-        .unwrap();
-        assert_eq!(&payload.calldata[..4], &selector);
-    }
-
-    #[test]
-    fn encode_single_swap_call_rejects_permit2() {
-        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
-        let encoder = MockTychoEncoder::new(
-            "singleSwapPermit2(uint256,address,address,uint256,bool,bool,address,(uint256),bytes)",
-            router.clone(),
-        );
-
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: format_address(&router),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            enable_tenderly_sim: None,
-            request_id: None,
-        };
-
-        let swap = ResimulatedSwapInternal {
-            pool: pool_ref("p1"),
-            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-            token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-            split_bps: 10_000,
-            amount_in: BigUint::from(10u32),
-            expected_amount_out: BigUint::from(9u32),
-            min_amount_out: BigUint::from(8u32),
-            pool_state: Arc::new(MockProtocolSim {}),
-            component: Arc::new(dummy_component()),
-        };
-
-        match encode_single_swap_call(Chain::Ethereum, &router, &encoder, &request, &swap) {
-            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::Encoding),
-            Ok(_) => panic!("permit2 should be rejected"),
+        match ensure_erc20_tokens(Chain::Ethereum, &native, &erc20) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
+            Ok(_) => panic!("native token should be rejected for settlement encoding"),
         }
     }
 
     #[test]
-    fn encode_single_swap_call_rejects_unknown_signature() {
-        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
-        let encoder = MockTychoEncoder::new(
-            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes32)",
-            router.clone(),
+    fn build_settlement_interactions_orders_approvals_then_router_call() {
+        let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let amount_in = BigUint::from(10u32);
+        let router_call = CallDataPayload {
+            target: router.clone(),
+            value: BigUint::zero(),
+            calldata: vec![0x11, 0x22, 0x33],
+        };
+
+        let interactions =
+            build_settlement_interactions(&token_in, &amount_in, router_call).unwrap();
+
+        assert_eq!(interactions.len(), 3);
+        assert_eq!(interactions[0].kind, InteractionKind::Erc20Approve);
+        assert_eq!(interactions[1].kind, InteractionKind::Erc20Approve);
+        assert_eq!(interactions[2].kind, InteractionKind::Call);
+        assert_eq!(interactions[0].target, format_address(&token_in));
+        assert_eq!(interactions[2].target, format_address(&router));
+
+        let selector = function_selector(ERC20_APPROVE_SIGNATURE).unwrap();
+        let expected_prefix = format!("0x{}", alloy_primitives::hex::encode(selector));
+        assert!(
+            interactions[0].calldata.starts_with(&expected_prefix),
+            "approval calldata should start with selector"
         );
-
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: format_address(&router),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            enable_tenderly_sim: None,
-            request_id: None,
-        };
-
-        let swap = ResimulatedSwapInternal {
-            pool: pool_ref("p1"),
-            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-            token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-            split_bps: 10_000,
-            amount_in: BigUint::from(10u32),
-            expected_amount_out: BigUint::from(9u32),
-            min_amount_out: BigUint::from(8u32),
-            pool_state: Arc::new(MockProtocolSim {}),
-            component: Arc::new(dummy_component()),
-        };
-
-        match encode_single_swap_call(Chain::Ethereum, &router, &encoder, &request, &swap) {
-            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::Encoding),
-            Ok(_) => panic!("unknown signature should be rejected"),
-        }
+        assert!(
+            interactions[1].calldata.starts_with(&expected_prefix),
+            "approval calldata should start with selector"
+        );
+        assert_eq!(
+            interactions[2].calldata,
+            format_calldata(&[0x11, 0x22, 0x33])
+        );
     }
 
     #[test]
@@ -2152,17 +1762,13 @@ mod tests {
             build_route_calldata_tx(&context, &resimulated, &encoder, &BigUint::from(8u32))
                 .unwrap();
 
-        assert_eq!(calldata.target, format_address(&router));
-        assert_eq!(calldata.value, "0");
+        assert_eq!(calldata.target, router);
+        assert_eq!(calldata.value, BigUint::zero());
         let selector = function_selector(
             "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
         )
         .unwrap();
-        let expected_prefix = format!("0x{}", alloy_primitives::hex::encode(selector));
-        assert!(
-            calldata.data.starts_with(&expected_prefix),
-            "route calldata should start with selector"
-        );
+        assert_eq!(&calldata.calldata[..4], &selector);
     }
 
     #[test]
@@ -2225,20 +1831,6 @@ mod tests {
         assert_eq!(swaps.len(), 2);
         assert!(swaps[0].split > 0.0);
         assert_eq!(swaps[1].split, 0.0);
-    }
-
-    fn dummy_swap(id: &str) -> ResimulatedSwapInternal {
-        ResimulatedSwapInternal {
-            pool: pool_ref(id),
-            token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-            token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-            split_bps: 5000,
-            amount_in: BigUint::from(1u32),
-            expected_amount_out: BigUint::from(1u32),
-            min_amount_out: BigUint::from(1u32),
-            pool_state: Arc::new(MockProtocolSim {}),
-            component: Arc::new(dummy_component()),
-        }
     }
 
     fn dummy_component() -> ProtocolComponent {
