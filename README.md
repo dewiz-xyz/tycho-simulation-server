@@ -125,7 +125,7 @@ Notes:
 - `settlementAddress` and `tychoRouterAddress` are required.
 - `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
 - Every pool swap must include `amountIn` and `minAmountOut` (already slippage-adjusted by the client).
-- The response is `RouteEncodeResponse` with `schemaVersion`, `normalizedRoute`, `calls`, `calldata`, and `totals`.
+- The response is `RouteEncodeResponse` (latest spec) with `normalizedRoute`, `calls`, `calldata`, and `totals`.
 - Errors return 4xx/5xx with `{ error, requestId }`.
 
 Example request (shape only):

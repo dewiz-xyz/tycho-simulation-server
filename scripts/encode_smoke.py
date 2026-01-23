@@ -87,7 +87,7 @@ def validate_encode_response(
     pool_second: str,
     expected_router: str,
 ) -> None:
-    if response.get("schemaVersion") != "2026-01-22":
+    if response.get("schemaVersion") != "latest":
         raise AssertionError("schemaVersion mismatch")
     if response.get("swapKind") != "MultiSwap":
         raise AssertionError("swapKind mismatch")

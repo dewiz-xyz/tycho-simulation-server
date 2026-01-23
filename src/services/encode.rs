@@ -33,7 +33,7 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 
-const SCHEMA_VERSION: &str = "2026-01-22";
+const SCHEMA_VERSION: &str = "latest";
 const BPS_DENOMINATOR: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 # /encode example (RouteEncodeRequest)
 
-This document shows the **v2026-01-22** `/encode` schema. The values are representative examples (shape-focused), not a verbatim capture.
+This document shows the **latest** `/encode` schema. The values are representative examples (shape-focused), not a verbatim capture.
 
 ## How this was built
 
@@ -69,7 +69,7 @@ This document shows the **v2026-01-22** `/encode` schema. The values are represe
 
 ```json
 {
-  "schemaVersion": "2026-01-22",
+  "schemaVersion": "latest",
   "chainId": 1,
   "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
