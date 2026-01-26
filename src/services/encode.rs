@@ -925,10 +925,19 @@ fn build_route_swaps(
     wrapped_address: &Bytes,
 ) -> Result<Vec<Swap>, EncodeError> {
     let mut ordered_swaps = Vec::new();
-    for segment in &resimulated.segments {
-        for hop in &segment.hops {
-            for swap in &hop.swaps {
-                ordered_swaps.push(swap);
+    // Order swaps by hop depth across segments so split sets match token availability.
+    let max_hops = resimulated
+        .segments
+        .iter()
+        .map(|segment| segment.hops.len())
+        .max()
+        .unwrap_or(0);
+    for hop_index in 0..max_hops {
+        for segment in &resimulated.segments {
+            if let Some(hop) = segment.hops.get(hop_index) {
+                for swap in &hop.swaps {
+                    ordered_swaps.push(swap);
+                }
             }
         }
     }
@@ -2084,6 +2093,128 @@ mod tests {
         assert_eq!(swaps.len(), 2);
         assert!(swaps[0].split > 0.0);
         assert_eq!(swaps[1].split, 0.0);
+    }
+
+    #[test]
+    fn build_route_swaps_orders_by_hop_depth_with_shared_intermediate() {
+        let token_a = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let token_b = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let token_c = Bytes::from_str("0x0000000000000000000000000000000000000003").unwrap();
+        let token_d = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
+        let pool_state: Arc<dyn ProtocolSim> = Arc::new(MockProtocolSim {});
+        let component = Arc::new(dummy_component());
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![
+                ResimulatedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
+                    share_bps: 6_000,
+                    amount_in: BigUint::from(60u32),
+                    expected_amount_out: BigUint::from(55u32),
+                    min_amount_out: BigUint::from(50u32),
+                    hops: vec![
+                        ResimulatedHopInternal {
+                            token_in: token_a.clone(),
+                            token_out: token_b.clone(),
+                            amount_in: BigUint::from(60u32),
+                            expected_amount_out: BigUint::from(58u32),
+                            min_amount_out: BigUint::from(56u32),
+                            swaps: vec![ResimulatedSwapInternal {
+                                pool: pool_ref("p1"),
+                                token_in: token_a.clone(),
+                                token_out: token_b.clone(),
+                                split_bps: 6_000,
+                                amount_in: BigUint::from(60u32),
+                                expected_amount_out: BigUint::from(58u32),
+                                min_amount_out: BigUint::from(56u32),
+                                pool_state: Arc::clone(&pool_state),
+                                component: Arc::clone(&component),
+                            }],
+                        },
+                        ResimulatedHopInternal {
+                            token_in: token_b.clone(),
+                            token_out: token_c.clone(),
+                            amount_in: BigUint::from(60u32),
+                            expected_amount_out: BigUint::from(55u32),
+                            min_amount_out: BigUint::from(50u32),
+                            swaps: vec![ResimulatedSwapInternal {
+                                pool: pool_ref("p2"),
+                                token_in: token_b.clone(),
+                                token_out: token_c.clone(),
+                                split_bps: 6_000,
+                                amount_in: BigUint::from(60u32),
+                                expected_amount_out: BigUint::from(55u32),
+                                min_amount_out: BigUint::from(50u32),
+                                pool_state: Arc::clone(&pool_state),
+                                component: Arc::clone(&component),
+                            }],
+                        },
+                    ],
+                },
+                ResimulatedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
+                    share_bps: 4_000,
+                    amount_in: BigUint::from(40u32),
+                    expected_amount_out: BigUint::from(37u32),
+                    min_amount_out: BigUint::from(34u32),
+                    hops: vec![
+                        ResimulatedHopInternal {
+                            token_in: token_a.clone(),
+                            token_out: token_b.clone(),
+                            amount_in: BigUint::from(40u32),
+                            expected_amount_out: BigUint::from(39u32),
+                            min_amount_out: BigUint::from(38u32),
+                            swaps: vec![ResimulatedSwapInternal {
+                                pool: pool_ref("p3"),
+                                token_in: token_a.clone(),
+                                token_out: token_b.clone(),
+                                split_bps: 4_000,
+                                amount_in: BigUint::from(40u32),
+                                expected_amount_out: BigUint::from(39u32),
+                                min_amount_out: BigUint::from(38u32),
+                                pool_state: Arc::clone(&pool_state),
+                                component: Arc::clone(&component),
+                            }],
+                        },
+                        ResimulatedHopInternal {
+                            token_in: token_b.clone(),
+                            token_out: token_d.clone(),
+                            amount_in: BigUint::from(40u32),
+                            expected_amount_out: BigUint::from(37u32),
+                            min_amount_out: BigUint::from(34u32),
+                            swaps: vec![ResimulatedSwapInternal {
+                                pool: pool_ref("p4"),
+                                token_in: token_b.clone(),
+                                token_out: token_d.clone(),
+                                split_bps: 4_000,
+                                amount_in: BigUint::from(40u32),
+                                expected_amount_out: BigUint::from(37u32),
+                                min_amount_out: BigUint::from(34u32),
+                                pool_state: Arc::clone(&pool_state),
+                                component: Arc::clone(&component),
+                            }],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let native = Chain::Ethereum.native_token().address;
+        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let swaps = build_route_swaps(&resimulated, false, false, &native, &wrapped).unwrap();
+
+        assert_eq!(swaps.len(), 4);
+        assert_eq!(swaps[0].token_in, token_a);
+        assert_eq!(swaps[0].token_out, token_b);
+        assert_eq!(swaps[1].token_in, token_a);
+        assert_eq!(swaps[1].token_out, token_b);
+        assert_eq!(swaps[2].token_in, token_b);
+        assert_eq!(swaps[2].token_out, token_c);
+        assert_eq!(swaps[3].token_in, token_b);
+        assert_eq!(swaps[3].token_out, token_d);
+        assert!((swaps[0].split - 0.6).abs() < 1e-9);
+        assert_eq!(swaps[1].split, 0.0);
+        assert!((swaps[2].split - 0.6).abs() < 1e-9);
+        assert_eq!(swaps[3].split, 0.0);
     }
 
     fn dummy_component() -> ProtocolComponent {
