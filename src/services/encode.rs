@@ -202,7 +202,8 @@ pub async fn encode_route(
     let router_address = parse_address(&request.tycho_router_address)?;
     ensure_erc20_tokens(chain, &token_in, &token_out)?;
 
-    let normalized = normalize_route(&request, &token_in, &token_out, &amount_in)?;
+    let native_address = chain.native_token().address;
+    let normalized = normalize_route(&request, &token_in, &token_out, &amount_in, &native_address)?;
     let resimulated = resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
     let encoder = build_encoder(chain, router_address.clone())?;
     let (expected_total, min_total) = compute_totals(&resimulated);
@@ -342,6 +343,7 @@ fn normalize_route(
     request_token_in: &Bytes,
     request_token_out: &Bytes,
     total_amount_in: &BigUint,
+    native_address: &Bytes,
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
@@ -368,7 +370,7 @@ fn normalize_route(
         let hops = segment
             .hops
             .iter()
-            .map(normalize_hop)
+            .map(|hop| normalize_hop(hop, native_address))
             .collect::<Result<Vec<_>, _>>()?;
 
         let first_hop = hops.first().ok_or_else(|| {
@@ -483,6 +485,7 @@ fn validate_hop_continuity(
 
 fn normalize_hop(
     hop: &crate::models::messages::HopDraft,
+    native_address: &Bytes,
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
@@ -490,6 +493,11 @@ fn normalize_hop(
 
     let token_in = parse_address(&hop.token_in)?;
     let token_out = parse_address(&hop.token_out)?;
+    if token_in == *native_address || token_out == *native_address {
+        return Err(EncodeError::invalid(
+            "hop tokenIn/tokenOut must be ERC20 addresses; use wrapped native token instead",
+        ));
+    }
     let swaps = hop
         .swaps
         .iter()
@@ -608,6 +616,7 @@ async fn resimulate_route(
                 let token_in = token_cache.get(&sim_token_in).await?;
                 let token_out = token_cache.get(&sim_token_out).await?;
 
+                let pre_state = Arc::clone(&pool_entry.0);
                 let result = pool_entry
                     .0
                     .get_amount_out(allocated.amount_in.clone(), &token_in, &token_out)
@@ -633,6 +642,12 @@ async fn resimulate_route(
                     )));
                 }
 
+                // Advance cached pool state so repeated-pool swaps simulate sequentially.
+                pool_cache.insert(
+                    allocated.pool.component_id.clone(),
+                    (Arc::from(result.new_state), Arc::clone(&pool_entry.1)),
+                );
+
                 hop_expected += expected_out.clone();
                 hop_min += min_out.clone();
 
@@ -644,7 +659,7 @@ async fn resimulate_route(
                     amount_in: allocated.amount_in,
                     expected_amount_out: expected_out,
                     min_amount_out: min_out,
-                    pool_state: Arc::clone(&pool_entry.0),
+                    pool_state: pre_state,
                     component: Arc::clone(&pool_entry.1),
                 });
 
@@ -984,23 +999,34 @@ fn compute_split_fraction(
         return Ok(0.0);
     }
 
+    if total_in.is_zero() {
+        return Err(EncodeError::invalid(
+            "TokenIn total amount must be positive for split calculation",
+        ));
+    }
+    if amount_in.is_zero() || amount_in >= total_in {
+        return Err(EncodeError::invalid(format!(
+            "Invalid split ratio for tokenIn {}",
+            format_address(token_in)
+        )));
+    }
+
     let amount_in = amount_in.to_f64().ok_or_else(|| {
         EncodeError::invalid("Failed to convert swap amountIn for split calculation")
     })?;
     let total_in = total_in.to_f64().ok_or_else(|| {
         EncodeError::invalid("Failed to convert tokenIn total amount for split calculation")
     })?;
-    if total_in <= 0.0 {
-        return Err(EncodeError::invalid(
-            "TokenIn total amount must be positive for split calculation",
-        ));
+    let mut split = amount_in / total_in;
+    if !split.is_finite() {
+        return Err(EncodeError::invalid("Invalid split ratio for tokenIn"));
     }
-    let split = amount_in / total_in;
-    if split <= 0.0 || split >= 1.0 {
-        return Err(EncodeError::invalid(format!(
-            "Invalid split ratio for tokenIn {}",
-            format_address(token_in)
-        )));
+    if split <= 0.0 {
+        // Clamp away from 0 for very skewed splits that lose precision in f64.
+        split = f64::MIN_POSITIVE;
+    } else if split >= 1.0 {
+        // Clamp away from 1 to preserve a non-remainder split.
+        split = 1.0 - f64::EPSILON;
     }
     Ok(split)
 }
@@ -1057,19 +1083,8 @@ fn encode_route_calldata(
     encode_function_call(signature, calldata_args)
 }
 
-fn encode_function_call(
-    signature: &str,
-    mut encoded_args: Vec<u8>,
-) -> Result<Vec<u8>, EncodeError> {
+fn encode_function_call(signature: &str, encoded_args: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
     let selector = function_selector(signature)?;
-    // Alloy encodes standalone dynamic bytes with a leading offset; strip if present.
-    if encoded_args.len() > 32 {
-        let mut prefix = vec![0u8; 31];
-        prefix.push(32);
-        if encoded_args[..32] == prefix {
-            encoded_args = encoded_args[32..].to_vec();
-        }
-    }
     let mut call_data = Vec::with_capacity(4 + encoded_args.len());
     call_data.extend_from_slice(&selector);
     call_data.extend(encoded_args);
@@ -1421,9 +1436,15 @@ impl<'a> TokenCache<'a> {
 mod tests {
     use super::*;
     use crate::models::messages::{HopDraft, SegmentDraft};
+    use crate::models::state::StateStore;
+    use crate::models::tokens::TokenStore;
     use chrono::NaiveDateTime;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
     use tycho_execution::encoding::models::Transaction;
     use tycho_execution::encoding::tycho_encoder::TychoEncoder;
+    use tycho_simulation::protocol::models::Update;
     use tycho_simulation::tycho_common::models::Chain;
 
     fn pool_ref(id: &str) -> PoolRef {
@@ -1547,7 +1568,9 @@ mod tests {
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        let normalized = normalize_route(&request, &token_in, &token_out, &amount_in).unwrap();
+        let native_address = Chain::Ethereum.native_token().address;
+        let normalized =
+            normalize_route(&request, &token_in, &token_out, &amount_in, &native_address).unwrap();
         assert_eq!(normalized.segments.len(), 2);
         assert_eq!(normalized.segments[0].share_bps, 2000);
         assert_eq!(normalized.segments[1].share_bps, 8000);
@@ -1604,9 +1627,66 @@ mod tests {
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in) {
+        let native_address = Chain::Ethereum.native_token().address;
+        match normalize_route(&request, &token_in, &token_out, &amount_in, &native_address) {
             Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
             Ok(_) => panic!("hop solvency should be rejected"),
+        }
+    }
+
+    #[test]
+    fn normalize_route_rejects_native_hops() {
+        let native = Chain::Ethereum.native_token().address;
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "100".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::MultiSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::MultiSwap,
+                share_bps: Some(10000),
+                is_remainder: None,
+                hops: vec![
+                    HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: format_address(&native),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p1"),
+                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                            token_out: format_address(&native),
+                            split_bps: Some(10000),
+                            amount_in: "100".to_string(),
+                            min_amount_out: "90".to_string(),
+                        }],
+                    },
+                    HopDraft {
+                        token_in: format_address(&native),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: pool_ref("p2"),
+                            token_in: format_address(&native),
+                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                            split_bps: Some(10000),
+                            amount_in: "90".to_string(),
+                            min_amount_out: "80".to_string(),
+                        }],
+                    },
+                ],
+            }],
+            enable_tenderly_sim: None,
+            request_id: None,
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+
+        match normalize_route(&request, &token_in, &token_out, &amount_in, &native) {
+            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
+            Ok(_) => panic!("native hop tokens should be rejected"),
         }
     }
 
@@ -1675,6 +1755,17 @@ mod tests {
             Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
             Ok(_) => panic!("native token should be rejected for settlement encoding"),
         }
+    }
+
+    #[test]
+    fn compute_split_fraction_clamps_rounding() {
+        let total_in = BigUint::from(1u64) << 60u32;
+        let amount_in = total_in.clone() - BigUint::from(1u32);
+        let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+
+        let split = compute_split_fraction(&amount_in, &total_in, false, 2, &token_in).unwrap();
+        assert!(split > 0.0, "split should remain positive");
+        assert!(split < 1.0, "split should remain less than 1");
     }
 
     #[test]
@@ -1812,6 +1903,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&calldata.calldata[..4], &selector);
+    }
+
+    #[test]
+    fn encode_function_call_preserves_leading_word() {
+        let signature = "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
+        let calldata_args = (
+            alloy_primitives::U256::from(32u32),
+            alloy_primitives::Address::from([0x11; 20]),
+            alloy_primitives::Address::from([0x22; 20]),
+            alloy_primitives::U256::from(1u32),
+            false,
+            false,
+            alloy_primitives::Address::from([0x33; 20]),
+            false,
+            vec![0x01u8, 0x02u8],
+        )
+            .abi_encode();
+
+        let calldata = encode_function_call(signature, calldata_args.clone()).unwrap();
+        assert_eq!(&calldata[4..], calldata_args.as_slice());
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_advances_pool_state_for_repeated_swaps() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let mut tokens = HashMap::new();
+        tokens.insert(token_in.address.clone(), token_in.clone());
+        tokens.insert(token_out.address.clone(), token_out.clone());
+
+        let tokens_store = Arc::new(TokenStore::new(
+            tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![token_in.clone(), token_out.clone()],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-1".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-1".to_string(), component);
+        let update = Update::new(1, states, new_pairs);
+        state_store.apply_update(update).await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            state_store: Arc::clone(&state_store),
+            quote_timeout: Duration::from_millis(10),
+            pool_timeout_native: Duration::from_millis(10),
+            pool_timeout_vm: Duration::from_millis(10),
+            request_timeout: Duration::from_millis(10),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    amount_in: BigUint::from(10u32),
+                    min_amount_out: BigUint::from(1u32),
+                    swaps: vec![
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-1"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: None,
+                            amount_in: BigUint::from(5u32),
+                            min_amount_out: BigUint::from(1u32),
+                        },
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-1"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: None,
+                            amount_in: BigUint::from(5u32),
+                            min_amount_out: BigUint::from(1u32),
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let resimulated = resimulate_route(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+        )
+        .await
+        .unwrap();
+
+        let swaps = &resimulated.segments[0].hops[0].swaps;
+        assert_eq!(swaps[0].expected_amount_out, BigUint::from(5u32));
+        assert_eq!(swaps[1].expected_amount_out, BigUint::from(10u32));
+        assert_eq!(step_multiplier(&swaps[0].pool_state), 1);
+        assert_eq!(step_multiplier(&swaps[1].pool_state), 2);
     }
 
     #[test]
@@ -1968,6 +2178,98 @@ mod tests {
         fn eq(&self, _other: &dyn ProtocolSim) -> bool {
             true
         }
+    }
+
+    #[derive(Debug)]
+    struct StepProtocolSim {
+        multiplier: u32,
+    }
+
+    impl ProtocolSim for StepProtocolSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(
+            &self,
+            _base: &Token,
+            _quote: &Token,
+        ) -> Result<f64, tycho_simulation::tycho_common::simulation::errors::SimulationError>
+        {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<
+            tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
+            tycho_simulation::tycho_common::simulation::errors::SimulationError,
+        > {
+            let amount_out = amount_in * BigUint::from(self.multiplier);
+            let next = StepProtocolSim {
+                multiplier: self.multiplier + 1,
+            };
+            Ok(
+                tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult::new(
+                    amount_out,
+                    BigUint::zero(),
+                    Box::new(next),
+                ),
+            )
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<
+            (BigUint, BigUint),
+            tycho_simulation::tycho_common::simulation::errors::SimulationError,
+        > {
+            Ok((BigUint::zero(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
+        ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
+        {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(Self {
+                multiplier: self.multiplier,
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<StepProtocolSim>()
+                .is_some_and(|rhs| rhs.multiplier == self.multiplier)
+        }
+    }
+
+    fn step_multiplier(state: &Arc<dyn ProtocolSim>) -> u32 {
+        state
+            .as_any()
+            .downcast_ref::<StepProtocolSim>()
+            .expect("Expected StepProtocolSim")
+            .multiplier
     }
 
     struct MockTychoEncoder {
