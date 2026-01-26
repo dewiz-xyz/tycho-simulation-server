@@ -924,6 +924,9 @@ fn build_route_swaps(
     native_address: &Bytes,
     wrapped_address: &Bytes,
 ) -> Result<Vec<Swap>, EncodeError> {
+    // Tycho split validation allows only one remainder per tokenIn, so depths must be consistent.
+    ensure_token_in_single_depth(resimulated)?;
+
     let mut ordered_swaps = Vec::new();
     // Order swaps by hop depth across segments so split sets match token availability.
     let max_hops = resimulated
@@ -995,6 +998,27 @@ fn build_route_swaps(
     }
 
     Ok(swaps)
+}
+
+fn ensure_token_in_single_depth(resimulated: &ResimulatedRouteInternal) -> Result<(), EncodeError> {
+    let mut token_depths: HashMap<Bytes, usize> = HashMap::new();
+    for segment in &resimulated.segments {
+        for (hop_index, hop) in segment.hops.iter().enumerate() {
+            for swap in &hop.swaps {
+                if let Some(existing_depth) = token_depths.get(&swap.token_in) {
+                    if *existing_depth != hop_index {
+                        return Err(EncodeError::invalid(format!(
+                            "tokenIn {} appears at multiple hop depths",
+                            format_address(&swap.token_in)
+                        )));
+                    }
+                } else {
+                    token_depths.insert(swap.token_in.clone(), hop_index);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compute_split_fraction(
@@ -2215,6 +2239,89 @@ mod tests {
         assert_eq!(swaps[1].split, 0.0);
         assert!((swaps[2].split - 0.6).abs() < 1e-9);
         assert_eq!(swaps[3].split, 0.0);
+    }
+
+    #[test]
+    fn build_route_swaps_rejects_token_in_at_multiple_depths() {
+        let token_a = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let token_b = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let token_c = Bytes::from_str("0x0000000000000000000000000000000000000003").unwrap();
+        let pool_state: Arc<dyn ProtocolSim> = Arc::new(MockProtocolSim {});
+        let component = Arc::new(dummy_component());
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                kind: SwapKind::MultiSwap,
+                share_bps: 10_000,
+                amount_in: BigUint::from(100u32),
+                expected_amount_out: BigUint::from(90u32),
+                min_amount_out: BigUint::from(80u32),
+                hops: vec![
+                    ResimulatedHopInternal {
+                        token_in: token_a.clone(),
+                        token_out: token_b.clone(),
+                        amount_in: BigUint::from(100u32),
+                        expected_amount_out: BigUint::from(95u32),
+                        min_amount_out: BigUint::from(90u32),
+                        swaps: vec![ResimulatedSwapInternal {
+                            pool: pool_ref("p1"),
+                            token_in: token_a.clone(),
+                            token_out: token_b.clone(),
+                            split_bps: 10_000,
+                            amount_in: BigUint::from(100u32),
+                            expected_amount_out: BigUint::from(95u32),
+                            min_amount_out: BigUint::from(90u32),
+                            pool_state: Arc::clone(&pool_state),
+                            component: Arc::clone(&component),
+                        }],
+                    },
+                    ResimulatedHopInternal {
+                        token_in: token_b.clone(),
+                        token_out: token_a.clone(),
+                        amount_in: BigUint::from(95u32),
+                        expected_amount_out: BigUint::from(92u32),
+                        min_amount_out: BigUint::from(90u32),
+                        swaps: vec![ResimulatedSwapInternal {
+                            pool: pool_ref("p2"),
+                            token_in: token_b.clone(),
+                            token_out: token_a.clone(),
+                            split_bps: 10_000,
+                            amount_in: BigUint::from(95u32),
+                            expected_amount_out: BigUint::from(92u32),
+                            min_amount_out: BigUint::from(90u32),
+                            pool_state: Arc::clone(&pool_state),
+                            component: Arc::clone(&component),
+                        }],
+                    },
+                    ResimulatedHopInternal {
+                        token_in: token_a.clone(),
+                        token_out: token_c.clone(),
+                        amount_in: BigUint::from(92u32),
+                        expected_amount_out: BigUint::from(90u32),
+                        min_amount_out: BigUint::from(88u32),
+                        swaps: vec![ResimulatedSwapInternal {
+                            pool: pool_ref("p3"),
+                            token_in: token_a.clone(),
+                            token_out: token_c.clone(),
+                            split_bps: 10_000,
+                            amount_in: BigUint::from(92u32),
+                            expected_amount_out: BigUint::from(90u32),
+                            min_amount_out: BigUint::from(88u32),
+                            pool_state: Arc::clone(&pool_state),
+                            component: Arc::clone(&component),
+                        }],
+                    },
+                ],
+            }],
+        };
+
+        let native = Chain::Ethereum.native_token().address;
+        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let err = build_route_swaps(&resimulated, false, false, &native, &wrapped)
+            .expect_err("rejects repeated token depth");
+        assert!(
+            err.message.contains("multiple hop depths"),
+            "unexpected error: {err:?}"
+        );
     }
 
     fn dummy_component() -> ProtocolComponent {
