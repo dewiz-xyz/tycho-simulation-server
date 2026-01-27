@@ -2028,10 +2028,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_function_call_preserves_leading_word() {
+    fn encode_function_call_appends_params() {
         let signature = "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
         let calldata_args = (
-            alloy_primitives::U256::from(32u32),
+            alloy_primitives::U256::from(1u32),
             alloy_primitives::Address::from([0x11; 20]),
             alloy_primitives::Address::from([0x22; 20]),
             alloy_primitives::U256::from(1u32),
@@ -2041,10 +2041,43 @@ mod tests {
             false,
             vec![0x01u8, 0x02u8],
         )
-            .abi_encode();
+            .abi_encode_params();
 
         let calldata = encode_function_call(signature, calldata_args.clone()).unwrap();
         assert_eq!(&calldata[4..], calldata_args.as_slice());
+    }
+
+    #[test]
+    fn encode_route_calldata_uses_param_encoding() {
+        let signature = "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
+        let encoded_solution = EncodedSolution {
+            swaps: vec![0x01, 0x02],
+            interacting_with: Bytes::from_str("0x0000000000000000000000000000000000000009")
+                .unwrap(),
+            function_signature: signature.to_string(),
+            n_tokens: 0,
+            permit: None,
+        };
+        let solution = Solution {
+            sender: Bytes::from_str("0x0000000000000000000000000000000000000011").unwrap(),
+            receiver: Bytes::from_str("0x0000000000000000000000000000000000000022").unwrap(),
+            given_token: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+            given_amount: BigUint::from(1u32),
+            checked_token: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+            exact_out: false,
+            checked_amount: BigUint::from(2u32),
+            swaps: Vec::new(),
+            native_action: None,
+        };
+        let receiver = Bytes::from_str("0x0000000000000000000000000000000000000033").unwrap();
+
+        let calldata = encode_route_calldata(&encoded_solution, &solution, &receiver, false, false)
+            .expect("route calldata");
+        let expected = alloy_primitives::U256::from(1u32).to_be_bytes::<32>();
+
+        assert!(calldata.len() >= 36);
+        assert_eq!(&calldata[..4], &function_selector(signature).unwrap());
+        assert_eq!(&calldata[4..36], expected.as_slice());
     }
 
     #[tokio::test]
