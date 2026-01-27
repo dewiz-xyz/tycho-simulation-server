@@ -116,7 +116,7 @@ export class AppServiceStack extends cdk.Stack {
             POOL_TIMEOUT_NATIVE_MS: "250",
             POOL_TIMEOUT_VM_MS: "1000",
             REQUEST_TIMEOUT_MS: "4500",
-            GLOBAL_NATIVE_SIM_CONCURRENCY: "420",
+            GLOBAL_NATIVE_SIM_CONCURRENCY: "400",
             GLOBAL_VM_SIM_CONCURRENCY: "200",
             ENABLE_VM_POOLS: "true",
             HOST: "0.0.0.0",
