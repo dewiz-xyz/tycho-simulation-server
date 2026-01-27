@@ -1,12 +1,22 @@
 # /encode example (RouteEncodeRequest)
 
-This document shows the **latest** `/encode` schema. The values are representative examples (shape-focused), not a verbatim capture.
+This document describes the target `/encode` schema for split-only routing. The values are representative examples that show the shape, not a verbatim capture.
+
+## Terminology
+
+- Swap: a single pool operation. It always uses one pool and one token pair.
+- Hop: a single token transition. A hop can split across many pools that all do the same tokenIn to tokenOut.
+- Segment: a full path from tokenIn to tokenOut. A MegaSwap contains multiple segments in parallel.
+
+SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tokenB. MultiSwap uses multiple hops with different intermediary tokens. MegaSwap runs multiple MultiSwaps in parallel, each with its own segment share.
 
 ## How this was built
 
-- Call `/simulate` for each hop to pick candidate pools.
-- Build a `RouteEncodeRequest` with `segments[] → hops[] → swaps[]`, including `amountIn` and `minAmountOut` per pool swap.
-- POST to `/encode`, which re-simulates each pool swap, verifies `expectedAmountOut >= minAmountOut`, fills expected amounts, and returns settlement `interactions[]` (approve amount → router call; approve reset is prepended for tokens that require it).
+- Call `/simulate` for candidate pools.
+- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps-only splits.
+- Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
+- POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
+- No per-hop or per-swap amounts or expected outputs are returned. Those values should be logged server-side.
 
 ## Request body (shape)
 
@@ -16,52 +26,97 @@ This document shows the **latest** `/encode` schema. The values are representati
   "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
+  "minAmountOut": "9980000",
   "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
   "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-  "swapKind": "MultiSwap",
+  "swapKind": "MegaSwap",
   "segments": [
     {
       "kind": "MultiSwap",
-      "shareBps": 10000,
+      "shareBps": 6000,
       "hops": [
         {
+          "shareBps": 10000,
           "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
           "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
           "swaps": [
             {
               "pool": {
                 "protocol": "uniswap_v3",
-                "componentId": "pool-dai-usdc"
+                "componentId": "pool-dai-usdc-3000",
+                "poolAddress": "0x1111111111111111111111111111111111111111"
               },
               "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
               "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-              "splitBps": 10000,
-              "amountIn": "1000000000000000000",
-              "minAmountOut": "1000250"
+              "splitBps": 6000
+            },
+            {
+              "pool": {
+                "protocol": "curve_v2",
+                "componentId": "pool-dai-usdc",
+                "poolAddress": "0x2222222222222222222222222222222222222222"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+              "splitBps": 0
             }
           ]
         },
         {
+          "shareBps": 10000,
           "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
           "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
           "swaps": [
             {
               "pool": {
                 "protocol": "uniswap_v3",
-                "componentId": "pool-usdc-usdt"
+                "componentId": "pool-usdc-usdt-100",
+                "poolAddress": "0x3333333333333333333333333333333333333333"
               },
               "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
               "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-              "splitBps": 10000,
-              "amountIn": "1000250",
-              "minAmountOut": "9974710"
+              "splitBps": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "SimpleSwap",
+      "shareBps": 0,
+      "hops": [
+        {
+          "shareBps": 10000,
+          "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+          "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "swaps": [
+            {
+              "pool": {
+                "protocol": "uniswap_v3",
+                "componentId": "pool-dai-usdt-100",
+                "poolAddress": "0x4444444444444444444444444444444444444444"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+              "splitBps": 5000
+            },
+            {
+              "pool": {
+                "protocol": "curve_v2",
+                "componentId": "pool-dai-usdt",
+                "poolAddress": "0x5555555555555555555555555555555555555555"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+              "splitBps": 0
             }
           ]
         }
       ]
     }
   ],
-  "requestId": "encode-example-1"
+  "enableTenderlySim": true,
+  "requestId": "encode-example-split-only-1"
 }
 ```
 
@@ -73,55 +128,88 @@ This document shows the **latest** `/encode` schema. The values are representati
   "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
-  "swapKind": "MultiSwap",
+  "minAmountOut": "9980000",
+  "swapKind": "MegaSwap",
   "normalizedRoute": {
     "segments": [
       {
         "kind": "MultiSwap",
-        "shareBps": 10000,
-        "amountIn": "1000000000000000000",
-        "expectedAmountOut": "9999709",
-        "minAmountOut": "9974710",
+        "shareBps": 6000,
         "hops": [
           {
+            "shareBps": 10000,
             "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
             "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-            "amountIn": "1000000000000000000",
-            "expectedAmountOut": "1000500",
-            "minAmountOut": "1000250",
             "swaps": [
               {
                 "pool": {
                   "protocol": "uniswap_v3",
-                  "componentId": "pool-dai-usdc"
+                  "componentId": "pool-dai-usdc-3000",
+                  "poolAddress": "0x1111111111111111111111111111111111111111"
                 },
                 "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
                 "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-                "splitBps": 10000,
-                "amountIn": "1000000000000000000",
-                "expectedAmountOut": "1000500",
-                "minAmountOut": "1000250"
+                "splitBps": 6000
+              },
+              {
+                "pool": {
+                  "protocol": "curve_v2",
+                  "componentId": "pool-dai-usdc",
+                  "poolAddress": "0x2222222222222222222222222222222222222222"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "splitBps": 0
               }
             ]
           },
           {
+            "shareBps": 10000,
             "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-            "amountIn": "1000500",
-            "expectedAmountOut": "9999709",
-            "minAmountOut": "9974710",
             "swaps": [
               {
                 "pool": {
                   "protocol": "uniswap_v3",
-                  "componentId": "pool-usdc-usdt"
+                  "componentId": "pool-usdc-usdt-100",
+                  "poolAddress": "0x3333333333333333333333333333333333333333"
                 },
                 "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
                 "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                "splitBps": 10000,
-                "amountIn": "1000500",
-                "expectedAmountOut": "9999709",
-                "minAmountOut": "9974710"
+                "splitBps": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "kind": "SimpleSwap",
+        "shareBps": 0,
+        "hops": [
+          {
+            "shareBps": 10000,
+            "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+            "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "swaps": [
+              {
+                "pool": {
+                  "protocol": "uniswap_v3",
+                  "componentId": "pool-dai-usdt-100",
+                  "poolAddress": "0x4444444444444444444444444444444444444444"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "splitBps": 5000
+              },
+              {
+                "pool": {
+                  "protocol": "curve_v2",
+                  "componentId": "pool-dai-usdt",
+                  "poolAddress": "0x5555555555555555555555555555555555555555"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "splitBps": 0
               }
             ]
           }
@@ -143,12 +231,12 @@ This document shows the **latest** `/encode` schema. The values are representati
       "calldata": "0x..."
     }
   ],
-  "totals": {
-    "expectedAmountOut": "9999709",
-    "minAmountOut": "9974710"
-  },
   "debug": {
-    "requestId": "encode-example-1",
+    "requestId": "encode-example-split-only-1",
+    "tenderly": {
+      "simulationUrl": "https://dashboard.tenderly.co/...",
+      "simulationId": "sim-123"
+    },
     "resimulation": {
       "blockNumber": 24200000
     }
@@ -158,7 +246,16 @@ This document shows the **latest** `/encode` schema. The values are representati
 
 ## Notes
 
-- `interactions[]` are emitted in order: approve(amountIn) → router call; for reset-allowance tokens an approve(0) is prepended.
-- The settlement encoding expects ERC20 `tokenIn`/`tokenOut` (use wrapped native tokens for ETH).
-- `minAmountOut` is supplied by the client and enforced to be non-zero for all swaps.
-- `/encode` fails if any resimulated `expectedAmountOut < minAmountOut`.
+- Only route-level `minAmountOut` is enforced. There are no per-hop or per-swap `minAmountOut` checks.
+- `shareBps` and `splitBps` use Tycho split semantics:
+  - `0` means remainder, or 100% if there is only one entry.
+  - For each split set, the last entry must be `0` so it receives the remainder.
+  - Non-last entries must be > 0.
+  - The sum of all non-remainder shares must be <= 10000.
+- SimpleSwap has a single hop. All swaps in that hop must share the same tokenIn and tokenOut.
+- MultiSwap has multiple hops. Each hop transitions between different tokens.
+- MegaSwap has multiple segments. Each segment is a MultiSwap or SimpleSwap and gets a segment share.
+- `poolAddress` is optional and may be omitted when unavailable.
+- `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
+- The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.
+- Structured logs should include computed `amountIn` and `expectedAmountOut` for each segment, hop, and swap. These are not returned in the response.
