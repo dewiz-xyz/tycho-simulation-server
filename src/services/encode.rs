@@ -1079,7 +1079,7 @@ fn encode_route_calldata(
             is_transfer_from_allowed,
             encoded_solution.swaps.clone(),
         )
-            .abi_encode()
+            .abi_encode_params()
     } else if signature.contains("singleSwap") || signature.contains("sequentialSwap") {
         (
             biguint_to_u256(&solution.given_amount),
@@ -1092,7 +1092,7 @@ fn encode_route_calldata(
             is_transfer_from_allowed,
             encoded_solution.swaps.clone(),
         )
-            .abi_encode()
+            .abi_encode_params()
     } else {
         return Err(EncodeError::encoding(format!(
             "Unsupported Tycho function signature: {}",
