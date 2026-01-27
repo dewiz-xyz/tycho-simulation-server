@@ -255,11 +255,11 @@ def main() -> int:
 
     min_out_first = hop_amounts_in[0]
     if int(min_out_first) <= 0:
-        print("[FAIL] computed minAmountOut for first hop is zero", file=sys.stderr)
+        print("[FAIL] computed hop output for first hop is zero", file=sys.stderr)
         return 1
     min_out_second = apply_slippage(pool_second["amounts_out"][0], DEFAULT_SLIPPAGE_BPS)
     if int(min_out_second) <= 0:
-        print("[FAIL] computed minAmountOut for second hop is zero", file=sys.stderr)
+        print("[FAIL] computed route minAmountOut is zero", file=sys.stderr)
         return 1
 
     encode_request = {
@@ -267,15 +267,17 @@ def main() -> int:
         "tokenIn": dai,
         "tokenOut": usdt,
         "amountIn": amounts[0],
+        "minAmountOut": min_out_second,
         "settlementAddress": settlement,
         "tychoRouterAddress": tycho_router,
         "swapKind": "MultiSwap",
         "segments": [
             {
                 "kind": "MultiSwap",
-                "shareBps": 10_000,
+                "shareBps": 0,
                 "hops": [
                     {
+                        "shareBps": 10_000,
                         "tokenIn": dai,
                         "tokenOut": usdc,
                         "swaps": [
@@ -287,13 +289,12 @@ def main() -> int:
                                 },
                                 "tokenIn": dai,
                                 "tokenOut": usdc,
-                                "splitBps": 10_000,
-                                "amountIn": amounts[0],
-                                "minAmountOut": min_out_first,
+                                "splitBps": 0,
                             }
                         ],
                     },
                     {
+                        "shareBps": 10_000,
                         "tokenIn": usdc,
                         "tokenOut": usdt,
                         "swaps": [
@@ -305,9 +306,7 @@ def main() -> int:
                                 },
                                 "tokenIn": usdc,
                                 "tokenOut": usdt,
-                                "splitBps": 10_000,
-                                "amountIn": min_out_first,
-                                "minAmountOut": min_out_second,
+                                "splitBps": 0,
                             }
                         ],
                     },

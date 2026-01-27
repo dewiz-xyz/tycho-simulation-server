@@ -118,14 +118,15 @@ Timeout behavior:
 
 ### `POST /encode`
 
-`POST /encode` builds Tycho single-swap calldata for a client-provided route. It **re-simulates** each pool swap and hard-fails if any swap cannot meet the client-supplied `minAmountOut`.
+`POST /encode` builds Tycho single-swap calldata for a client-provided route. It **re-simulates** each pool swap, derives per-hop/per-swap amounts internally, and enforces only the route-level `minAmountOut`.
 
 Notes:
 - The request shape follows `RouteEncodeRequest` (camelCase fields).
 - `settlementAddress` and `tychoRouterAddress` are required.
 - `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
-- Every pool swap must include `amountIn` and `minAmountOut` (already slippage-adjusted by the client).
-- The response is `RouteEncodeResponse` (latest spec) with `normalizedRoute`, `calls`, `calldata`, and `totals`.
+- Requests include route-level `amountIn` and `minAmountOut`, plus `shareBps`/`splitBps` for splits.
+- Per-hop and per-swap amounts are not accepted and not returned.
+- The response is `RouteEncodeResponse` with `normalizedRoute` and settlement `interactions`.
 - Errors return 4xx/5xx with `{ error, requestId }`.
 
 Example request (shape only):
@@ -138,15 +139,17 @@ curl -X POST "http://localhost:3000/encode" \
     "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
     "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
     "amountIn": "1000000000000000000",
+    "minAmountOut": "1000000",
     "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
     "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
     "swapKind": "SimpleSwap",
     "segments": [
       {
         "kind": "SimpleSwap",
-        "shareBps": 10000,
+        "shareBps": 0,
         "hops": [
           {
+            "shareBps": 10000,
             "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
             "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "swaps": [
@@ -154,9 +157,7 @@ curl -X POST "http://localhost:3000/encode" \
                 "pool": { "protocol": "uniswap_v3", "componentId": "pool-id" },
                 "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
                 "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-                "splitBps": 10000,
-                "amountIn": "1000000000000000000",
-                "minAmountOut": "1000000"
+                "splitBps": 0
               }
             ]
           }
@@ -167,7 +168,7 @@ curl -X POST "http://localhost:3000/encode" \
   }'
 ```
 
-The response includes `calls[]` entries with `target`, `value`, `calldata`, `approvals`, and hop metadata, plus a top-level `calldata` transaction payload ready for the Tycho router.
+The response includes ordered `interactions[]` (approve + router call). Computed per-hop/per-swap amounts are logged server-side, not returned.
 
 ### `GET /status`
 

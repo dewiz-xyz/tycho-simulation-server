@@ -98,15 +98,13 @@ pub struct PoolSwapDraft {
     pub pool: PoolRef,
     pub token_in: String,
     pub token_out: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub split_bps: Option<u32>,
-    pub amount_in: String,
-    pub min_amount_out: String,
+    pub split_bps: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HopDraft {
+    pub share_bps: u32,
     pub token_in: String,
     pub token_out: String,
     pub swaps: Vec<PoolSwapDraft>,
@@ -116,10 +114,7 @@ pub struct HopDraft {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SegmentDraft {
     pub kind: SwapKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_bps: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_remainder: Option<bool>,
+    pub share_bps: u32,
     pub hops: Vec<HopDraft>,
 }
 
@@ -139,6 +134,7 @@ pub struct RouteEncodeRequest {
     pub token_in: String,
     pub token_out: String,
     pub amount_in: String,
+    pub min_amount_out: String,
     pub settlement_address: String,
     pub tycho_router_address: String,
     pub swap_kind: SwapKind,
@@ -173,19 +169,14 @@ pub struct PoolSwap {
     pub token_in: String,
     pub token_out: String,
     pub split_bps: u32,
-    pub amount_in: String,
-    pub expected_amount_out: String,
-    pub min_amount_out: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Hop {
+    pub share_bps: u32,
     pub token_in: String,
     pub token_out: String,
-    pub amount_in: String,
-    pub expected_amount_out: String,
-    pub min_amount_out: String,
     pub swaps: Vec<PoolSwap>,
 }
 
@@ -194,17 +185,7 @@ pub struct Hop {
 pub struct Segment {
     pub kind: SwapKind,
     pub share_bps: u32,
-    pub amount_in: String,
-    pub expected_amount_out: String,
-    pub min_amount_out: String,
     pub hops: Vec<Hop>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RouteTotals {
-    pub expected_amount_out: String,
-    pub min_amount_out: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -249,10 +230,10 @@ pub struct RouteEncodeResponse {
     pub token_in: String,
     pub token_out: String,
     pub amount_in: String,
+    pub min_amount_out: String,
     pub swap_kind: SwapKind,
     pub normalized_route: NormalizedRoute,
     pub interactions: Vec<Interaction>,
-    pub totals: RouteTotals,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<RouteDebug>,
 }
