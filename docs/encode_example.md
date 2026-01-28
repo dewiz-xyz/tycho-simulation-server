@@ -1,6 +1,6 @@
 # /encode example (RouteEncodeRequest)
 
-This document describes the target `/encode` schema for split-only routing. The values are representative examples that show the shape, not a verbatim capture.
+This document describes the target `/encode` schema.
 
 ## Terminology
 
@@ -10,13 +10,12 @@ This document describes the target `/encode` schema for split-only routing. The 
 
 SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tokenB. MultiSwap uses multiple hops with different intermediary tokens. MegaSwap runs multiple MultiSwaps in parallel, each with its own segment share.
 
-## How this was built
+## Workflow
 
 - Call `/simulate` for candidate pools.
-- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps-only splits.
+- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps only splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
-- No per-hop or per-swap amounts or expected outputs are returned. Those values should be logged server-side.
 
 ## Request body (shape)
 
@@ -246,7 +245,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 
 ## Notes
 
-- Only route-level `minAmountOut` is enforced. There are no per-hop or per-swap `minAmountOut` checks.
+- Only route level `minAmountOut` is enforced. There are no per-hop or per-swap `minAmountOut` checks.
 - `shareBps` and `splitBps` use Tycho split semantics:
   - `0` means remainder, or 100% if there is only one entry.
   - For each split set, the last entry must be `0` so it receives the remainder.
@@ -258,4 +257,3 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - `poolAddress` is optional and may be omitted when unavailable.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
 - The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.
-- Structured logs should include computed `amountIn` and `expectedAmountOut` for each segment, hop, and swap. These are not returned in the response.
