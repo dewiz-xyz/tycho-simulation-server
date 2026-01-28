@@ -2213,6 +2213,130 @@ mod tests {
         assert_eq!(step_multiplier(&swaps[1].pool_state), 2);
     }
 
+    #[tokio::test]
+    async fn resimulate_route_orders_by_hop_depth_across_segments() {
+        let token_a = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_b = dummy_token("0x0000000000000000000000000000000000000002");
+        let token_c = dummy_token("0x0000000000000000000000000000000000000003");
+        let mut tokens = HashMap::new();
+        tokens.insert(token_a.address.clone(), token_a.clone());
+        tokens.insert(token_b.address.clone(), token_b.clone());
+        tokens.insert(token_c.address.clone(), token_c.clone());
+
+        let tokens_store = Arc::new(TokenStore::new(
+            tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let component_a = component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let component_shared = component_with_tokens(
+            "0x000000000000000000000000000000000000000a",
+            vec![token_a.clone(), token_b.clone(), token_c.clone()],
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-a".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        states.insert(
+            "pool-shared".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-a".to_string(), component_a);
+        new_pairs.insert("pool-shared".to_string(), component_shared);
+        let update = Update::new(1, states, new_pairs);
+        state_store.apply_update(update).await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            state_store: Arc::clone(&state_store),
+            quote_timeout: Duration::from_millis(10),
+            pool_timeout_native: Duration::from_millis(10),
+            pool_timeout_vm: Duration::from_millis(10),
+            request_timeout: Duration::from_millis(10),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![
+                NormalizedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
+                    share_bps: 6_000,
+                    amount_in: BigUint::from(100u32),
+                    hops: vec![
+                        NormalizedHopInternal {
+                            share_bps: 10_000,
+                            token_in: token_a.address.clone(),
+                            token_out: token_b.address.clone(),
+                            swaps: vec![NormalizedSwapDraftInternal {
+                                pool: pool_ref("pool-a"),
+                                token_in: token_a.address.clone(),
+                                token_out: token_b.address.clone(),
+                                split_bps: 0,
+                            }],
+                        },
+                        NormalizedHopInternal {
+                            share_bps: 10_000,
+                            token_in: token_b.address.clone(),
+                            token_out: token_c.address.clone(),
+                            swaps: vec![NormalizedSwapDraftInternal {
+                                pool: pool_ref("pool-shared"),
+                                token_in: token_b.address.clone(),
+                                token_out: token_c.address.clone(),
+                                split_bps: 0,
+                            }],
+                        },
+                    ],
+                },
+                NormalizedSegmentInternal {
+                    kind: SwapKind::MultiSwap,
+                    share_bps: 4_000,
+                    amount_in: BigUint::from(50u32),
+                    hops: vec![NormalizedHopInternal {
+                        share_bps: 10_000,
+                        token_in: token_a.address.clone(),
+                        token_out: token_b.address.clone(),
+                        swaps: vec![NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-shared"),
+                            token_in: token_a.address.clone(),
+                            token_out: token_b.address.clone(),
+                            split_bps: 0,
+                        }],
+                    }],
+                },
+            ],
+        };
+
+        let resimulated = resimulate_route(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_a.address,
+            &token_c.address,
+        )
+        .await
+        .unwrap();
+
+        let seg_a_hop1_swap = &resimulated.segments[0].hops[1].swaps[0];
+        let seg_b_hop0_swap = &resimulated.segments[1].hops[0].swaps[0];
+
+        assert_eq!(seg_b_hop0_swap.expected_amount_out, BigUint::from(50u32));
+        assert_eq!(step_multiplier(&seg_b_hop0_swap.pool_state), 1);
+        assert_eq!(seg_a_hop1_swap.expected_amount_out, BigUint::from(200u32));
+        assert_eq!(step_multiplier(&seg_a_hop1_swap.pool_state), 2);
+    }
+
     #[test]
     fn build_route_swaps_sets_remainder_split_last() {
         let resimulated = ResimulatedRouteInternal {
@@ -2468,14 +2592,22 @@ mod tests {
     }
 
     fn dummy_component() -> ProtocolComponent {
-        let token_a = dummy_token("0x0000000000000000000000000000000000000001");
-        let token_b = dummy_token("0x0000000000000000000000000000000000000002");
+        component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
+            vec![
+                dummy_token("0x0000000000000000000000000000000000000001"),
+                dummy_token("0x0000000000000000000000000000000000000002"),
+            ],
+        )
+    }
+
+    fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolComponent {
         ProtocolComponent::new(
-            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            Bytes::from_str(id).unwrap(),
             "uniswap_v2".to_string(),
             "uniswap_v2".to_string(),
             Chain::Ethereum,
-            vec![token_a, token_b],
+            tokens,
             Vec::new(),
             HashMap::new(),
             Bytes::default(),
