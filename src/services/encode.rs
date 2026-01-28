@@ -583,12 +583,36 @@ async fn resimulate_route(
     let mut pool_cache: HashMap<String, (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
         HashMap::new();
 
-    let mut resim_segments = Vec::with_capacity(normalized.segments.len());
-    for (segment_index, segment) in normalized.segments.iter().enumerate() {
-        let mut resim_hops = Vec::with_capacity(segment.hops.len());
-        let mut hop_amount_in = segment.amount_in.clone();
+    struct SegmentSimState {
+        next_amount_in: BigUint,
+        hops: Vec<Option<ResimulatedHopInternal>>,
+    }
 
-        for (hop_index, hop) in segment.hops.iter().enumerate() {
+    let mut segment_states = normalized
+        .segments
+        .iter()
+        .map(|segment| SegmentSimState {
+            next_amount_in: segment.amount_in.clone(),
+            hops: (0..segment.hops.len()).map(|_| None).collect(),
+        })
+        .collect::<Vec<_>>();
+    let max_hops = normalized
+        .segments
+        .iter()
+        .map(|segment| segment.hops.len())
+        .max()
+        .unwrap_or(0);
+
+    // Resimulate in hop-depth order to match build_route_swaps execution order.
+    for hop_index in 0..max_hops {
+        for (segment_index, segment) in normalized.segments.iter().enumerate() {
+            let Some(hop) = segment.hops.get(hop_index) else {
+                continue;
+            };
+            let segment_state = segment_states
+                .get_mut(segment_index)
+                .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+            let hop_amount_in = segment_state.next_amount_in.clone();
             if hop_amount_in.is_zero() {
                 return Err(EncodeError::invalid(format!(
                     "segment[{}].hop[{}] amountIn is zero",
@@ -680,8 +704,23 @@ async fn resimulate_route(
                 expected_amount_out: hop_expected.clone(),
                 swaps: swap_results,
             };
+
+            segment_state.hops[hop_index] = Some(resim_hop);
+            segment_state.next_amount_in = hop_expected;
+        }
+    }
+
+    let mut resim_segments = Vec::with_capacity(normalized.segments.len());
+    for (segment_index, segment) in normalized.segments.iter().enumerate() {
+        let mut resim_hops = Vec::with_capacity(segment.hops.len());
+        let segment_state = segment_states
+            .get_mut(segment_index)
+            .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+        for hop_index in 0..segment.hops.len() {
+            let resim_hop = segment_state.hops[hop_index]
+                .take()
+                .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
             resim_hops.push(resim_hop);
-            hop_amount_in = hop_expected;
         }
 
         let last_hop = resim_hops
