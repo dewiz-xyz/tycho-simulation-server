@@ -115,7 +115,6 @@ struct NormalizedSegmentInternal {
 }
 
 struct NormalizedHopInternal {
-    share_bps: u32,
     token_in: Bytes,
     token_out: Bytes,
     swaps: Vec<NormalizedSwapDraftInternal>,
@@ -141,7 +140,6 @@ struct ResimulatedSegmentInternal {
 }
 
 struct ResimulatedHopInternal {
-    share_bps: u32,
     token_in: Bytes,
     token_out: Bytes,
     amount_in: BigUint,
@@ -266,7 +264,6 @@ fn log_resimulation_amounts(request_id: Option<&str>, resimulated: &ResimulatedR
                 request_id,
                 segment_index,
                 hop_index,
-                share_bps = hop.share_bps,
                 token_in = %format_address(&hop.token_in),
                 token_out = %format_address(&hop.token_out),
                 amount_in = %hop.amount_in,
@@ -406,8 +403,7 @@ fn normalize_route(
         let hops = segment
             .hops
             .iter()
-            .enumerate()
-            .map(|(hop_index, hop)| normalize_hop(hop, native_address, segment_index, hop_index))
+            .map(|hop| normalize_hop(hop, native_address))
             .collect::<Result<Vec<_>, _>>()?;
 
         let segment_amount_in = segment_amounts
@@ -484,39 +480,13 @@ fn validate_hop_continuity(
     Ok(())
 }
 
-fn validate_hop_share_bps(
-    hop: &crate::models::messages::HopDraft,
-    segment_index: usize,
-    hop_index: usize,
-) -> Result<(), EncodeError> {
-    if hop.share_bps > BPS_DENOMINATOR {
-        return Err(EncodeError::invalid(format!(
-            "segment[{}].hop[{}].shareBps must be <= 10000",
-            segment_index, hop_index
-        )));
-    }
-
-    if hop.share_bps != 0 && hop.share_bps != BPS_DENOMINATOR {
-        return Err(EncodeError::invalid(format!(
-            "segment[{}].hop[{}].shareBps must be 0 or 10000 for sequential hops",
-            segment_index, hop_index
-        )));
-    }
-
-    Ok(())
-}
-
 fn normalize_hop(
     hop: &crate::models::messages::HopDraft,
     native_address: &Bytes,
-    segment_index: usize,
-    hop_index: usize,
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
     }
-
-    validate_hop_share_bps(hop, segment_index, hop_index)?;
 
     let token_in = parse_address(&hop.token_in)?;
     let token_out = parse_address(&hop.token_out)?;
@@ -532,7 +502,6 @@ fn normalize_hop(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(NormalizedHopInternal {
-        share_bps: hop.share_bps,
         token_in,
         token_out,
         swaps,
@@ -694,7 +663,6 @@ async fn resimulate_route(
             }
 
             let resim_hop = ResimulatedHopInternal {
-                share_bps: hop.share_bps,
                 token_in: hop.token_in.clone(),
                 token_out: hop.token_out.clone(),
                 amount_in: hop_amount_in.clone(),
@@ -1176,7 +1144,6 @@ fn build_normalized_route_response(resimulated: &ResimulatedRouteInternal) -> No
                 .hops
                 .iter()
                 .map(|hop| Hop {
-                    share_bps: hop.share_bps,
                     token_in: format_address(&hop.token_in),
                     token_out: format_address(&hop.token_out),
                     swaps: hop
@@ -1463,7 +1430,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 2000,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1478,7 +1444,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 0,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1523,7 +1488,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 4000,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1538,7 +1502,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 6000,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1564,59 +1527,6 @@ mod tests {
         }
     }
     #[test]
-    fn normalize_route_rejects_non_10000_hop_share_for_multihop() {
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "100".to_string(),
-            min_amount_out: "90".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-            swap_kind: SwapKind::MultiSwap,
-            segments: vec![SegmentDraft {
-                kind: SwapKind::MultiSwap,
-                share_bps: 0,
-                hops: vec![
-                    HopDraft {
-                        share_bps: 5000,
-                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
-                        token_out: "0x0000000000000000000000000000000000000003".to_string(),
-                        swaps: vec![PoolSwapDraft {
-                            pool: pool_ref("p1"),
-                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-                            token_out: "0x0000000000000000000000000000000000000003".to_string(),
-                            split_bps: 0,
-                        }],
-                    },
-                    HopDraft {
-                        share_bps: 10000,
-                        token_in: "0x0000000000000000000000000000000000000003".to_string(),
-                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
-                        swaps: vec![PoolSwapDraft {
-                            pool: pool_ref("p2"),
-                            token_in: "0x0000000000000000000000000000000000000003".to_string(),
-                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-                            split_bps: 0,
-                        }],
-                    },
-                ],
-            }],
-            request_id: None,
-        };
-
-        let token_in = parse_address(&request.token_in).unwrap();
-        let token_out = parse_address(&request.token_out).unwrap();
-        let amount_in = parse_amount(&request.amount_in).unwrap();
-
-        let native_address = Chain::Ethereum.native_token().address;
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native_address) {
-            Err(err) => assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest),
-            Ok(_) => panic!("invalid hop share should be rejected"),
-        }
-    }
-
-    #[test]
     fn normalize_route_rejects_native_hops() {
         let native = Chain::Ethereum.native_token().address;
         let request = RouteEncodeRequest {
@@ -1633,7 +1543,6 @@ mod tests {
                 share_bps: 0,
                 hops: vec![
                     HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: format_address(&native),
                         swaps: vec![PoolSwapDraft {
@@ -1644,7 +1553,6 @@ mod tests {
                         }],
                     },
                     HopDraft {
-                        share_bps: 10000,
                         token_in: format_address(&native),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1685,7 +1593,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 5000,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1700,7 +1607,6 @@ mod tests {
                     kind: SwapKind::SimpleSwap,
                     share_bps: 0,
                     hops: vec![HopDraft {
-                        share_bps: 10000,
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![PoolSwapDraft {
@@ -1829,7 +1735,6 @@ mod tests {
                 amount_in: BigUint::from(10u32),
                 expected_amount_out: BigUint::from(9u32),
                 hops: vec![ResimulatedHopInternal {
-                    share_bps: 10_000,
                     token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                         .unwrap(),
                     token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
@@ -1987,7 +1892,6 @@ mod tests {
                 share_bps: 10_000,
                 amount_in: BigUint::from(10u32),
                 hops: vec![NormalizedHopInternal {
-                    share_bps: 10_000,
                     token_in: token_in.address.clone(),
                     token_out: token_out.address.clone(),
                     swaps: vec![
@@ -2088,7 +1992,6 @@ mod tests {
                     amount_in: BigUint::from(100u32),
                     hops: vec![
                         NormalizedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_a.address.clone(),
                             token_out: token_b.address.clone(),
                             swaps: vec![NormalizedSwapDraftInternal {
@@ -2099,7 +2002,6 @@ mod tests {
                             }],
                         },
                         NormalizedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_b.address.clone(),
                             token_out: token_c.address.clone(),
                             swaps: vec![NormalizedSwapDraftInternal {
@@ -2116,7 +2018,6 @@ mod tests {
                     share_bps: 4_000,
                     amount_in: BigUint::from(50u32),
                     hops: vec![NormalizedHopInternal {
-                        share_bps: 10_000,
                         token_in: token_a.address.clone(),
                         token_out: token_b.address.clone(),
                         swaps: vec![NormalizedSwapDraftInternal {
@@ -2158,7 +2059,6 @@ mod tests {
                 amount_in: BigUint::from(100u32),
                 expected_amount_out: BigUint::from(90u32),
                 hops: vec![ResimulatedHopInternal {
-                    share_bps: 10_000,
                     token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                         .unwrap(),
                     token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
@@ -2225,7 +2125,6 @@ mod tests {
                     expected_amount_out: BigUint::from(55u32),
                     hops: vec![
                         ResimulatedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_a.clone(),
                             token_out: token_b.clone(),
                             amount_in: BigUint::from(60u32),
@@ -2242,7 +2141,6 @@ mod tests {
                             }],
                         },
                         ResimulatedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_b.clone(),
                             token_out: token_c.clone(),
                             amount_in: BigUint::from(60u32),
@@ -2267,7 +2165,6 @@ mod tests {
                     expected_amount_out: BigUint::from(37u32),
                     hops: vec![
                         ResimulatedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_a.clone(),
                             token_out: token_b.clone(),
                             amount_in: BigUint::from(40u32),
@@ -2284,7 +2181,6 @@ mod tests {
                             }],
                         },
                         ResimulatedHopInternal {
-                            share_bps: 10_000,
                             token_in: token_b.clone(),
                             token_out: token_d.clone(),
                             amount_in: BigUint::from(40u32),
@@ -2339,7 +2235,6 @@ mod tests {
                 expected_amount_out: BigUint::from(90u32),
                 hops: vec![
                     ResimulatedHopInternal {
-                        share_bps: 10_000,
                         token_in: token_a.clone(),
                         token_out: token_b.clone(),
                         amount_in: BigUint::from(100u32),
@@ -2356,7 +2251,6 @@ mod tests {
                         }],
                     },
                     ResimulatedHopInternal {
-                        share_bps: 10_000,
                         token_in: token_b.clone(),
                         token_out: token_a.clone(),
                         amount_in: BigUint::from(95u32),
@@ -2373,7 +2267,6 @@ mod tests {
                         }],
                     },
                     ResimulatedHopInternal {
-                        share_bps: 10_000,
                         token_in: token_a.clone(),
                         token_out: token_c.clone(),
                         amount_in: BigUint::from(92u32),

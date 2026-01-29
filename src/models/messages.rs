@@ -104,7 +104,6 @@ pub struct PoolSwapDraft {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HopDraft {
-    pub share_bps: u32,
     pub token_in: String,
     pub token_out: String,
     pub swaps: Vec<PoolSwapDraft>,
@@ -172,7 +171,6 @@ pub struct PoolSwap {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Hop {
-    pub share_bps: u32,
     pub token_in: String,
     pub token_out: String,
     pub swaps: Vec<PoolSwap>,

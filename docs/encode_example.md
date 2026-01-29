@@ -13,7 +13,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 ## Workflow
 
 - Call `/simulate` for candidate pools.
-- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps to define splits.
+- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
 
@@ -35,7 +35,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
       "shareBps": 6000,
       "hops": [
         {
-          "shareBps": 10000,
           "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
           "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
           "swaps": [
@@ -62,7 +61,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
           ]
         },
         {
-          "shareBps": 10000,
           "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
           "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
           "swaps": [
@@ -85,7 +83,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
       "shareBps": 0,
       "hops": [
         {
-          "shareBps": 10000,
           "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
           "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
           "swaps": [
@@ -135,7 +132,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
         "shareBps": 6000,
         "hops": [
           {
-            "shareBps": 10000,
             "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
             "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "swaps": [
@@ -162,7 +158,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
             ]
           },
           {
-            "shareBps": 10000,
             "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
             "swaps": [
@@ -185,7 +180,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
         "shareBps": 0,
         "hops": [
           {
-            "shareBps": 10000,
             "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
             "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
             "swaps": [
@@ -241,14 +235,16 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 ## Notes
 
 - Only route level `minAmountOut` is enforced. There are no per-hop or per-swap `minAmountOut` checks.
-- `shareBps` and `splitBps` use Tycho split semantics:
+- `shareBps` (segment-level) and `splitBps` (swap-level) use Tycho split semantics:
   - `0` means remainder, or 100% if there is only one entry.
   - For each split set, the last entry must be `0` so it receives the remainder.
   - Non-last entries must be > 0.
   - The sum of all non-remainder shares must be <= 10000.
+- Hops are sequential in the order provided; there is no hop-level share.
 - SimpleSwap has a single hop. All swaps in that hop must share the same tokenIn and tokenOut.
 - MultiSwap has multiple hops. Each hop transitions between different tokens.
 - MegaSwap has multiple segments. Each segment is a MultiSwap or SimpleSwap and gets a segment share.
+- The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` based on route shape and splits.
 - `poolAddress` is optional and may be omitted when unavailable.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
 - The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.

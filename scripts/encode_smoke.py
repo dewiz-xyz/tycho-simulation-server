@@ -277,7 +277,6 @@ def main() -> int:
                 "shareBps": 0,
                 "hops": [
                     {
-                        "shareBps": 10_000,
                         "tokenIn": dai,
                         "tokenOut": usdc,
                         "swaps": [
@@ -294,7 +293,6 @@ def main() -> int:
                         ],
                     },
                     {
-                        "shareBps": 10_000,
                         "tokenIn": usdc,
                         "tokenOut": usdt,
                         "swaps": [
