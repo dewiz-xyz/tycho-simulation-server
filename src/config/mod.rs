@@ -27,14 +27,6 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid PORT");
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let rpc_url = std::env::var("RPC_URL").ok().and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
 
     // Create socket address from host and port
     let addr = host.to_string();
@@ -120,7 +112,6 @@ pub fn load_config() -> AppConfig {
         tvl_keep_threshold,
         port,
         host,
-        rpc_url,
         quote_timeout_ms,
         pool_timeout_native_ms,
         pool_timeout_vm_ms,
@@ -141,7 +132,6 @@ pub struct AppConfig {
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: String,
-    pub rpc_url: Option<String>,
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,

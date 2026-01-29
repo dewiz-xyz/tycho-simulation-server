@@ -140,8 +140,6 @@ pub struct RouteEncodeRequest {
     pub swap_kind: SwapKind,
     pub segments: Vec<SegmentDraft>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_tenderly_sim: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
@@ -190,19 +188,6 @@ pub struct Segment {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct TenderlyDebug {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub simulation_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub simulation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct ResimulationDebug {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_number: Option<u64>,
@@ -215,8 +200,6 @@ pub struct ResimulationDebug {
 pub struct RouteDebug {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tenderly: Option<TenderlyDebug>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resimulation: Option<ResimulationDebug>,
 }

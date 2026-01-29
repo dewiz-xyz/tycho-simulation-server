@@ -4,11 +4,10 @@ mod handlers;
 mod models;
 mod services;
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
@@ -64,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
-        rpc_url: config.rpc_url.clone(),
         quote_timeout,
         pool_timeout_native,
         pool_timeout_vm,
@@ -72,7 +70,6 @@ async fn main() -> anyhow::Result<()> {
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
         reset_allowance_tokens: Arc::new(config.reset_allowance_tokens.clone()),
-        tenderly_balance_slots: Arc::new(RwLock::new(HashMap::new())),
     };
 
     info!(

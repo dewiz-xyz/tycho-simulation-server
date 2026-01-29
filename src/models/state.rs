@@ -16,7 +16,6 @@ use super::{protocol::ProtocolKind, tokens::TokenStore};
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub state_store: Arc<StateStore>,
-    pub rpc_url: Option<String>,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
@@ -24,7 +23,6 @@ pub struct AppState {
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
-    pub tenderly_balance_slots: Arc<RwLock<HashMap<(u64, Bytes), u64>>>,
 }
 
 impl AppState {
