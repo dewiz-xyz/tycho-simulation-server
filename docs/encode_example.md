@@ -13,7 +13,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 ## Workflow
 
 - Call `/simulate` for candidate pools.
-- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps only splits.
+- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]` using bps to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
 
