@@ -195,6 +195,10 @@ pub struct TenderlyDebug {
     pub simulation_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub simulation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

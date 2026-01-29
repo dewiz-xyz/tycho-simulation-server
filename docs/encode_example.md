@@ -257,3 +257,4 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - `poolAddress` is optional and may be omitted when unavailable.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
 - The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.
+- When `enableTenderlySim=true`, the service applies Tenderly state overrides to set the settlement contract balance for `tokenIn`. This requires `RPC_URL` for balance slot discovery.

@@ -34,6 +34,10 @@ use crate::models::messages::{
 use crate::models::state::AppState;
 
 const BPS_DENOMINATOR: u32 = 10_000;
+const BALANCE_SLOT_SCAN_MAX: u64 = 10;
+const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+const BALANCE_SLOT_SENTINEL_HEX: &str =
+    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeErrorKind {
@@ -1218,22 +1222,26 @@ async fn build_debug(
 
     if request.enable_tenderly_sim.unwrap_or(false) {
         match TenderlyConfig::from_env() {
-            Some(config) => match simulate_tenderly_bundle(request, interactions, &config).await {
-                Ok(tenderly) => {
-                    debug.tenderly = Some(tenderly);
+            Some(config) => {
+                match simulate_tenderly_bundle(state, request, interactions, &config).await {
+                    Ok(tenderly) => {
+                        debug.tenderly = Some(tenderly);
+                    }
+                    Err(err) => {
+                        warn!(
+                            request_id = request.request_id.as_deref().unwrap_or(""),
+                            error = err.message(),
+                            "Tenderly simulation failed"
+                        );
+                        debug.tenderly = Some(TenderlyDebug {
+                            simulation_url: None,
+                            simulation_id: None,
+                            skipped: None,
+                            skip_reason: None,
+                        });
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        request_id = request.request_id.as_deref().unwrap_or(""),
-                        error = err.message(),
-                        "Tenderly simulation failed"
-                    );
-                    debug.tenderly = Some(TenderlyDebug {
-                        simulation_url: None,
-                        simulation_id: None,
-                    });
-                }
-            },
+            }
             None => {
                 warn!(
                     request_id = request.request_id.as_deref().unwrap_or(""),
@@ -1242,6 +1250,8 @@ async fn build_debug(
                 debug.tenderly = Some(TenderlyDebug {
                     simulation_url: None,
                     simulation_id: None,
+                    skipped: None,
+                    skip_reason: None,
                 });
             }
         }
@@ -1327,7 +1337,23 @@ impl TenderlyConfig {
     }
 }
 
+enum BalanceSlotResolution {
+    Resolved(u64),
+    Skipped(String),
+}
+
+impl BalanceSlotResolution {
+    fn resolved(slot: u64) -> Self {
+        Self::Resolved(slot)
+    }
+
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped(reason.into())
+    }
+}
+
 async fn simulate_tenderly_bundle(
+    state: &AppState,
     request: &RouteEncodeRequest,
     interactions: &[Interaction],
     config: &TenderlyConfig,
@@ -1336,14 +1362,40 @@ async fn simulate_tenderly_bundle(
         return Ok(TenderlyDebug {
             simulation_url: None,
             simulation_id: None,
+            skipped: None,
+            skip_reason: None,
         });
     }
+
+    let token_in = parse_address(&request.token_in)?;
+    let settlement = parse_address(&request.settlement_address)?;
+    let amount_in = parse_amount(&request.amount_in)?;
+    let balance_slot =
+        resolve_balance_slot_for_tenderly(state, request.chain_id, &token_in, &settlement).await;
+    let balance_slot = match balance_slot {
+        BalanceSlotResolution::Resolved(slot) => slot,
+        BalanceSlotResolution::Skipped(reason) => {
+            warn!(
+                request_id = request.request_id.as_deref().unwrap_or(""),
+                reason = reason.as_str(),
+                "Skipping Tenderly simulation"
+            );
+            return Ok(TenderlyDebug {
+                simulation_url: None,
+                simulation_id: None,
+                skipped: Some(true),
+                skip_reason: Some(reason),
+            });
+        }
+    };
+    let storage_key = mapping_storage_key(&settlement, balance_slot);
+    let state_objects = tenderly_state_objects(&token_in, storage_key, &amount_in)?;
 
     let simulations: Vec<Value> = interactions
         .iter()
         .map(|interaction| {
             let value_json = tenderly_value_json(&interaction.value)?;
-            Ok(json!({
+            let mut simulation = json!({
                 "network_id": request.chain_id.to_string(),
                 "save": true,
                 "save_if_fails": true,
@@ -1354,7 +1406,11 @@ async fn simulate_tenderly_bundle(
                 "gas": config.gas,
                 "gas_price": 0,
                 "value": value_json,
-            }))
+            });
+            if let Some(map) = simulation.as_object_mut() {
+                map.insert("state_objects".to_string(), state_objects.clone());
+            }
+            Ok(simulation)
         })
         .collect::<Result<Vec<_>, EncodeError>>()?;
 
@@ -1398,6 +1454,8 @@ async fn simulate_tenderly_bundle(
     Ok(TenderlyDebug {
         simulation_url,
         simulation_id,
+        skipped: None,
+        skip_reason: None,
     })
 }
 
@@ -1408,6 +1466,208 @@ fn tenderly_value_json(value: &str) -> Result<Value, EncodeError> {
     } else {
         Ok(json!(amount.to_str_radix(10)))
     }
+}
+
+fn tenderly_state_objects(
+    token_address: &Bytes,
+    storage_key: [u8; 32],
+    amount: &BigUint,
+) -> Result<Value, EncodeError> {
+    let storage_key = format_bytes32_hex(&storage_key);
+    let value_hex = format_u256_hex(amount)?;
+    Ok(json!({
+        format_address(token_address): {
+            "storage": {
+                storage_key: value_hex
+            }
+        }
+    }))
+}
+
+async fn resolve_balance_slot_for_tenderly(
+    state: &AppState,
+    chain_id: u64,
+    token: &Bytes,
+    settlement: &Bytes,
+) -> BalanceSlotResolution {
+    let cache_key = (chain_id, token.clone());
+    if let Some(slot) = {
+        let guard = state.tenderly_balance_slots.read().await;
+        guard.get(&cache_key).copied()
+    } {
+        return BalanceSlotResolution::resolved(slot);
+    }
+
+    let Some(rpc_url) = state.rpc_url.as_deref() else {
+        return BalanceSlotResolution::skipped(
+            "RPC_URL not set; balance slot resolution unavailable",
+        );
+    };
+
+    match probe_balance_slot(rpc_url, token, settlement).await {
+        Ok(Some(slot)) => {
+            let mut guard = state.tenderly_balance_slots.write().await;
+            guard.insert(cache_key, slot);
+            BalanceSlotResolution::resolved(slot)
+        }
+        Ok(None) => BalanceSlotResolution::skipped(
+            "Token balance slot resolution failed; Tenderly override not applied",
+        ),
+        Err(err) => BalanceSlotResolution::skipped(format!(
+            "Token balance slot resolution errored: {}",
+            err.message()
+        )),
+    }
+}
+
+async fn probe_balance_slot(
+    rpc_url: &str,
+    token: &Bytes,
+    settlement: &Bytes,
+) -> Result<Option<u64>, EncodeError> {
+    let token_address = format_address(token);
+    let calldata = erc20_balance_of_calldata(settlement);
+    let sentinel = parse_hex_u256(BALANCE_SLOT_SENTINEL_HEX)?;
+    let sentinel_hex = format_u256_hex(&sentinel)?;
+    let client = Client::new();
+
+    // Probe candidate slots by overriding storage and checking balanceOf output.
+    for slot in 0..=BALANCE_SLOT_SCAN_MAX {
+        let storage_key = mapping_storage_key(settlement, slot);
+        let storage_key_hex = format_bytes32_hex(&storage_key);
+        let state_override = json!({
+            token_address.clone(): {
+                "stateDiff": {
+                    storage_key_hex: sentinel_hex.clone()
+                }
+            }
+        });
+
+        let result =
+            rpc_eth_call_with_override(&client, rpc_url, &token_address, &calldata, state_override)
+                .await?;
+        let balance = parse_hex_u256(&result)?;
+        if balance == sentinel {
+            return Ok(Some(slot));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn rpc_eth_call_with_override(
+    client: &Client,
+    rpc_url: &str,
+    to: &str,
+    data: &str,
+    state_override: Value,
+) -> Result<String, EncodeError> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [
+            {
+                "to": to,
+                "data": data
+            },
+            "latest",
+            state_override
+        ]
+    });
+
+    let response = client
+        .post(rpc_url)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| EncodeError::encoding(format!("RPC eth_call failed: {err}")))?;
+
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| EncodeError::encoding(format!("RPC response decode failed: {err}")))?;
+
+    if !status.is_success() {
+        return Err(EncodeError::encoding(format!(
+            "RPC eth_call returned status {}",
+            status
+        )));
+    }
+
+    if let Some(error) = body.get("error") {
+        return Err(EncodeError::encoding(format!(
+            "RPC eth_call error: {}",
+            error
+        )));
+    }
+
+    let result = body
+        .get("result")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| EncodeError::encoding("RPC eth_call missing result"))?;
+
+    Ok(result.to_string())
+}
+
+fn erc20_balance_of_calldata(holder: &Bytes) -> String {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&ERC20_BALANCE_OF_SELECTOR);
+    let mut padded = [0u8; 32];
+    padded[12..].copy_from_slice(holder);
+    data.extend_from_slice(&padded);
+    format_0x_hex(&format!("{:x}", Bytes::from(data)))
+}
+
+fn mapping_storage_key(address: &Bytes, slot: u64) -> [u8; 32] {
+    // Solidity mapping storage: keccak256(pad(key) || pad(slot)).
+    let mut hasher = Keccak256::new();
+    hasher.update(pad_address_32(address));
+    hasher.update(pad_u64_32(slot));
+    let hash = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash[..]);
+    out
+}
+
+fn pad_address_32(address: &Bytes) -> [u8; 32] {
+    let mut padded = [0u8; 32];
+    padded[32 - address.len()..].copy_from_slice(address);
+    padded
+}
+
+fn pad_u64_32(value: u64) -> [u8; 32] {
+    let mut padded = [0u8; 32];
+    padded[24..].copy_from_slice(&value.to_be_bytes());
+    padded
+}
+
+fn format_bytes32_hex(value: &[u8; 32]) -> String {
+    let bytes = Bytes::from(value.to_vec());
+    format_0x_hex(&format!("{bytes:x}"))
+}
+
+fn format_u256_hex(value: &BigUint) -> Result<String, EncodeError> {
+    let hex = value.to_str_radix(16);
+    if hex.len() > 64 {
+        return Err(EncodeError::encoding(
+            "Tenderly override value exceeds 256 bits",
+        ));
+    }
+    Ok(format!("0x{:0>64}", hex))
+}
+
+fn parse_hex_u256(value: &str) -> Result<BigUint, EncodeError> {
+    let raw = value.trim();
+    let stripped = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
+    let digits = stripped.unwrap_or(raw);
+    if digits.is_empty() {
+        return Ok(BigUint::zero());
+    }
+    BigUint::parse_bytes(digits.as_bytes(), 16)
+        .ok_or_else(|| EncodeError::encoding(format!("Invalid hex value: {}", value)))
 }
 
 fn extract_simulation_id(body: &Value) -> Option<String> {
@@ -1581,6 +1841,34 @@ mod tests {
         assert_eq!(allocated[1].amount_in, BigUint::from(70u32));
         assert_eq!(allocated[0].split_bps, 3000);
         assert_eq!(allocated[1].split_bps, 0);
+    }
+
+    #[test]
+    fn mapping_storage_key_matches_tenderly_example() {
+        let ward = parse_address("0xe2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2").unwrap();
+        let storage_key = mapping_storage_key(&ward, 0);
+        let expected = "0xedd7d04419e9c48ceb6055956cbb4e2091ae310313a4d1fa7cbcfe7561616e03";
+        assert_eq!(format_bytes32_hex(&storage_key), expected);
+    }
+
+    #[test]
+    fn tenderly_state_objects_serializes_storage_override() {
+        let token = parse_address("0x6b175474e89094c44da98b954eedeac495271d0f").unwrap();
+        let ward = parse_address("0xe2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2").unwrap();
+        let storage_key = mapping_storage_key(&ward, 0);
+        let value = BigUint::from(1u32);
+        let expected = json!({
+            "0x6b175474e89094c44da98b954eedeac495271d0f": {
+                "storage": {
+                    "0xedd7d04419e9c48ceb6055956cbb4e2091ae310313a4d1fa7cbcfe7561616e03":
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                }
+            }
+        });
+        assert_eq!(
+            tenderly_state_objects(&token, storage_key, &value).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -2160,6 +2448,7 @@ mod tests {
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
             state_store: Arc::clone(&state_store),
+            rpc_url: None,
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
@@ -2167,6 +2456,7 @@ mod tests {
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
+            tenderly_balance_slots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         };
 
         let normalized = NormalizedRouteInternal {
@@ -2259,6 +2549,7 @@ mod tests {
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
             state_store: Arc::clone(&state_store),
+            rpc_url: None,
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
@@ -2266,6 +2557,7 @@ mod tests {
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
+            tenderly_balance_slots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         };
 
         let normalized = NormalizedRouteInternal {
