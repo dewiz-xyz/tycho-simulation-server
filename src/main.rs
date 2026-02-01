@@ -1,9 +1,3 @@
-mod api;
-mod config;
-mod handlers;
-mod models;
-mod services;
-
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +6,12 @@ use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
-use crate::api::create_router;
-use crate::config::{init_logging, load_config};
-use crate::handlers::stream::process_stream;
-use crate::models::state::{AppState, StateStore};
-use crate::models::tokens::TokenStore;
-use crate::services::stream_builder::build_merged_streams;
+use tycho_simulation_server::api::create_router;
+use tycho_simulation_server::config::{init_logging, load_config};
+use tycho_simulation_server::handlers::stream::process_stream;
+use tycho_simulation_server::models::state::{AppState, StateStore};
+use tycho_simulation_server::models::tokens::TokenStore;
+use tycho_simulation_server::services::stream_builder::build_merged_streams;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
