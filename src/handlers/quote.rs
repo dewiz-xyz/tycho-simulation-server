@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use axum::{extract::State, Json};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn, debug};
+use tracing::{debug, warn};
 
 use crate::{
     models::{
