@@ -132,6 +132,24 @@ cargo run --release
 
 The application binds to the configured `HOST:PORT` and begins streaming protocol data before serving HTTP requests.
 
+## Testing
+
+- `cargo test` runs unit and integration tests.
+- Integration tests live under `tests/integration/` and are wired by `tests/integration/main.rs`.
+- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up.
+
+Run only the integration tests:
+
+```bash
+cargo test --test integration
+```
+
+Run just the jemalloc plateau test:
+
+```bash
+cargo test --test integration jemalloc_memory_plateau_after_reset
+```
+
 ## Dependencies
 
 - `tycho-simulation` – protocol stream and simulator client

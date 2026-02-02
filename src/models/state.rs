@@ -104,6 +104,11 @@ impl ProtocolShard {
         let guard = self.states.read().await;
         guard.len()
     }
+
+    async fn clear(&self) {
+        let mut guard = self.states.write().await;
+        guard.clear();
+    }
 }
 
 pub struct UpdateMetrics {
@@ -140,6 +145,72 @@ impl StateStore {
             block_number: RwLock::new(0),
             ready: AtomicBool::new(false),
             ready_tx,
+        }
+    }
+
+    async fn rebuild_indexes(&self) -> usize {
+        let mut id_to_kind = HashMap::new();
+        let mut token_index: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        let mut total_pairs = 0usize;
+
+        for (kind, shard) in self.shards.iter() {
+            let guard = shard.states.read().await;
+            for (id, (_, component)) in guard.iter() {
+                id_to_kind.insert(id.clone(), *kind);
+                total_pairs += 1;
+                for token in component.tokens.iter() {
+                    token_index
+                        .entry(token.address.clone())
+                        .or_default()
+                        .insert(id.clone());
+                }
+            }
+        }
+
+        *self.id_to_kind.write().await = id_to_kind;
+        *self.token_index.write().await = token_index;
+        total_pairs
+    }
+
+    pub async fn reset(&self) {
+        for shard in self.shards.values() {
+            shard.clear().await;
+        }
+        self.id_to_kind.write().await.clear();
+        self.token_index.write().await.clear();
+        *self.block_number.write().await = 0;
+        self.ready.store(false, Ordering::Relaxed);
+        let _ = self.ready_tx.send(false);
+    }
+
+    pub async fn reset_protocols(&self, protocols: &[ProtocolKind]) {
+        if protocols.is_empty() {
+            return;
+        }
+
+        if protocols.len() >= self.shards.len() {
+            self.reset().await;
+            return;
+        }
+
+        let mut any_cleared = false;
+        for kind in protocols {
+            if let Some(shard) = self.shards.get(kind) {
+                shard.clear().await;
+                any_cleared = true;
+            }
+        }
+
+        if !any_cleared {
+            return;
+        }
+
+        let total_pairs = self.rebuild_indexes().await;
+        let was_ready = self.ready.load(Ordering::Acquire);
+        let now_ready = total_pairs > 0;
+        if was_ready != now_ready {
+            self.ready.store(now_ready, Ordering::Release);
+            let _ = self.ready_tx.send(now_ready);
         }
     }
 
@@ -272,6 +343,10 @@ impl StateStore {
         total
     }
 
+    pub async fn has_pool(&self, id: &str) -> bool {
+        self.id_to_kind.read().await.contains_key(id)
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
@@ -385,10 +460,125 @@ fn apply_token_index_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use num_bigint::BigUint;
+    use tycho_simulation::{
+        protocol::models::ProtocolComponent,
+        tycho_common::{
+            dto::ProtocolStateDelta,
+            models::{token::Token, Chain},
+            simulation::{
+                errors::{SimulationError, TransitionError},
+                protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
+            },
+            Bytes,
+        },
+    };
+
+    #[derive(Debug, Clone)]
+    struct DummySim;
+
+    impl ProtocolSim for DummySim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            _amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            Ok(GetAmountOutResult::new(
+                BigUint::from(0u8),
+                BigUint::from(0u8),
+                Box::new(self.clone()),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(0u8), BigUint::from(0u8)))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<DummySim>()
+        }
+    }
 
     fn token(address: &str) -> Bytes {
         Bytes::from_str(address.trim_start_matches("0x")).expect("valid token address")
+    }
+
+    fn address(seed: u8) -> Bytes {
+        Bytes::from([seed; 20])
+    }
+
+    fn mk_token(seed: u8, symbol: &str) -> Token {
+        Token::new(&address(seed), symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    fn mk_component(
+        id_seed: u8,
+        protocol_system: &str,
+        protocol_type_name: &str,
+        tokens: Vec<Token>,
+    ) -> ProtocolComponent {
+        ProtocolComponent::new(
+            address(id_seed),
+            protocol_system.to_string(),
+            protocol_type_name.to_string(),
+            Chain::Ethereum,
+            tokens,
+            Vec::new(),
+            HashMap::new(),
+            Bytes::new(),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .expect("valid timestamp")
+                .naive_utc(),
+        )
+    }
+
+    fn mk_update(pairs: Vec<(String, ProtocolComponent, Box<dyn ProtocolSim>)>) -> Update {
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        for (id, component, state) in pairs {
+            states.insert(id.clone(), state);
+            new_pairs.insert(id, component);
+        }
+        Update::new(1, states, new_pairs)
     }
 
     #[test]
@@ -465,5 +655,90 @@ mod tests {
         }
 
         assert_eq!(batched, sequential);
+    }
+
+    #[tokio::test]
+    async fn reset_protocols_preserves_unaffected_pools() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let token_a = mk_token(1, "TKNA");
+        let token_b = mk_token(2, "TKNB");
+        let token_c = mk_token(3, "TKNC");
+        let token_d = mk_token(4, "TKND");
+
+        let component_v2 = mk_component(
+            10,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let component_v3 = mk_component(
+            11,
+            "uniswap_v3",
+            "uniswap_v3_pool",
+            vec![token_c.clone(), token_d.clone()],
+        );
+
+        let update = mk_update(vec![
+            ("pool-v2".to_string(), component_v2, Box::new(DummySim)),
+            ("pool-v3".to_string(), component_v3, Box::new(DummySim)),
+        ]);
+        store.apply_update(update).await;
+
+        assert_eq!(store.total_states().await, 2);
+        assert!(store.is_ready());
+
+        store.reset_protocols(&[ProtocolKind::UniswapV2]).await;
+
+        assert_eq!(store.total_states().await, 1);
+        assert!(store.is_ready());
+
+        let remaining = store
+            .matching_pools_by_addresses(&token_c.address, &token_d.address)
+            .await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "pool-v3");
+
+        let cleared = store
+            .matching_pools_by_addresses(&token_a.address, &token_b.address)
+            .await;
+        assert!(cleared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_protocols_updates_ready_when_empty() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let token_a = mk_token(5, "TKN1");
+        let token_b = mk_token(6, "TKN2");
+        let component = mk_component(12, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
+
+        let update = mk_update(vec![(
+            "pool-only".to_string(),
+            component,
+            Box::new(DummySim),
+        )]);
+        store.apply_update(update).await;
+
+        assert!(store.is_ready());
+
+        store.reset_protocols(&[ProtocolKind::UniswapV2]).await;
+
+        assert_eq!(store.total_states().await, 0);
+        assert!(!store.is_ready());
     }
 }
