@@ -26,6 +26,7 @@ use crate::models::tokens::TokenStoreError;
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub skipped_vm_unavailable: bool,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
     pub skipped_native_deadline: usize,
@@ -305,20 +306,35 @@ pub async fn get_amounts_out(
     let amounts_in = Arc::new(amounts_in);
     let quote_deadline = Instant::now() + quote_timeout;
 
-    let candidates_raw = state
-        .state_store
+    let native_candidates_raw = state
+        .native_state_store
         .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
         .await;
 
-    let mut native_candidates = Vec::new();
-    let mut vm_candidates = Vec::new();
-    for (id, (pool_state, component)) in candidates_raw.into_iter() {
-        if component.protocol_system.starts_with("vm:") {
-            vm_candidates.push((id, pool_state, component));
-        } else {
-            native_candidates.push((id, pool_state, component));
-        }
+    let vm_ready = state.vm_ready().await;
+    if !vm_ready {
+        metrics.skipped_vm_unavailable = true;
     }
+    let vm_candidates_raw = if vm_ready {
+        state
+            .vm_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
+            .await
+    } else {
+        Vec::new()
+    };
+
+    let mut native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        native_candidates_raw
+            .into_iter()
+            .map(|(id, (pool_state, component))| (id, pool_state, component))
+            .collect();
+
+    let mut vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        vm_candidates_raw
+            .into_iter()
+            .map(|(id, (pool_state, component))| (id, pool_state, component))
+            .collect();
 
     let total_candidates = native_candidates.len() + vm_candidates.len();
     meta.matching_pools = total_candidates;

@@ -7961,6 +7961,7 @@ dependencies = [
  "jemallocator",
  "num-bigint",
  "num-traits",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

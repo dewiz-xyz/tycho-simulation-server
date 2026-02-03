@@ -64,6 +64,36 @@ impl AppState {
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
     }
+
+    pub async fn vm_ready(&self) -> bool {
+        if !self.enable_vm_pools {
+            return false;
+        }
+        if self.vm_rebuilding().await {
+            return false;
+        }
+        self.vm_state_store.is_ready()
+    }
+
+    pub async fn vm_rebuilding(&self) -> bool {
+        self.vm_stream.read().await.rebuilding
+    }
+
+    pub async fn vm_block(&self) -> u64 {
+        self.vm_state_store.current_block().await
+    }
+
+    pub async fn vm_pools(&self) -> usize {
+        self.vm_state_store.total_states().await
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VmStreamStatus {
+    pub rebuilding: bool,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_started_at: Option<Instant>,
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);

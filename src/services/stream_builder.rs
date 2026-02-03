@@ -30,13 +30,12 @@ static UNISWAP_V4_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_FILTERED: AtomicUsize = AtomicUsize::new(0);
 static UNISWAP_V4_LOGGED: AtomicBool = AtomicBool::new(false);
 
-pub async fn build_merged_streams(
+pub async fn build_native_stream(
     tycho_url: &str,
     api_key: &str,
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
     tokens: Arc<TokenStore>,
-    enable_vm_pools: bool,
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -50,18 +49,8 @@ pub async fn build_merged_streams(
     UNISWAP_V4_FILTERED.store(0, Ordering::Relaxed);
     UNISWAP_V4_LOGGED.store(false, Ordering::Relaxed);
 
-    let add_tvl = tvl_add_threshold;
-    let keep_tvl = tvl_keep_threshold.min(add_tvl);
-    info!(
-        "Using TVL thresholds: remove/keep={} add={}",
-        keep_tvl, add_tvl
-    );
-    let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
-
-    let mut builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
-        .latency_buffer(15)
-        .auth_key(Some(api_key.to_string()))
-        .skip_state_decode_failures(true);
+    let (mut builder, tvl_filter) =
+        base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
 
     builder = builder.exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV2State>("sushiswap_v2", tvl_filter.clone(), None);
@@ -77,22 +66,6 @@ pub async fn build_merged_streams(
         Some(fluid_v1_paused_pools_filter),
     );
     // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
-
-    if enable_vm_pools {
-        builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-            "vm:curve",
-            tvl_filter.clone(),
-            Some(curve_pool_filter),
-        );
-        builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-            "vm:balancer_v2",
-            tvl_filter.clone(),
-            Some(balancer_v2_pool_filter),
-        );
-        info!("VM pool feeds enabled");
-    } else {
-        info!("VM pool feeds disabled");
-    }
 
     // COMING SOON!
     // builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), None);
@@ -117,4 +90,63 @@ pub async fn build_merged_streams(
         }
         item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
     }))
+}
+
+pub async fn build_vm_stream(
+    tycho_url: &str,
+    api_key: &str,
+    tvl_add_threshold: f64,
+    tvl_keep_threshold: f64,
+    tokens: Arc<TokenStore>,
+) -> Result<
+    impl futures::Stream<
+            Item = Result<
+                tycho_simulation::protocol::models::Update,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
+> {
+    let (mut builder, tvl_filter) =
+        base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
+
+    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
+        "vm:curve",
+        tvl_filter.clone(),
+        Some(curve_pool_filter),
+    );
+    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
+        "vm:balancer_v2",
+        tvl_filter.clone(),
+        Some(balancer_v2_pool_filter),
+    );
+
+    let snapshot = tokens.snapshot().await;
+    let stream = builder.set_tokens(snapshot).await.build().await?;
+
+    Ok(stream.map(|item| {
+        item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
+    }))
+}
+
+fn base_builder(
+    tycho_url: &str,
+    api_key: &str,
+    tvl_add_threshold: f64,
+    tvl_keep_threshold: f64,
+) -> (ProtocolStreamBuilder, ComponentFilter) {
+    let add_tvl = tvl_add_threshold;
+    let keep_tvl = tvl_keep_threshold.min(add_tvl);
+    info!(
+        "Using TVL thresholds: remove/keep={} add={}",
+        keep_tvl, add_tvl
+    );
+    let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
+
+    let builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
+        .latency_buffer(15)
+        .auth_key(Some(api_key.to_string()))
+        .skip_state_decode_failures(true);
+
+    (builder, tvl_filter)
 }

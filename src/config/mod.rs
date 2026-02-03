@@ -98,6 +98,80 @@ pub fn load_config() -> AppConfig {
         .unwrap_or(default_vm)
         .max(1);
 
+    let stream_stale_secs: u64 = std::env::var("STREAM_STALE_SECS")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .expect("Invalid STREAM_STALE_SECS");
+    let stream_missing_block_burst: u64 = std::env::var("STREAM_MISSING_BLOCK_BURST")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .expect("Invalid STREAM_MISSING_BLOCK_BURST");
+    let stream_missing_block_window_secs: u64 = std::env::var("STREAM_MISSING_BLOCK_WINDOW_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid STREAM_MISSING_BLOCK_WINDOW_SECS");
+    let stream_error_burst: u64 = std::env::var("STREAM_ERROR_BURST")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .expect("Invalid STREAM_ERROR_BURST");
+    let stream_error_window_secs: u64 = std::env::var("STREAM_ERROR_WINDOW_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid STREAM_ERROR_WINDOW_SECS");
+    let resync_grace_secs: u64 = std::env::var("RESYNC_GRACE_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid RESYNC_GRACE_SECS");
+    let stream_restart_backoff_min_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MIN_MS")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_MIN_MS");
+    let stream_restart_backoff_max_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MAX_MS")
+        .unwrap_or_else(|_| "30000".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_MAX_MS");
+    let stream_restart_backoff_jitter_pct: f64 = std::env::var("STREAM_RESTART_BACKOFF_JITTER_PCT")
+        .unwrap_or_else(|_| "0.2".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_JITTER_PCT");
+    let readiness_stale_secs: u64 = std::env::var("READINESS_STALE_SECS")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .expect("Invalid READINESS_STALE_SECS");
+
+    assert!(stream_stale_secs > 0, "STREAM_STALE_SECS must be > 0");
+    assert!(
+        stream_missing_block_burst > 0,
+        "STREAM_MISSING_BLOCK_BURST must be > 0"
+    );
+    assert!(
+        stream_missing_block_window_secs > 0,
+        "STREAM_MISSING_BLOCK_WINDOW_SECS must be > 0"
+    );
+    assert!(stream_error_burst > 0, "STREAM_ERROR_BURST must be > 0");
+    assert!(
+        stream_error_window_secs > 0,
+        "STREAM_ERROR_WINDOW_SECS must be > 0"
+    );
+    assert!(resync_grace_secs > 0, "RESYNC_GRACE_SECS must be > 0");
+    assert!(
+        stream_restart_backoff_min_ms > 0,
+        "STREAM_RESTART_BACKOFF_MIN_MS must be > 0"
+    );
+    assert!(
+        stream_restart_backoff_max_ms > 0,
+        "STREAM_RESTART_BACKOFF_MAX_MS must be > 0"
+    );
+    assert!(
+        stream_restart_backoff_min_ms <= stream_restart_backoff_max_ms,
+        "STREAM_RESTART_BACKOFF_MIN_MS must be <= STREAM_RESTART_BACKOFF_MAX_MS"
+    );
+    assert!(
+        (0.0..=1.0).contains(&stream_restart_backoff_jitter_pct),
+        "STREAM_RESTART_BACKOFF_JITTER_PCT must be within [0.0, 1.0]"
+    );
+    assert!(readiness_stale_secs > 0, "READINESS_STALE_SECS must be > 0");
+
     AppConfig {
         tycho_url,
         api_key,
@@ -113,6 +187,16 @@ pub fn load_config() -> AppConfig {
         enable_vm_pools,
         global_native_sim_concurrency,
         global_vm_sim_concurrency,
+        stream_stale_secs,
+        stream_missing_block_burst,
+        stream_missing_block_window_secs,
+        stream_error_burst,
+        stream_error_window_secs,
+        resync_grace_secs,
+        stream_restart_backoff_min_ms,
+        stream_restart_backoff_max_ms,
+        stream_restart_backoff_jitter_pct,
+        readiness_stale_secs,
     }
 }
 
@@ -132,4 +216,14 @@ pub struct AppConfig {
     pub enable_vm_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
+    pub stream_stale_secs: u64,
+    pub stream_missing_block_burst: u64,
+    pub stream_missing_block_window_secs: u64,
+    pub stream_error_burst: u64,
+    pub stream_error_window_secs: u64,
+    pub resync_grace_secs: u64,
+    pub stream_restart_backoff_min_ms: u64,
+    pub stream_restart_backoff_max_ms: u64,
+    pub stream_restart_backoff_jitter_pct: f64,
+    pub readiness_stale_secs: u64,
 }
