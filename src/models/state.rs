@@ -38,6 +38,13 @@ impl AppState {
         self.native_state_store.current_block().await
     }
 
+    pub async fn current_vm_block(&self) -> Option<u64> {
+        if !self.vm_ready().await {
+            return None;
+        }
+        Some(self.vm_state_store.current_block().await)
+    }
+
     pub async fn total_pools(&self) -> usize {
         let native = self.native_state_store.total_states().await;
         let vm = self.vm_state_store.total_states().await;
@@ -841,5 +848,6 @@ mod tests {
         };
 
         assert_eq!(app_state.total_pools().await, 2);
+        assert_eq!(app_state.current_vm_block().await, Some(1));
     }
 }

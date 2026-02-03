@@ -10,7 +10,7 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 
 - Background ingestion of Tycho protocol streams with TVL-based filtering.
 - `POST /simulate` endpoint that returns laddered amount-out simulated quotes with rich metadata.
-- `GET /status` endpoint for readiness polling (block height, pool count).
+- `GET /status` endpoint for readiness polling (native + VM block height, pool count).
 - Structured logging with `tracing`.
 - Fully asynchronous execution with Tokio.
 
@@ -93,6 +93,7 @@ Response body:
   "meta": {
     "status": "ready",
     "block_number": 19876543,
+    "vm_block_number": 19876540,
     "matching_pools": 4,
     "candidate_pools": 4,
     "total_pools": 412,
@@ -101,7 +102,7 @@ Response body:
 }
 ```
 
-`QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`.
+`QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`. `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
 Timeout behavior:
 - Handler-level timeout returns `200 OK` with `PartialFailure`, includes `request_id`, `block_number`, `total_pools`, and a `Timeout` failure.
@@ -116,6 +117,7 @@ Returns readiness information for health checks and pollers:
 {
   "status": "ready",
   "block": 19876543,
+  "vm_block": 19876540,
   "pools": 412
 }
 ```

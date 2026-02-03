@@ -52,11 +52,13 @@ pub async fn get_amounts_out(
     let quote_timeout = state.quote_timeout();
 
     let mut current_block = state.current_block().await;
+    let mut current_vm_block = state.current_vm_block().await;
     let mut total_pools = state.total_pools().await;
 
     let mut meta = QuoteMeta {
         status: QuoteStatus::Ready,
         block_number: current_block,
+        vm_block_number: current_vm_block,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: Some(total_pools),
@@ -136,8 +138,10 @@ pub async fn get_amounts_out(
             };
         }
         current_block = state.current_block().await;
+        current_vm_block = state.current_vm_block().await;
         total_pools = state.total_pools().await;
         meta.block_number = current_block;
+        meta.vm_block_number = current_vm_block;
         meta.total_pools = Some(total_pools);
     }
 
@@ -652,7 +656,7 @@ pub async fn get_amounts_out(
 
         let top = &responses[0];
         debug!(
-            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={}",
+            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={} vm_block={:?}",
             responses.len(),
             top.pool_name,
             top.pool_address,
@@ -660,7 +664,8 @@ pub async fn get_amounts_out(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "0".to_string()),
-            top.block_number
+            top.block_number,
+            meta.vm_block_number
         );
 
         if !failures.is_empty() && matches!(meta.status, QuoteStatus::Ready) {
