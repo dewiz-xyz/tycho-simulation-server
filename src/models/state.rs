@@ -424,19 +424,34 @@ impl StateStore {
         }
     }
 
+    async fn ids_for_token(&self, token: &Bytes) -> Option<HashSet<String>> {
+        let wrapped_native_token = self.tokens.wrapped_native_token();
+        let needs_native = wrapped_native_token
+            .as_ref()
+            .map_or(false, |weth| weth == token);
+        let native_address = Bytes::from([0u8; 20]);
+
+        let index = self.token_index.read().await;
+        let mut ids = index.get(token).cloned()?;
+
+        if needs_native {
+            if let Some(native_ids) = index.get(&native_address) {
+                ids.extend(native_ids.iter().cloned());
+            }
+        }
+
+        Some(ids)
+    }
+
     pub(crate) async fn matching_pools_by_addresses(
         &self,
         token_in: &Bytes,
         token_out: &Bytes,
     ) -> Vec<(String, PoolEntry)> {
-        let (token_in_ids, token_out_ids) = {
-            let index = self.token_index.read().await;
-            let token_in_ids = index.get(token_in).cloned();
-            let token_out_ids = index.get(token_out).cloned();
-            (token_in_ids, token_out_ids)
-        };
-
-        let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
+        let (Some(token_in_ids), Some(token_out_ids)) = (
+            self.ids_for_token(token_in).await,
+            self.ids_for_token(token_out).await,
+        ) else {
             return Vec::new();
         };
 
@@ -849,5 +864,59 @@ mod tests {
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+    }
+
+    async fn matching_pools_includes_native_for_wrapped_native() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let weth_address =
+            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let weth_token = Token::new(&weth_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
+        let native_address = Bytes::from([0u8; 20]);
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let token_x = mk_token(9, "TKNX");
+
+        let component_wrapped = mk_component(
+            20,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![weth_token, token_x.clone()],
+        );
+        let component_native = mk_component(
+            21,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![native_token, token_x.clone()],
+        );
+
+        let update = mk_update(vec![
+            (
+                "pool-weth".to_string(),
+                component_wrapped,
+                Box::new(DummySim),
+            ),
+            (
+                "pool-native".to_string(),
+                component_native,
+                Box::new(DummySim),
+            ),
+        ]);
+        store.apply_update(update).await;
+
+        let matches = store
+            .matching_pools_by_addresses(&weth_address, &token_x.address)
+            .await;
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("pool-weth"));
+        assert!(ids.contains("pool-native"));
     }
 }
