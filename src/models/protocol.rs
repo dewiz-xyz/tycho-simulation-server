@@ -59,18 +59,32 @@ impl ProtocolKind {
         let system_name = normalize_proto_name(&component.protocol_system);
 
         match type_name.as_str() {
-            "uniswap_v2" | "uniswapv2" => return Some(ProtocolKind::UniswapV2),
-            "uniswap_v3" | "uniswapv3" => return Some(ProtocolKind::UniswapV3),
-            "uniswap_v4" | "uniswapv4" => return Some(ProtocolKind::UniswapV4),
+            "uniswap_v2" | "uniswapv2" | "uniswap_v2_pool" => {
+                return Some(ProtocolKind::UniswapV2);
+            }
+            "uniswap_v3" | "uniswapv3" | "uniswap_v3_pool" => {
+                return Some(ProtocolKind::UniswapV3);
+            }
+            "uniswap_v4" | "uniswapv4" | "uniswap_v4_pool" | "uniswap_v4_hooks" => {
+                return Some(ProtocolKind::UniswapV4);
+            }
             "curve_pool" => return Some(ProtocolKind::Curve),
-            "pancakeswap_v2" | "pancakeswapv2" => return Some(ProtocolKind::PancakeswapV2),
-            "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
+            "pancakeswap_v2" | "pancakeswapv2" | "pancakeswap_v2_pool" => {
+                return Some(ProtocolKind::PancakeswapV2);
+            }
+            "pancakeswap_v3" | "pancakeswapv3" | "pancakeswap_v3_pool" => {
+                return Some(ProtocolKind::PancakeswapV3);
+            }
             "ekubo_v2" | "ekubov2" => return Some(ProtocolKind::EkuboV2),
-            "sushiswap_v2" | "sushiswapv2" => return Some(ProtocolKind::SushiswapV2),
+            "sushiswap_v2" | "sushiswapv2" | "sushiswap_v2_pool" => {
+                return Some(ProtocolKind::SushiswapV2);
+            }
             "maverick_v2" | "maverickv2" | "vm:maverick_v2" => {
                 return Some(ProtocolKind::MaverickV2)
             }
-            "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
+            "balancer_v2" | "balancer_v2_pool" | "balancerv2_pool" => {
+                return Some(ProtocolKind::BalancerV2);
+            }
             "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
             "rocketpool" => return Some(ProtocolKind::Rocketpool),
             "ekubo_v3" | "ekubov3" => return Some(ProtocolKind::EkuboV3),
@@ -80,7 +94,7 @@ impl ProtocolKind {
         match system_name.as_str() {
             "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
-            "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
+            "uniswap_v4" | "uniswapv4" | "uniswap_v4_hooks" => Some(ProtocolKind::UniswapV4),
             "vm:curve" => Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
@@ -99,16 +113,22 @@ impl ProtocolKind {
         let name = normalize_proto_name(protocol);
 
         match name.as_str() {
-            "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
-            "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
-            "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
+            "uniswap_v2" | "uniswapv2" | "uniswap_v2_pool" => Some(ProtocolKind::UniswapV2),
+            "uniswap_v3" | "uniswapv3" | "uniswap_v3_pool" => Some(ProtocolKind::UniswapV3),
+            "uniswap_v4" | "uniswapv4" | "uniswap_v4_pool" | "uniswap_v4_hooks" => {
+                Some(ProtocolKind::UniswapV4)
+            }
             "curve" | "curve_pool" | "vm:curve" => Some(ProtocolKind::Curve),
-            "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
-            "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
+            "pancakeswap_v2" | "pancakeswapv2" | "pancakeswap_v2_pool" => {
+                Some(ProtocolKind::PancakeswapV2)
+            }
+            "pancakeswap_v3" | "pancakeswapv3" | "pancakeswap_v3_pool" => {
+                Some(ProtocolKind::PancakeswapV3)
+            }
             "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
-            "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
+            "sushiswap_v2" | "sushiswapv2" | "sushiswap_v2_pool" => Some(ProtocolKind::SushiswapV2),
             "maverick_v2" | "maverickv2" | "vm:maverick_v2" => Some(ProtocolKind::MaverickV2),
-            "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
+            "balancer_v2" | "balancer_v2_pool" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
             "ekubo_v3" | "ekubov3" => Some(ProtocolKind::EkuboV3),
@@ -136,19 +156,23 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn recognizes_vm_curve_component() {
-        let component = ProtocolComponent::new(
+    fn protocol_component(protocol_system: &str, protocol_type_name: &str) -> ProtocolComponent {
+        ProtocolComponent::new(
             Bytes::default(),
-            "vm:curve".to_string(),
-            "curve_pool".to_string(),
+            protocol_system.to_string(),
+            protocol_type_name.to_string(),
             Chain::Ethereum,
             Vec::<Token>::new(),
             Vec::<Bytes>::new(),
             HashMap::<String, Bytes>::new(),
             Bytes::default(),
             Default::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn recognizes_vm_curve_component() {
+        let component = protocol_component("vm:curve", "curve_pool");
 
         assert_eq!(
             ProtocolKind::from_component(&component),
@@ -157,18 +181,48 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_protocol_type_aliases() {
+        let cases = [
+            ("uniswap_v2_pool", ProtocolKind::UniswapV2),
+            ("uniswap_v3_pool", ProtocolKind::UniswapV3),
+            ("uniswap_v4_pool", ProtocolKind::UniswapV4),
+            ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
+            ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
+            ("pancakeswap_v3_pool", ProtocolKind::PancakeswapV3),
+            ("balancer_v2_pool", ProtocolKind::BalancerV2),
+        ];
+
+        for (protocol_type_name, expected) in cases {
+            let component = protocol_component("", protocol_type_name);
+            assert_eq!(ProtocolKind::from_component(&component), Some(expected));
+        }
+    }
+
+    #[test]
+    fn recognizes_registered_stream_protocol_systems() {
+        let cases = [
+            ("uniswap_v2", ProtocolKind::UniswapV2),
+            ("sushiswap_v2", ProtocolKind::SushiswapV2),
+            ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
+            ("uniswap_v3", ProtocolKind::UniswapV3),
+            ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
+            ("uniswap_v4", ProtocolKind::UniswapV4),
+            ("uniswap_v4_hooks", ProtocolKind::UniswapV4),
+            ("ekubo_v2", ProtocolKind::EkuboV2),
+            ("fluid_v1", ProtocolKind::FluidV1),
+            ("vm:curve", ProtocolKind::Curve),
+            ("vm:balancer_v2", ProtocolKind::BalancerV2),
+        ];
+
+        for (protocol_system, expected) in cases {
+            let component = protocol_component(protocol_system, "");
+            assert_eq!(ProtocolKind::from_component(&component), Some(expected));
+        }
+    }
+
+    #[test]
     fn recognizes_vm_maverick_component() {
-        let component = ProtocolComponent::new(
-            Bytes::default(),
-            "vm:maverick_v2".to_string(),
-            "maverick_v2".to_string(),
-            Chain::Ethereum,
-            Vec::<Token>::new(),
-            Vec::<Bytes>::new(),
-            HashMap::<String, Bytes>::new(),
-            Bytes::default(),
-            Default::default(),
-        );
+        let component = protocol_component("vm:maverick_v2", "maverick_v2");
 
         assert_eq!(
             ProtocolKind::from_component(&component),
@@ -186,17 +240,7 @@ mod tests {
 
     #[test]
     fn recognizes_ekubo_v3_component_by_system() {
-        let component = ProtocolComponent::new(
-            Bytes::default(),
-            "ekubo_v3".to_string(),
-            "base_pool".to_string(),
-            Chain::Ethereum,
-            Vec::<Token>::new(),
-            Vec::<Bytes>::new(),
-            HashMap::<String, Bytes>::new(),
-            Bytes::default(),
-            Default::default(),
-        );
+        let component = protocol_component("ekubo_v3", "base_pool");
 
         assert_eq!(
             ProtocolKind::from_component(&component),
@@ -213,7 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_recognize_v4_hooks_sync_key() {
-        assert_eq!(ProtocolKind::from_sync_state_key("uniswap_v4_hooks"), None);
+    fn recognizes_v4_hooks_sync_key() {
+        assert_eq!(
+            ProtocolKind::from_sync_state_key("uniswap_v4_hooks"),
+            Some(ProtocolKind::UniswapV4)
+        );
     }
 }
