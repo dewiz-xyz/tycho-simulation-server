@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::{header, Client, ClientBuilder};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tycho_simulation::tycho_common::{
     dto::{TokensRequestBody, TokensRequestResponse},
     models::{token::Token, Chain},
@@ -130,10 +130,10 @@ impl TokenStore {
             return Ok(Some(token));
         }
 
-        warn!(
+        info!(
             scope = "token_single_fetch",
             token_address = %address,
-            "Fetching single token from Tycho RPC - this should be rare"
+            "Token not in cache, trying to fetch from Tycho RPC"
         );
 
         let start = Instant::now();
@@ -175,7 +175,7 @@ impl TokenStore {
 
             if !response.status().is_success() {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                warn!(
+                info!(
                     scope = "token_single_fetch",
                     token_address = %address,
                     status = %response.status(),
