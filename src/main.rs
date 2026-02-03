@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Loaded {} tokens", all_tokens.len());
 
     // Create shared state
+    // Shared token cache across native + VM stores to avoid duplicate fetches and keep metadata consistent.
     let tokens = Arc::new(TokenStore::new(
         all_tokens,
         config.tycho_url.clone(),
