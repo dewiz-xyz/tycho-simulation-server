@@ -83,15 +83,19 @@ if curl -s "$status_url" >/dev/null 2>&1; then
 else
   echo "Starting server..."
   if [[ "$enable_vm_pools" == "true" ]]; then
-    "$script_dir/start_server.sh" --repo "$repo" --enable-vm-pools
+    "$script_dir/start_server.sh" --repo "$repo" --enable-vm-pools --env RUST_LOG=info
   else
-    "$script_dir/start_server.sh" --repo "$repo"
+    "$script_dir/start_server.sh" --repo "$repo" --env RUST_LOG=info
   fi
   started_by_me="true"
 fi
 
 echo "Waiting for readiness..."
-"$script_dir/wait_ready.sh" --url "$status_url" --timeout 300 --interval 2
+if [[ "$enable_vm_pools" == "true" ]]; then
+  "$script_dir/wait_ready.sh" --url "$status_url" --timeout 300 --interval 2 --require-vm-ready
+else
+  "$script_dir/wait_ready.sh" --url "$status_url" --timeout 300 --interval 2
+fi
 
 echo "Smoke testing /simulate..."
 python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status ready

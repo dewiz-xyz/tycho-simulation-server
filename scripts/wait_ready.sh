@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>]
+Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>] [--require-vm-ready]
 
 Poll the /status endpoint until it returns ready or times out.
 
@@ -11,6 +11,7 @@ Options:
   --url        Status URL (default: http://localhost:3000/status)
   --timeout    Timeout in seconds (default: 180)
   --interval   Poll interval in seconds (default: 2)
+  --require-vm-ready  Also wait for vm_status=ready
   -h, --help   Show this help
 USAGE
 }
@@ -18,6 +19,7 @@ USAGE
 url="http://localhost:3000/status"
 timeout=180
 interval=2
+require_vm_ready="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +34,10 @@ while [[ $# -gt 0 ]]; do
     --interval)
       interval="$2"
       shift 2
+      ;;
+    --require-vm-ready)
+      require_vm_ready="true"
+      shift 1
       ;;
     -h|--help)
       usage
@@ -52,9 +58,13 @@ while true; do
   body="${response%$'\n'*}"
   status_code="${response##*$'\n'}"
 
-  if [[ "$status_code" == "200" ]] && [[ "$body" == *"\"ready\""* ]]; then
-    echo "ready"
-    exit 0
+  if [[ "$status_code" == "200" ]] && [[ "$body" == *"\"status\":\"ready\""* ]]; then
+    if [[ "$require_vm_ready" == "true" ]] && [[ "$body" != *"\"vm_status\":\"ready\""* ]]; then
+      :
+    else
+      echo "ready"
+      exit 0
+    fi
   fi
 
   now="$(date +%s)"

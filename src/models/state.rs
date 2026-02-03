@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{debug, warn};
@@ -15,7 +15,10 @@ use super::{protocol::ProtocolKind, tokens::TokenStore};
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
-    pub state_store: Arc<StateStore>,
+    pub enable_vm_pools: bool,
+    pub native_state_store: Arc<StateStore>,
+    pub vm_state_store: Arc<StateStore>,
+    pub vm_stream: Arc<VmStreamStatus>,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
@@ -26,19 +29,35 @@ pub struct AppState {
 
 impl AppState {
     pub async fn current_block(&self) -> u64 {
-        self.state_store.current_block().await
+        self.native_state_store.current_block().await
     }
 
     pub async fn total_pools(&self) -> usize {
-        self.state_store.total_states().await
+        self.native_state_store.total_states().await
     }
 
     pub fn is_ready(&self) -> bool {
-        self.state_store.is_ready()
+        self.native_state_store.is_ready()
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
-        self.state_store.wait_until_ready(wait).await
+        self.native_state_store.wait_until_ready(wait).await
+    }
+
+    pub async fn vm_block(&self) -> u64 {
+        self.vm_state_store.current_block().await
+    }
+
+    pub async fn vm_pools(&self) -> usize {
+        self.vm_state_store.total_states().await
+    }
+
+    pub fn vm_rebuilding(&self) -> bool {
+        self.vm_stream.is_rebuilding()
+    }
+
+    pub fn vm_ready(&self) -> bool {
+        self.enable_vm_pools && !self.vm_rebuilding() && self.vm_state_store.is_ready()
     }
 
     pub fn quote_timeout(&self) -> Duration {
@@ -63,6 +82,55 @@ impl AppState {
 
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VmStreamStatus {
+    rebuilding: AtomicBool,
+    restart_count: AtomicU64,
+    rebuild_started_at: RwLock<Option<Instant>>,
+    last_error: RwLock<Option<String>>,
+}
+
+impl VmStreamStatus {
+    pub async fn mark_rebuilding(&self) -> u64 {
+        let rebuild_id = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.rebuilding.store(true, Ordering::Release);
+        *self.rebuild_started_at.write().await = Some(Instant::now());
+        rebuild_id
+    }
+
+    pub async fn mark_running_if_current(&self, rebuild_id: u64) -> bool {
+        if self.restart_count.load(Ordering::Relaxed) != rebuild_id {
+            return false;
+        }
+
+        self.rebuilding.store(false, Ordering::Release);
+        *self.rebuild_started_at.write().await = None;
+        *self.last_error.write().await = None;
+        true
+    }
+
+    pub async fn record_error(&self, message: String) {
+        *self.last_error.write().await = Some(message);
+    }
+
+    pub fn is_rebuilding(&self) -> bool {
+        self.rebuilding.load(Ordering::Acquire)
+    }
+
+    pub fn restart_count(&self) -> u64 {
+        self.restart_count.load(Ordering::Relaxed)
+    }
+
+    pub async fn last_error(&self) -> Option<String> {
+        self.last_error.read().await.clone()
+    }
+
+    pub async fn rebuild_duration_ms(&self) -> Option<u128> {
+        let started = *self.rebuild_started_at.read().await;
+        started.map(|instant| instant.elapsed().as_millis())
     }
 }
 

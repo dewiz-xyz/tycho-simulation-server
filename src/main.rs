@@ -8,10 +8,12 @@ use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
 use tycho_simulation_server::api::create_router;
 use tycho_simulation_server::config::{init_logging, load_config};
-use tycho_simulation_server::handlers::stream::process_stream;
-use tycho_simulation_server::models::state::{AppState, StateStore};
+use tycho_simulation_server::handlers::stream::{
+    process_stream, run_vm_stream_manager, VmStreamManagerArgs,
+};
+use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
 use tycho_simulation_server::models::tokens::TokenStore;
-use tycho_simulation_server::services::stream_builder::build_merged_streams;
+use tycho_simulation_server::services::stream_builder::build_native_stream;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
         Chain::Ethereum,
         Duration::from_millis(config.token_refresh_timeout_ms),
     ));
-    let state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+    let vm_stream = Arc::new(VmStreamStatus::default());
     debug!("Created shared state");
 
     // Create app state
@@ -56,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
-        state_store: Arc::clone(&state_store),
+        enable_vm_pools: config.enable_vm_pools,
+        native_state_store: Arc::clone(&native_state_store),
+        vm_state_store: Arc::clone(&vm_state_store),
+        vm_stream: Arc::clone(&vm_stream),
         quote_timeout,
         pool_timeout_native,
         pool_timeout_vm,
@@ -72,33 +80,57 @@ async fn main() -> anyhow::Result<()> {
         "Initialized simulation concurrency limits"
     );
 
-    // Build protocol stream in background and start processing
+    // Build native protocol stream in background and start processing
     {
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
-        let state_store_bg = Arc::clone(&state_store);
+        let state_store_bg = Arc::clone(&native_state_store);
         tokio::spawn(async move {
-            info!("Starting merged protocol streams in background...");
-            match build_merged_streams(
+            info!("Starting native protocol stream in background...");
+            match build_native_stream(
                 &cfg.tycho_url,
                 &cfg.api_key,
                 cfg.tvl_threshold,
                 cfg.tvl_keep_threshold,
                 tokens_bg,
-                cfg.enable_vm_pools,
             )
             .await
             {
                 Ok(stream) => {
-                    info!("Merged protocol streams running (background)");
-                    process_stream(stream, state_store_bg).await;
+                    info!("Native protocol stream running (background)");
+                    let _ = process_stream(stream, state_store_bg, "native", false).await;
                 }
                 Err(e) => {
-                    error!("Failed to initialize merged streams: {:?}", e);
+                    error!("Failed to initialize native stream: {:?}", e);
                 }
             }
         });
         debug!("Stream processing task spawned (background)");
+    }
+
+    if config.enable_vm_pools {
+        let cfg = config.clone();
+        let tokens_bg = Arc::clone(&tokens);
+        let vm_store_bg = Arc::clone(&vm_state_store);
+        let vm_stream_bg = Arc::clone(&vm_stream);
+        let vm_semaphore_bg = app_state.vm_sim_semaphore();
+        tokio::spawn(async move {
+            info!("Starting VM protocol stream manager in background...");
+            run_vm_stream_manager(VmStreamManagerArgs {
+                tycho_url: cfg.tycho_url,
+                api_key: cfg.api_key,
+                tvl_add_threshold: cfg.tvl_threshold,
+                tvl_keep_threshold: cfg.tvl_keep_threshold,
+                tokens: tokens_bg,
+                vm_state_store: vm_store_bg,
+                vm_stream: vm_stream_bg,
+                vm_sim_semaphore: vm_semaphore_bg,
+                vm_sim_concurrency,
+            })
+            .await
+        });
+    } else {
+        info!("VM pool feeds disabled");
     }
 
     // Create router and start server

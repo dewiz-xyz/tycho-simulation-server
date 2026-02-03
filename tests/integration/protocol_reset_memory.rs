@@ -231,6 +231,8 @@ async fn protocol_reset_preserves_unaffected_pools() {
     process_stream(
         stream::iter(vec![ok_update(initial_update)]),
         Arc::clone(&state_store),
+        "native",
+        false,
     )
     .await;
 
@@ -260,6 +262,8 @@ async fn protocol_reset_preserves_unaffected_pools() {
     process_stream(
         stream::iter(vec![ok_update(resync_update)]),
         Arc::clone(&state_store),
+        "native",
+        false,
     )
     .await;
 
@@ -351,6 +355,8 @@ async fn overlapping_resyncs_reset_newly_advanced_protocols() {
             ok_update(resync_v3_update),
         ]),
         Arc::clone(&state_store),
+        "native",
+        false,
     )
     .await;
 
@@ -392,6 +398,8 @@ async fn jemalloc_memory_plateau_after_reset() {
     process_stream(
         stream::iter(vec![ok_update(initial_update)]),
         Arc::clone(&state_store),
+        "native",
+        false,
     )
     .await;
 
@@ -411,6 +419,8 @@ async fn jemalloc_memory_plateau_after_reset() {
     process_stream(
         stream::iter(vec![ok_update(resync_update)]),
         Arc::clone(&state_store),
+        "native",
+        false,
     )
     .await;
 
