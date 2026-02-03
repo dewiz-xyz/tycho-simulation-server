@@ -50,6 +50,7 @@ pub async fn simulate(
         Err(_) => {
             // Rely on CancelOnDrop to cancel outstanding work
             let block_number = state.current_block().await;
+            let vm_block_number = state.current_vm_block().await;
             let total_pools = state.total_pools().await;
             let timeout_ms = request_timeout.as_millis() as u64;
 
@@ -74,6 +75,7 @@ pub async fn simulate(
             let meta = QuoteMeta {
                 status: QuoteStatus::PartialFailure,
                 block_number,
+                vm_block_number,
                 matching_pools: 0,
                 candidate_pools: 0,
                 total_pools: Some(total_pools),
@@ -108,6 +110,7 @@ pub async fn simulate(
             failures = computation.meta.failures.len(),
             scheduled_native_pools = computation.metrics.scheduled_native_pools,
             scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
+            skipped_vm_unavailable = computation.metrics.skipped_vm_unavailable,
             skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
             skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = computation.metrics.skipped_native_deadline,
@@ -125,6 +128,7 @@ pub async fn simulate(
             failures = computation.meta.failures.len(),
             scheduled_native_pools = computation.metrics.scheduled_native_pools,
             scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
+            skipped_vm_unavailable = computation.metrics.skipped_vm_unavailable,
             skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
             skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = computation.metrics.skipped_native_deadline,

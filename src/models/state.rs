@@ -4,41 +4,59 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{watch, RwLock, Semaphore};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
-use super::{protocol::ProtocolKind, tokens::TokenStore};
+use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
-    pub state_store: Arc<StateStore>,
+    pub native_state_store: Arc<StateStore>,
+    pub vm_state_store: Arc<StateStore>,
+    pub native_stream_health: Arc<StreamHealth>,
+    pub vm_stream_health: Arc<StreamHealth>,
+    pub vm_stream: Arc<RwLock<VmStreamStatus>>,
+    pub enable_vm_pools: bool,
+    pub readiness_stale: Duration,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub native_sim_concurrency: usize,
+    pub vm_sim_concurrency: usize,
 }
 
 impl AppState {
     pub async fn current_block(&self) -> u64 {
-        self.state_store.current_block().await
+        self.native_state_store.current_block().await
+    }
+
+    pub async fn current_vm_block(&self) -> Option<u64> {
+        if !self.vm_ready().await {
+            return None;
+        }
+        Some(self.vm_state_store.current_block().await)
     }
 
     pub async fn total_pools(&self) -> usize {
-        self.state_store.total_states().await
+        let native = self.native_state_store.total_states().await;
+        let vm = self.vm_state_store.total_states().await;
+        native + vm
     }
 
     pub fn is_ready(&self) -> bool {
-        self.state_store.is_ready()
+        self.native_state_store.is_ready()
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
-        self.state_store.wait_until_ready(wait).await
+        self.native_state_store.wait_until_ready(wait).await
     }
 
     pub fn quote_timeout(&self) -> Duration {
@@ -64,6 +82,36 @@ impl AppState {
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
     }
+
+    pub async fn vm_ready(&self) -> bool {
+        if !self.enable_vm_pools {
+            return false;
+        }
+        if self.vm_rebuilding().await {
+            return false;
+        }
+        self.vm_state_store.is_ready()
+    }
+
+    pub async fn vm_rebuilding(&self) -> bool {
+        self.vm_stream.read().await.rebuilding
+    }
+
+    pub async fn vm_block(&self) -> u64 {
+        self.vm_state_store.current_block().await
+    }
+
+    pub async fn vm_pools(&self) -> usize {
+        self.vm_state_store.total_states().await
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VmStreamStatus {
+    pub rebuilding: bool,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_started_at: Option<Instant>,
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
@@ -740,5 +788,66 @@ mod tests {
 
         assert_eq!(store.total_states().await, 0);
         assert!(!store.is_ready());
+    }
+
+    #[tokio::test]
+    async fn total_pools_includes_vm_store() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let token_a = mk_token(7, "TKNA");
+        let token_b = mk_token(8, "TKNB");
+
+        let native_component = mk_component(
+            20,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let vm_component = mk_component(21, "vm:curve", "curve_pool", vec![token_a, token_b]);
+
+        native_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                native_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+        vm_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                vm_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_store),
+            vm_state_store: Arc::clone(&vm_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        assert_eq!(app_state.total_pools().await, 2);
+        assert_eq!(app_state.current_vm_block().await, Some(1));
     }
 }

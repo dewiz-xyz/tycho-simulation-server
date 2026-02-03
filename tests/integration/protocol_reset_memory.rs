@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,9 @@ use futures::stream;
 use jemalloc_ctl as jemalloc;
 use jemallocator::Jemalloc;
 use num_bigint::BigUint;
+use tokio::sync::Semaphore;
+use tokio::task::yield_now;
+use tokio::time::advance;
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
 use tycho_simulation::tycho_client::feed::{BlockHeader, SynchronizerState};
 use tycho_simulation::tycho_common::{
@@ -18,9 +22,14 @@ use tycho_simulation::tycho_common::{
     },
     Bytes,
 };
-use tycho_simulation_server::handlers::stream::process_stream;
-use tycho_simulation_server::models::state::StateStore;
+use tycho_simulation_server::handlers::stream::{
+    process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
+};
+use tycho_simulation_server::models::messages::AmountOutRequest;
+use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
+use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
+use tycho_simulation_server::services::quotes::get_amounts_out;
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -84,8 +93,12 @@ impl ProtocolSim for DummySim {
     }
 }
 
+fn address_hex(seed: u8) -> String {
+    format!("{:02x}", seed).repeat(20)
+}
+
 fn address(seed: u8) -> Bytes {
-    Bytes::from([seed; 20])
+    Bytes::from_str(&address_hex(seed)).expect("valid address")
 }
 
 fn make_token(seed: u8, symbol: &str) -> Token {
@@ -142,15 +155,19 @@ fn ready_state(protocol: &str, number: u64) -> (String, SynchronizerState) {
     )
 }
 
-fn advanced_state(protocol: &str, number: u64) -> (String, SynchronizerState) {
-    (
-        protocol.to_string(),
-        SynchronizerState::Advanced(block_header(number)),
-    )
+#[derive(Debug)]
+struct TestError(&'static str);
+
+impl std::fmt::Display for TestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
-fn ok_update(update: Update) -> Result<Update, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    Ok(update)
+impl std::error::Error for TestError {}
+
+fn missing_block_error() -> Result<Update, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    Err(Box::new(TestError("Missing block!")))
 }
 
 fn build_pairs(
@@ -186,90 +203,26 @@ fn build_pairs(
 }
 
 fn jemalloc_allocated_bytes() -> usize {
-    // Jemalloc requires epoch advancement to refresh stats.
     jemalloc::epoch::advance().expect("jemalloc epoch advance");
     jemalloc::stats::allocated::read().expect("jemalloc allocated bytes")
 }
 
-#[tokio::test]
-async fn protocol_reset_preserves_unaffected_pools() {
-    let token_store = Arc::new(TokenStore::new(
-        HashMap::new(),
-        "http://localhost".to_string(),
-        "test".to_string(),
-        Chain::Ethereum,
-        Duration::from_secs(1),
-    ));
-    let state_store = Arc::new(StateStore::new(token_store));
-
-    let token_a = make_token(10, "TKNA");
-    let token_b = make_token(11, "TKNB");
-    let token_c = make_token(12, "TKNC");
-    let token_d = make_token(13, "TKND");
-
-    let component_v2 = make_component(50, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
-    let component_v3 = make_component(51, "uniswap_v3", "uniswap_v3_pool", vec![token_c, token_d]);
-
-    let mut initial_states = HashMap::new();
-    initial_states.insert(
-        "pool-v2".to_string(),
-        Box::new(DummySim) as Box<dyn ProtocolSim>,
-    );
-    initial_states.insert(
-        "pool-v3".to_string(),
-        Box::new(DummySim) as Box<dyn ProtocolSim>,
-    );
-    let mut initial_pairs = HashMap::new();
-    initial_pairs.insert("pool-v2".to_string(), component_v2);
-    initial_pairs.insert("pool-v3".to_string(), component_v3);
-    let initial_update =
-        Update::new(1, initial_states, initial_pairs).set_sync_states(HashMap::from([
-            ready_state("uniswap_v2", 1),
-            ready_state("uniswap_v3", 1),
-        ]));
-
-    process_stream(
-        stream::iter(vec![ok_update(initial_update)]),
-        Arc::clone(&state_store),
-    )
-    .await;
-
-    assert!(state_store.has_pool("pool-v2").await);
-    assert!(state_store.has_pool("pool-v3").await);
-
-    let component_v2_resync = make_component(
-        52,
-        "uniswap_v2",
-        "uniswap_v2_pool",
-        vec![make_token(14, "TKNX"), make_token(15, "TKNY")],
-    );
-
-    let resync_update = make_update(
-        2,
-        vec![(
-            "pool-v2".to_string(),
-            component_v2_resync,
-            Box::new(DummySim),
-        )],
-        HashMap::from([
-            advanced_state("uniswap_v2", 2),
-            ready_state("uniswap_v3", 2),
-        ]),
-    );
-
-    process_stream(
-        stream::iter(vec![ok_update(resync_update)]),
-        Arc::clone(&state_store),
-    )
-    .await;
-
-    assert!(state_store.has_pool("pool-v2").await);
-    assert!(state_store.has_pool("pool-v3").await);
-    assert_eq!(state_store.total_states().await, 2);
+fn default_stream_config() -> StreamSupervisorConfig {
+    StreamSupervisorConfig {
+        stream_stale: Duration::from_secs(3600),
+        missing_block_burst: 3,
+        missing_block_window: Duration::from_secs(60),
+        error_burst: 3,
+        error_window: Duration::from_secs(60),
+        resync_grace: Duration::from_secs(60),
+        restart_backoff_min: Duration::from_millis(10),
+        restart_backoff_max: Duration::from_millis(20),
+        restart_backoff_jitter_pct: 0.0,
+    }
 }
 
 #[tokio::test]
-async fn overlapping_resyncs_reset_newly_advanced_protocols() {
+async fn missing_block_burst_does_not_restart_below_threshold() {
     let token_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
@@ -278,87 +231,176 @@ async fn overlapping_resyncs_reset_newly_advanced_protocols() {
         Duration::from_secs(1),
     ));
     let state_store = Arc::new(StateStore::new(token_store));
+    let health = Arc::new(StreamHealth::new());
 
-    let token_a = make_token(20, "TKA");
-    let token_b = make_token(21, "TKB");
-    let token_c = make_token(22, "TKC");
-    let token_d = make_token(23, "TKD");
+    let stream = stream::iter(vec![missing_block_error(), missing_block_error()]);
 
-    let component_v2_old =
-        make_component(70, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
-    let component_v3_old =
-        make_component(71, "uniswap_v3", "uniswap_v3_pool", vec![token_c, token_d]);
-
-    let initial_update = make_update(
-        1,
-        vec![
-            (
-                "pool-v2-old".to_string(),
-                component_v2_old,
-                Box::new(DummySim),
-            ),
-            (
-                "pool-v3-old".to_string(),
-                component_v3_old,
-                Box::new(DummySim),
-            ),
-        ],
-        HashMap::from([ready_state("uniswap_v2", 1), ready_state("uniswap_v3", 1)]),
-    );
-
-    let component_v2_new = make_component(
-        72,
-        "uniswap_v2",
-        "uniswap_v2_pool",
-        vec![make_token(24, "TKE"), make_token(25, "TKF")],
-    );
-    let resync_v2_update = make_update(
-        2,
-        vec![(
-            "pool-v2-new".to_string(),
-            component_v2_new,
-            Box::new(DummySim),
-        )],
-        HashMap::from([
-            advanced_state("uniswap_v2", 2),
-            ready_state("uniswap_v3", 2),
-        ]),
-    );
-
-    let component_v3_new = make_component(
-        73,
-        "uniswap_v3",
-        "uniswap_v3_pool",
-        vec![make_token(26, "TKG"), make_token(27, "TKH")],
-    );
-    let resync_v3_update = make_update(
-        3,
-        vec![(
-            "pool-v3-new".to_string(),
-            component_v3_new,
-            Box::new(DummySim),
-        )],
-        HashMap::from([
-            advanced_state("uniswap_v2", 3),
-            advanced_state("uniswap_v3", 3),
-        ]),
-    );
-
-    process_stream(
-        stream::iter(vec![
-            ok_update(initial_update),
-            ok_update(resync_v2_update),
-            ok_update(resync_v3_update),
-        ]),
-        Arc::clone(&state_store),
+    let exit = process_stream(
+        StreamKind::Native,
+        stream,
+        state_store,
+        health,
+        default_stream_config(),
     )
     .await;
 
-    assert!(state_store.has_pool("pool-v2-new").await);
-    assert!(state_store.has_pool("pool-v3-new").await);
-    assert!(!state_store.has_pool("pool-v2-old").await);
-    assert!(!state_store.has_pool("pool-v3-old").await);
-    assert_eq!(state_store.total_states().await, 2);
+    assert_eq!(exit.reason, StreamRestartReason::Ended);
+}
+
+#[tokio::test]
+async fn missing_block_burst_restarts_at_threshold() {
+    let token_store = Arc::new(TokenStore::new(
+        HashMap::new(),
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+    let state_store = Arc::new(StateStore::new(token_store));
+    let health = Arc::new(StreamHealth::new());
+
+    let stream = stream::iter(vec![
+        missing_block_error(),
+        missing_block_error(),
+        missing_block_error(),
+    ]);
+
+    let exit = process_stream(
+        StreamKind::Native,
+        stream,
+        state_store,
+        health,
+        default_stream_config(),
+    )
+    .await;
+
+    assert_eq!(exit.reason, StreamRestartReason::MissingBlock);
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_stream_restarts_on_stale() {
+    let token_store = Arc::new(TokenStore::new(
+        HashMap::new(),
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+    let state_store = Arc::new(StateStore::new(token_store));
+    let health = Arc::new(StreamHealth::new());
+
+    let mut cfg = default_stream_config();
+    cfg.stream_stale = Duration::from_secs(5);
+
+    let stream = futures::stream::pending();
+    let handle = tokio::spawn(process_stream(
+        StreamKind::Native,
+        stream,
+        state_store,
+        health,
+        cfg,
+    ));
+
+    advance(Duration::from_secs(6)).await;
+    yield_now().await;
+
+    let exit = handle.await.expect("stream task join");
+    assert_eq!(exit.reason, StreamRestartReason::Stale);
+}
+
+#[tokio::test]
+async fn vm_rebuild_resets_store_and_blocks_quotes() {
+    let token_a = make_token(1, "TKNA");
+    let token_b = make_token(2, "TKNB");
+
+    let mut token_map = HashMap::new();
+    token_map.insert(token_a.address.clone(), token_a.clone());
+    token_map.insert(token_b.address.clone(), token_b.clone());
+
+    let token_store = Arc::new(TokenStore::new(
+        token_map,
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+    let native_component = make_component(
+        10,
+        "uniswap_v2",
+        "uniswap_v2_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
+    let native_update = make_update(
+        1,
+        vec![(
+            "pool-native".to_string(),
+            native_component,
+            Box::new(DummySim),
+        )],
+        HashMap::from([ready_state("uniswap_v2", 1)]),
+    );
+    native_state_store.apply_update(native_update).await;
+
+    let vm_component = make_component(
+        11,
+        "vm:curve",
+        "curve_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
+    let vm_update = make_update(
+        1,
+        vec![("pool-vm".to_string(), vm_component, Box::new(DummySim))],
+        HashMap::from([ready_state("vm:curve", 1)]),
+    );
+    vm_state_store.apply_update(vm_update).await;
+
+    let app_state = AppState {
+        tokens: Arc::clone(&token_store),
+        native_state_store: Arc::clone(&native_state_store),
+        vm_state_store: Arc::clone(&vm_state_store),
+        native_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        enable_vm_pools: true,
+        readiness_stale: Duration::from_secs(120),
+        quote_timeout: Duration::from_millis(100),
+        pool_timeout_native: Duration::from_millis(50),
+        pool_timeout_vm: Duration::from_millis(50),
+        request_timeout: Duration::from_millis(1000),
+        native_sim_semaphore: Arc::new(Semaphore::new(4)),
+        vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        native_sim_concurrency: 4,
+        vm_sim_concurrency: 4,
+    };
+
+    assert!(app_state.vm_ready().await);
+
+    vm_state_store.reset().await;
+    {
+        let mut status = app_state.vm_stream.write().await;
+        status.rebuilding = true;
+        status.rebuild_started_at = Some(tokio::time::Instant::now());
+    }
+
+    assert!(!app_state.vm_ready().await);
+    assert_eq!(vm_state_store.total_states().await, 0);
+
+    let request = AmountOutRequest {
+        request_id: "req-1".to_string(),
+        auction_id: None,
+        token_in: format!("0x{}", address_hex(1)),
+        token_out: format!("0x{}", address_hex(2)),
+        amounts: vec!["1000".to_string()],
+    };
+
+    let computation = get_amounts_out(app_state.clone(), request, None).await;
+    assert!(computation.metrics.skipped_vm_unavailable);
+    assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+    assert!(computation.metrics.scheduled_native_pools > 0);
 }
 
 #[tokio::test]
@@ -383,36 +425,23 @@ async fn jemalloc_memory_plateau_after_reset() {
         POOL_COUNT,
     ));
 
-    let initial_update = make_update(
-        10,
-        initial_pairs,
-        HashMap::from([ready_state("uniswap_v2", 10), ready_state("uniswap_v3", 10)]),
-    );
-
-    process_stream(
-        stream::iter(vec![ok_update(initial_update)]),
-        Arc::clone(&state_store),
-    )
-    .await;
+    let initial_update = make_update(10, initial_pairs, HashMap::new());
+    state_store.apply_update(initial_update).await;
 
     assert_eq!(state_store.total_states().await, POOL_COUNT * 2);
     let baseline = jemalloc_allocated_bytes();
 
-    let resync_pairs = build_pairs("uniswap_v2", "uniswap_v2_pool", 1, POOL_COUNT);
-    let resync_update = make_update(
-        11,
-        resync_pairs,
-        HashMap::from([
-            advanced_state("uniswap_v2", 11),
-            ready_state("uniswap_v3", 11),
-        ]),
-    );
+    state_store.reset().await;
 
-    process_stream(
-        stream::iter(vec![ok_update(resync_update)]),
-        Arc::clone(&state_store),
-    )
-    .await;
+    let mut resync_pairs = build_pairs("uniswap_v2", "uniswap_v2_pool", 1, POOL_COUNT);
+    resync_pairs.extend(build_pairs(
+        "uniswap_v3",
+        "uniswap_v3_pool",
+        120,
+        POOL_COUNT,
+    ));
+    let resync_update = make_update(11, resync_pairs, HashMap::new());
+    state_store.apply_update(resync_update).await;
 
     assert_eq!(state_store.total_states().await, POOL_COUNT * 2);
     let after = jemalloc_allocated_bytes();

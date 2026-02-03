@@ -26,6 +26,7 @@ use crate::models::tokens::TokenStoreError;
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub skipped_vm_unavailable: bool,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
     pub skipped_native_deadline: usize,
@@ -51,11 +52,13 @@ pub async fn get_amounts_out(
     let quote_timeout = state.quote_timeout();
 
     let mut current_block = state.current_block().await;
+    let mut current_vm_block = state.current_vm_block().await;
     let mut total_pools = state.total_pools().await;
 
     let mut meta = QuoteMeta {
         status: QuoteStatus::Ready,
         block_number: current_block,
+        vm_block_number: current_vm_block,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: Some(total_pools),
@@ -135,8 +138,10 @@ pub async fn get_amounts_out(
             };
         }
         current_block = state.current_block().await;
+        current_vm_block = state.current_vm_block().await;
         total_pools = state.total_pools().await;
         meta.block_number = current_block;
+        meta.vm_block_number = current_vm_block;
         meta.total_pools = Some(total_pools);
     }
 
@@ -305,20 +310,35 @@ pub async fn get_amounts_out(
     let amounts_in = Arc::new(amounts_in);
     let quote_deadline = Instant::now() + quote_timeout;
 
-    let candidates_raw = state
-        .state_store
+    let native_candidates_raw = state
+        .native_state_store
         .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
         .await;
 
-    let mut native_candidates = Vec::new();
-    let mut vm_candidates = Vec::new();
-    for (id, (pool_state, component)) in candidates_raw.into_iter() {
-        if component.protocol_system.starts_with("vm:") {
-            vm_candidates.push((id, pool_state, component));
-        } else {
-            native_candidates.push((id, pool_state, component));
-        }
+    let vm_ready = state.vm_ready().await;
+    if !vm_ready {
+        metrics.skipped_vm_unavailable = true;
     }
+    let vm_candidates_raw = if vm_ready {
+        state
+            .vm_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
+            .await
+    } else {
+        Vec::new()
+    };
+
+    let mut native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        native_candidates_raw
+            .into_iter()
+            .map(|(id, (pool_state, component))| (id, pool_state, component))
+            .collect();
+
+    let mut vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        vm_candidates_raw
+            .into_iter()
+            .map(|(id, (pool_state, component))| (id, pool_state, component))
+            .collect();
 
     let total_candidates = native_candidates.len() + vm_candidates.len();
     meta.matching_pools = total_candidates;
@@ -636,7 +656,7 @@ pub async fn get_amounts_out(
 
         let top = &responses[0];
         debug!(
-            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={}",
+            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={} vm_block={:?}",
             responses.len(),
             top.pool_name,
             top.pool_address,
@@ -644,7 +664,8 @@ pub async fn get_amounts_out(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "0".to_string()),
-            top.block_number
+            top.block_number,
+            meta.vm_block_number
         );
 
         if !failures.is_empty() && matches!(meta.status, QuoteStatus::Ready) {
