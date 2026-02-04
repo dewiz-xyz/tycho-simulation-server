@@ -576,7 +576,6 @@ async fn jemalloc_memory_plateau_after_reset() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn memory_spike_breakdown_harness() {
     const POOL_COUNT: usize = 512;
     const DB_ACCOUNT_COUNT: usize = 4000;
@@ -646,7 +645,6 @@ async fn memory_spike_breakdown_harness() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn shared_db_rebuild_stress_harness() {
     const DB_ACCOUNT_COUNT: usize = 4000;
     const DB_SLOTS_PER_ACCOUNT: usize = 64;
