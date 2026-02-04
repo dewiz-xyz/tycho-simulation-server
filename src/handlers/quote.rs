@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
+    metrics::{emit_simulate_completion, emit_simulate_timeout, TimeoutKind},
     models::{
         messages::{
             AmountOutRequest, QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResult, QuoteStatus,
@@ -83,6 +84,9 @@ pub async fn simulate(
                 failures: vec![failure],
             };
 
+            emit_simulate_completion(QuoteStatus::PartialFailure, true);
+            emit_simulate_timeout(TimeoutKind::RequestGuard);
+
             return Json(QuoteResult {
                 request_id: request.request_id,
                 data: Vec::new(),
@@ -136,6 +140,8 @@ pub async fn simulate(
             "Simulate computation completed"
         );
     }
+
+    emit_simulate_completion(computation.meta.status, timed_out);
 
     Json(QuoteResult {
         request_id: request.request_id,
