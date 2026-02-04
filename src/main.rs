@@ -16,6 +16,9 @@ use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 use tycho_simulation_server::services::stream_builder::{build_native_stream, build_vm_stream};
 
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging

@@ -138,7 +138,7 @@ The application binds to the configured `HOST:PORT` and begins streaming protoco
 
 - `cargo test` runs unit and integration tests.
 - Integration tests live under `tests/integration/` and are wired by `tests/integration/main.rs`.
-- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up.
+- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up. Jemalloc is the default allocator for the service.
 
 Run only the integration tests:
 
