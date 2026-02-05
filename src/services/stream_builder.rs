@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -20,34 +19,11 @@ use tycho_simulation::{
         },
         stream::ProtocolStreamBuilder,
     },
-    tycho_client::feed::{component_tracker::ComponentFilter, synchronizer::ComponentWithState},
+    tycho_client::feed::component_tracker::ComponentFilter,
     tycho_common::models::Chain,
 };
 
 use crate::models::tokens::TokenStore;
-
-// TODO(pedro): Temporary hook re-introduction for staging memory-spike validation.
-// Remove these counters and hook registration once the investigation is complete.
-static UNISWAP_V4_HOOKS_WITH_IDENTIFIER: AtomicUsize = AtomicUsize::new(0);
-static UNISWAP_V4_HOOKS_MISSING_IDENTIFIER: AtomicUsize = AtomicUsize::new(0);
-static UNISWAP_V4_HOOKS_LOGGED: AtomicBool = AtomicBool::new(false);
-
-fn uniswap_v4_hooks_passthrough_with_stats(component: &ComponentWithState) -> bool {
-    let has_hook_identifier = component
-        .component
-        .static_attributes
-        .get("hook_identifier")
-        .is_some_and(|value| !value.is_empty());
-
-    if has_hook_identifier {
-        UNISWAP_V4_HOOKS_WITH_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
-    } else {
-        UNISWAP_V4_HOOKS_MISSING_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
-    }
-
-    // Keep hook pools enabled for staging memory-spike reproduction.
-    true
-}
 
 pub async fn build_native_stream(
     tycho_url: &str,
@@ -64,11 +40,6 @@ pub async fn build_native_stream(
         > + Unpin
         + Send,
 > {
-    // TODO(pedro): Temporary hook re-introduction for staging memory-spike validation.
-    UNISWAP_V4_HOOKS_WITH_IDENTIFIER.store(0, Ordering::Relaxed);
-    UNISWAP_V4_HOOKS_MISSING_IDENTIFIER.store(0, Ordering::Relaxed);
-    UNISWAP_V4_HOOKS_LOGGED.store(false, Ordering::Relaxed);
-
     let (mut builder, tvl_filter) =
         base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
 
@@ -78,12 +49,6 @@ pub async fn build_native_stream(
     builder = builder.exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
-    // TODO(pedro): Temporary hook re-introduction for staging memory-spike validation.
-    builder = builder.exchange::<UniswapV4State>(
-        "uniswap_v4_hooks",
-        tvl_filter.clone(),
-        Some(uniswap_v4_hooks_passthrough_with_stats),
-    );
     builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<FluidV1>(
         "fluid_v1",
@@ -93,31 +58,12 @@ pub async fn build_native_stream(
     // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
 
     // COMING SOON!
-    // TODO(pedro): Remove once hooks memory investigation is finished.
     // builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        if UNISWAP_V4_HOOKS_LOGGED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            let with_identifier = UNISWAP_V4_HOOKS_WITH_IDENTIFIER.load(Ordering::Relaxed);
-            let missing_identifier = UNISWAP_V4_HOOKS_MISSING_IDENTIFIER.load(Ordering::Relaxed);
-            let considered = with_identifier + missing_identifier;
-            info!(
-                protocol = "uniswap_v4_hooks",
-                filter_rule = "passthrough_no_filter",
-                considered_pools = considered,
-                accepted_pools = considered,
-                filtered_pools = 0,
-                pools_with_hook_identifier = with_identifier,
-                pools_missing_hook_identifier = missing_identifier,
-                "RegisteredUniswapV4HookFilter"
-            );
-        }
         item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
     }))
 }

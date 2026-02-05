@@ -58,10 +58,7 @@ impl ProtocolKind {
         match type_name.as_str() {
             "uniswap_v2" | "uniswapv2" => return Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => return Some(ProtocolKind::UniswapV3),
-            // TODO(pedro): Temporary alias while uniswap_v4_hooks is re-enabled for memory debugging.
-            "uniswap_v4" | "uniswapv4" | "uniswap_v4_hooks" => {
-                return Some(ProtocolKind::UniswapV4);
-            }
+            "uniswap_v4" | "uniswapv4" => return Some(ProtocolKind::UniswapV4),
             "curve_pool" => return Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => return Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
@@ -77,8 +74,7 @@ impl ProtocolKind {
         match system_name.as_str() {
             "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
-            // TODO(pedro): Temporary alias while uniswap_v4_hooks is re-enabled for memory debugging.
-            "uniswap_v4" | "uniswapv4" | "uniswap_v4_hooks" => Some(ProtocolKind::UniswapV4),
+            "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
             "vm:curve" => Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
@@ -98,8 +94,7 @@ impl ProtocolKind {
         match name.as_str() {
             "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
             "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
-            // TODO(pedro): Temporary alias while uniswap_v4_hooks is re-enabled for memory debugging.
-            "uniswap_v4" | "uniswapv4" | "uniswap_v4_hooks" => Some(ProtocolKind::UniswapV4),
+            "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
             "curve" | "curve_pool" | "vm:curve" => Some(ProtocolKind::Curve),
             "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
@@ -154,10 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_v4_hooks_sync_key() {
-        assert_eq!(
-            ProtocolKind::from_sync_state_key("uniswap_v4_hooks"),
-            Some(ProtocolKind::UniswapV4)
-        );
+    fn does_not_recognize_v4_hooks_sync_key() {
+        assert_eq!(ProtocolKind::from_sync_state_key("uniswap_v4_hooks"), None);
     }
 }
