@@ -25,6 +25,7 @@ use tycho_simulation::tycho_common::{
     },
     Bytes,
 };
+use tycho_simulation_server::config::MemoryConfig;
 use tycho_simulation_server::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
@@ -335,6 +336,13 @@ fn default_stream_config() -> StreamSupervisorConfig {
         restart_backoff_min: Duration::from_millis(10),
         restart_backoff_max: Duration::from_millis(20),
         restart_backoff_jitter_pct: 0.0,
+        memory: MemoryConfig {
+            purge_enabled: false,
+            snapshots_enabled: false,
+            snapshots_min_interval_secs: 60,
+            snapshots_min_new_pairs: 1000,
+            snapshots_emit_emf: false,
+        },
     }
 }
 

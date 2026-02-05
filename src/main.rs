@@ -11,6 +11,7 @@ use tycho_simulation_server::config::{init_logging, load_config};
 use tycho_simulation_server::handlers::stream::{
     supervise_native_stream, supervise_vm_stream, StreamSupervisorConfig, VmStreamControls,
 };
+use tycho_simulation_server::memory::maybe_log_memory_snapshot;
 use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
@@ -27,6 +28,32 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = load_config();
     info!("Initializing price service...");
+
+    info!(
+        event = "memory_config",
+        purge_enabled = config.memory.purge_enabled,
+        snapshots_enabled = config.memory.snapshots_enabled,
+        min_interval_secs = config.memory.snapshots_min_interval_secs,
+        min_new_pairs = config.memory.snapshots_min_new_pairs,
+        emf_enabled = config.memory.snapshots_emit_emf,
+        "Memory config loaded"
+    );
+    maybe_log_memory_snapshot("service", "startup", None, config.memory, true);
+
+    if config.memory.snapshots_enabled {
+        let memory_cfg = config.memory;
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(memory_cfg.snapshots_min_interval_secs));
+            // tokio::time::interval ticks immediately on first await; skip it so "startup"
+            // remains the first snapshot by default.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                maybe_log_memory_snapshot("service", "periodic", None, memory_cfg, false);
+            }
+        });
+    }
 
     // Load tokens
     let all_tokens = load_all_tokens(
@@ -102,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         restart_backoff_min: Duration::from_millis(config.stream_restart_backoff_min_ms),
         restart_backoff_max: Duration::from_millis(config.stream_restart_backoff_max_ms),
         restart_backoff_jitter_pct: config.stream_restart_backoff_jitter_pct,
+        memory: config.memory,
     };
 
     // Build protocol streams in background and start processing

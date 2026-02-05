@@ -1,5 +1,7 @@
 mod logging;
+mod memory;
 pub use logging::init_logging;
+pub use memory::MemoryConfig;
 
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
@@ -172,6 +174,8 @@ pub fn load_config() -> AppConfig {
     );
     assert!(readiness_stale_secs > 0, "READINESS_STALE_SECS must be > 0");
 
+    let memory = MemoryConfig::from_env();
+
     AppConfig {
         tycho_url,
         api_key,
@@ -197,6 +201,7 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct,
         readiness_stale_secs,
+        memory,
     }
 }
 
@@ -226,4 +231,5 @@ pub struct AppConfig {
     pub stream_restart_backoff_max_ms: u64,
     pub stream_restart_backoff_jitter_pct: f64,
     pub readiness_stale_secs: u64,
+    pub memory: MemoryConfig,
 }

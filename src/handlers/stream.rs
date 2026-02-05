@@ -1,9 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
-use jemalloc_ctl::{epoch, stats};
 use rand::Rng;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
@@ -13,7 +11,8 @@ use tycho_simulation::{
     tycho_client::feed::SynchronizerState,
 };
 
-use crate::memory::maybe_purge_allocator;
+use crate::config::MemoryConfig;
+use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
     state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
@@ -63,16 +62,6 @@ pub struct StreamExit {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-struct MemLogConfig {
-    enabled: bool,
-    min_new_pairs: usize,
-    min_interval_secs: u64,
-}
-
-static MEM_LOG_CONFIG: OnceLock<MemLogConfig> = OnceLock::new();
-static LAST_MEM_LOG_TS: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Clone, Copy)]
 pub struct StreamSupervisorConfig {
     pub stream_stale: Duration,
@@ -84,6 +73,7 @@ pub struct StreamSupervisorConfig {
     pub restart_backoff_min: Duration,
     pub restart_backoff_max: Duration,
     pub restart_backoff_jitter_pct: f64,
+    pub memory: MemoryConfig,
 }
 
 pub struct VmStreamControls {
@@ -179,7 +169,13 @@ pub async fn process_stream(
                         total_pairs = metrics.total_pairs,
                         "Stream update processed"
                     );
-                    maybe_log_mem(kind, "stream_update", Some(metrics.new_pairs));
+                    maybe_log_memory_snapshot(
+                        kind.as_str(),
+                        "stream_update",
+                        Some(metrics.new_pairs),
+                        cfg.memory,
+                        false,
+                    );
 
                     if !ready_logged && metrics.total_pairs > 0 {
                         info!(
@@ -298,7 +294,7 @@ pub async fn supervise_native_stream<F, Fut, S>(
         );
 
         state_store.reset().await;
-        maybe_purge_allocator("native_restart");
+        maybe_purge_allocator("native_restart", cfg.memory);
 
         sleep(Duration::from_millis(backoff_ms)).await;
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
@@ -326,7 +322,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
         let stream = match build_stream().await {
             Ok(stream) => {
                 if let Some(rebuild) = pending_rebuild.take() {
-                    finish_vm_rebuild(&controls, rebuild).await;
+                    finish_vm_rebuild(&controls, rebuild, cfg.memory).await;
                 }
                 stream
             }
@@ -363,6 +359,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             Arc::clone(&state_store),
             exit.reason,
             exit.last_error,
+            cfg.memory,
         )
         .await;
         pending_rebuild = Some(rebuild_state);
@@ -395,6 +392,7 @@ async fn begin_vm_rebuild(
     state_store: Arc<StateStore>,
     reason: StreamRestartReason,
     last_error: Option<String>,
+    memory_cfg: MemoryConfig,
 ) -> VmRebuildState {
     let rebuild_id = {
         let mut status = controls.vm_stream.write().await;
@@ -406,7 +404,7 @@ async fn begin_vm_rebuild(
     };
 
     info!(event = "vm_rebuild_start", rebuild_id, "VM rebuild started");
-    maybe_log_mem(StreamKind::Vm, "vm_rebuild_start", None);
+    maybe_log_memory_snapshot("vm", "vm_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
 
@@ -420,8 +418,8 @@ async fn begin_vm_rebuild(
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
     }
-    maybe_purge_allocator("vm_rebuild");
-    maybe_log_mem(StreamKind::Vm, "vm_rebuild_after_clear", None);
+    maybe_purge_allocator("vm_rebuild", memory_cfg);
+    maybe_log_memory_snapshot("vm", "vm_rebuild_after_clear", None, memory_cfg, true);
 
     VmRebuildState {
         guard,
@@ -430,7 +428,11 @@ async fn begin_vm_rebuild(
     }
 }
 
-async fn finish_vm_rebuild(controls: &VmStreamControls, rebuild: VmRebuildState) {
+async fn finish_vm_rebuild(
+    controls: &VmStreamControls,
+    rebuild: VmRebuildState,
+    memory_cfg: MemoryConfig,
+) {
     drop(rebuild.guard);
 
     let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
@@ -446,7 +448,7 @@ async fn finish_vm_rebuild(controls: &VmStreamControls, rebuild: VmRebuildState)
         duration_ms,
         "VM rebuild completed"
     );
-    maybe_log_mem(StreamKind::Vm, "vm_rebuild_success", None);
+    maybe_log_memory_snapshot("vm", "vm_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {
@@ -468,80 +470,4 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
     let jitter = rand::thread_rng().gen_range(-clamped..=clamped);
     let adjusted = (base_ms * (1.0 + jitter)).max(1.0);
     adjusted.round() as u64
-}
-
-fn mem_log_config() -> MemLogConfig {
-    *MEM_LOG_CONFIG.get_or_init(|| MemLogConfig {
-        enabled: parse_env_bool("STREAM_MEM_LOG", false),
-        min_new_pairs: std::env::var("STREAM_MEM_LOG_MIN_NEW_PAIRS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1000),
-        min_interval_secs: std::env::var("STREAM_MEM_LOG_MIN_INTERVAL_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(30),
-    })
-}
-
-fn maybe_log_mem(kind: StreamKind, label: &str, new_pairs: Option<usize>) {
-    let cfg = mem_log_config();
-    if !cfg.enabled {
-        return;
-    }
-    if let Some(count) = new_pairs {
-        if count < cfg.min_new_pairs {
-            return;
-        }
-    }
-
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => return,
-    };
-    let last = LAST_MEM_LOG_TS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < cfg.min_interval_secs {
-        return;
-    }
-    LAST_MEM_LOG_TS.store(now, Ordering::Relaxed);
-
-    if let Err(err) = epoch::advance() {
-        warn!(error = %err, "Failed advancing jemalloc epoch");
-        return;
-    }
-
-    let allocated = match stats::allocated::read() {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(error = %err, "Failed reading jemalloc allocated bytes");
-            return;
-        }
-    };
-    let resident = match stats::resident::read() {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(error = %err, "Failed reading jemalloc resident bytes");
-            return;
-        }
-    };
-
-    info!(
-        event = "stream_mem",
-        stream = kind.as_str(),
-        label,
-        new_pairs = new_pairs.unwrap_or(0),
-        jemalloc_allocated_bytes = allocated,
-        jemalloc_resident_bytes = resident,
-        "Memory snapshot"
-    );
-}
-
-fn parse_env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(value) => matches!(
-            value.as_str(),
-            "1" | "true" | "TRUE" | "True" | "yes" | "YES"
-        ),
-        Err(_) => default,
-    }
 }
