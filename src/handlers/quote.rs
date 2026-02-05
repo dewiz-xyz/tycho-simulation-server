@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use axum::{extract::State, Json};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     metrics::{emit_simulate_completion, emit_simulate_timeout, TimeoutKind},
@@ -103,6 +104,16 @@ pub async fn simulate(
 
     let latency_ms = started_at.elapsed().as_millis() as u64;
 
+    let top_response = computation.responses.first();
+    let top_pool = top_response.map(|response| response.pool.as_str());
+    let top_pool_name = top_response.map(|response| response.pool_name.as_str());
+    let top_pool_address = top_response.map(|response| response.pool_address.as_str());
+    let top_amount_out =
+        top_response.and_then(|response| response.amounts_out.first().map(String::as_str));
+    let top_gas_used = top_response.and_then(|response| response.gas_used.first().copied());
+
+    let failure_summary = summarize_failures(&computation.meta.failures);
+
     if timed_out {
         warn!(
             scope = "handler_timeout",
@@ -119,11 +130,23 @@ pub async fn simulate(
             skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
+            token_in = request.token_in.as_str(),
+            token_out = request.token_out.as_str(),
+            amounts = request.amounts.len(),
+            top_pool,
+            top_pool_name,
+            top_pool_address,
+            top_amount_out,
+            top_gas_used,
+            failure_kinds = ?failure_summary.kind_counts,
+            failure_protocols = ?failure_summary.protocol_counts,
+            failure_pool_kinds = ?failure_summary.pool_kind_counts,
+            failure_samples = ?failure_summary.samples,
             "Simulate computation completed with timeout"
         );
     } else {
-        debug!(
-            scope = "handler_timeout",
+        info!(
+            scope = "handler_complete",
             request_id = request.request_id.as_str(),
             auction_id,
             latency_ms,
@@ -137,6 +160,18 @@ pub async fn simulate(
             skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
+            token_in = request.token_in.as_str(),
+            token_out = request.token_out.as_str(),
+            amounts = request.amounts.len(),
+            top_pool,
+            top_pool_name,
+            top_pool_address,
+            top_amount_out,
+            top_gas_used,
+            failure_kinds = ?failure_summary.kind_counts,
+            failure_protocols = ?failure_summary.protocol_counts,
+            failure_pool_kinds = ?failure_summary.pool_kind_counts,
+            failure_samples = ?failure_summary.samples,
             "Simulate computation completed"
         );
     }
@@ -148,6 +183,63 @@ pub async fn simulate(
         data: computation.responses,
         meta: computation.meta,
     })
+}
+
+#[derive(Debug, Default)]
+struct FailureSummary {
+    kind_counts: Vec<(String, usize)>,
+    protocol_counts: Vec<(String, usize)>,
+    pool_kind_counts: Vec<(String, usize)>,
+    samples: Vec<String>,
+}
+
+// Aggregate failure details for a single summary log entry per request.
+fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
+    if failures.is_empty() {
+        return FailureSummary::default();
+    }
+
+    let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut protocol_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pool_kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut samples = Vec::new();
+
+    for failure in failures {
+        let kind_label = failure.kind.label();
+        *kind_counts.entry(kind_label.to_string()).or_insert(0) += 1;
+
+        if let Some(protocol) = failure.protocol.as_deref() {
+            *protocol_counts.entry(protocol.to_string()).or_insert(0) += 1;
+            let pool_kind = if protocol.starts_with("vm:") {
+                "vm"
+            } else {
+                "native"
+            };
+            *pool_kind_counts.entry(pool_kind.to_string()).or_insert(0) += 1;
+        } else {
+            *pool_kind_counts.entry("unknown".to_string()).or_insert(0) += 1;
+        }
+
+        if samples.len() < 5 {
+            let sample = format!(
+                "kind={} protocol={:?} pool={:?} pool_name={:?} pool_address={:?} message={}",
+                kind_label,
+                failure.protocol,
+                failure.pool,
+                failure.pool_name,
+                failure.pool_address,
+                failure.message
+            );
+            samples.push(sample);
+        }
+    }
+
+    FailureSummary {
+        kind_counts: kind_counts.into_iter().collect(),
+        protocol_counts: protocol_counts.into_iter().collect(),
+        pool_kind_counts: pool_kind_counts.into_iter().collect(),
+        samples,
+    }
 }
 
 struct CancelOnDrop {

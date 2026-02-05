@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AmountOutRequest {
@@ -32,8 +32,7 @@ pub enum QuoteStatus {
     InternalError,
 }
 
-#[derive(Debug, Serialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 pub enum QuoteFailureKind {
     WarmUp,
     TokenValidation,
@@ -46,6 +45,33 @@ pub enum QuoteFailureKind {
     InconsistentResult,
     Internal,
     InvalidRequest,
+}
+
+impl QuoteFailureKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            QuoteFailureKind::WarmUp => "warm_up",
+            QuoteFailureKind::TokenValidation => "token_validation",
+            QuoteFailureKind::TokenCoverage => "token_coverage",
+            QuoteFailureKind::Timeout => "timeout",
+            QuoteFailureKind::ConcurrencyLimit => "concurrency_limit",
+            QuoteFailureKind::Overflow => "overflow",
+            QuoteFailureKind::Simulator => "simulator",
+            QuoteFailureKind::NoPools => "no_pools",
+            QuoteFailureKind::InconsistentResult => "inconsistent_result",
+            QuoteFailureKind::Internal => "internal",
+            QuoteFailureKind::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+impl Serialize for QuoteFailureKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.label())
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
