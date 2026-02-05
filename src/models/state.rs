@@ -155,7 +155,7 @@ impl ProtocolShard {
 
     async fn clear(&self) {
         let mut guard = self.states.write().await;
-        guard.clear();
+        *guard = HashMap::new();
     }
 }
 
@@ -224,8 +224,8 @@ impl StateStore {
         for shard in self.shards.values() {
             shard.clear().await;
         }
-        self.id_to_kind.write().await.clear();
-        self.token_index.write().await.clear();
+        *self.id_to_kind.write().await = HashMap::new();
+        *self.token_index.write().await = HashMap::new();
         *self.block_number.write().await = 0;
         self.ready.store(false, Ordering::Relaxed);
         let _ = self.ready_tx.send(false);

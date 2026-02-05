@@ -11,6 +11,8 @@ use tycho_simulation::{
     tycho_client::feed::SynchronizerState,
 };
 
+use crate::config::MemoryConfig;
+use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
     state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
@@ -71,6 +73,7 @@ pub struct StreamSupervisorConfig {
     pub restart_backoff_min: Duration,
     pub restart_backoff_max: Duration,
     pub restart_backoff_jitter_pct: f64,
+    pub memory: MemoryConfig,
 }
 
 pub struct VmStreamControls {
@@ -165,6 +168,13 @@ pub async fn process_stream(
                         removed_pairs = metrics.removed_pairs,
                         total_pairs = metrics.total_pairs,
                         "Stream update processed"
+                    );
+                    maybe_log_memory_snapshot(
+                        kind.as_str(),
+                        "stream_update",
+                        Some(metrics.new_pairs),
+                        cfg.memory,
+                        false,
                     );
 
                     if !ready_logged && metrics.total_pairs > 0 {
@@ -284,6 +294,7 @@ pub async fn supervise_native_stream<F, Fut, S>(
         );
 
         state_store.reset().await;
+        maybe_purge_allocator("native_restart", cfg.memory);
 
         sleep(Duration::from_millis(backoff_ms)).await;
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
@@ -311,7 +322,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
         let stream = match build_stream().await {
             Ok(stream) => {
                 if let Some(rebuild) = pending_rebuild.take() {
-                    finish_vm_rebuild(&controls, rebuild).await;
+                    finish_vm_rebuild(&controls, rebuild, cfg.memory).await;
                 }
                 stream
             }
@@ -348,6 +359,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             Arc::clone(&state_store),
             exit.reason,
             exit.last_error,
+            cfg.memory,
         )
         .await;
         pending_rebuild = Some(rebuild_state);
@@ -380,6 +392,7 @@ async fn begin_vm_rebuild(
     state_store: Arc<StateStore>,
     reason: StreamRestartReason,
     last_error: Option<String>,
+    memory_cfg: MemoryConfig,
 ) -> VmRebuildState {
     let rebuild_id = {
         let mut status = controls.vm_stream.write().await;
@@ -391,6 +404,7 @@ async fn begin_vm_rebuild(
     };
 
     info!(event = "vm_rebuild_start", rebuild_id, "VM rebuild started");
+    maybe_log_memory_snapshot("vm", "vm_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
 
@@ -404,6 +418,8 @@ async fn begin_vm_rebuild(
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
     }
+    maybe_purge_allocator("vm_rebuild", memory_cfg);
+    maybe_log_memory_snapshot("vm", "vm_rebuild_after_clear", None, memory_cfg, true);
 
     VmRebuildState {
         guard,
@@ -412,7 +428,11 @@ async fn begin_vm_rebuild(
     }
 }
 
-async fn finish_vm_rebuild(controls: &VmStreamControls, rebuild: VmRebuildState) {
+async fn finish_vm_rebuild(
+    controls: &VmStreamControls,
+    rebuild: VmRebuildState,
+    memory_cfg: MemoryConfig,
+) {
     drop(rebuild.guard);
 
     let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
@@ -428,6 +448,7 @@ async fn finish_vm_rebuild(controls: &VmStreamControls, rebuild: VmRebuildState)
         duration_ms,
         "VM rebuild completed"
     );
+    maybe_log_memory_snapshot("vm", "vm_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {

@@ -21,4 +21,3 @@ RUN useradd -m appuser
 USER appuser
 
 ENTRYPOINT ["tycho-price-service"]
-

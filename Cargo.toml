@@ -29,8 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["timeout", "util"] }
 rand = "0.8"
+jemalloc-ctl = "0.5"
+jemallocator = "0.5"
 
 [dev-dependencies]
 chrono = "0.4"
-jemalloc-ctl = "0.5"
-jemallocator = "0.5"
+alloy-primitives = "1.5.4"

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,10 +25,6 @@ use tycho_simulation::{
 
 use crate::models::tokens::TokenStore;
 
-static UNISWAP_V4_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
-static UNISWAP_V4_FILTERED: AtomicUsize = AtomicUsize::new(0);
-static UNISWAP_V4_LOGGED: AtomicBool = AtomicBool::new(false);
-
 pub async fn build_native_stream(
     tycho_url: &str,
     api_key: &str,
@@ -45,10 +40,6 @@ pub async fn build_native_stream(
         > + Unpin
         + Send,
 > {
-    UNISWAP_V4_ACCEPTED.store(0, Ordering::Relaxed);
-    UNISWAP_V4_FILTERED.store(0, Ordering::Relaxed);
-    UNISWAP_V4_LOGGED.store(false, Ordering::Relaxed);
-
     let (mut builder, tvl_filter) =
         base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
 
@@ -58,7 +49,6 @@ pub async fn build_native_stream(
     builder = builder.exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), None);
     builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<FluidV1>(
         "fluid_v1",
@@ -68,26 +58,12 @@ pub async fn build_native_stream(
     // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
 
     // COMING SOON!
-    // builder = builder.exchange::<UniswapV4State>("uniswap_v4_hooks", tvl_filter.clone(), None);
     // builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        if UNISWAP_V4_LOGGED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            let accepted = UNISWAP_V4_ACCEPTED.load(Ordering::Relaxed);
-            let filtered = UNISWAP_V4_FILTERED.load(Ordering::Relaxed);
-            info!(
-                protocol = "uniswap_v4",
-                accepted_pools = accepted,
-                filtered_pools = filtered,
-                "RegisteredUniswapV4HookFilter"
-            );
-        }
         item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
     }))
 }

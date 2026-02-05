@@ -55,6 +55,11 @@ The following environment variables are read at startup:
 - `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
 - `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`)
+- `STREAM_MEM_PURGE` – Purge jemalloc arenas on stream restarts/rebuilds (default: `true`)
+- `STREAM_MEM_LOG` – Enable periodic + event-triggered memory snapshots (default: `true`)
+- `STREAM_MEM_LOG_MIN_INTERVAL_SECS` – Minimum seconds between snapshots (default: `60`)
+- `STREAM_MEM_LOG_MIN_NEW_PAIRS` – Only snapshot on stream updates with at least this many new pairs (default: `1000`)
+- `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
 Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
 
@@ -138,7 +143,7 @@ The application binds to the configured `HOST:PORT` and begins streaming protoco
 
 - `cargo test` runs unit and integration tests.
 - Integration tests live under `tests/integration/` and are wired by `tests/integration/main.rs`.
-- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up.
+- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up. Jemalloc is the default allocator for the service.
 
 Run only the integration tests:
 
