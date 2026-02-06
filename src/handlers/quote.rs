@@ -127,6 +127,7 @@ pub async fn simulate(
                 failures = computation.meta.failures.len(),
                 scheduled_native_pools = computation.metrics.scheduled_native_pools,
                 scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
+                simulation_runs = computation.metrics.scheduled_native_pools + computation.metrics.scheduled_vm_pools,
                 skipped_vm_unavailable = computation.metrics.skipped_vm_unavailable,
                 skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
                 skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
