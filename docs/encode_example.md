@@ -1,299 +1,250 @@
-# /encode example
+# /encode example (RouteEncodeRequest)
 
-This is a real request/response captured from a live local run. It uses two identical multi-hop routes to keep the example small but still show multiple steps.
+This document describes the target `/encode` schema.
 
-## How this was built
+## Terminology
 
-- Called `/simulate` for DAI -> USDC (3 amounts) and took the first pool’s `pool`, `amounts_out`, `gas_used`, and `block_number`.
-- Called `/simulate` for USDC -> USDT using the previous `amounts_out` to get hop 2.
-- Built two routes with the same hops and sent them to `/encode` in `tycho_router_transfer_from` mode.
+- Swap: a single pool operation. It always uses one pool and one token pair.
+- Hop: a single token transition. A hop can split across many pools that all do the same tokenIn to tokenOut.
+- Segment: a full path from tokenIn to tokenOut. A MegaSwap contains multiple segments in parallel.
 
-## Request body
+SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tokenB. MultiSwap uses multiple hops with different intermediary tokens. MegaSwap runs multiple MultiSwaps in parallel, each with its own segment share.
+
+## Workflow
+
+- Call `/simulate` for candidate pools.
+- Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
+- Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
+- POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
+
+## Request body (shape)
 
 ```json
 {
-  "request_id": "encode-example-0c44449a",
-  "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
-  "token_out": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-  "calldata": {
-    "mode": "tycho_router_transfer_from",
-    "sender": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
-    "receiver": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
-  },
-  "routes": [
+  "chainId": 1,
+  "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+  "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+  "amountIn": "1000000000000000000",
+  "minAmountOut": "9980000",
+  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+  "swapKind": "MegaSwap",
+  "segments": [
     {
-      "route_id": "route-multi-a",
+      "kind": "MultiSwap",
+      "shareBps": 6000,
       "hops": [
         {
-          "pool_id": "0x5777d92f208679db4b9778590fa3cab3ac9e2168",
-          "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
-          "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+          "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+          "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "swaps": [
+            {
+              "pool": {
+                "protocol": "uniswap_v3",
+                "componentId": "pool-dai-usdc-3000",
+                "poolAddress": "0x1111111111111111111111111111111111111111"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+              "splitBps": 6000
+            },
+            {
+              "pool": {
+                "protocol": "curve_v2",
+                "componentId": "pool-dai-usdc",
+                "poolAddress": "0x2222222222222222222222222222222222222222"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+              "splitBps": 0
+            }
+          ]
         },
         {
-          "pool_id": "0x8aa4e11cbdf30eedc92100f4c8a31ff748e201d44712cc8c90d189edaa8e4e47",
-          "token_in": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-          "token_out": "0xdac17f958d2ee523a2206206994597c13d831ec7"
+          "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "swaps": [
+            {
+              "pool": {
+                "protocol": "uniswap_v3",
+                "componentId": "pool-usdc-usdt-100",
+                "poolAddress": "0x3333333333333333333333333333333333333333"
+              },
+              "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+              "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+              "splitBps": 0
+            }
+          ]
         }
-      ],
-      "amounts": [
-        "1000000000000000000",
-        "5000000000000000000",
-        "10000000000000000000"
-      ],
-      "amounts_out": ["999970", "4999854", "9999709"],
-      "gas_used": [132000, 132000, 132000],
-      "block_number": 24176578
+      ]
     },
     {
-      "route_id": "route-multi-b",
+      "kind": "SimpleSwap",
+      "shareBps": 0,
       "hops": [
         {
-          "pool_id": "0x5777d92f208679db4b9778590fa3cab3ac9e2168",
-          "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
-          "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-        },
-        {
-          "pool_id": "0x8aa4e11cbdf30eedc92100f4c8a31ff748e201d44712cc8c90d189edaa8e4e47",
-          "token_in": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-          "token_out": "0xdac17f958d2ee523a2206206994597c13d831ec7"
+          "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+          "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "swaps": [
+            {
+              "pool": {
+                "protocol": "uniswap_v3",
+                "componentId": "pool-dai-usdt-100",
+                "poolAddress": "0x4444444444444444444444444444444444444444"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+              "splitBps": 5000
+            },
+            {
+              "pool": {
+                "protocol": "curve_v2",
+                "componentId": "pool-dai-usdt",
+                "poolAddress": "0x5555555555555555555555555555555555555555"
+              },
+              "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+              "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+              "splitBps": 0
+            }
+          ]
         }
-      ],
-      "amounts": [
-        "1000000000000000000",
-        "5000000000000000000",
-        "10000000000000000000"
-      ],
-      "amounts_out": ["999970", "4999854", "9999709"],
-      "gas_used": [132000, 132000, 132000],
-      "block_number": 24176578
+      ]
     }
-  ]
+  ],
+  "requestId": "encode-example-split-only-1"
 }
 ```
 
-## Response body
+## Response body (shape)
 
 ```json
 {
-  "request_id": "encode-example-0c44449a",
-  "data": [
-    {
-      "route_id": "route-multi-a",
-      "amounts_out": ["999970", "4999854", "9999709"],
-      "gas_used": [132000, 132000, 132000],
-      "block_number": 24176578,
-      "calldata": {
-        "mode": "tycho_router_transfer_from",
-        "sender": "0x9008d19f58aabd9ed0d60971565aa8510560ab41",
-        "receiver": "0x9008d19f58aabd9ed0d60971565aa8510560ab41",
-        "steps": [
+  "chainId": 1,
+  "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+  "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+  "amountIn": "1000000000000000000",
+  "minAmountOut": "9980000",
+  "swapKind": "MegaSwap",
+  "normalizedRoute": {
+    "segments": [
+      {
+        "kind": "MultiSwap",
+        "shareBps": 6000,
+        "hops": [
           {
-            "calls": [
+            "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+            "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "swaps": [
               {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec700000000000000000000000000000000000000000000000000000000000f3e3a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "1000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "1000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "999970"
-                  }
-                ]
+                "pool": {
+                  "protocol": "uniswap_v3",
+                  "componentId": "pool-dai-usdc-3000",
+                  "poolAddress": "0x1111111111111111111111111111111111111111"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "splitBps": 6000
+              },
+              {
+                "pool": {
+                  "protocol": "curve_v2",
+                  "componentId": "pool-dai-usdc",
+                  "poolAddress": "0x2222222222222222222222222222222222222222"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "splitBps": 0
               }
             ]
           },
           {
-            "calls": [
+            "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "swaps": [
               {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000004563918244f400000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec700000000000000000000000000000000000000000000000000000000004c3726000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "5000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "5000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "4999854"
-                  }
-                ]
+                "pool": {
+                  "protocol": "uniswap_v3",
+                  "componentId": "pool-usdc-usdt-100",
+                  "poolAddress": "0x3333333333333333333333333333333333333333"
+                },
+                "tokenIn": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "splitBps": 0
               }
             ]
-          },
+          }
+        ]
+      },
+      {
+        "kind": "SimpleSwap",
+        "shareBps": 0,
+        "hops": [
           {
-            "calls": [
+            "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+            "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "swaps": [
               {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000008ac7230489e800000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec70000000000000000000000000000000000000000000000000000000000986e4d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "10000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "10000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "9999709"
-                  }
-                ]
+                "pool": {
+                  "protocol": "uniswap_v3",
+                  "componentId": "pool-dai-usdt-100",
+                  "poolAddress": "0x4444444444444444444444444444444444444444"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "splitBps": 5000
+              },
+              {
+                "pool": {
+                  "protocol": "curve_v2",
+                  "componentId": "pool-dai-usdt",
+                  "poolAddress": "0x5555555555555555555555555555555555555555"
+                },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "splitBps": 0
               }
             ]
           }
         ]
       }
+    ]
+  },
+  "interactions": [
+    {
+      "kind": "ERC20_APPROVE",
+      "target": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "value": "0",
+      "calldata": "0x095ea7b3..."
     },
     {
-      "route_id": "route-multi-b",
-      "amounts_out": ["999970", "4999854", "9999709"],
-      "gas_used": [132000, 132000, 132000],
-      "block_number": 24176578,
-      "calldata": {
-        "mode": "tycho_router_transfer_from",
-        "sender": "0x9008d19f58aabd9ed0d60971565aa8510560ab41",
-        "receiver": "0x9008d19f58aabd9ed0d60971565aa8510560ab41",
-        "steps": [
-          {
-            "calls": [
-              {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec700000000000000000000000000000000000000000000000000000000000f3e3a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "1000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "1000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "999970"
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "calls": [
-              {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000004563918244f400000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec700000000000000000000000000000000000000000000000000000000004c3726000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "5000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "5000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "4999854"
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "calls": [
-              {
-                "call_type": "tycho_router",
-                "target": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                "value": "0",
-                "calldata": "0xe21dd0d30000000000000000000000000000000000000000000000008ac7230489e800000000000000000000000000006b175474e89094c44da98b954eedeac495271d0f000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec70000000000000000000000000000000000000000000000000000000000986e4d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009008d19f58aabd9ed0d60971565aa8510560ab410000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000ef0069bab7124c9662b15c6b9af0b1f329907dd55a24fc6b175474e89094c44da98b954eedeac495271d0fa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000064fd0b31d2e955fa55e3fa641fe90e08b677188d355777d92f208679db4b9778590fa3cab3ac9e216801000082e49b916032c734cd89cdfe80a868805c738a6ceba0b86991c6218b36c1d19d4a2e9eb0ce3606eb48dac17f958d2ee523a2206206994597c13d831ec701019008d19f58aabd9ed0d60971565aa8510560ab41dac17f958d2ee523a2206206994597c13d831ec700000a000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "allowances": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "spender": "0xfd0b31d2e955fa55e3fa641fe90e08b677188d35",
-                    "amount": "10000000000000000000"
-                  }
-                ],
-                "inputs": [
-                  {
-                    "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
-                    "amount": "10000000000000000000"
-                  }
-                ],
-                "outputs": [
-                  {
-                    "token": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-                    "amount": "9999709"
-                  }
-                ]
-              }
-            ]
-          }
-        ]
-      }
+      "kind": "CALL",
+      "target": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+      "value": "0",
+      "calldata": "0x..."
     }
   ],
-  "meta": {
-    "status": "ready"
+  "debug": {
+    "requestId": "encode-example-split-only-1",
+    "resimulation": {
+      "blockNumber": 24200000
+    }
   }
 }
 ```
 
-## Notes for solver clients
+## Notes
 
-- **Pool IDs**: use `simulate.data[].pool` verbatim as `routes[].hops[].pool_id` (don’t normalize or re-encode).
-- **Big numbers**: amounts are decimal strings; parse as bigints (not `u64`).
-- **Hex formatting**: `target`, `calldata`, `sender`, `receiver` are `0x`-prefixed hex strings; treat addresses case-insensitively.
-- **Steps vs amounts**: `steps.len()` matches `amounts.len()`; each step corresponds to one ladder amount.
-- **Call types**:
-  - `tycho_router_transfer_from`: one call per step (`call_type = tycho_router`) with `allowances`, `inputs`, `outputs`.
-  - `tycho_router_none`: two calls per step (`erc20_transfer` then `tycho_router`), no allowances on the router call.
-- **Failure semantics**: `meta.status` can be `ready`, `partial_failure`, or `invalid_request`.
-  - For `partial_failure`, some routes may omit `calldata` while others succeed.
-  - Response order always matches request order.
-- **Defaults**: if `calldata.sender`/`receiver` are omitted, the server falls back to `COW_SETTLEMENT_CONTRACT` (env).
+- Only route level `minAmountOut` is enforced. There are no per-hop or per-swap `minAmountOut` checks.
+- `shareBps` (segment-level) and `splitBps` (swap-level) use Tycho split semantics:
+  - `0` means remainder, or 100% if there is only one entry.
+  - For each split set, the last entry must be `0` so it receives the remainder.
+  - Non-last entries must be > 0.
+  - The sum of all non-remainder shares must be <= 10000.
+- Hops are sequential in the order provided; there is no hop-level share.
+- SimpleSwap has a single hop. All swaps in that hop must share the same tokenIn and tokenOut.
+- MultiSwap has multiple hops. Each hop transitions between different tokens.
+- MegaSwap has multiple segments. Each segment is a MultiSwap or SimpleSwap and gets a segment share.
+- The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` based on route shape and splits.
+- `poolAddress` is optional and may be omitted when unavailable.
+- `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
+- The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.

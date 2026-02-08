@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test helper for POST /encode."""
+"""Smoke test helper for POST /encode (RouteEncodeRequest spec)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from urllib.error import HTTPError, URLError
 from presets import TOKENS, default_amounts_for_token
 
 DEFAULT_SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
+DEFAULT_SLIPPAGE_BPS = 25
 
 
 def request_json(url: str, payload: dict, timeout: float) -> tuple[int, dict, float]:
@@ -28,8 +30,8 @@ def request_json(url: str, payload: dict, timeout: float) -> tuple[int, dict, fl
         return response.status, json.loads(body), elapsed
 
 
-def load_env_contract(repo: Path) -> str | None:
-    env_value = os.environ.get("COW_SETTLEMENT_CONTRACT")
+def load_env_value(repo: Path, key: str) -> str | None:
+    env_value = os.environ.get(key)
     if env_value:
         return env_value.strip()
     env_path = repo / ".env"
@@ -40,8 +42,8 @@ def load_env_contract(repo: Path) -> str | None:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, value = line.split("=", 1)
-            if key.strip() == "COW_SETTLEMENT_CONTRACT":
+            name, value = line.split("=", 1)
+            if name.strip() == key:
                 return value.strip()
     except OSError:
         return None
@@ -55,9 +57,10 @@ def assert_hex(value: str, label: str) -> None:
         raise AssertionError(f"{label} must be even-length hex")
 
 
-def validate_calldata_meta(calldata: dict) -> None:
-    assert_hex(calldata.get("sender", ""), "calldata sender")
-    assert_hex(calldata.get("receiver", ""), "calldata receiver")
+def apply_slippage(amount: str | int, bps: int) -> str:
+    value = int(amount)
+    safe_bps = 10_000 - bps
+    return str((value * safe_bps) // 10_000)
 
 
 def select_pool(response: dict, label: str) -> dict:
@@ -65,68 +68,116 @@ def select_pool(response: dict, label: str) -> dict:
     if not isinstance(data, list) or not data:
         raise AssertionError(f"{label}: no pool data")
     pool = data[0]
-    required = ["pool", "amounts_out", "gas_used", "block_number"]
+    required = ["pool", "amounts_out", "gas_used", "block_number", "pool_name", "pool_address"]
     for key in required:
         if key not in pool:
             raise AssertionError(f"{label}: missing {key}")
     return pool
 
 
-def validate_transfer_from(calldata: dict, amounts_len: int) -> None:
-    validate_calldata_meta(calldata)
-    steps = calldata.get("steps")
-    if not isinstance(steps, list) or len(steps) != amounts_len:
-        raise AssertionError("calldata.steps length mismatch")
-    for step in steps:
-        calls = step.get("calls")
-        if not isinstance(calls, list) or len(calls) != 1:
-            raise AssertionError("transfer_from step should have 1 call")
-        call = calls[0]
-        if call.get("call_type") != "tycho_router":
-            raise AssertionError("transfer_from call_type should be tycho_router")
-        assert_hex(call.get("target", ""), "router target")
-        assert_hex(call.get("calldata", ""), "router calldata")
-        allowances = call.get("allowances", [])
-        if not isinstance(allowances, list) or len(allowances) != 1:
-            raise AssertionError("transfer_from should include one allowance")
+def protocol_from_pool_name(pool_name: str) -> str:
+    if "::" in pool_name:
+        return pool_name.split("::", 1)[0]
+    return "unknown"
 
 
-def validate_none_mode(calldata: dict, amounts_len: int) -> None:
-    validate_calldata_meta(calldata)
-    steps = calldata.get("steps")
-    if not isinstance(steps, list) or len(steps) != amounts_len:
-        raise AssertionError("calldata.steps length mismatch")
-    for step in steps:
-        calls = step.get("calls")
-        if not isinstance(calls, list) or len(calls) != 2:
-            raise AssertionError("none mode step should have 2 calls")
-        if calls[0].get("call_type") != "erc20_transfer":
-            raise AssertionError("none mode first call should be erc20_transfer")
-        if calls[1].get("call_type") != "tycho_router":
-            raise AssertionError("none mode second call should be tycho_router")
-        assert_hex(calls[0].get("target", ""), "erc20 transfer target")
-        assert_hex(calls[1].get("target", ""), "router target")
-        assert_hex(calls[0].get("calldata", ""), "erc20 transfer calldata")
-        assert_hex(calls[1].get("calldata", ""), "router calldata")
-        allowances = calls[1].get("allowances", [])
-        if allowances:
-            raise AssertionError("none mode router call should not include allowances")
+def validate_encode_response(response: dict, expected_router: str) -> int:
+    if response.get("swapKind") != "MultiSwap":
+        raise AssertionError("swapKind mismatch")
+    token_in = response.get("tokenIn")
+    assert_hex(token_in, "tokenIn")
+    normalized = response.get("normalizedRoute", {})
+    segments = normalized.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise AssertionError("normalizedRoute segments missing")
+    if segments[0].get("kind") != "MultiSwap":
+        raise AssertionError("segment kind mismatch")
+    interactions = response.get("interactions")
+    if not isinstance(interactions, list) or len(interactions) not in (2, 3):
+        raise AssertionError("interactions length mismatch")
+
+    if len(interactions) == 2:
+        approval, router = interactions
+        if approval.get("kind") != "ERC20_APPROVE":
+            raise AssertionError("approval interaction missing")
+        if router.get("kind") != "CALL":
+            raise AssertionError("router call interaction missing")
+        assert_hex(approval.get("target", ""), "interaction target")
+        assert_hex(router.get("target", ""), "interaction target")
+        assert_hex(approval.get("calldata", ""), "interaction calldata")
+        assert_hex(router.get("calldata", ""), "interaction calldata")
+        if approval.get("target", "").lower() != token_in.lower():
+            raise AssertionError("approval target mismatch (tokenIn)")
+        if router.get("target", "").lower() != expected_router.lower():
+            raise AssertionError("router interaction target mismatch")
+        return 2
+
+    first, second, third = interactions
+    if first.get("kind") != "ERC20_APPROVE" or second.get("kind") != "ERC20_APPROVE":
+        raise AssertionError("approval interactions missing or misordered")
+    if third.get("kind") != "CALL":
+        raise AssertionError("router call interaction missing")
+
+    assert_hex(first.get("target", ""), "interaction target")
+    assert_hex(second.get("target", ""), "interaction target")
+    assert_hex(third.get("target", ""), "interaction target")
+    assert_hex(first.get("calldata", ""), "interaction calldata")
+    assert_hex(second.get("calldata", ""), "interaction calldata")
+    assert_hex(third.get("calldata", ""), "interaction calldata")
+
+    if first.get("target", "").lower() != token_in.lower():
+        raise AssertionError("approval target mismatch (tokenIn)")
+    if second.get("target", "").lower() != token_in.lower():
+        raise AssertionError("approval target mismatch (tokenIn)")
+    if third.get("target", "").lower() != expected_router.lower():
+        raise AssertionError("router interaction target mismatch")
+    return 3
+
+
+def validate_pool_ordering(response: dict, pool_first: dict, pool_second: dict) -> None:
+    normalized = response.get("normalizedRoute", {})
+    segments = normalized.get("segments")
+    if not isinstance(segments, list) or len(segments) != 1:
+        raise AssertionError("normalizedRoute segments length mismatch")
+
+    hops = segments[0].get("hops")
+    if not isinstance(hops, list) or len(hops) != 2:
+        raise AssertionError("normalizedRoute hops length mismatch")
+
+    first_swaps = hops[0].get("swaps")
+    second_swaps = hops[1].get("swaps")
+    if not isinstance(first_swaps, list) or not first_swaps:
+        raise AssertionError("normalizedRoute first hop swaps missing")
+    if not isinstance(second_swaps, list) or not second_swaps:
+        raise AssertionError("normalizedRoute second hop swaps missing")
+
+    first_pool = first_swaps[0].get("pool", {}).get("componentId")
+    second_pool = second_swaps[0].get("pool", {}).get("componentId")
+    if first_pool != pool_first["pool"]:
+        raise AssertionError("normalizedRoute first hop pool mismatch")
+    if second_pool != pool_second["pool"]:
+        raise AssertionError("normalizedRoute second hop pool mismatch")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Smoke test POST /encode")
+    parser = argparse.ArgumentParser(description="Smoke test POST /encode (spec schema)")
     parser.add_argument("--encode-url", default="http://localhost:3000/encode")
     parser.add_argument("--simulate-url", default="http://localhost:3000/simulate")
     parser.add_argument("--repo", default=".")
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
+    parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
 
     repo = Path(args.repo)
-    env_contract = load_env_contract(repo)
-    settlement = env_contract or DEFAULT_SETTLEMENT
-    has_env_default = env_contract is not None
+    settlement = load_env_value(repo, "COW_SETTLEMENT_CONTRACT") or DEFAULT_SETTLEMENT
+    tycho_router = load_env_value(repo, "TYCHO_ROUTER_ADDRESS") or DEFAULT_TYCHO_ROUTER
+    allowed_statuses = {status.strip() for status in args.allow_status.split(",") if status.strip()}
+    if not allowed_statuses:
+        print("Error: --allow-status produced no values", file=sys.stderr)
+        return 2
 
     dai = TOKENS.get("DAI")
     usdc = TOKENS.get("USDC")
@@ -154,19 +205,25 @@ def main() -> int:
         print(f"[FAIL] simulate HTTP {status}")
         return 1
 
-    status_value = response.get("meta", {}).get("status")
-    if status_value != "ready":
-        print(f"[FAIL] simulate dai->usdc expected ready, got {status_value}")
+    meta = response.get("meta", {})
+    status_value = meta.get("status") if isinstance(meta, dict) else None
+    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
+    if status_value not in allowed_statuses:
+        print(f"[FAIL] simulate dai->usdc expected {sorted(allowed_statuses)}, got {status_value}")
+        return 1
+    if failures_list and not args.allow_failures:
+        print(f"[FAIL] simulate dai->usdc had {len(failures_list)} failures")
         return 1
 
-    pool = select_pool(response, "simulate dai->usdc")
+    pool_first = select_pool(response, "simulate dai->usdc")
 
-    hop_amounts_out = pool["amounts_out"]
+    hop_amounts_out = pool_first["amounts_out"]
+    hop_amounts_in = [apply_slippage(value, DEFAULT_SLIPPAGE_BPS) for value in hop_amounts_out]
     simulate_payload_second = {
         "request_id": f"encode-smoke-hop-{uuid.uuid4().hex[:8]}",
         "token_in": usdc,
         "token_out": usdt,
-        "amounts": hop_amounts_out,
+        "amounts": hop_amounts_in,
     }
 
     try:
@@ -181,237 +238,108 @@ def main() -> int:
         print(f"[FAIL] simulate second hop HTTP {status}")
         return 1
 
-    status_value = response_second.get("meta", {}).get("status")
-    if status_value != "ready":
-        print(f"[FAIL] simulate usdc->usdt expected ready, got {status_value}")
+    meta = response_second.get("meta", {})
+    status_value = meta.get("status") if isinstance(meta, dict) else None
+    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
+    if status_value not in allowed_statuses:
+        print(f"[FAIL] simulate usdc->usdt expected {sorted(allowed_statuses)}, got {status_value}")
+        return 1
+    if failures_list and not args.allow_failures:
+        print(f"[FAIL] simulate usdc->usdt had {len(failures_list)} failures")
         return 1
 
     pool_second = select_pool(response_second, "simulate usdc->usdt")
 
-    route_single = {
-        "route_id": "route-single",
-        "hops": [
-            {"pool_id": pool["pool"], "token_in": dai, "token_out": usdc},
+    protocol_first = protocol_from_pool_name(pool_first.get("pool_name", ""))
+    protocol_second = protocol_from_pool_name(pool_second.get("pool_name", ""))
+
+    min_out_first = hop_amounts_in[0]
+    if int(min_out_first) <= 0:
+        print("[FAIL] computed hop output for first hop is zero", file=sys.stderr)
+        return 1
+    min_out_second = apply_slippage(pool_second["amounts_out"][0], DEFAULT_SLIPPAGE_BPS)
+    if int(min_out_second) <= 0:
+        print("[FAIL] computed route minAmountOut is zero", file=sys.stderr)
+        return 1
+
+    encode_request = {
+        "chainId": 1,
+        "tokenIn": dai,
+        "tokenOut": usdt,
+        "amountIn": amounts[0],
+        "minAmountOut": min_out_second,
+        "settlementAddress": settlement,
+        "tychoRouterAddress": tycho_router,
+        "swapKind": "MultiSwap",
+        "segments": [
+            {
+                "kind": "MultiSwap",
+                "shareBps": 0,
+                "hops": [
+                    {
+                        "tokenIn": dai,
+                        "tokenOut": usdc,
+                        "swaps": [
+                            {
+                                "pool": {
+                                    "protocol": protocol_first,
+                                    "componentId": pool_first["pool"],
+                                    "poolAddress": pool_first["pool_address"],
+                                },
+                                "tokenIn": dai,
+                                "tokenOut": usdc,
+                                "splitBps": 0,
+                            }
+                        ],
+                    },
+                    {
+                        "tokenIn": usdc,
+                        "tokenOut": usdt,
+                        "swaps": [
+                            {
+                                "pool": {
+                                    "protocol": protocol_second,
+                                    "componentId": pool_second["pool"],
+                                    "poolAddress": pool_second["pool_address"],
+                                },
+                                "tokenIn": usdc,
+                                "tokenOut": usdt,
+                                "splitBps": 0,
+                            }
+                        ],
+                    },
+                ],
+            }
         ],
-        "amounts": amounts,
-        "amounts_out": pool["amounts_out"],
-        "gas_used": pool["gas_used"],
-        "block_number": pool["block_number"],
+        "requestId": f"encode-smoke-{uuid.uuid4().hex[:8]}",
     }
 
-    route_multi = {
-        "route_id": "route-multi",
-        "hops": [
-            {"pool_id": pool["pool"], "token_in": dai, "token_out": usdc},
-            {"pool_id": pool_second["pool"], "token_in": usdc, "token_out": usdt},
-        ],
-        "amounts": amounts,
-        "amounts_out": pool_second["amounts_out"],
-        "gas_used": pool_second["gas_used"],
-        "block_number": pool_second["block_number"],
-    }
-
-    route_invalid = {
-        "route_id": "route-invalid",
-        "hops": [
-            {"pool_id": pool["pool"], "token_in": dai, "token_out": usdc},
-            {"pool_id": pool_second["pool"], "token_in": dai, "token_out": usdt},
-        ],
-        "amounts": amounts,
-        "amounts_out": pool_second["amounts_out"],
-        "gas_used": pool_second["gas_used"],
-        "block_number": pool_second["block_number"],
-    }
-
-    transfer_from_payload = {
-        "request_id": f"encode-smoke-transfer-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdc,
-        "calldata": {
-            "mode": "tycho_router_transfer_from",
-            "sender": settlement,
-            "receiver": settlement,
-        },
-        "routes": [route_single, route_invalid],
-    }
+    if args.verbose:
+        print(json.dumps(encode_request, indent=2))
 
     try:
-        status, encode_response, _ = request_json(
-            args.encode_url, transfer_from_payload, args.timeout
+        status, encode_response, elapsed = request_json(
+            args.encode_url, encode_request, args.timeout
         )
     except (HTTPError, URLError) as exc:
-        print(f"[FAIL] encode transfer_from failed: {exc}")
+        print(f"[FAIL] encode request failed: {exc}")
         return 1
 
     if status != 200:
-        print(f"[FAIL] encode transfer_from HTTP {status}")
+        print(f"[FAIL] encode HTTP {status}")
         return 1
-
-    meta_status = encode_response.get("meta", {}).get("status")
-    if meta_status != "partial_failure":
-        print(f"[FAIL] transfer_from expected partial_failure, got {meta_status}")
-        return 1
-
-    data = encode_response.get("data", [])
-    if len(data) != 2:
-        print("[FAIL] transfer_from expected 2 routes")
-        return 1
-
-    if data[0].get("route_id") != "route-single" or data[1].get("route_id") != "route-invalid":
-        print("[FAIL] transfer_from route ordering mismatch")
-        return 1
-
-    if "calldata" not in data[0]:
-        print("[FAIL] transfer_from missing calldata for valid route")
-        return 1
-
-    if "calldata" in data[1]:
-        print("[FAIL] invalid route should not include calldata")
-        return 1
-
-    validate_transfer_from(data[0]["calldata"], len(amounts))
-
-    none_payload = {
-        "request_id": f"encode-smoke-none-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdc,
-        "calldata": {
-            "mode": "tycho_router_none",
-            "sender": settlement,
-            "receiver": settlement,
-        },
-        "routes": [route_single],
-    }
 
     try:
-        status, none_response, _ = request_json(args.encode_url, none_payload, args.timeout)
-    except (HTTPError, URLError) as exc:
-        print(f"[FAIL] encode none failed: {exc}")
-        return 1
-
-    if status != 200:
-        print(f"[FAIL] encode none HTTP {status}")
-        return 1
-
-    meta_status = none_response.get("meta", {}).get("status")
-    if meta_status != "ready":
-        print(f"[FAIL] none mode expected ready, got {meta_status}")
-        return 1
-
-    none_data = none_response.get("data", [])
-    if len(none_data) != 1 or "calldata" not in none_data[0]:
-        print("[FAIL] none mode missing calldata")
-        return 1
-
-    validate_none_mode(none_data[0]["calldata"], len(amounts))
-
-    multi_payload = {
-        "request_id": f"encode-smoke-multi-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdt,
-        "calldata": {
-            "mode": "tycho_router_transfer_from",
-            "sender": settlement,
-            "receiver": settlement,
-        },
-        "routes": [route_multi],
-    }
-
-    try:
-        status, multi_response, _ = request_json(args.encode_url, multi_payload, args.timeout)
-    except (HTTPError, URLError) as exc:
-        print(f"[FAIL] encode multi-hop failed: {exc}")
-        return 1
-
-    if status != 200:
-        print(f"[FAIL] encode multi-hop HTTP {status}")
-        return 1
-
-    multi_status = multi_response.get("meta", {}).get("status")
-    if multi_status != "ready":
-        print(f"[FAIL] multi-hop expected ready, got {multi_status}")
-        return 1
-
-    multi_data = multi_response.get("data", [])
-    if len(multi_data) != 1 or "calldata" not in multi_data[0]:
-        print("[FAIL] multi-hop missing calldata")
-        return 1
-
-    validate_transfer_from(multi_data[0]["calldata"], len(amounts))
-
-    defaults_payload = {
-        "request_id": f"encode-smoke-defaults-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdc,
-        "calldata": {"mode": "tycho_router_transfer_from"},
-        "routes": [route_single],
-    }
-
-    try:
-        status, defaults_response, _ = request_json(
-            args.encode_url, defaults_payload, args.timeout
-        )
-    except (HTTPError, URLError) as exc:
-        print(f"[FAIL] encode defaults failed: {exc}")
-        return 1
-
-    if status != 200:
-        print(f"[FAIL] encode defaults HTTP {status}")
-        return 1
-
-    defaults_status = defaults_response.get("meta", {}).get("status")
-    if has_env_default:
-        if defaults_status != "ready":
-            print(f"[FAIL] defaults expected ready, got {defaults_status}")
-            return 1
-        if "calldata" not in defaults_response.get("data", [{}])[0]:
-            print("[FAIL] defaults missing calldata")
-            return 1
-    else:
-        if defaults_status != "invalid_request":
-            print(f"[FAIL] defaults expected invalid_request, got {defaults_status}")
-            return 1
-        if defaults_response.get("data"):
-            print("[FAIL] defaults invalid_request should return empty data")
-            return 1
-
-    duplicate_payload = {
-        "request_id": f"encode-smoke-dup-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdc,
-        "calldata": {
-            "mode": "tycho_router_transfer_from",
-            "sender": settlement,
-            "receiver": settlement,
-        },
-        "routes": [
-            {**route_single, "route_id": "dup"},
-            {**route_single, "route_id": "dup"},
-        ],
-    }
-
-    try:
-        status, dup_response, _ = request_json(args.encode_url, duplicate_payload, args.timeout)
-    except (HTTPError, URLError) as exc:
-        print(f"[FAIL] encode duplicate failed: {exc}")
-        return 1
-
-    if status != 200:
-        print(f"[FAIL] encode duplicate HTTP {status}")
-        return 1
-
-    dup_status = dup_response.get("meta", {}).get("status")
-    if dup_status != "invalid_request":
-        print(f"[FAIL] duplicate expected invalid_request, got {dup_status}")
-        return 1
-    if dup_response.get("data"):
-        print("[FAIL] duplicate invalid_request should return empty data")
+        interactions_len = validate_encode_response(encode_response, tycho_router)
+        validate_pool_ordering(encode_response, pool_first, pool_second)
+    except AssertionError as exc:
+        print(f"[FAIL] encode response validation failed: {exc}")
         return 1
 
     if args.verbose:
-        print(json.dumps({"transfer_from": encode_response, "none": none_response}, indent=2))
+        print(json.dumps(encode_response, indent=2))
 
-    print("[OK] encode smoke passed")
+    print(f"[OK] encode route {elapsed:.3f}s interactions={interactions_len}")
     return 0
 
 

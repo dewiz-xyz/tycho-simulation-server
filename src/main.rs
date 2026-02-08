@@ -10,15 +10,12 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
-use tycho_execution::encoding::{
-    evm::encoder_builders::TychoRouterEncoderBuilder, models::UserTransferType,
-};
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
-use crate::models::state::{AppState, EncodeState, StateStore};
+use crate::models::state::{AppState, StateStore};
 use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_merged_streams;
 
@@ -63,21 +60,6 @@ async fn main() -> anyhow::Result<()> {
 
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
-    let transfer_from_encoder = TychoRouterEncoderBuilder::new()
-        .chain(Chain::Ethereum)
-        .user_transfer_type(UserTransferType::TransferFrom)
-        .build()
-        .map_err(|err| anyhow::anyhow!("Failed to build transfer_from encoder: {err}"))?;
-    let none_encoder = TychoRouterEncoderBuilder::new()
-        .chain(Chain::Ethereum)
-        .user_transfer_type(UserTransferType::None)
-        .build()
-        .map_err(|err| anyhow::anyhow!("Failed to build none encoder: {err}"))?;
-    let encode_state = Arc::new(EncodeState {
-        cow_settlement_contract: config.cow_settlement_contract.clone(),
-        transfer_from_encoder: Arc::from(transfer_from_encoder),
-        none_encoder: Arc::from(none_encoder),
-    });
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
@@ -87,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
-        encode_state,
+        reset_allowance_tokens: Arc::new(config.reset_allowance_tokens.clone()),
     };
 
     info!(

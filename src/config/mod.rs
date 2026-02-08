@@ -1,9 +1,10 @@
-mod logging;
-pub use logging::init_logging;
-
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use tycho_simulation::tycho_common::Bytes;
+
+mod logging;
+pub use logging::init_logging;
 
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
@@ -26,16 +27,6 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid PORT");
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-
-    let cow_settlement_contract = std::env::var("COW_SETTLEMENT_CONTRACT").ok().map(|value| {
-        let trimmed = value.trim();
-        let bytes = Bytes::from_str(trimmed).expect("Invalid COW_SETTLEMENT_CONTRACT");
-        assert!(
-            bytes.len() == 20,
-            "COW_SETTLEMENT_CONTRACT must be a 20-byte address"
-        );
-        bytes
-    });
 
     // Create socket address from host and port
     let addr = host.to_string();
@@ -90,6 +81,8 @@ pub fn load_config() -> AppConfig {
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
 
+    let reset_allowance_tokens = default_reset_allowance_tokens();
+
     let max_sim_concurrency = 256usize;
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -119,7 +112,6 @@ pub fn load_config() -> AppConfig {
         tvl_keep_threshold,
         port,
         host,
-        cow_settlement_contract,
         quote_timeout_ms,
         pool_timeout_native_ms,
         pool_timeout_vm_ms,
@@ -128,6 +120,7 @@ pub fn load_config() -> AppConfig {
         enable_vm_pools,
         global_native_sim_concurrency,
         global_vm_sim_concurrency,
+        reset_allowance_tokens,
     }
 }
 
@@ -139,7 +132,6 @@ pub struct AppConfig {
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: String,
-    pub cow_settlement_contract: Option<Bytes>,
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,
@@ -148,4 +140,26 @@ pub struct AppConfig {
     pub enable_vm_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
+    pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
+}
+
+const ETHEREUM_CHAIN_ID: u64 = 1;
+const ETHEREUM_USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+
+fn default_reset_allowance_tokens() -> HashMap<u64, HashSet<Bytes>> {
+    // Tokens that require approve(0) before approve(amount).
+    let mut tokens = HashMap::new();
+    let mut mainnet = HashSet::new();
+    mainnet.insert(parse_address(ETHEREUM_USDT));
+    tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
+    tokens
+}
+
+fn parse_address(value: &str) -> Bytes {
+    let bytes = Bytes::from_str(value).expect("reset_allowance_tokens address is invalid");
+    assert!(
+        bytes.len() == 20,
+        "reset_allowance_tokens address must be 20 bytes"
+    );
+    bytes
 }

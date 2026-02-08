@@ -83,119 +83,150 @@ pub struct QuoteResult {
     pub meta: QuoteMeta,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CalldataMode {
-    #[default]
-    TychoRouterTransferFrom,
-    TychoRouterNone,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct CalldataConfig {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolRef {
+    pub protocol: String,
+    pub component_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<CalldataMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receiver: Option<String>,
+    pub pool_address: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RouteHop {
-    pub pool_id: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolSwapDraft {
+    pub pool: PoolRef,
     pub token_in: String,
     pub token_out: String,
+    pub split_bps: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EncodeRoute {
-    pub route_id: String,
-    pub hops: Vec<RouteHop>,
-    pub amounts: Vec<String>,
-    pub amounts_out: Vec<String>,
-    pub gas_used: Vec<u64>,
-    pub block_number: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EncodeRequest {
-    pub request_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auction_id: Option<String>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HopDraft {
     pub token_in: String,
     pub token_out: String,
+    pub swaps: Vec<PoolSwapDraft>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SegmentDraft {
+    pub kind: SwapKind,
+    pub share_bps: u32,
+    pub hops: Vec<HopDraft>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::enum_variant_names)]
+pub enum SwapKind {
+    SimpleSwap,
+    MultiSwap,
+    MegaSwap,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteEncodeRequest {
+    pub chain_id: u64,
+    pub token_in: String,
+    pub token_out: String,
+    pub amount_in: String,
+    pub min_amount_out: String,
+    pub settlement_address: String,
+    pub tycho_router_address: String,
+    pub swap_kind: SwapKind,
+    pub segments: Vec<SegmentDraft>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub calldata: Option<CalldataConfig>,
-    pub routes: Vec<EncodeRoute>,
+    pub request_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct EncodeMeta {
-    pub status: QuoteStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auction_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failures: Vec<QuoteFailure>,
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionKind {
+    #[serde(rename = "ERC20_APPROVE")]
+    Erc20Approve,
+    #[serde(rename = "CALL")]
+    Call,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct EncodeRouteResult {
-    pub route_id: String,
-    pub amounts_out: Vec<String>,
-    pub gas_used: Vec<u64>,
-    pub block_number: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub calldata: Option<CalldataResult>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct EncodeResult {
-    pub request_id: String,
-    pub data: Vec<EncodeRouteResult>,
-    pub meta: EncodeMeta,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct CalldataResult {
-    pub mode: CalldataMode,
-    pub sender: String,
-    pub receiver: String,
-    pub steps: Vec<CalldataStep>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct CalldataStep {
-    pub calls: Vec<ExecutionCall>,
-}
-
-#[derive(Debug, Serialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionCallType {
-    Erc20Transfer,
-    TychoRouter,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct ExecutionCall {
-    pub call_type: ExecutionCallType,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Interaction {
+    pub kind: InteractionKind,
     pub target: String,
     pub value: String,
     pub calldata: String,
-    pub allowances: Vec<Allowance>,
-    pub inputs: Vec<Asset>,
-    pub outputs: Vec<Asset>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct Asset {
-    pub token: String,
-    pub amount: String,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolSwap {
+    pub pool: PoolRef,
+    pub token_in: String,
+    pub token_out: String,
+    pub split_bps: u32,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct Allowance {
-    pub token: String,
-    pub spender: String,
-    pub amount: String,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Hop {
+    pub token_in: String,
+    pub token_out: String,
+    pub swaps: Vec<PoolSwap>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    pub kind: SwapKind,
+    pub share_bps: u32,
+    pub hops: Vec<Hop>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ResimulationDebug {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tycho_state_tag: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDebug {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resimulation: Option<ResimulationDebug>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedRoute {
+    pub segments: Vec<Segment>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteEncodeResponse {
+    pub chain_id: u64,
+    pub token_in: String,
+    pub token_out: String,
+    pub amount_in: String,
+    pub min_amount_out: String,
+    pub swap_kind: SwapKind,
+    pub normalized_route: NormalizedRoute,
+    pub interactions: Vec<Interaction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<RouteDebug>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }

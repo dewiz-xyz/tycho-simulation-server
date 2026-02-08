@@ -6431,8 +6431,11 @@ dependencies = [
 name = "tycho-simulation-server"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "axum 0.7.9",
+ "chrono",
  "dotenv",
  "futures 0.3.31",
  "num-bigint",

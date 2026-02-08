@@ -47,7 +47,8 @@ The following environment variables are read at startup:
 - `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep/remove pools (default: `0.2`)
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
-- `COW_SETTLEMENT_CONTRACT` – Default sender/receiver for `POST /encode` (default: unset; required if not provided per request)
+- `COW_SETTLEMENT_CONTRACT` – Default settlement address for `scripts/encode_smoke.py` (optional)
+- `TYCHO_ROUTER_ADDRESS` – Default router address for `scripts/encode_smoke.py` (optional)
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
@@ -62,7 +63,7 @@ Note: when concurrency caps are saturated or a pool would exceed the quote deadl
 
 ## Docs
 
-- `docs/encode_example.md` – end-to-end `/encode` workflow example with real request/response payloads.
+- `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request/response examples.
 
 ## HTTP API
 
@@ -110,49 +111,65 @@ Response body:
 `QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`.
 
 Timeout behavior:
-- Handler-level timeout returns `200 OK` with `PartialFailure`, includes `request_id`, `block_number`, `total_pools`, and a `Timeout` failure.
-- Router-level timeout (rare fallback, applied to `/simulate` and `/encode`) returns `200 OK` with `PartialFailure`. Logs include `scope="router_timeout"`.
+- `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
+- `/simulate` router-level timeouts return `200 OK` with `partial_failure`. Logs include `scope="router_timeout"`.
+- `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
   - `/status` is not subject to router-level timeouts.
 
 ### `POST /encode`
 
-`POST /encode` encodes client-provided routes and simulated outputs into calldata for CoW `CustomInteraction` objects. It does not run simulations.
+`POST /encode` builds Tycho router calldata (`singleSwap`, `sequentialSwap`, or `splitSwap`) for a client-provided route. It **re-simulates** each pool swap, derives per-hop/per-swap amounts internally, and enforces only the route-level `minAmountOut`.
 
 Notes:
-- The request `routes[]` are the only routes that will be encoded.
-- If `calldata.sender`/`calldata.receiver` are omitted, `COW_SETTLEMENT_CONTRACT` must be set.
-- If any route fails validation or encoding, the response `meta.status` is `partial_failure` and that route omits `calldata`.
+- The request shape follows `RouteEncodeRequest` (camelCase fields).
+- `settlementAddress` and `tychoRouterAddress` are required.
+- `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
+- Requests include route-level `amountIn` and `minAmountOut`, plus segment `shareBps` and swap `splitBps` for splits.
+- Hops are sequential in the order provided; there is no hop-level share.
+- The encoder chooses `singleSwap` for one swap, `sequentialSwap` for multi-hop without splits, and `splitSwap` when any split is present.
+- Per-hop and per-swap amounts are not accepted and not returned.
+- The response is `RouteEncodeResponse` with `normalizedRoute` and settlement `interactions`.
+- Errors return 4xx/5xx with `{ error, requestId }`.
 
-Example request (single route, transfer-from mode):
+Example request (shape only):
 
 ```bash
 curl -X POST "http://localhost:3000/encode" \
   -H "Content-Type: application/json" \
   -d '{
-    "request_id": "req-encode-1",
-    "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
-    "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-    "calldata": { "mode": "tycho_router_transfer_from" },
-    "routes": [
+    "chainId": 1,
+    "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+    "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "amountIn": "1000000000000000000",
+    "minAmountOut": "1000000",
+    "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+    "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+    "swapKind": "SimpleSwap",
+    "segments": [
       {
-        "route_id": "route-1",
+        "kind": "SimpleSwap",
+        "shareBps": 0,
         "hops": [
           {
-            "pool_id": "uniswapv3-1",
-            "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
-            "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+            "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "swaps": [
+              {
+                "pool": { "protocol": "uniswap_v3", "componentId": "pool-id" },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "splitBps": 0
+              }
+            ]
           }
-        ],
-        "amounts": ["1000000000000000000"],
-        "amounts_out": ["999000000"],
-        "gas_used": [210000],
-        "block_number": 19876543
+        ]
       }
-    ]
+    ],
+    "requestId": "req-encode-1"
   }'
 ```
 
-The response includes `calldata.steps[].calls[]` with `target`, `calldata`, `allowances`, and `inputs`/`outputs` for each ladder step.
+The response includes ordered `interactions[]` (approve + router call). Computed per-hop/per-swap amounts are logged server-side, not returned.
 
 ### `GET /status`
 
