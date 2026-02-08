@@ -10,7 +10,7 @@ use num_traits::{ToPrimitive, Zero};
 use tracing::info;
 use tycho_execution::encoding::{errors::EncodingError, evm::utils::bytes_to_address};
 use tycho_execution::encoding::{
-    evm::{encoder_builders::TychoRouterEncoderBuilder, utils::biguint_to_u256},
+    evm::encoder_builders::TychoRouterEncoderBuilder,
     models::{EncodedSolution, NativeAction, Solution, Swap, UserTransferType},
     tycho_encoder::TychoEncoder,
 };
@@ -191,6 +191,9 @@ pub async fn encode_route(
     let amount_in = parse_amount(&request.amount_in)?;
     let min_amount_out = parse_amount(&request.min_amount_out)?;
     let router_address = parse_address(&request.tycho_router_address)?;
+    // Guard against panics in downstream EVM encoding (uint256 inputs).
+    biguint_to_u256_checked(&amount_in, "amountIn")?;
+    biguint_to_u256_checked(&min_amount_out, "minAmountOut")?;
     ensure_erc20_tokens(chain, &token_in, &token_out)?;
 
     let native_address = chain.native_token().address;
@@ -903,7 +906,7 @@ fn encode_erc20_approve_calldata(
     amount: &BigUint,
 ) -> Result<Vec<u8>, EncodeError> {
     let spender = bytes_to_address(spender).map_err(map_encoding_error)?;
-    let amount = biguint_to_u256(amount);
+    let amount = biguint_to_u256_checked(amount, "approve amount")?;
     let calldata_args = (spender, amount).abi_encode();
     encode_function_call(ERC20_APPROVE_SIGNATURE, calldata_args)
 }
@@ -1069,13 +1072,15 @@ fn encode_route_calldata(
         ));
     }
     let is_transfer_from_allowed = !is_wrap;
+    let given_amount = biguint_to_u256_checked(&solution.given_amount, "amountIn")?;
+    let checked_amount = biguint_to_u256_checked(&solution.checked_amount, "minAmountOut")?;
 
     let calldata_args = if signature.contains("splitSwap") {
         (
-            biguint_to_u256(&solution.given_amount),
+            given_amount,
             bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
             bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
-            biguint_to_u256(&solution.checked_amount),
+            checked_amount,
             is_wrap,
             is_unwrap,
             alloy_primitives::U256::from(encoded_solution.n_tokens),
@@ -1086,10 +1091,10 @@ fn encode_route_calldata(
             .abi_encode_params()
     } else if signature.contains("singleSwap") || signature.contains("sequentialSwap") {
         (
-            biguint_to_u256(&solution.given_amount),
+            given_amount,
             bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
             bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
-            biguint_to_u256(&solution.checked_amount),
+            checked_amount,
             is_wrap,
             is_unwrap,
             bytes_to_address(receiver).map_err(map_encoding_error)?,
@@ -1216,6 +1221,18 @@ fn format_0x_hex(raw: &str) -> String {
 fn format_calldata(data: &[u8]) -> String {
     let bytes = Bytes::from(data.to_vec());
     format_0x_hex(&format!("{bytes:x}"))
+}
+
+fn biguint_to_u256_checked(
+    value: &BigUint,
+    label: &str,
+) -> Result<alloy_primitives::U256, EncodeError> {
+    let bytes = value.to_bytes_be();
+    if bytes.len() > 32 {
+        return Err(EncodeError::invalid(format!("{} must fit uint256", label)));
+    }
+
+    Ok(alloy_primitives::U256::from_be_slice(&bytes))
 }
 
 fn map_swap_token(address: &Bytes, chain: Chain) -> Bytes {
@@ -1836,6 +1853,42 @@ mod tests {
         assert!(calldata.len() >= 36);
         assert_eq!(&calldata[..4], &function_selector(signature).unwrap());
         assert_eq!(&calldata[4..36], expected.as_slice());
+    }
+
+    #[test]
+    fn encode_route_calldata_rejects_amount_over_uint256() {
+        let signature = "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
+        let encoded_solution = EncodedSolution {
+            swaps: vec![0x00],
+            interacting_with: router.clone(),
+            function_signature: signature.to_string(),
+            n_tokens: 0,
+            permit: None,
+        };
+
+        let too_large = BigUint::from(1u32) << 256;
+        let solution = Solution {
+            sender: Bytes::from_str("0x0000000000000000000000000000000000000011").unwrap(),
+            receiver: Bytes::from_str("0x0000000000000000000000000000000000000022").unwrap(),
+            given_token: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+            given_amount: too_large,
+            checked_token: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+            exact_out: false,
+            checked_amount: BigUint::from(1u32),
+            swaps: Vec::new(),
+            native_action: None,
+        };
+        let receiver = Bytes::from_str("0x0000000000000000000000000000000000000033").unwrap();
+
+        let err = encode_route_calldata(&encoded_solution, &solution, &receiver, false, false)
+            .unwrap_err();
+        assert_eq!(err.kind(), EncodeErrorKind::InvalidRequest);
+        assert!(
+            err.message.contains("uint256"),
+            "unexpected error message: {:?}",
+            err.message
+        );
     }
 
     #[tokio::test]

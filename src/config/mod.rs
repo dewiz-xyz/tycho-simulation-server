@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use tycho_simulation::tycho_common::Bytes;
 
@@ -79,11 +80,11 @@ pub fn load_config() -> AppConfig {
     );
 
     let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
-        .unwrap_or_else(|_| "true".to_string())
+        .unwrap_or_else(|_| "false".to_string())
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
 
-    let reset_allowance_tokens = default_reset_allowance_tokens();
+    let reset_allowance_tokens = Arc::new(default_reset_allowance_tokens());
 
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -229,7 +230,7 @@ pub struct AppConfig {
     pub enable_vm_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
-    pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
+    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
     pub stream_missing_block_window_secs: u64,
