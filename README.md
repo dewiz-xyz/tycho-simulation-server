@@ -11,7 +11,7 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 - Background ingestion of Tycho protocol streams with TVL-based filtering.
 - `POST /simulate` endpoint that returns laddered amount-out simulated quotes with rich metadata.
 - `POST /encode` endpoint that returns CoW-ready calldata for client-provided routes.
-- `GET /status` endpoint for readiness polling (block height, pool count).
+- `GET /status` endpoint for readiness polling (native + VM block height, pool count).
 - Structured logging with `tracing`.
 - Fully asynchronous execution with Tokio.
 
@@ -56,8 +56,23 @@ The following environment variables are read at startup:
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
 - `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
-- `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`, clamped to `256`)
-- `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `2 * num_cpus`, clamped to `256`)
+- `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
+- `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`)
+- `STREAM_STALE_SECS` – Consider a stream unhealthy if no updates arrive within this many seconds (default: `120`)
+- `STREAM_MISSING_BLOCK_BURST` – Missing-block errors allowed within the missing-block window before triggering a restart (default: `3`)
+- `STREAM_MISSING_BLOCK_WINDOW_SECS` – Window size for missing-block burst counting (default: `60`)
+- `STREAM_ERROR_BURST` – Stream errors allowed within the error window before triggering a restart (default: `3`)
+- `STREAM_ERROR_WINDOW_SECS` – Window size for stream error burst counting (default: `60`)
+- `RESYNC_GRACE_SECS` – Grace period after a resync starts before treating the stream as stale (default: `60`)
+- `STREAM_RESTART_BACKOFF_MIN_MS` – Minimum restart backoff (default: `500`)
+- `STREAM_RESTART_BACKOFF_MAX_MS` – Maximum restart backoff (default: `30000`)
+- `STREAM_RESTART_BACKOFF_JITTER_PCT` – Jitter fraction applied to restart backoff (default: `0.2`)
+- `READINESS_STALE_SECS` – Readiness stale threshold for native/VM readiness checks (default: `120`)
+- `STREAM_MEM_PURGE` – Purge jemalloc arenas on stream restarts/rebuilds (default: `true`)
+- `STREAM_MEM_LOG` – Enable periodic + event-triggered memory snapshots (default: `true`)
+- `STREAM_MEM_LOG_MIN_INTERVAL_SECS` – Minimum seconds between snapshots (default: `60`)
+- `STREAM_MEM_LOG_MIN_NEW_PAIRS` – Only snapshot on stream updates with at least this many new pairs (default: `1000`)
+- `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
 Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
 
@@ -100,6 +115,7 @@ Response body:
   "meta": {
     "status": "ready",
     "block_number": 19876543,
+    "vm_block_number": 19876540,
     "matching_pools": 4,
     "candidate_pools": 4,
     "total_pools": 412,
@@ -108,7 +124,7 @@ Response body:
 }
 ```
 
-`QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`.
+`QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`. `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
 Timeout behavior:
 - `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
@@ -179,6 +195,7 @@ Returns readiness information for health checks and pollers:
 {
   "status": "ready",
   "block": 19876543,
+  "vm_block": 19876540,
   "pools": 412
 }
 ```
@@ -194,6 +211,24 @@ cargo run --release
 ```
 
 The application binds to the configured `HOST:PORT` and begins streaming protocol data before serving HTTP requests.
+
+## Testing
+
+- `cargo test` runs unit and integration tests.
+- Integration tests live under `tests/integration/` and are wired by `tests/integration/main.rs`.
+- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up. Jemalloc is the default allocator for the service.
+
+Run only the integration tests:
+
+```bash
+cargo test --test integration
+```
+
+Run just the jemalloc plateau test:
+
+```bash
+cargo test --test integration jemalloc_memory_plateau_after_reset
+```
 
 ## Dependencies
 

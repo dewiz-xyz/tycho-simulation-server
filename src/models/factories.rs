@@ -18,6 +18,7 @@ pub fn router_timeout_result() -> QuoteResult {
     let meta = QuoteMeta {
         status: QuoteStatus::PartialFailure,
         block_number: 0,
+        vm_block_number: None,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: None,

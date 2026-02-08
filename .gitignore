@@ -5,6 +5,10 @@
 # Python
 __pycache__/
 
+# Codex skills (packaged artifacts)
+skills/*.dist/
+skills/**/*.skill
+
 # Node.js
 node_modules/
 

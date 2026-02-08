@@ -4,7 +4,9 @@ use std::str::FromStr;
 use tycho_simulation::tycho_common::Bytes;
 
 mod logging;
+mod memory;
 pub use logging::init_logging;
+pub use memory::MemoryConfig;
 
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
@@ -77,19 +79,18 @@ pub fn load_config() -> AppConfig {
     );
 
     let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
-        .unwrap_or_else(|_| "false".to_string())
+        .unwrap_or_else(|_| "true".to_string())
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
 
     let reset_allowance_tokens = default_reset_allowance_tokens();
 
-    let max_sim_concurrency = 256usize;
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
 
-    let default_native = (cpu_count.saturating_mul(4)).clamp(1, max_sim_concurrency);
-    let default_vm = cpu_count.saturating_mul(2).clamp(1, max_sim_concurrency);
+    let default_native = (cpu_count.saturating_mul(4)).max(1);
+    let default_vm = cpu_count.max(1);
 
     let global_native_sim_concurrency: usize = std::env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
         .ok()
@@ -99,12 +100,89 @@ pub fn load_config() -> AppConfig {
                 .expect("Invalid GLOBAL_NATIVE_SIM_CONCURRENCY")
         })
         .unwrap_or(default_native)
-        .clamp(1, max_sim_concurrency);
+        .max(1);
     let global_vm_sim_concurrency: usize = std::env::var("GLOBAL_VM_SIM_CONCURRENCY")
         .ok()
         .map(|value| value.parse().expect("Invalid GLOBAL_VM_SIM_CONCURRENCY"))
         .unwrap_or(default_vm)
-        .clamp(1, max_sim_concurrency);
+        .max(1);
+
+    let stream_stale_secs: u64 = std::env::var("STREAM_STALE_SECS")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .expect("Invalid STREAM_STALE_SECS");
+    let stream_missing_block_burst: u64 = std::env::var("STREAM_MISSING_BLOCK_BURST")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .expect("Invalid STREAM_MISSING_BLOCK_BURST");
+    let stream_missing_block_window_secs: u64 = std::env::var("STREAM_MISSING_BLOCK_WINDOW_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid STREAM_MISSING_BLOCK_WINDOW_SECS");
+    let stream_error_burst: u64 = std::env::var("STREAM_ERROR_BURST")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .expect("Invalid STREAM_ERROR_BURST");
+    let stream_error_window_secs: u64 = std::env::var("STREAM_ERROR_WINDOW_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid STREAM_ERROR_WINDOW_SECS");
+    let resync_grace_secs: u64 = std::env::var("RESYNC_GRACE_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("Invalid RESYNC_GRACE_SECS");
+    let stream_restart_backoff_min_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MIN_MS")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_MIN_MS");
+    let stream_restart_backoff_max_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MAX_MS")
+        .unwrap_or_else(|_| "30000".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_MAX_MS");
+    let stream_restart_backoff_jitter_pct: f64 = std::env::var("STREAM_RESTART_BACKOFF_JITTER_PCT")
+        .unwrap_or_else(|_| "0.2".to_string())
+        .parse()
+        .expect("Invalid STREAM_RESTART_BACKOFF_JITTER_PCT");
+    let readiness_stale_secs: u64 = std::env::var("READINESS_STALE_SECS")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .expect("Invalid READINESS_STALE_SECS");
+
+    assert!(stream_stale_secs > 0, "STREAM_STALE_SECS must be > 0");
+    assert!(
+        stream_missing_block_burst > 0,
+        "STREAM_MISSING_BLOCK_BURST must be > 0"
+    );
+    assert!(
+        stream_missing_block_window_secs > 0,
+        "STREAM_MISSING_BLOCK_WINDOW_SECS must be > 0"
+    );
+    assert!(stream_error_burst > 0, "STREAM_ERROR_BURST must be > 0");
+    assert!(
+        stream_error_window_secs > 0,
+        "STREAM_ERROR_WINDOW_SECS must be > 0"
+    );
+    assert!(resync_grace_secs > 0, "RESYNC_GRACE_SECS must be > 0");
+    assert!(
+        stream_restart_backoff_min_ms > 0,
+        "STREAM_RESTART_BACKOFF_MIN_MS must be > 0"
+    );
+    assert!(
+        stream_restart_backoff_max_ms > 0,
+        "STREAM_RESTART_BACKOFF_MAX_MS must be > 0"
+    );
+    assert!(
+        stream_restart_backoff_min_ms <= stream_restart_backoff_max_ms,
+        "STREAM_RESTART_BACKOFF_MIN_MS must be <= STREAM_RESTART_BACKOFF_MAX_MS"
+    );
+    assert!(
+        (0.0..=1.0).contains(&stream_restart_backoff_jitter_pct),
+        "STREAM_RESTART_BACKOFF_JITTER_PCT must be within [0.0, 1.0]"
+    );
+    assert!(readiness_stale_secs > 0, "READINESS_STALE_SECS must be > 0");
+
+    let memory = MemoryConfig::from_env();
+
     AppConfig {
         tycho_url,
         api_key,
@@ -121,6 +199,17 @@ pub fn load_config() -> AppConfig {
         global_native_sim_concurrency,
         global_vm_sim_concurrency,
         reset_allowance_tokens,
+        stream_stale_secs,
+        stream_missing_block_burst,
+        stream_missing_block_window_secs,
+        stream_error_burst,
+        stream_error_window_secs,
+        resync_grace_secs,
+        stream_restart_backoff_min_ms,
+        stream_restart_backoff_max_ms,
+        stream_restart_backoff_jitter_pct,
+        readiness_stale_secs,
+        memory,
     }
 }
 
@@ -141,6 +230,17 @@ pub struct AppConfig {
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
+    pub stream_stale_secs: u64,
+    pub stream_missing_block_burst: u64,
+    pub stream_missing_block_window_secs: u64,
+    pub stream_error_burst: u64,
+    pub stream_error_window_secs: u64,
+    pub resync_grace_secs: u64,
+    pub stream_restart_backoff_min_ms: u64,
+    pub stream_restart_backoff_max_ms: u64,
+    pub stream_restart_backoff_jitter_pct: f64,
+    pub readiness_stale_secs: u64,
+    pub memory: MemoryConfig,
 }
 
 const ETHEREUM_CHAIN_ID: u64 = 1;

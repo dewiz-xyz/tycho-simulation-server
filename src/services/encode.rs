@@ -1324,6 +1324,8 @@ mod tests {
     use super::*;
     use crate::models::messages::{HopDraft, SegmentDraft};
     use crate::models::state::StateStore;
+    use crate::models::state::VmStreamStatus;
+    use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use chrono::NaiveDateTime;
     use std::collections::HashMap;
@@ -1851,7 +1853,8 @@ mod tests {
             Chain::Ethereum,
             Duration::from_millis(10),
         ));
-        let state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -1872,11 +1875,17 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         let update = Update::new(1, states, new_pairs);
-        state_store.apply_update(update).await;
+        native_state_store.apply_update(update).await;
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
-            state_store: Arc::clone(&state_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
@@ -1884,6 +1893,8 @@ mod tests {
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {
@@ -1946,7 +1957,8 @@ mod tests {
             Chain::Ethereum,
             Duration::from_millis(10),
         ));
-        let state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component_a = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -1970,11 +1982,17 @@ mod tests {
         new_pairs.insert("pool-a".to_string(), component_a);
         new_pairs.insert("pool-shared".to_string(), component_shared);
         let update = Update::new(1, states, new_pairs);
-        state_store.apply_update(update).await;
+        native_state_store.apply_update(update).await;
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
-            state_store: Arc::clone(&state_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
@@ -1982,6 +2000,8 @@ mod tests {
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {

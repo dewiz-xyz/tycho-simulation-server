@@ -13,7 +13,9 @@ use tower::{
 use tracing::warn;
 
 use crate::handlers::{encode::encode, quote::simulate, readiness::status};
+use crate::metrics::{emit_simulate_completion, emit_simulate_timeout, TimeoutKind};
 use crate::models::factories::{encode_router_timeout_result, router_timeout_result};
+use crate::models::messages::QuoteStatus;
 use crate::models::state::AppState;
 
 pub fn create_router(app_state: AppState) -> Router {
@@ -52,6 +54,8 @@ async fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
             scope = "router_timeout",
             timeout_ms, "Request-level timeout triggered at router boundary: {}", err
         );
+        emit_simulate_completion(QuoteStatus::PartialFailure, true);
+        emit_simulate_timeout(TimeoutKind::RouterBoundary);
         return (StatusCode::OK, Json(router_timeout_result())).into_response();
     }
 

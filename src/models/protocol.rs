@@ -87,6 +87,26 @@ impl ProtocolKind {
             _ => None,
         }
     }
+
+    pub fn from_sync_state_key(protocol: &str) -> Option<Self> {
+        let name = normalize_proto_name(protocol);
+
+        match name.as_str() {
+            "uniswap_v2" | "uniswapv2" => Some(ProtocolKind::UniswapV2),
+            "uniswap_v3" | "uniswapv3" => Some(ProtocolKind::UniswapV3),
+            "uniswap_v4" | "uniswapv4" => Some(ProtocolKind::UniswapV4),
+            "curve" | "curve_pool" | "vm:curve" => Some(ProtocolKind::Curve),
+            "pancakeswap_v2" | "pancakeswapv2" => Some(ProtocolKind::PancakeswapV2),
+            "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
+            "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
+            "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
+            "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
+            "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
+            "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
+            "rocketpool" => Some(ProtocolKind::Rocketpool),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ProtocolKind {
@@ -126,5 +146,10 @@ mod tests {
             ProtocolKind::from_component(&component),
             Some(ProtocolKind::Curve)
         );
+    }
+
+    #[test]
+    fn does_not_recognize_v4_hooks_sync_key() {
+        assert_eq!(ProtocolKind::from_sync_state_key("uniswap_v4_hooks"), None);
     }
 }

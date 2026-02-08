@@ -12,7 +12,7 @@ name = "tycho-price-service"
 path = "src/main.rs"
 
 [dependencies]
-tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.225.1" }
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.206.0" }
 tycho-execution = "0.148.1"
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
@@ -24,13 +24,16 @@ axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenv = "0.15.0"
-alloy-primitives = "1.5.2"
+alloy-primitives = "1.5.4"
 alloy-sol-types = "1.5.2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["timeout", "util"] }
+rand = "0.8"
+jemalloc-ctl = "0.5"
+jemallocator = "0.5"
 
 [dev-dependencies]
 chrono = "0.4"
