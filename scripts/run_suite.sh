@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--enable-vm-pools] [--allow-no-liquidity] [--allow-partial] [--stop]
+Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--allow-no-liquidity] [--allow-partial] [--stop]
 
 Run a small end-to-end test suite:
 1) start server (if not already running)
@@ -16,7 +16,8 @@ Options:
   --repo             Repo root containing Cargo.toml
   --base-url         Base URL (default: http://localhost:3000)
   --suite            Pair suite for coverage/latency (default: core)
-  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true
+  --disable-vm-pools Start server with ENABLE_VM_POOLS=false
+  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default)
   --allow-no-liquidity  Allow no_liquidity responses with only no_pools failures
   --allow-partial    Allow partial_failure responses (and their failures)
   --stop             Stop server when done (only if started by this script)
@@ -29,7 +30,7 @@ USAGE
 repo=""
 base_url="http://localhost:3000"
 suite="core"
-enable_vm_pools="false"
+enable_vm_pools="true"
 allow_no_liquidity="false"
 allow_partial="false"
 stop_after="false"
@@ -47,6 +48,10 @@ while [[ $# -gt 0 ]]; do
     --suite)
       suite="$2"
       shift 2
+      ;;
+    --disable-vm-pools)
+      enable_vm_pools="false"
+      shift 1
       ;;
     --enable-vm-pools)
       enable_vm_pools="true"
@@ -92,6 +97,7 @@ started_by_me="false"
 
 echo "Base URL: $base_url"
 echo "Suite: $suite"
+echo "Enable VM pools: $enable_vm_pools"
 echo "Allow no_liquidity: $allow_no_liquidity"
 echo "Allow partial_failure: $allow_partial"
 
@@ -120,6 +126,8 @@ else
   echo "Starting server..."
   if [[ "$enable_vm_pools" == "true" ]]; then
     "$script_dir/start_server.sh" --repo "$repo" --enable-vm-pools
+  elif [[ "$enable_vm_pools" == "false" ]]; then
+    "$script_dir/start_server.sh" --repo "$repo" --env ENABLE_VM_POOLS=false
   else
     "$script_dir/start_server.sh" --repo "$repo"
   fi
