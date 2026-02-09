@@ -55,7 +55,7 @@ The following environment variables are read at startup:
 - `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `150`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
-- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
+- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `true`)
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
 - `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`)
 - `STREAM_STALE_SECS` – Consider a stream unhealthy if no updates arrive within this many seconds (default: `120`)

@@ -80,7 +80,7 @@ pub fn load_config() -> AppConfig {
     );
 
     let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
-        .unwrap_or_else(|_| "false".to_string())
+        .unwrap_or_else(|_| "true".to_string())
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
 
