@@ -7,6 +7,7 @@ use alloy_sol_types::SolValue;
 use axum::http::StatusCode;
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
+use tokio::task::spawn_blocking;
 use tracing::info;
 use tycho_execution::encoding::{errors::EncodingError, evm::utils::bytes_to_address};
 use tycho_execution::encoding::{
@@ -615,16 +616,55 @@ async fn resimulate_route(
                 let token_in = token_cache.get(&sim_token_in).await?;
                 let token_out = token_cache.get(&sim_token_out).await?;
 
-                let pre_state = Arc::clone(&pool_entry.0);
-                let result = pool_entry
-                    .0
-                    .get_amount_out(allocated.amount_in.clone(), &token_in, &token_out)
-                    .map_err(|err| {
-                        EncodeError::simulation(format!(
-                            "Pool {} simulation failed: {}",
-                            allocated.pool.component_id, err
-                        ))
-                    })?;
+                // Offload pool simulation to the blocking pool (VM pools can be CPU-heavy).
+                //
+                // Mirror `/simulate` guardrails: hold a semaphore permit inside the blocking task
+                // so timeouts/cancellation don't accidentally uncap concurrent CPU-bound work.
+                let is_vm = pool_entry.1.protocol_system.starts_with("vm:");
+                let permit = if is_vm {
+                    state
+                        .vm_sim_semaphore()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| EncodeError::internal("VM pool semaphore closed"))?
+                } else {
+                    state
+                        .native_sim_semaphore()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| EncodeError::internal("Native pool semaphore closed"))?
+                };
+                let pool_state = Arc::clone(&pool_entry.0);
+                let amount_in_for_sim = allocated.amount_in.clone();
+                let (pre_state, result) = spawn_blocking(move || {
+                    // Hold the permit until the blocking work exits.
+                    let _permit = permit;
+                    // Move the pool state into the blocking task and return it so the caller can
+                    // attach it to the response without an extra clone.
+                    let pre_state = pool_state;
+                    let result = pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
+                    (pre_state, result)
+                })
+                .await
+                .map_err(|join_err| {
+                    let reason = if join_err.is_panic() {
+                        "panicked"
+                    } else if join_err.is_cancelled() {
+                        "was cancelled"
+                    } else {
+                        "failed"
+                    };
+                    EncodeError::internal(format!(
+                        "Pool {} simulation task {}: {}",
+                        allocated.pool.component_id, reason, join_err
+                    ))
+                })?;
+                let result = result.map_err(|err| {
+                    EncodeError::simulation(format!(
+                        "Pool {} simulation failed: {}",
+                        allocated.pool.component_id, err
+                    ))
+                })?;
                 let expected_out = result.amount;
                 if expected_out.is_zero() {
                     return Err(EncodeError::simulation(format!(
