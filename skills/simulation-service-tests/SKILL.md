@@ -30,9 +30,9 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
-To include Curve/Balancer pools (VM feeds):
+VM pools (Curve/Balancer feeds) are enabled by default. To exclude them:
 ```bash
-scripts/run_suite.sh --repo . --suite core --enable-vm-pools --stop
+scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop
 ```
 
 If you need to tolerate partial failures or empty-liquidity responses while still running the suite:
@@ -84,7 +84,7 @@ python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json
 python3 scripts/coverage_sweep.py --suite v4_candidates
 ```
 
-If you need Curve/Balancer coverage, start the server with `ENABLE_VM_POOLS=true` (see `references/protocols.md`).
+VM pool feeds (Curve/Balancer) are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
 
 To assert specific protocol presence (derived from `pool_name` prefixes), use:
 ```bash
