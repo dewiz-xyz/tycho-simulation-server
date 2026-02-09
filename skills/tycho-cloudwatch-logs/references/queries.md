@@ -13,6 +13,8 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | Preset | Focus | Notes |
 | --- | --- | --- |
 | block-updates | Block height progress | Matches "Block update:" messages. |
+| block-updates-window | Block height progress (window) | Same as block-updates, but sorts ascending. |
+| block-updates-count | Block update frequency | Counts block update logs; also reports first/last timestamp in window. |
 | readiness | Service readiness | Matches "Service ready: first pools ingested". |
 | resync | Resync lifecycle | Matches any "Resync" message. |
 | stream-health | Stream startup and errors | Stream start, merged stream status, and stream errors. |
@@ -83,6 +85,27 @@ fields @timestamp, @logStream
 | sort @timestamp desc
 | display @timestamp, level, msg, @logStream
 | limit 100
+```
+
+### block-updates-window
+```
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"level":"(?<level>[^"]+)"/
+| filter msg like /Block update:/
+| sort @timestamp asc
+| display @timestamp, level, msg, @logStream
+| limit 100
+```
+
+### block-updates-count
+```
+fields @timestamp
+| parse @message '"message":"*"' as msg
+| filter msg like /Block update:/
+| stats count() as block_updates,
+        min(@timestamp) as first_update,
+        max(@timestamp) as last_update
 ```
 
 ### readiness

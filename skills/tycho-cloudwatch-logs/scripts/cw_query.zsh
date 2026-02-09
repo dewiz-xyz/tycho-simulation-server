@@ -18,7 +18,8 @@ Usage: cw_query.zsh [--since 30m] [--until now] [--limit 100]
                    [--query "..."] [--file query.cwl] [--preset name]
                    [--log-group "/ecs/tycho-simulator"]
 
-Presets: block-updates, readiness, resync, stream-health, stream-supervision,
+Presets: block-updates, block-updates-window, block-updates-count,
+         readiness, resync, stream-health, stream-supervision,
          vm-rebuild, startup, server, timeouts, router-timeouts,
          simulate-requests, simulate-completions, simulate-successes, token-metadata,
          token-rpc-fetch, state-anomalies, vm-pools, tvl-thresholds,
@@ -41,6 +42,27 @@ fields @timestamp, @logStream
 | sort @timestamp desc
 | display @timestamp, level, msg, @logStream
 | limit ${limit}
+QUERY
+      ;;
+    block-updates-window)
+      cat <<QUERY
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"level":"(?<level>[^"]+)"/
+| filter msg like /Block update:/
+| sort @timestamp asc
+| display @timestamp, level, msg, @logStream
+| limit ${limit}
+QUERY
+      ;;
+    block-updates-count)
+      cat <<QUERY
+fields @timestamp
+| parse @message '"message":"*"' as msg
+| filter msg like /Block update:/
+| stats count() as block_updates,
+        min(@timestamp) as first_update,
+        max(@timestamp) as last_update
 QUERY
       ;;
     readiness)
