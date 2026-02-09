@@ -239,7 +239,47 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
   - `0` means remainder, or 100% if there is only one entry.
   - For each split set, the last entry must be `0` so it receives the remainder.
   - Non-last entries must be > 0.
-  - The sum of all non-remainder shares must be <= 10000.
+  - The sum of all non-remainder shares must be <= 10000, and it must leave a positive remainder
+    amount for the last entry when there are 2+ entries (prefer sum < 10000 to avoid edge cases).
+
+### Client-side validation (recommended)
+
+If you generate split routes client-side, validate splits using **integer math in base units** (the same way the router/server behave) to avoid building routes that deterministically fail due to rounding.
+
+#### Allocation formulas (BPS, integer)
+
+Given a split set with total amount `T` (base units) and `bps[0..N-1]` where `bps[N-1] == 0` is the remainder:
+
+- For `i` in `0..N-2`:
+  - `amount[i] = floor(T * bps[i] / 10000)`
+- `amount[N-1] = T - sum(amount[0..N-2])`
+
+#### Required invariants
+
+- If `N == 1`: require `bps[0] == 0` (router interprets 0 as 100%).
+- If `N > 1`:
+  - `bps[N-1] == 0` (remainder must be last)
+  - for all `i < N-1`: `bps[i] > 0`
+  - `amount[N-1] > 0` (must leave a positive remainder for the last entry)
+  - for all `i < N-1`: `amount[i] > 0` (prevents non-remainder legs that round down to 0)
+
+#### Practical rule of thumb
+
+To guarantee `amount[i] >= 1` for a non-remainder leg with `bps = b`:
+
+- `T >= ceil(10000 / b)`
+
+#### Examples (rounding pitfalls)
+
+- Example A (bad: remainder becomes 0):
+  - `T = 100`, `splitBps = [5000, 5000, 0]`
+  - `amount = [50, 50, 0]` => invalid (no remainder left for the last entry)
+- Example B (bad: non-remainder rounds to 0):
+  - `T = 100`, `splitBps = [1, 0]`
+  - `amount[0] = floor(100 * 1 / 10000) = 0`, remainder gets 100
+  - invalid (the 1 bps leg would execute with 0 input)
+
+Note: this validation is deterministic for the **first hop** (route `amountIn` and segment `shareBps` are known). For later hops, validate using your best estimate of hop amounts (typically derived from `/simulate` outputs).
 - Hops are sequential in the order provided; there is no hop-level share.
 - SimpleSwap has a single hop. All swaps in that hop must share the same tokenIn and tokenOut.
 - MultiSwap has multiple hops. Each hop transitions between different tokens.
