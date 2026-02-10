@@ -152,8 +152,10 @@ pub(super) async fn resimulate_route(
                         })?
                     }
                     _ = sleep(pool_timeout) => {
-                        // Avoid letting queued blocking tasks start after the request has already
-                        // moved on (e.g. due to pool-level timeout).
+                        // Best-effort attempt to stop waiting on the blocking task after a pool-level
+                        // timeout; this doesn't reliably prevent `spawn_blocking` work from running
+                        // once scheduled. The semaphore permit is held inside the closure to cap
+                        // concurrent CPU usage even if the task keeps running.
                         handle.as_mut().abort();
                         return Err(EncodeError::simulation(format!(
                             "Pool {} simulation timed out after {}ms",
