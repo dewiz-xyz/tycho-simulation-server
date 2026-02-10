@@ -23,8 +23,8 @@ Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or
    - `python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50`
 
 ## VM pools (Curve/Balancer)
-Run the same suite with VM pools enabled:
-- `scripts/run_suite.sh --repo . --suite core --enable-vm-pools --stop`
+VM pools are enabled by default; keep a run with them disabled for comparison:
+- `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
 
 ## Load testing / regressions
 - Prefer `scripts/run_suite.sh` and/or `scripts/latency_percentiles.py` with higher `--requests`/`--concurrency`.

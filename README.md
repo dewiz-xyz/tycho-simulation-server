@@ -10,6 +10,7 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 
 - Background ingestion of Tycho protocol streams with TVL-based filtering.
 - `POST /simulate` endpoint that returns laddered amount-out simulated quotes with rich metadata.
+- `POST /encode` endpoint that returns CoW-ready calldata for client-provided routes.
 - `GET /status` endpoint for readiness polling (native + VM block height, pool count).
 - Structured logging with `tracing`.
 - Fully asynchronous execution with Tokio.
@@ -46,15 +47,27 @@ The following environment variables are read at startup:
 - `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep/remove pools (default: `0.2`)
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
+- `COW_SETTLEMENT_CONTRACT` – Default settlement address for `scripts/encode_smoke.py` (optional)
+- `TYCHO_ROUTER_ADDRESS` – Default router address for `scripts/encode_smoke.py` (optional)
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
 - `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `150`)
 - `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
-- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `false`)
+- `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `true`)
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
 - `GLOBAL_VM_SIM_CONCURRENCY` – Global VM simulation concurrency cap (default: `1 * num_cpus`)
+- `STREAM_STALE_SECS` – Consider a stream unhealthy if no updates arrive within this many seconds (default: `120`)
+- `STREAM_MISSING_BLOCK_BURST` – Missing-block errors allowed within the missing-block window before triggering a restart (default: `3`)
+- `STREAM_MISSING_BLOCK_WINDOW_SECS` – Window size for missing-block burst counting (default: `60`)
+- `STREAM_ERROR_BURST` – Stream errors allowed within the error window before triggering a restart (default: `3`)
+- `STREAM_ERROR_WINDOW_SECS` – Window size for stream error burst counting (default: `60`)
+- `RESYNC_GRACE_SECS` – Grace period after a resync starts before treating the stream as stale (default: `60`)
+- `STREAM_RESTART_BACKOFF_MIN_MS` – Minimum restart backoff (default: `500`)
+- `STREAM_RESTART_BACKOFF_MAX_MS` – Maximum restart backoff (default: `30000`)
+- `STREAM_RESTART_BACKOFF_JITTER_PCT` – Jitter fraction applied to restart backoff (default: `0.2`)
+- `READINESS_STALE_SECS` – Readiness stale threshold for native/VM readiness checks (default: `120`)
 - `STREAM_MEM_PURGE` – Purge jemalloc arenas on stream restarts/rebuilds (default: `true`)
 - `STREAM_MEM_LOG` – Enable periodic + event-triggered memory snapshots (default: `true`)
 - `STREAM_MEM_LOG_MIN_INTERVAL_SECS` – Minimum seconds between snapshots (default: `60`)
@@ -62,6 +75,10 @@ The following environment variables are read at startup:
 - `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
 Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
+
+## Docs
+
+- `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request/response examples.
 
 ## HTTP API
 
@@ -110,9 +127,65 @@ Response body:
 `QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`. `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
 Timeout behavior:
-- Handler-level timeout returns `200 OK` with `PartialFailure`, includes `request_id`, `block_number`, `total_pools`, and a `Timeout` failure.
-- Router-level timeout (rare fallback, applied only to `/simulate`) returns `200 OK` with `PartialFailure`, `request_id` may be empty, `block_number` is `0`, and `total_pools` is unset. Logs include `scope="router_timeout"`.
+- `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
+- `/simulate` router-level timeouts return `200 OK` with `partial_failure`. Logs include `scope="router_timeout"`.
+- `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
   - `/status` is not subject to router-level timeouts.
+
+### `POST /encode`
+
+`POST /encode` builds Tycho router calldata (`singleSwap`, `sequentialSwap`, or `splitSwap`) for a client-provided route. It **re-simulates** each pool swap, derives per-hop/per-swap amounts internally, and enforces only the route-level `minAmountOut`.
+
+Notes:
+- The request shape follows `RouteEncodeRequest` (camelCase fields).
+- `settlementAddress` and `tychoRouterAddress` are required.
+- `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
+- Requests include route-level `amountIn` and `minAmountOut`, plus segment `shareBps` and swap `splitBps` for splits.
+- Hops are sequential in the order provided; there is no hop-level share.
+- The encoder chooses `singleSwap` for one swap, `sequentialSwap` for multi-hop without splits, and `splitSwap` when any split is present.
+- Per-hop and per-swap amounts are not accepted and not returned.
+- The response is `RouteEncodeResponse` with settlement `interactions` (and optional `debug`).
+- Errors return 4xx/5xx with `{ error, requestId }`.
+
+Example request (shape only):
+
+```bash
+curl -X POST "http://localhost:3000/encode" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 1,
+    "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+    "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "amountIn": "1000000000000000000",
+    "minAmountOut": "1000000",
+    "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+    "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+    "swapKind": "SimpleSwap",
+    "segments": [
+      {
+        "kind": "SimpleSwap",
+        "shareBps": 0,
+        "hops": [
+          {
+            "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+            "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "swaps": [
+              {
+                "pool": { "protocol": "uniswap_v3", "componentId": "pool-id" },
+                "tokenIn": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "tokenOut": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "splitBps": 0
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "requestId": "req-encode-1"
+  }'
+```
+
+The response includes ordered `interactions[]` (approve + router call). Computed per-hop/per-swap amounts are logged server-side, not returned.
 
 ### `GET /status`
 

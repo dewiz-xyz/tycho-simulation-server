@@ -24,6 +24,8 @@ Simulate completion logs are now emitted at `info` level for successful requests
 | Preset | Purpose |
 | --- | --- |
 | block-updates | Track block height progress. |
+| block-updates-window | Track block height progress (oldest to newest in the window). |
+| block-updates-count | Count block updates in the window (with first/last timestamp). |
 | readiness | Confirm readiness events. |
 | resync | Inspect resync lifecycle. |
 | stream-health | Stream startup and errors. |

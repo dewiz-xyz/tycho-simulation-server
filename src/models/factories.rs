@@ -1,5 +1,5 @@
 use crate::models::messages::{
-    QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResult, QuoteStatus,
+    EncodeErrorResponse, QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResult, QuoteStatus,
 };
 
 /// Constructs a router-level timeout response using sentinel values.
@@ -29,5 +29,13 @@ pub fn router_timeout_result() -> QuoteResult {
         request_id: String::new(),
         data: Vec::new(),
         meta,
+    }
+}
+
+/// Constructs an encode router-level timeout response using sentinel values.
+pub fn encode_router_timeout_result() -> EncodeErrorResponse {
+    EncodeErrorResponse {
+        error: "Encode request timed out".to_string(),
+        request_id: None,
     }
 }

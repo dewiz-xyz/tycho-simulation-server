@@ -18,6 +18,7 @@ node_modules/
 .cursor/
 .codex/
 .claude/
+.rikugan/
 *.swp
 *.swo
 *.node

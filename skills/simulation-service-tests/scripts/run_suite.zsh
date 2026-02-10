@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_suite.zsh --repo <path> [--base-url <url>] [--suite <name>] [--enable-vm-pools] [--stop]
+Usage: run_suite.zsh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--stop]
 
 Run a small end-to-end test suite:
 1) start server (if not already running)
@@ -16,7 +16,8 @@ Options:
   --repo             Repo root containing Cargo.toml
   --base-url         Base URL (default: http://localhost:3000)
   --suite            Pair suite for coverage/latency (default: core)
-  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true
+  --disable-vm-pools Start server with ENABLE_VM_POOLS=false
+  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default)
   --stop             Stop server when done (only if started by this script)
   -h, --help         Show this help
 USAGE
@@ -25,7 +26,7 @@ USAGE
 repo=""
 base_url="http://localhost:3000"
 suite="core"
-enable_vm_pools="false"
+enable_vm_pools="true"
 stop_after="false"
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
     --suite)
       suite="$2"
       shift 2
+      ;;
+    --disable-vm-pools)
+      enable_vm_pools="false"
+      shift 1
       ;;
     --enable-vm-pools)
       enable_vm_pools="true"
@@ -75,6 +80,8 @@ if [[ -f "$repo_script" ]]; then
   args=(--repo "$repo" --base-url "$base_url" --suite "$suite")
   if [[ "$enable_vm_pools" == "true" ]]; then
     args+=(--enable-vm-pools)
+  elif [[ "$enable_vm_pools" == "false" ]]; then
+    args+=(--disable-vm-pools)
   fi
   if [[ "$stop_after" == "true" ]]; then
     args+=(--stop)
@@ -90,16 +97,19 @@ started_by_me="false"
 
 echo "Base URL: $base_url"
 echo "Suite: $suite"
+echo "Enable VM pools: $enable_vm_pools"
 
 if curl -s "$status_url" >/dev/null 2>&1; then
   echo "Server already responding at $status_url"
 else
   echo "Starting server..."
+  start_server_args=(--repo "$repo")
   if [[ "$enable_vm_pools" == "true" ]]; then
-    "$skill_dir/start_server.zsh" --repo "$repo" --enable-vm-pools
-  else
-    "$skill_dir/start_server.zsh" --repo "$repo"
+    start_server_args+=(--enable-vm-pools)
+  elif [[ "$enable_vm_pools" == "false" ]]; then
+    start_server_args+=(--env ENABLE_VM_POOLS=false)
   fi
+  "$skill_dir/start_server.zsh" "${start_server_args[@]}"
   started_by_me="true"
 fi
 

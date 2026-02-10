@@ -38,9 +38,10 @@ use tycho_simulation_server::services::quotes::get_amounts_out;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim;
 
+#[typetag::serde]
 impl ProtocolSim for DummySim {
     fn fee(&self) -> f64 {
         0.0
@@ -498,6 +499,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         request_timeout: Duration::from_millis(1000),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 4,
     };

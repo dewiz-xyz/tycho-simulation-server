@@ -12,13 +12,15 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - `ekubo_v2`
 
 ## Optional (VM feeds)
-- `vm:curve` (requires `ENABLE_VM_POOLS=true`)
-- `vm:balancer_v2` (requires `ENABLE_VM_POOLS=true`)
+- `vm:curve` (enabled when `ENABLE_VM_POOLS=true`, default)
+- `vm:balancer_v2` (enabled when `ENABLE_VM_POOLS=true`, default)
 
 ## Notes that affect test coverage
 
-- **VM pools are off by default**. Enable them for Curve/Balancer coverage:
-  - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --enable-vm-pools`
+- **VM pools are on by default**. Disable them if you want to validate native-only behavior:
+  - `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
+  - Or start the server with `ENABLE_VM_POOLS=false`:
+    - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --env ENABLE_VM_POOLS=false`
 - **TVL filtering matters**: pools are included/removed based on `TVL_THRESHOLD` + `TVL_KEEP_RATIO`.
   - If your tests miss protocols/pools, try lowering `TVL_THRESHOLD` (at the cost of ingesting more pools).
 - **Uniswap v4 pairs**: some v4 pools may use native ETH (often represented as `0x000...000`).

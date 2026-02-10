@@ -34,7 +34,7 @@
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
   - `scripts/run_suite.sh --repo . --suite core --stop`
-  - Add `--enable-vm-pools` when validating VM feeds (Curve/Balancer).
+  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer).
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
 - Individual runners:
   - `python3 scripts/simulate_smoke.py --suite smoke`

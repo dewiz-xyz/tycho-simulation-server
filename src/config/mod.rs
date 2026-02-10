@@ -1,3 +1,9 @@
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::Arc;
+
+use tycho_simulation::tycho_common::Bytes;
+
 mod logging;
 mod memory;
 pub use logging::init_logging;
@@ -77,6 +83,8 @@ pub fn load_config() -> AppConfig {
         .unwrap_or_else(|_| "true".to_string())
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
+
+    let reset_allowance_tokens = Arc::new(default_reset_allowance_tokens());
 
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -191,6 +199,7 @@ pub fn load_config() -> AppConfig {
         enable_vm_pools,
         global_native_sim_concurrency,
         global_vm_sim_concurrency,
+        reset_allowance_tokens,
         stream_stale_secs,
         stream_missing_block_burst,
         stream_missing_block_window_secs,
@@ -221,6 +230,7 @@ pub struct AppConfig {
     pub enable_vm_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
+    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
     pub stream_missing_block_window_secs: u64,
@@ -232,4 +242,25 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
+}
+
+const ETHEREUM_CHAIN_ID: u64 = 1;
+const ETHEREUM_USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+
+fn default_reset_allowance_tokens() -> HashMap<u64, HashSet<Bytes>> {
+    // Tokens that require approve(0) before approve(amount).
+    let mut tokens = HashMap::new();
+    let mut mainnet = HashSet::new();
+    mainnet.insert(parse_address(ETHEREUM_USDT));
+    tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
+    tokens
+}
+
+fn parse_address(value: &str) -> Bytes {
+    let bytes = Bytes::from_str(value).expect("reset_allowance_tokens address is invalid");
+    assert!(
+        bytes.len() == 20,
+        "reset_allowance_tokens address must be 20 bytes"
+    );
+    bytes
 }

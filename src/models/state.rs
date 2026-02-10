@@ -29,6 +29,7 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
 }
@@ -74,13 +75,24 @@ impl AppState {
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
-
     pub fn native_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.native_sim_semaphore)
     }
 
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
+    }
+
+    pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
+        if let Some(entry) = self.native_state_store.pool_by_id(id).await {
+            return Some(entry);
+        }
+
+        if !self.vm_ready().await {
+            return None;
+        }
+
+        self.vm_state_store.pool_by_id(id).await
     }
 
     pub async fn vm_ready(&self) -> bool {
@@ -115,7 +127,6 @@ pub struct VmStreamStatus {
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-
 #[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
 struct ProtocolShard {
@@ -484,6 +495,16 @@ impl StateStore {
 
         result
     }
+
+    pub(crate) async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
+        let kind_opt = { self.id_to_kind.read().await.get(id).copied() };
+        let kind = kind_opt?;
+        let shard = self.shards.get(&kind)?;
+        let guard = shard.states.read().await;
+        guard
+            .get(id)
+            .map(|(state, component)| (Arc::clone(state), Arc::clone(component)))
+    }
 }
 
 fn apply_token_index_changes(
@@ -527,9 +548,10 @@ mod tests {
         },
     };
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;
 
+    #[typetag::serde]
     impl ProtocolSim for DummySim {
         fn fee(&self) -> f64 {
             0.0
@@ -843,6 +865,7 @@ mod tests {
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
         };

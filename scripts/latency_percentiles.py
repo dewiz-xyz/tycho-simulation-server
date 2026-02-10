@@ -11,7 +11,9 @@ import statistics
 import sys
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from urllib import request
 from urllib.error import HTTPError, URLError
 
@@ -73,6 +75,11 @@ def main() -> int:
     parser.add_argument("--amounts", help="Comma-separated amounts in wei")
     parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
     parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
+    parser.add_argument(
+        "--allow-no-pools",
+        action="store_true",
+        help="Allow no_liquidity responses that only report no_pools failures",
+    )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
     parser.add_argument("--list-tokens", action="store_true", help="List available token symbols and exit")
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -165,6 +172,8 @@ def main() -> int:
     response_times = []
     failures = 0
     failure_reasons: dict[str, int] = {}
+    status_counts: Counter[str] = Counter()
+    status_lock = Lock()
 
     def worker(index):
         token_in, token_out = pick_pair()
@@ -187,11 +196,24 @@ def main() -> int:
             status = meta.get("status")
             failures_list = meta.get("failures", [])
 
+            with status_lock:
+                status_counts[str(status)] += 1
+
             if status not in allowed_statuses:
                 return None, f"meta_status:{status}"
 
             if failures_list and not args.allow_failures:
-                return None, "meta_failures"
+                if args.allow_no_pools and status == "no_liquidity":
+                    only_no_pools = all(
+                        isinstance(item, dict) and item.get("kind") == "no_pools"
+                        for item in failures_list
+                    )
+                    if only_no_pools:
+                        failures_list = []
+                    else:
+                        return None, "meta_failures"
+                else:
+                    return None, "meta_failures"
 
             return elapsed, None
         except HTTPError as exc:
@@ -245,6 +267,11 @@ def main() -> int:
         print("\nFailure reasons (top 8):")
         for reason, count in sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)[:8]:
             print(f"- {reason}: {count}")
+
+    if status_counts:
+        print("\nStatus counts:")
+        for status, count in status_counts.most_common():
+            print(f"- {status}: {count}")
 
     return 0 if failures == 0 else 1
 
