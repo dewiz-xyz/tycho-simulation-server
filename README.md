@@ -144,7 +144,7 @@ Notes:
 - Hops are sequential in the order provided; there is no hop-level share.
 - The encoder chooses `singleSwap` for one swap, `sequentialSwap` for multi-hop without splits, and `splitSwap` when any split is present.
 - Per-hop and per-swap amounts are not accepted and not returned.
-- The response is `RouteEncodeResponse` with `normalizedRoute` and settlement `interactions`.
+- The response is `RouteEncodeResponse` with settlement `interactions` (and optional `debug`).
 - Errors return 4xx/5xx with `{ error, requestId }`.
 
 Example request (shape only):

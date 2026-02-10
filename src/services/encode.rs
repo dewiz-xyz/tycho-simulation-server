@@ -25,9 +25,8 @@ use tycho_simulation::{
 };
 
 use crate::models::messages::{
-    Hop, Interaction, InteractionKind, NormalizedRoute, PoolRef, PoolSwap, PoolSwapDraft,
-    ResimulationDebug, RouteDebug, RouteEncodeRequest, RouteEncodeResponse, Segment, SegmentDraft,
-    SwapKind,
+    Interaction, InteractionKind, PoolRef, PoolSwapDraft, ResimulationDebug, RouteDebug,
+    RouteEncodeRequest, RouteEncodeResponse, SegmentDraft, SwapKind,
 };
 use crate::models::state::AppState;
 
@@ -109,7 +108,6 @@ struct NormalizedRouteInternal {
 }
 
 struct NormalizedSegmentInternal {
-    kind: SwapKind,
     share_bps: u32,
     amount_in: BigUint,
     hops: Vec<NormalizedHopInternal>,
@@ -133,7 +131,6 @@ struct ResimulatedRouteInternal {
 }
 
 struct ResimulatedSegmentInternal {
-    kind: SwapKind,
     share_bps: u32,
     amount_in: BigUint,
     expected_amount_out: BigUint,
@@ -225,18 +222,9 @@ pub async fn encode_route(
     let interactions =
         build_settlement_interactions(&token_in, &amount_in, router_call, reset_approval)?;
 
-    let normalized_route = build_normalized_route_response(&resimulated);
-
     let debug = build_debug(&state, &request).await;
 
     Ok(RouteEncodeResponse {
-        chain_id: request.chain_id,
-        token_in: format_address(&token_in),
-        token_out: format_address(&token_out),
-        amount_in: amount_in.to_str_radix(10),
-        min_amount_out: min_amount_out.to_str_radix(10),
-        swap_kind: request.swap_kind,
-        normalized_route,
         interactions,
         debug,
     })
@@ -421,7 +409,6 @@ fn normalize_route(
         }
 
         normalized_segments.push(NormalizedSegmentInternal {
-            kind: segment.kind,
             share_bps: segment.share_bps,
             amount_in: segment_amount_in,
             hops,
@@ -735,7 +722,6 @@ async fn resimulate_route(
             .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
 
         resim_segments.push(ResimulatedSegmentInternal {
-            kind: segment.kind,
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.clone(),
             expected_amount_out: last_hop.expected_amount_out.clone(),
@@ -1138,36 +1124,6 @@ fn map_encoding_error(err: EncodingError) -> EncodeError {
         }
         _ => EncodeError::encoding(format!("Tycho encoding error: {err}")),
     }
-}
-
-fn build_normalized_route_response(resimulated: &ResimulatedRouteInternal) -> NormalizedRoute {
-    let segments = resimulated
-        .segments
-        .iter()
-        .map(|segment| Segment {
-            kind: segment.kind,
-            share_bps: segment.share_bps,
-            hops: segment
-                .hops
-                .iter()
-                .map(|hop| Hop {
-                    token_in: format_address(&hop.token_in),
-                    token_out: format_address(&hop.token_out),
-                    swaps: hop
-                        .swaps
-                        .iter()
-                        .map(|swap| PoolSwap {
-                            pool: swap.pool.clone(),
-                            token_in: format_address(&swap.token_in),
-                            token_out: format_address(&swap.token_out),
-                            split_bps: swap.split_bps,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-        .collect();
-    NormalizedRoute { segments }
 }
 
 async fn build_debug(state: &AppState, request: &RouteEncodeRequest) -> Option<RouteDebug> {
@@ -1913,7 +1869,6 @@ mod tests {
 
         let resimulated = ResimulatedRouteInternal {
             segments: vec![ResimulatedSegmentInternal {
-                kind: SwapKind::SimpleSwap,
                 share_bps: 10_000,
                 amount_in: BigUint::from(10u32),
                 expected_amount_out: BigUint::from(9u32),
@@ -1985,7 +1940,6 @@ mod tests {
 
         let resimulated = ResimulatedRouteInternal {
             segments: vec![ResimulatedSegmentInternal {
-                kind: SwapKind::SimpleSwap,
                 share_bps: 10_000,
                 amount_in: BigUint::from(10u32),
                 expected_amount_out: BigUint::from(9u32),
@@ -2185,7 +2139,6 @@ mod tests {
 
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
-                kind: SwapKind::SimpleSwap,
                 share_bps: 10_000,
                 amount_in: BigUint::from(10u32),
                 hops: vec![NormalizedHopInternal {
@@ -2405,7 +2358,6 @@ mod tests {
         let normalized = NormalizedRouteInternal {
             segments: vec![
                 NormalizedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
                     share_bps: 6_000,
                     amount_in: BigUint::from(100u32),
                     hops: vec![
@@ -2432,7 +2384,6 @@ mod tests {
                     ],
                 },
                 NormalizedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
                     share_bps: 4_000,
                     amount_in: BigUint::from(50u32),
                     hops: vec![NormalizedHopInternal {
@@ -2472,7 +2423,6 @@ mod tests {
     fn build_route_swaps_sets_remainder_split_last() {
         let resimulated = ResimulatedRouteInternal {
             segments: vec![ResimulatedSegmentInternal {
-                kind: SwapKind::SimpleSwap,
                 share_bps: 10_000,
                 amount_in: BigUint::from(100u32),
                 expected_amount_out: BigUint::from(90u32),
@@ -2535,7 +2485,6 @@ mod tests {
         let resimulated = ResimulatedRouteInternal {
             segments: vec![
                 ResimulatedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
                     share_bps: 6_000,
                     amount_in: BigUint::from(60u32),
                     expected_amount_out: BigUint::from(55u32),
@@ -2575,7 +2524,6 @@ mod tests {
                     ],
                 },
                 ResimulatedSegmentInternal {
-                    kind: SwapKind::MultiSwap,
                     share_bps: 4_000,
                     amount_in: BigUint::from(40u32),
                     expected_amount_out: BigUint::from(37u32),
@@ -2643,7 +2591,6 @@ mod tests {
         let component = Arc::new(dummy_component());
         let resimulated = ResimulatedRouteInternal {
             segments: vec![ResimulatedSegmentInternal {
-                kind: SwapKind::MultiSwap,
                 share_bps: 10_000,
                 amount_in: BigUint::from(100u32),
                 expected_amount_out: BigUint::from(90u32),

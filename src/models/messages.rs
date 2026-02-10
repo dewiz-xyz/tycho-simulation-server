@@ -189,31 +189,6 @@ pub struct Interaction {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct PoolSwap {
-    pub pool: PoolRef,
-    pub token_in: String,
-    pub token_out: String,
-    pub split_bps: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Hop {
-    pub token_in: String,
-    pub token_out: String,
-    pub swaps: Vec<PoolSwap>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Segment {
-    pub kind: SwapKind,
-    pub share_bps: u32,
-    pub hops: Vec<Hop>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct ResimulationDebug {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_number: Option<u64>,
@@ -232,20 +207,7 @@ pub struct RouteDebug {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NormalizedRoute {
-    pub segments: Vec<Segment>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct RouteEncodeResponse {
-    pub chain_id: u64,
-    pub token_in: String,
-    pub token_out: String,
-    pub amount_in: String,
-    pub min_amount_out: String,
-    pub swap_kind: SwapKind,
-    pub normalized_route: NormalizedRoute,
     pub interactions: Vec<Interaction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<RouteDebug>,
