@@ -4,6 +4,7 @@ use std::sync::Arc;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tokio::task::spawn_blocking;
+use tokio::time::sleep;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
@@ -117,7 +118,13 @@ pub(super) async fn resimulate_route(
                 };
                 let pool_state = Arc::clone(&pool_entry.0);
                 let amount_in_for_sim = allocated.amount_in.clone();
-                let (pre_state, result) = spawn_blocking(move || {
+                let pool_timeout = if is_vm {
+                    state.pool_timeout_vm()
+                } else {
+                    state.pool_timeout_native()
+                };
+
+                let handle = spawn_blocking(move || {
                     // Hold the permit until the blocking work exits.
                     let _permit = permit;
                     // Move the pool state into the blocking task and return it so the caller can
@@ -125,21 +132,36 @@ pub(super) async fn resimulate_route(
                     let pre_state = pool_state;
                     let result = pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
                     (pre_state, result)
-                })
-                .await
-                .map_err(|join_err| {
-                    let reason = if join_err.is_panic() {
-                        "panicked"
-                    } else if join_err.is_cancelled() {
-                        "was cancelled"
-                    } else {
-                        "failed"
-                    };
-                    EncodeError::internal(format!(
-                        "Pool {} simulation task {}: {}",
-                        allocated.pool.component_id, reason, join_err
-                    ))
-                })?;
+                });
+                tokio::pin!(handle);
+
+                let (pre_state, result) = tokio::select! {
+                    res = handle.as_mut() => {
+                        res.map_err(|join_err| {
+                            let reason = if join_err.is_panic() {
+                                "panicked"
+                            } else if join_err.is_cancelled() {
+                                "was cancelled"
+                            } else {
+                                "failed"
+                            };
+                            EncodeError::internal(format!(
+                                "Pool {} simulation task {}: {}",
+                                allocated.pool.component_id, reason, join_err
+                            ))
+                        })?
+                    }
+                    _ = sleep(pool_timeout) => {
+                        // Avoid letting queued blocking tasks start after the request has already
+                        // moved on (e.g. due to pool-level timeout).
+                        handle.as_mut().abort();
+                        return Err(EncodeError::simulation(format!(
+                            "Pool {} simulation timed out after {}ms",
+                            allocated.pool.component_id,
+                            pool_timeout.as_millis()
+                        )));
+                    }
+                };
                 let result = result.map_err(|err| {
                     EncodeError::simulation(format!(
                         "Pool {} simulation failed: {}",
@@ -292,6 +314,88 @@ mod tests {
     use crate::services::encode::test_support::{
         component_with_tokens, dummy_token, pool_ref, step_multiplier, StepProtocolSim,
     };
+
+    #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+    struct SlowProtocolSim {
+        sleep_for: Duration,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for SlowProtocolSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(
+            &self,
+            _base: &Token,
+            _quote: &Token,
+        ) -> Result<f64, tycho_simulation::tycho_common::simulation::errors::SimulationError>
+        {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<
+            tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
+            tycho_simulation::tycho_common::simulation::errors::SimulationError,
+        > {
+            std::thread::sleep(self.sleep_for);
+            Ok(
+                tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult::new(
+                    amount_in,
+                    BigUint::zero(),
+                    self.clone_box(),
+                ),
+            )
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<
+            (BigUint, BigUint),
+            tycho_simulation::tycho_common::simulation::errors::SimulationError,
+        > {
+            Ok((BigUint::zero(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
+        ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
+        {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(Self {
+                sleep_for: self.sleep_for,
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<SlowProtocolSim>()
+                .is_some_and(|rhs| rhs.sleep_for == self.sleep_for)
+        }
+    }
 
     #[tokio::test]
     async fn resimulate_route_advances_pool_state_for_repeated_swaps() {
@@ -520,5 +624,212 @@ mod tests {
         assert_eq!(step_multiplier(&seg_b_hop0_swap.pool_state), 1);
         assert_eq!(seg_a_hop1_swap.expected_amount_out, BigUint::from(200u32));
         assert_eq!(step_multiplier(&seg_a_hop1_swap.pool_state), 2);
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_times_out_native_pool_simulation() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let mut tokens = HashMap::new();
+        tokens.insert(token_in.address.clone(), token_in.clone());
+        tokens.insert(token_out.address.clone(), token_out.clone());
+
+        let tokens_store = Arc::new(TokenStore::new(
+            tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![token_in.clone(), token_out.clone()],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-slow".to_string(),
+            Box::new(SlowProtocolSim {
+                sleep_for: Duration::from_millis(80),
+            }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-slow".to_string(), component);
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(1000),
+            pool_timeout_native: Duration::from_millis(10),
+            pool_timeout_vm: Duration::from_millis(1000),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref("pool-slow"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let err = match resimulate_route(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+        )
+        .await
+        {
+            Ok(_) => panic!("Expected pool simulation timeout"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::Simulation
+        );
+        assert!(
+            err.message().contains("pool-slow") && err.message().contains("timed out"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_times_out_vm_pool_simulation() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let mut tokens = HashMap::new();
+        tokens.insert(token_in.address.clone(), token_in.clone());
+        tokens.insert(token_out.address.clone(), token_out.clone());
+
+        let tokens_store = Arc::new(TokenStore::new(
+            tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "vm:curve".to_string(),
+            "curve_pool".to_string(),
+            Chain::Ethereum,
+            vec![token_in.clone(), token_out.clone()],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-vm-slow".to_string(),
+            Box::new(SlowProtocolSim {
+                sleep_for: Duration::from_millis(80),
+            }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-vm-slow".to_string(), component);
+        vm_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(1000),
+            pool_timeout_native: Duration::from_millis(1000),
+            pool_timeout_vm: Duration::from_millis(10),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref("pool-vm-slow"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let err = match resimulate_route(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+        )
+        .await
+        {
+            Ok(_) => panic!("Expected VM pool simulation timeout"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::Simulation
+        );
+        assert!(
+            err.message().contains("pool-vm-slow") && err.message().contains("timed out"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 }
