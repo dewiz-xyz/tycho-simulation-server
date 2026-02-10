@@ -7,6 +7,7 @@ use num_traits::Zero;
 use tycho_execution::encoding::{errors::EncodingError, evm::utils::bytes_to_address};
 use tycho_execution::encoding::{
     evm::encoder_builders::TychoRouterEncoderBuilder,
+    evm::swap_encoder::swap_encoder_registry::SwapEncoderRegistry,
     models::{EncodedSolution, Solution, UserTransferType},
     tycho_encoder::TychoEncoder,
 };
@@ -38,9 +39,20 @@ pub(super) fn build_encoder(
     chain: Chain,
     router_address: Bytes,
 ) -> Result<Arc<dyn TychoEncoder>, EncodeError> {
+    // TODO: we can probably optimize this in the feature to initialize the encoder registry + add default encoders during the server's startup.
+    let swap_encoder_registry = SwapEncoderRegistry::new(chain)
+        .add_default_encoders(None)
+        .map_err(|err| {
+            EncodeError::encoding(format!(
+                "Failed to build swap encoder registry for {}: {}",
+                chain, err
+            ))
+        })?;
+
     TychoRouterEncoderBuilder::new()
         .chain(chain)
         .user_transfer_type(UserTransferType::TransferFrom)
+        .swap_encoder_registry(swap_encoder_registry)
         .router_address(router_address)
         .build()
         .map(Arc::from)

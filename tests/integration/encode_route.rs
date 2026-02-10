@@ -28,9 +28,10 @@ use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatu
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
 
+#[typetag::serde]
 impl ProtocolSim for EchoAmountSim {
     fn fee(&self) -> f64 {
         0.0
@@ -224,9 +225,15 @@ async fn encode_route_end_to_end_returns_interactions_and_debug() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
     let response: RouteEncodeResponse = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(response.interactions.len(), 3, "reset-then-approve path");
@@ -323,9 +330,15 @@ async fn encode_route_rejects_when_min_amount_out_exceeds_expected() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
     let response: EncodeErrorResponse = serde_json::from_slice(&body).unwrap();
     assert!(
         response.error.contains("below minAmountOut"),

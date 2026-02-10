@@ -53,9 +53,10 @@ pub(super) fn dummy_token(address: &str) -> Token {
     Token::new(&bytes, "TKN", 18, 0, &[], Chain::Ethereum, 100)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct MockProtocolSim;
 
+#[typetag::serde]
 impl ProtocolSim for MockProtocolSim {
     fn fee(&self) -> f64 {
         0.0
@@ -125,11 +126,12 @@ impl ProtocolSim for MockProtocolSim {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct StepProtocolSim {
     pub(super) multiplier: u32,
 }
 
+#[typetag::serde]
 impl ProtocolSim for StepProtocolSim {
     fn fee(&self) -> f64 {
         0.0

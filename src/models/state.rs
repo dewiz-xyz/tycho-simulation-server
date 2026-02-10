@@ -548,9 +548,10 @@ mod tests {
         },
     };
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;
 
+    #[typetag::serde]
     impl ProtocolSim for DummySim {
         fn fee(&self) -> f64 {
             0.0

@@ -76,11 +76,9 @@ pub(super) fn build_route_swaps(
             common_component,
             swap.token_in.clone(),
             swap.token_out.clone(),
-            split,
-            None,
-            Some(Arc::clone(&swap.pool_state)),
-            None,
-        );
+        )
+        .split(split)
+        .protocol_state(Arc::clone(&swap.pool_state));
         swaps.push(swap_data);
     }
 
@@ -163,6 +161,15 @@ mod tests {
     use crate::services::encode::test_support::{dummy_component, pool_ref, MockProtocolSim};
     use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
 
+    fn swap_split(swap: &Swap) -> f64 {
+        // `Swap`'s fields are private; use the serialized view to validate split behavior.
+        let value = serde_json::to_value(swap).expect("swap should serialize");
+        value
+            .get("split")
+            .and_then(|s| s.as_f64())
+            .expect("swap.split should be a JSON number")
+    }
+
     #[test]
     fn compute_split_fraction_clamps_rounding() {
         let total_in = BigUint::from(1u64) << 60u32;
@@ -225,8 +232,8 @@ mod tests {
         let swaps = build_route_swaps(&resimulated).unwrap();
 
         assert_eq!(swaps.len(), 2);
-        assert!(swaps[0].split > 0.0);
-        assert_eq!(swaps[1].split, 0.0);
+        assert!(swap_split(&swaps[0]) > 0.0);
+        assert_eq!(swap_split(&swaps[1]), 0.0);
     }
 
     #[test]
@@ -323,18 +330,18 @@ mod tests {
         let swaps = build_route_swaps(&resimulated).unwrap();
 
         assert_eq!(swaps.len(), 4);
-        assert_eq!(swaps[0].token_in, token_a);
-        assert_eq!(swaps[0].token_out, token_b);
-        assert_eq!(swaps[1].token_in, token_a);
-        assert_eq!(swaps[1].token_out, token_b);
-        assert_eq!(swaps[2].token_in, token_b);
-        assert_eq!(swaps[2].token_out, token_c);
-        assert_eq!(swaps[3].token_in, token_b);
-        assert_eq!(swaps[3].token_out, token_d);
-        assert!((swaps[0].split - 0.6).abs() < 1e-9);
-        assert_eq!(swaps[1].split, 0.0);
-        assert!((swaps[2].split - 0.6).abs() < 1e-9);
-        assert_eq!(swaps[3].split, 0.0);
+        assert_eq!(swaps[0].token_in(), &token_a);
+        assert_eq!(swaps[0].token_out(), &token_b);
+        assert_eq!(swaps[1].token_in(), &token_a);
+        assert_eq!(swaps[1].token_out(), &token_b);
+        assert_eq!(swaps[2].token_in(), &token_b);
+        assert_eq!(swaps[2].token_out(), &token_c);
+        assert_eq!(swaps[3].token_in(), &token_b);
+        assert_eq!(swaps[3].token_out(), &token_d);
+        assert!((swap_split(&swaps[0]) - 0.6).abs() < 1e-9);
+        assert_eq!(swap_split(&swaps[1]), 0.0);
+        assert!((swap_split(&swaps[2]) - 0.6).abs() < 1e-9);
+        assert_eq!(swap_split(&swaps[3]), 0.0);
     }
 
     #[test]

@@ -38,9 +38,10 @@ use tycho_simulation_server::services::quotes::get_amounts_out;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim;
 
+#[typetag::serde]
 impl ProtocolSim for DummySim {
     fn fee(&self) -> f64 {
         0.0
