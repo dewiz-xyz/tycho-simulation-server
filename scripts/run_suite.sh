@@ -3,11 +3,12 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--allow-no-liquidity] [--allow-partial] [--stop]
+Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--wait-vm-ready] [--allow-no-liquidity] [--allow-partial] [--stop]
 
 Run a small end-to-end test suite:
 1) start server (if not already running)
 2) wait for /status ready
+2.5) (optional) wait for VM pool readiness
 3) smoke test /simulate
 4) coverage sweep (pool/protocol summary)
 5) latency percentiles (p50/p90/p99)
@@ -18,6 +19,7 @@ Options:
   --suite            Pair suite for coverage/latency (default: core)
   --disable-vm-pools Start server with ENABLE_VM_POOLS=false
   --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default)
+  --wait-vm-ready    Wait for vm_status=ready after /status is ready (only when VM pools are enabled)
   --allow-no-liquidity  Allow no_liquidity responses with only no_pools failures
   --allow-partial    Allow partial_failure responses (and their failures)
   --stop             Stop server when done (only if started by this script)
@@ -31,6 +33,7 @@ repo=""
 base_url="http://localhost:3000"
 suite="core"
 enable_vm_pools="true"
+wait_vm_ready="false"
 allow_no_liquidity="false"
 allow_partial="false"
 stop_after="false"
@@ -55,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --enable-vm-pools)
       enable_vm_pools="true"
+      shift 1
+      ;;
+    --wait-vm-ready)
+      wait_vm_ready="true"
       shift 1
       ;;
     --allow-no-liquidity)
@@ -98,6 +105,7 @@ started_by_me="false"
 echo "Base URL: $base_url"
 echo "Suite: $suite"
 echo "Enable VM pools: $enable_vm_pools"
+echo "Wait VM ready: $wait_vm_ready"
 echo "Allow no_liquidity: $allow_no_liquidity"
 echo "Allow partial_failure: $allow_partial"
 
@@ -136,6 +144,33 @@ fi
 
 echo "Waiting for readiness..."
 "$script_dir/wait_ready.sh" --url "$status_url" --timeout 300 --interval 2
+
+if [[ "$enable_vm_pools" == "true" ]] && [[ "$wait_vm_ready" == "true" ]]; then
+  echo "Waiting for VM pool readiness..."
+  STATUS_URL="$status_url" python3 -u - <<'PY'
+import json
+import os
+import time
+import urllib.request
+
+status_url = os.environ["STATUS_URL"]
+deadline = time.time() + 300
+
+while True:
+    with urllib.request.urlopen(status_url, timeout=5) as r:
+        s = json.loads(r.read().decode())
+    vm_enabled = s.get("vm_enabled")
+    vm_status = s.get("vm_status")
+    vm_pools = s.get("vm_pools")
+    if not vm_enabled:
+        break
+    if vm_status == "ready":
+        break
+    if time.time() > deadline:
+        raise SystemExit(f"timeout waiting for vm ready (vm_status={vm_status} vm_pools={vm_pools})")
+    time.sleep(5)
+PY
+fi
 
 echo "Smoke testing /simulate..."
 python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status "$simulate_allow_status" $allow_failures_flag

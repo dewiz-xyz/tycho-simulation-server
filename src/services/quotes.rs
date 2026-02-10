@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
-use num_traits::cast::ToPrimitive;
+use num_traits::{cast::ToPrimitive, Zero};
 use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
@@ -31,6 +31,8 @@ pub struct QuoteMetrics {
     pub skipped_vm_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+    pub skipped_native_limits: usize,
+    pub skipped_vm_limits: usize,
 }
 
 pub struct QuoteComputation {
@@ -307,6 +309,7 @@ pub async fn get_amounts_out(
         }
     };
 
+    let requested_max_in = amounts_in.iter().max().cloned().unwrap_or_default();
     let amounts_in = Arc::new(amounts_in);
     let quote_deadline = Instant::now() + quote_timeout;
 
@@ -442,6 +445,7 @@ pub async fn get_amounts_out(
             Arc::clone(&token_in),
             Arc::clone(&token_out),
             Arc::clone(&amounts_in),
+            requested_max_in.clone(),
             expected_len,
             pool_deadline,
             pool_cancel,
@@ -501,6 +505,7 @@ pub async fn get_amounts_out(
             Arc::clone(&token_in),
             Arc::clone(&token_out),
             Arc::clone(&amounts_in),
+            requested_max_in.clone(),
             expected_len,
             pool_deadline,
             pool_cancel,
@@ -535,7 +540,8 @@ pub async fn get_amounts_out(
                     match maybe_outcome {
                         Some(outcome) => {
                             match outcome {
-                                Ok(result) => {
+                                Ok(outcome) => match outcome {
+                                    PoolSimOutcome::Simulated(result) => {
                                     // Classify before moving fields to avoid clones
                                     let had_timeout = result.timed_out;
                                     let is_partial = result.amounts_out.len() < expected_len;
@@ -589,6 +595,14 @@ pub async fn get_amounts_out(
                                         });
                                     }
                                 }
+                                    PoolSimOutcome::SkippedDueToLimits { protocol } => {
+                                        if protocol.starts_with("vm:") {
+                                            metrics.skipped_vm_limits += 1;
+                                        } else {
+                                            metrics.skipped_native_limits += 1;
+                                        }
+                                    }
+                                },
                                 Err(failure) => {
                                     if matches!(failure.kind, QuoteFailureKind::Internal) {
                                         meta.status = QuoteStatus::InternalError;
@@ -629,15 +643,27 @@ pub async fn get_amounts_out(
     }
 
     if responses.is_empty() {
-        if matches!(meta.status, QuoteStatus::Ready) {
-            meta.status = QuoteStatus::PartialFailure;
-        }
-        if failures.is_empty() {
+        if failures.is_empty()
+            && (metrics.skipped_native_limits > 0 || metrics.skipped_vm_limits > 0)
+        {
+            meta.status = QuoteStatus::NoLiquidity;
             failures.push(make_failure(
-                QuoteFailureKind::Simulator,
-                "All pools returned zero amounts".to_string(),
+                QuoteFailureKind::NoPools,
+                "All matching pools exceed liquidity limits for requested amount; check get_limits before quoting"
+                    .to_string(),
                 None,
             ));
+        } else {
+            if matches!(meta.status, QuoteStatus::Ready) {
+                meta.status = QuoteStatus::PartialFailure;
+            }
+            if failures.is_empty() {
+                failures.push(make_failure(
+                    QuoteFailureKind::Simulator,
+                    "All pools returned zero amounts".to_string(),
+                    None,
+                ));
+            }
         }
     } else {
         responses.sort_by(|a, b| {
@@ -692,6 +718,11 @@ struct PoolQuoteResult {
     timed_out: bool,
 }
 
+enum PoolSimOutcome {
+    Simulated(PoolQuoteResult),
+    SkippedDueToLimits { protocol: String },
+}
+
 struct FailureContext<'a> {
     pool_id: &'a str,
     pool_name: Option<&'a str>,
@@ -709,11 +740,12 @@ async fn simulate_pool(
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
+    requested_max_in: BigUint,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
     permit: OwnedSemaphorePermit,
-) -> Result<PoolQuoteResult, QuoteFailure> {
+) -> Result<PoolSimOutcome, QuoteFailure> {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
     let pool_name_for_failure = pool_name.clone();
@@ -729,6 +761,48 @@ async fn simulate_pool(
     let handle = spawn_blocking(move || {
         // Hold the permit until the blocking work exits.
         let _permit = permit;
+
+        // Short-circuit when the request exceeds pool limits to avoid wasted compute.
+        //
+        // Note: `get_limits` can be a "soft" limit (advisory). When the request exceeds the
+        // reported limit, we do a single probe at the maximum amount. If that probe fails, we
+        // skip the pool rather than spending CPU on a ladder that can never complete.
+        let mut probed_max: Option<(String, u64)> = None;
+        if !requested_max_in.is_zero() {
+            match pool_state.get_limits(
+                token_in_clone.address.clone(),
+                token_out_clone.address.clone(),
+            ) {
+                Ok((max_in, _max_out)) => {
+                    if !max_in.is_zero() && requested_max_in > max_in {
+                        match pool_state.get_amount_out(
+                            requested_max_in.clone(),
+                            &token_in_clone,
+                            &token_out_clone,
+                        ) {
+                            Ok(result) => {
+                                if let Some(gas_u64) = result.gas.to_u64() {
+                                    probed_max = Some((result.amount.to_string(), gas_u64));
+                                } else {
+                                    return PoolSimOutcome::SkippedDueToLimits {
+                                        protocol: pool_protocol.clone(),
+                                    };
+                                }
+                            }
+                            Err(_) => {
+                                return PoolSimOutcome::SkippedDueToLimits {
+                                    protocol: pool_protocol.clone(),
+                                };
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Best-effort: if limits are unavailable, proceed with the normal ladder.
+                }
+            }
+        }
+
         let mut amounts_out = Vec::with_capacity(expected_len);
         let mut gas_used = Vec::with_capacity(expected_len);
         let mut errors = Vec::new();
@@ -760,6 +834,15 @@ async fn simulate_pool(
                 timed_out = true;
                 break;
             }
+
+            if let Some((amount_out, gas_u64)) = &probed_max {
+                if amount_in == &requested_max_in {
+                    amounts_out.push(amount_out.clone());
+                    gas_used.push(*gas_u64);
+                    continue;
+                }
+            }
+
             match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
                 Ok(result) => {
                     if let Some(gas_u64) = result.gas.to_u64() {
@@ -815,7 +898,7 @@ async fn simulate_pool(
             }
         }
 
-        PoolQuoteResult {
+        PoolSimOutcome::Simulated(PoolQuoteResult {
             pool: pool_id,
             pool_name,
             pool_address,
@@ -824,7 +907,7 @@ async fn simulate_pool(
             gas_used,
             errors,
             timed_out,
-        }
+        })
     });
     tokio::pin!(handle);
 
@@ -997,5 +1080,359 @@ fn make_failure(
         pool_name,
         pool_address,
         protocol,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use chrono::NaiveDateTime;
+    use num_traits::Zero;
+    use tokio::sync::{RwLock, Semaphore};
+    use tycho_simulation::protocol::models::Update;
+    use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
+    use tycho_simulation::tycho_common::models::{token::Token, Chain};
+    use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
+    use tycho_simulation::tycho_common::simulation::protocol_sim::{
+        Balances, GetAmountOutResult, ProtocolSim,
+    };
+    use tycho_simulation::tycho_common::Bytes;
+
+    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::stream_health::StreamHealth;
+    use crate::models::tokens::TokenStore;
+
+    fn default_calls() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct LimitCountingSim {
+        max_in: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for LimitCountingSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in > self.max_in {
+                return Err(SimulationError::FatalError(
+                    "amount_in exceeds get_limits max_in".to_string(),
+                ));
+            }
+            Ok(GetAmountOutResult::new(
+                BigUint::zero(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    fn make_token(address: &Bytes, symbol: &str) -> Token {
+        Token::new(address, symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    #[tokio::test]
+    async fn skips_pool_when_request_exceeds_limits_and_max_probe_fails() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let token_in_meta = make_token(&token_in, "TK1");
+        let token_out_meta = make_token(&token_out, "TK2");
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let pool_id = "pool-1".to_string();
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![token_in_meta, token_out_meta],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = LimitCountingSim {
+            max_in: BigUint::from(10u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(pool_id.clone(), Box::new(sim) as Box<dyn ProtocolSim>);
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(pool_id.clone(), component);
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-1".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string(), "5".to_string(), "11".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::NoPools
+        ));
+        assert!(computation.meta.failures[0].message.contains("get_limits"));
+        assert_eq!(computation.metrics.skipped_native_limits, 1);
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct SoftLimitSim {
+        max_in: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for SoftLimitSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            _amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GetAmountOutResult::new(
+                BigUint::zero(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_skip_when_pool_can_quote_beyond_soft_limit() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let token_in_meta = make_token(&token_in, "TK1");
+        let token_out_meta = make_token(&token_out, "TK2");
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let pool_id = "pool-1".to_string();
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![token_in_meta, token_out_meta],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = SoftLimitSim {
+            max_in: BigUint::from(10u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(pool_id.clone(), Box::new(sim) as Box<dyn ProtocolSim>);
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(pool_id.clone(), component);
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-2".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string(), "11".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(computation.meta.failures.is_empty());
+        assert_eq!(computation.metrics.skipped_native_limits, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
     }
 }

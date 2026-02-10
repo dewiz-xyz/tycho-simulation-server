@@ -133,6 +133,8 @@ pub async fn simulate(
                 skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
                 skipped_native_deadline = computation.metrics.skipped_native_deadline,
                 skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
+                skipped_native_limits = computation.metrics.skipped_native_limits,
+                skipped_vm_limits = computation.metrics.skipped_vm_limits,
                 token_in = request.token_in.as_str(),
                 token_out = request.token_out.as_str(),
                 amounts = request.amounts.len(),
