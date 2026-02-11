@@ -812,9 +812,11 @@ async fn simulate_pool(
         // Short-circuit when the request exceeds pool limits to avoid wasted compute.
         //
         // Note: `get_limits` can be a "soft" limit (advisory). When the request exceeds the
-        // reported limit, we do a single probe at the maximum amount. If that probe fails, we
-        // skip the pool rather than spending CPU on a ladder that can never complete.
+        // reported limit, we do a single probe at the maximum amount. If that probe fails with a
+        // clear limits signal, we only skip the whole pool when every requested amount exceeds
+        // that limit; otherwise we continue to quote the lower ladder amounts.
         let mut probed_max: Option<(String, u64)> = None;
+        let mut probed_max_error: Option<String> = None;
         if !requested_max_in.is_zero() {
             match pool_state.get_limits(
                 token_in_clone.address.clone(),
@@ -847,10 +849,32 @@ async fn simulate_pool(
                                 }
                             }
                             Err(SimulationError::InvalidInput(message, maybe_result)) => {
+                                let probe_error = format!(
+                                    "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
+                                    requested_max_in, max_in, message,
+                                );
                                 if is_limits_exhaustion_probe_error(
                                     &message,
                                     maybe_result.is_some(),
                                 ) {
+                                    let all_amounts_exceed_limit =
+                                        amounts_clone.iter().all(|amount| amount > &max_in);
+                                    if all_amounts_exceed_limit {
+                                        debug!(
+                                            scope = "limits_precheck",
+                                            pool_id = %pool_id,
+                                            protocol = %pool_protocol,
+                                            pool_name = %pool_name,
+                                            pool_address = %pool_address,
+                                            amount_in = %requested_max_in,
+                                            max_in = %max_in,
+                                            "Skipping pool due to get_limits precheck: {}",
+                                            message,
+                                        );
+                                        return PoolSimOutcome::SkippedDueToLimits {
+                                            protocol: pool_protocol.clone(),
+                                        };
+                                    }
                                     debug!(
                                         scope = "limits_precheck",
                                         pool_id = %pool_id,
@@ -859,26 +883,22 @@ async fn simulate_pool(
                                         pool_address = %pool_address,
                                         amount_in = %requested_max_in,
                                         max_in = %max_in,
-                                        "Skipping pool due to get_limits precheck: {}",
+                                        "Probe indicates limit on max amount; continuing with lower amounts: {}",
                                         message,
                                     );
-                                    return PoolSimOutcome::SkippedDueToLimits {
-                                        protocol: pool_protocol.clone(),
-                                    };
+                                    probed_max_error = Some(probe_error);
+                                } else {
+                                    return PoolSimOutcome::Simulated(PoolQuoteResult {
+                                        pool: pool_id,
+                                        pool_name,
+                                        pool_address,
+                                        protocol: pool_protocol,
+                                        amounts_out: Vec::new(),
+                                        gas_used: Vec::new(),
+                                        errors: vec![probe_error],
+                                        timed_out: false,
+                                    });
                                 }
-                                return PoolSimOutcome::Simulated(PoolQuoteResult {
-                                    pool: pool_id,
-                                    pool_name,
-                                    pool_address,
-                                    protocol: pool_protocol,
-                                    amounts_out: Vec::new(),
-                                    gas_used: Vec::new(),
-                                    errors: vec![format!(
-                                        "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
-                                        requested_max_in, max_in, message,
-                                    )],
-                                    timed_out: false,
-                                });
                             }
                             Err(other) => {
                                 return PoolSimOutcome::Simulated(PoolQuoteResult {
@@ -940,6 +960,12 @@ async fn simulate_pool(
                 if amount_in == &requested_max_in {
                     amounts_out.push(amount_out.clone());
                     gas_used.push(*gas_u64);
+                    continue;
+                }
+            }
+            if let Some(probe_error) = &probed_max_error {
+                if amount_in == &requested_max_in {
+                    errors.push(probe_error.clone());
                     continue;
                 }
             }
@@ -1080,14 +1106,20 @@ fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
 }
 
 fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> bool {
-    if has_partial_result {
-        return true;
-    }
     let lowered = message.to_ascii_lowercase();
-    lowered.contains("max_in")
+    let limit_signal = lowered.contains("max_in")
         || lowered.contains("get_limits")
+        || lowered.contains("sell amount exceeds limit")
+        || lowered.contains("exceeds limit")
+        || lowered.contains("ticks exceeded")
         || lowered.contains("not enough liquidity")
-        || lowered.contains("support complete swap")
+        || lowered.contains("support complete swap");
+    if has_partial_result {
+        // Partial results are commonly attached to limit exhaustion errors, but are not a
+        // sufficient signal on their own.
+        return limit_signal;
+    }
+    limit_signal
 }
 
 fn format_pool_descriptor(context: &FailureContext<'_>) -> String {
@@ -1392,6 +1424,56 @@ mod tests {
         ));
         assert!(computation.meta.failures[0].message.contains("get_limits"));
         assert_eq!(computation.metrics.skipped_native_limits, 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_skip_when_lower_ladder_amounts_are_within_limit() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = LimitCountingSim {
+            max_in: BigUint::from(10u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(
+            "pool-1".to_string(),
+            Arc::new(sim),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
+            BigUint::from(11u8),
+            2,
+            Instant::now() + Duration::from_secs(1),
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(result.amounts_out.len(), 1);
+                assert_eq!(result.gas_used.len(), 1);
+                assert_eq!(result.errors.len(), 1);
+                assert!(result.errors[0].contains("Probe quote failed"));
+            }
+            PoolSimOutcome::SkippedDueToLimits { .. } => {
+                panic!("mixed ladder should still quote lower amounts")
+            }
+        }
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1835,5 +1917,18 @@ mod tests {
                 panic!("non-limit invalid input should not be treated as limits skip")
             }
         }
+    }
+
+    #[test]
+    fn partial_result_probe_error_still_requires_limit_signals() {
+        assert!(!is_limits_exhaustion_probe_error(
+            "token_in invalid for probe",
+            true
+        ));
+        assert!(is_limits_exhaustion_probe_error(
+            "Sell amount exceeds limit 42",
+            true
+        ));
+        assert!(is_limits_exhaustion_probe_error("Ticks exceeded", true));
     }
 }
