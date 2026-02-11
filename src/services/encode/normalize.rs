@@ -9,6 +9,7 @@ use super::model::{
     NormalizedHopInternal, NormalizedRouteInternal, NormalizedSegmentInternal,
     NormalizedSwapDraftInternal,
 };
+use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
 use super::wire::parse_address;
 use super::EncodeError;
 
@@ -130,9 +131,15 @@ fn normalize_hop(
     let token_in = parse_address(&hop.token_in)?;
     let token_out = parse_address(&hop.token_out)?;
     if token_in == *native_address || token_out == *native_address {
-        return Err(EncodeError::invalid(
-            "hop tokenIn/tokenOut must be ERC20 addresses; use wrapped native token instead",
-        ));
+        for swap in &hop.swaps {
+            if !is_native_protocol_allowlisted(&swap.pool.protocol) {
+                let supported = native_protocol_allowlist().join(", ");
+                return Err(EncodeError::invalid(format!(
+                    "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
+                    supported, swap.pool.protocol
+                )));
+            }
+        }
     }
     let swaps = hop
         .swaps
@@ -182,6 +189,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::models::messages::PoolRef;
     use crate::models::messages::{PoolSwapDraft, SwapKind};
     use crate::services::encode::test_support::pool_ref;
     use crate::services::encode::wire::{format_address, parse_address, parse_amount};
@@ -368,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_route_rejects_native_hops() {
+    fn normalize_route_rejects_native_hops_for_non_allowlisted_protocols() {
         let native = Chain::Ethereum.native_token().address;
         let request = RouteEncodeRequest {
             chain_id: 1,
@@ -417,7 +425,54 @@ mod tests {
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
             ),
-            Ok(_) => panic!("native hop tokens should be rejected"),
+            Ok(_) => panic!("native hop tokens should be rejected for non-allowlisted protocols"),
         }
+    }
+
+    #[test]
+    fn normalize_route_allows_native_hops_for_rocketpool() {
+        let native = Chain::Ethereum.native_token().address;
+        let token_out = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: format_address(&native),
+            token_out: format_address(&token_out),
+            amount_in: "100".to_string(),
+            min_amount_out: "90".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 0,
+                hops: vec![HopDraft {
+                    token_in: format_address(&native),
+                    token_out: format_address(&token_out),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "rocketpool".to_string(),
+                            component_id: "p1".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: format_address(&native),
+                        token_out: format_address(&token_out),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+            request_id: None,
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let request_token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+
+        let normalized =
+            normalize_route(&request, &token_in, &request_token_out, &amount_in, &native)
+                .expect("rocketpool native route should normalize");
+        assert_eq!(normalized.segments.len(), 1);
+        assert_eq!(normalized.segments[0].hops.len(), 1);
+        assert_eq!(normalized.segments[0].hops[0].token_in, native);
+        assert_eq!(normalized.segments[0].hops[0].token_out, token_out);
     }
 }

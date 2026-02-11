@@ -22,6 +22,7 @@ TOKENS: dict[str, str] = {
     "USDC": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
     "USDT": "0xdac17f958d2ee523a2206206994597c13d831ec7",
     "DAI": "0x6b175474e89094c44da98b954eedeac495271d0f",
+    "GHO": "0x40d16fc0246ad3160ccc09b8d0d3a2cd28ae6c2f",
     "FRAX": "0x853d955acef822db058eb8505911ed77f175b99e",
     "LUSD": "0x5f98805a4e8be255a32880fdec7f6728c6568ba0",
     # LSTs
@@ -131,6 +132,7 @@ PAIR_SUITES: dict[str, list[Pair]] = {
     "core": [
         ("DAI", "USDC"),
         ("USDC", "USDT"),
+        ("GHO", "USDC"),
         ("WETH", "USDC"),
         ("WETH", "USDT"),
         ("WETH", "DAI"),
@@ -140,6 +142,8 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("STETH", "WETH"),
         ("WSTETH", "WETH"),
         ("RETH", "WETH"),
+        ("ETH", "RETH"),
+        ("RETH", "ETH"),
         ("CBETH", "WETH"),
         ("UNI", "WETH"),
         ("LINK", "WETH"),
@@ -153,6 +157,7 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("DAI", "USDC"),
         ("DAI", "USDT"),
         ("USDC", "USDT"),
+        ("GHO", "USDC"),
         ("FRAX", "USDC"),
     ],
     "lst": [

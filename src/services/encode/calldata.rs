@@ -33,6 +33,7 @@ pub(super) struct RouteContext<'a> {
     pub(super) token_out: &'a Bytes,
     pub(super) amount_in: &'a BigUint,
     pub(super) router_address: &'a Bytes,
+    pub(super) is_native_input: bool,
 }
 
 pub(super) fn build_encoder(
@@ -109,7 +110,11 @@ pub(super) fn build_route_calldata_tx(
     }
 
     let calldata = encode_route_calldata(&encoded_solution, &solution, &receiver)?;
-    let value = BigUint::zero();
+    let value = if context.is_native_input {
+        context.amount_in.clone()
+    } else {
+        BigUint::zero()
+    };
 
     Ok(CallDataPayload {
         target: encoded_solution.interacting_with,
@@ -123,24 +128,34 @@ pub(super) fn build_settlement_interactions(
     amount_in: &BigUint,
     router_call: CallDataPayload,
     reset_approval: bool,
+    is_native_input: bool,
 ) -> Result<Vec<Interaction>, EncodeError> {
-    let mut interactions = Vec::with_capacity(if reset_approval { 3 } else { 2 });
-    if reset_approval {
-        // Reset-then-approve is required for allowance-reset tokens like USDT.
-        interactions.push(build_erc20_approve_interaction(
-            token_in,
-            &router_call.target,
-            &BigUint::zero(),
-        )?);
+    let mut interactions = Vec::with_capacity(if is_native_input {
+        1
+    } else if reset_approval {
+        3
+    } else {
+        2
+    });
+    if !is_native_input {
+        if reset_approval {
+            // Reset-then-approve is required for allowance-reset tokens like USDT.
+            interactions.push(build_erc20_approve_interaction(
+                token_in,
+                &router_call.target,
+                &BigUint::zero(),
+            )?);
+        }
+        let set_approval =
+            build_erc20_approve_interaction(token_in, &router_call.target, amount_in)?;
+        interactions.push(set_approval);
     }
-    let set_approval = build_erc20_approve_interaction(token_in, &router_call.target, amount_in)?;
     let router_interaction = Interaction {
         kind: InteractionKind::Call,
         target: format_address(&router_call.target),
         value: router_call.value.to_str_radix(10),
         calldata: format_calldata(&router_call.calldata),
     };
-    interactions.push(set_approval);
     interactions.push(router_interaction);
     Ok(interactions)
 }
@@ -177,7 +192,8 @@ fn encode_route_calldata(
     receiver: &Bytes,
 ) -> Result<Vec<u8>, EncodeError> {
     let signature = encoded_solution.function_signature.as_str();
-    // `/encode` rejects native tokenIn/tokenOut upstream, so wrap/unwrap is always false here.
+    // `/encode` does not auto-wrap/unwrap native tokens; routes are expected to already match
+    // protocol/token expectations.
     let is_wrap = false;
     let is_unwrap = false;
     let is_transfer_from_allowed = true;
@@ -267,7 +283,7 @@ mod tests {
         };
 
         let interactions =
-            build_settlement_interactions(&token_in, &amount_in, router_call, true).unwrap();
+            build_settlement_interactions(&token_in, &amount_in, router_call, true, false).unwrap();
 
         assert_eq!(interactions.len(), 3);
         assert_eq!(interactions[0].kind, InteractionKind::Erc20Approve);
@@ -304,13 +320,34 @@ mod tests {
         };
 
         let interactions =
-            build_settlement_interactions(&token_in, &amount_in, router_call, false).unwrap();
+            build_settlement_interactions(&token_in, &amount_in, router_call, false, false)
+                .unwrap();
 
         assert_eq!(interactions.len(), 2);
         assert_eq!(interactions[0].kind, InteractionKind::Erc20Approve);
         assert_eq!(interactions[1].kind, InteractionKind::Call);
         assert_eq!(interactions[0].target, format_address(&token_in));
         assert_eq!(interactions[1].target, format_address(&router));
+    }
+
+    #[test]
+    fn build_settlement_interactions_skips_approvals_for_native_input() {
+        let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let amount_in = BigUint::from(10u32);
+        let router_call = CallDataPayload {
+            target: router.clone(),
+            value: amount_in.clone(),
+            calldata: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+
+        let interactions =
+            build_settlement_interactions(&token_in, &amount_in, router_call, true, true).unwrap();
+
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(interactions[0].kind, InteractionKind::Call);
+        assert_eq!(interactions[0].target, format_address(&router));
+        assert_eq!(interactions[0].value, "10");
     }
 
     #[test]
@@ -372,6 +409,7 @@ mod tests {
             token_out: &token_out,
             amount_in: &amount_in,
             router_address: &router,
+            is_native_input: false,
         };
 
         let calldata =
@@ -385,6 +423,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&calldata.calldata[..4], &selector);
+    }
+
+    #[test]
+    fn build_route_calldata_tx_sets_call_value_for_native_input() {
+        let native = Chain::Ethereum.native_token().address;
+        let token_out = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let router = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
+        let encoder = MockTychoEncoder::new(
+            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
+            router.clone(),
+        );
+
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: format_address(&native),
+            token_out: format_address(&token_out),
+            amount_in: "10".to_string(),
+            min_amount_out: "8".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: format_address(&router),
+            swap_kind: crate::models::messages::SwapKind::SimpleSwap,
+            segments: Vec::new(),
+            request_id: None,
+        };
+
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                expected_amount_out: BigUint::from(9u32),
+                hops: vec![ResimulatedHopInternal {
+                    token_in: native.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: BigUint::from(10u32),
+                    expected_amount_out: BigUint::from(9u32),
+                    swaps: vec![ResimulatedSwapInternal {
+                        pool: pool_ref("p1"),
+                        token_in: native.clone(),
+                        token_out: token_out.clone(),
+                        split_bps: 10_000,
+                        amount_in: BigUint::from(10u32),
+                        expected_amount_out: BigUint::from(9u32),
+                        pool_state: Arc::new(MockProtocolSim {}),
+                        component: Arc::new(dummy_component()),
+                    }],
+                }],
+            }],
+        };
+
+        let token_in = super::super::wire::parse_address(&request.token_in).unwrap();
+        let token_out = super::super::wire::parse_address(&request.token_out).unwrap();
+        let amount_in = super::super::wire::parse_amount(&request.amount_in).unwrap();
+
+        let context = RouteContext {
+            request: &request,
+            token_in: &token_in,
+            token_out: &token_out,
+            amount_in: &amount_in,
+            router_address: &router,
+            is_native_input: true,
+        };
+
+        let calldata =
+            build_route_calldata_tx(&context, &resimulated, &encoder, &BigUint::from(8u32))
+                .unwrap();
+
+        assert_eq!(calldata.target, router);
+        assert_eq!(calldata.value, amount_in);
     }
 
     #[test]
@@ -442,6 +548,7 @@ mod tests {
             token_out: &token_out,
             amount_in: &amount_in,
             router_address: &router,
+            is_native_input: false,
         };
 
         let err =

@@ -97,16 +97,51 @@ fn hex_to_bytes(value: &str) -> Vec<u8> {
     alloy_primitives::hex::decode(stripped).expect("valid hex")
 }
 
-async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, RouteEncodeRequest) {
-    let token_in_hex = "0x0000000000000000000000000000000000000001";
-    let token_out_hex = "0x0000000000000000000000000000000000000002";
-    let token_in = Bytes::from_str(token_in_hex).unwrap();
-    let token_out = Bytes::from_str(token_out_hex).unwrap();
+struct EncodeFixtureConfig<'a> {
+    min_amount_out: &'a str,
+    token_in_hex: &'a str,
+    token_out_hex: &'a str,
+    request_pool_protocol: &'a str,
+    component_protocol_system: &'a str,
+    component_protocol_type_name: &'a str,
+    vm_pool: bool,
+    enable_vm_pools: bool,
+    reset_allowance: bool,
+    request_id: &'a str,
+}
+
+impl Default for EncodeFixtureConfig<'_> {
+    fn default() -> Self {
+        Self {
+            min_amount_out: "8",
+            token_in_hex: "0x0000000000000000000000000000000000000001",
+            token_out_hex: "0x0000000000000000000000000000000000000002",
+            request_pool_protocol: "uniswap_v2",
+            component_protocol_system: "uniswap_v2",
+            component_protocol_type_name: "uniswap_v2",
+            vm_pool: false,
+            enable_vm_pools: false,
+            reset_allowance: true,
+            request_id: "req-1",
+        }
+    }
+}
+
+async fn setup_app_state_and_request(
+    config: EncodeFixtureConfig<'_>,
+) -> (axum::Router, RouteEncodeRequest) {
+    let token_in = Bytes::from_str(config.token_in_hex).unwrap();
+    let token_out = Bytes::from_str(config.token_out_hex).unwrap();
     let settlement = "0x0000000000000000000000000000000000000003".to_string();
     let router = "0x0000000000000000000000000000000000000004".to_string();
     let pool_id = "pool-1".to_string();
 
-    let token_in_meta = make_token(&token_in, "TK1");
+    let token_in_symbol = if token_in == Chain::Ethereum.native_token().address {
+        "ETH"
+    } else {
+        "TK1"
+    };
+    let token_in_meta = make_token(&token_in, token_in_symbol);
     let token_out_meta = make_token(&token_out, "TK2");
 
     let mut initial_tokens = HashMap::new();
@@ -126,8 +161,8 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
 
     let component = ProtocolComponent::new(
         Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
-        "uniswap_v2".to_string(),
-        "uniswap_v2".to_string(),
+        config.component_protocol_system.to_string(),
+        config.component_protocol_type_name.to_string(),
         Chain::Ethereum,
         vec![token_in_meta.clone(), token_out_meta.clone()],
         Vec::new(),
@@ -143,15 +178,23 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
     );
     let mut new_pairs = HashMap::new();
     new_pairs.insert(pool_id.clone(), component);
-    native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
-        .await;
+    if config.vm_pool {
+        vm_state_store
+            .apply_update(Update::new(42, states, new_pairs))
+            .await;
+    } else {
+        native_state_store
+            .apply_update(Update::new(42, states, new_pairs))
+            .await;
+    }
 
     let mut reset_allowance_tokens: HashMap<u64, HashSet<Bytes>> = HashMap::new();
-    reset_allowance_tokens
-        .entry(1)
-        .or_default()
-        .insert(token_in.clone());
+    if config.reset_allowance {
+        reset_allowance_tokens
+            .entry(1)
+            .or_default()
+            .insert(token_in.clone());
+    }
 
     let state = AppState {
         tokens: Arc::clone(&tokens_store),
@@ -160,7 +203,7 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        enable_vm_pools: false,
+        enable_vm_pools: config.enable_vm_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_secs(1),
@@ -175,10 +218,10 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
 
     let request = RouteEncodeRequest {
         chain_id: 1,
-        token_in: token_in_hex.to_string(),
-        token_out: token_out_hex.to_string(),
+        token_in: config.token_in_hex.to_string(),
+        token_out: config.token_out_hex.to_string(),
         amount_in: "10".to_string(),
-        min_amount_out: min_amount_out.to_string(),
+        min_amount_out: config.min_amount_out.to_string(),
         settlement_address: settlement,
         tycho_router_address: router,
         swap_kind: SwapKind::SimpleSwap,
@@ -187,22 +230,22 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
             // A single segment must have `share_bps=0` to take the remainder.
             share_bps: 0,
             hops: vec![HopDraft {
-                token_in: token_in_hex.to_string(),
-                token_out: token_out_hex.to_string(),
+                token_in: config.token_in_hex.to_string(),
+                token_out: config.token_out_hex.to_string(),
                 swaps: vec![PoolSwapDraft {
                     pool: PoolRef {
-                        protocol: "uniswap_v2".to_string(),
+                        protocol: config.request_pool_protocol.to_string(),
                         component_id: pool_id,
                         pool_address: None,
                     },
-                    token_in: token_in_hex.to_string(),
-                    token_out: token_out_hex.to_string(),
+                    token_in: config.token_in_hex.to_string(),
+                    token_out: config.token_out_hex.to_string(),
                     // A single swap must have `split_bps=0` to take the remainder.
                     split_bps: 0,
                 }],
             }],
         }],
-        request_id: Some("req-1".to_string()),
+        request_id: Some(config.request_id.to_string()),
     };
 
     let router = create_router(state);
@@ -211,7 +254,7 @@ async fn setup_app_state_and_request(min_amount_out: &str) -> (axum::Router, Rou
 
 #[tokio::test]
 async fn encode_route_end_to_end_returns_interactions_and_debug() {
-    let (app, request) = setup_app_state_and_request("8").await;
+    let (app, request) = setup_app_state_and_request(EncodeFixtureConfig::default()).await;
 
     let response = app
         .oneshot(
@@ -316,7 +359,11 @@ async fn encode_route_end_to_end_returns_interactions_and_debug() {
 
 #[tokio::test]
 async fn encode_route_rejects_when_min_amount_out_exceeds_expected() {
-    let (app, request) = setup_app_state_and_request("11").await;
+    let config = EncodeFixtureConfig {
+        min_amount_out: "11",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
 
     let response = app
         .oneshot(
@@ -346,4 +393,169 @@ async fn encode_route_rejects_when_min_amount_out_exceeds_expected() {
         response.error
     );
     assert_eq!(response.request_id.as_deref(), Some("req-1"));
+}
+
+#[tokio::test]
+async fn encode_route_succeeds_for_vm_maverick_v2_pool() {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: true,
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.interactions.len(), 2);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
+    assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+}
+
+#[tokio::test]
+async fn encode_route_succeeds_for_rocketpool_native_input() {
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0x0000000000000000000000000000000000000000",
+        token_out_hex: "0xae78736cd615f374d3085123a210448e74fc6393",
+        request_pool_protocol: "rocketpool",
+        component_protocol_system: "rocketpool",
+        component_protocol_type_name: "rocketpool",
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.interactions.len(), 1);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Call);
+    assert_eq!(response.interactions[0].value, "10");
+}
+
+#[tokio::test]
+async fn encode_route_succeeds_for_rocketpool_native_output() {
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0xae78736cd615f374d3085123a210448e74fc6393",
+        token_out_hex: "0x0000000000000000000000000000000000000000",
+        request_pool_protocol: "rocketpool",
+        component_protocol_system: "rocketpool",
+        component_protocol_type_name: "rocketpool",
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.interactions.len(), 2);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
+    assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+    assert_eq!(response.interactions[1].value, "0");
+}
+
+#[tokio::test]
+async fn encode_route_rejects_native_input_for_non_allowlisted_protocol() {
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0x0000000000000000000000000000000000000000",
+        token_out_hex: "0x0000000000000000000000000000000000000002",
+        request_pool_protocol: "uniswap_v2",
+        component_protocol_system: "uniswap_v2",
+        component_protocol_type_name: "uniswap_v2",
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body).unwrap();
+    assert!(
+        response
+            .error
+            .contains("only supported for protocols [rocketpool]"),
+        "unexpected error: {}",
+        response.error
+    );
 }
