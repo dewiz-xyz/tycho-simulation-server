@@ -767,6 +767,48 @@ async fn simulate_pool(
         // Hold the permit until the blocking work exits.
         let _permit = permit;
 
+        // Abort quickly if this task starts after cancellation/deadline.
+        if cancel_token_clone.is_cancelled() {
+            debug!(
+                scope = "pool_timeout",
+                pool_id = %pool_id,
+                protocol = %pool_protocol,
+                pool_name = %pool_name,
+                pool_address = %pool_address,
+                "Pool quote cancelled before completion"
+            );
+            return PoolSimOutcome::Simulated(PoolQuoteResult {
+                pool: pool_id,
+                pool_name,
+                pool_address,
+                protocol: pool_protocol,
+                amounts_out: Vec::new(),
+                gas_used: Vec::new(),
+                errors: vec!["Cancelled".to_string()],
+                timed_out: false,
+            });
+        }
+        if Instant::now() >= deadline {
+            debug!(
+                scope = "pool_timeout",
+                pool_id = %pool_id,
+                protocol = %pool_protocol,
+                pool_name = %pool_name,
+                pool_address = %pool_address,
+                "Pool quote exceeded deadline before completion"
+            );
+            return PoolSimOutcome::Simulated(PoolQuoteResult {
+                pool: pool_id,
+                pool_name,
+                pool_address,
+                protocol: pool_protocol,
+                amounts_out: Vec::new(),
+                gas_used: Vec::new(),
+                errors: vec!["Timed out".to_string()],
+                timed_out: true,
+            });
+        }
+
         // Short-circuit when the request exceeds pool limits to avoid wasted compute.
         //
         // Note: `get_limits` can be a "soft" limit (advisory). When the request exceeds the
@@ -804,8 +846,11 @@ async fn simulate_pool(
                                     });
                                 }
                             }
-                            Err(err) => match err {
-                                SimulationError::InvalidInput(message, _maybe_result) => {
+                            Err(SimulationError::InvalidInput(message, maybe_result)) => {
+                                if is_limits_exhaustion_probe_error(
+                                    &message,
+                                    maybe_result.is_some(),
+                                ) {
                                     debug!(
                                         scope = "limits_precheck",
                                         pool_id = %pool_id,
@@ -821,22 +866,35 @@ async fn simulate_pool(
                                         protocol: pool_protocol.clone(),
                                     };
                                 }
-                                other => {
-                                    return PoolSimOutcome::Simulated(PoolQuoteResult {
-                                        pool: pool_id,
-                                        pool_name,
-                                        pool_address,
-                                        protocol: pool_protocol,
-                                        amounts_out: Vec::new(),
-                                        gas_used: Vec::new(),
-                                        errors: vec![format!(
-                                            "Probe quote failed (amount_in={}, max_in={}): {}",
-                                            requested_max_in, max_in, other,
-                                        )],
-                                        timed_out: false,
-                                    });
-                                }
-                            },
+                                return PoolSimOutcome::Simulated(PoolQuoteResult {
+                                    pool: pool_id,
+                                    pool_name,
+                                    pool_address,
+                                    protocol: pool_protocol,
+                                    amounts_out: Vec::new(),
+                                    gas_used: Vec::new(),
+                                    errors: vec![format!(
+                                        "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
+                                        requested_max_in, max_in, message,
+                                    )],
+                                    timed_out: false,
+                                });
+                            }
+                            Err(other) => {
+                                return PoolSimOutcome::Simulated(PoolQuoteResult {
+                                    pool: pool_id,
+                                    pool_name,
+                                    pool_address,
+                                    protocol: pool_protocol,
+                                    amounts_out: Vec::new(),
+                                    gas_used: Vec::new(),
+                                    errors: vec![format!(
+                                        "Probe quote failed (amount_in={}, max_in={}): {}",
+                                        requested_max_in, max_in, other,
+                                    )],
+                                    timed_out: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -1019,6 +1077,17 @@ fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
     } else {
         QuoteFailureKind::Simulator
     }
+}
+
+fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> bool {
+    if has_partial_result {
+        return true;
+    }
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("max_in")
+        || lowered.contains("get_limits")
+        || lowered.contains("not enough liquidity")
+        || lowered.contains("support complete swap")
 }
 
 fn format_pool_descriptor(context: &FailureContext<'_>) -> String {
@@ -1644,5 +1713,127 @@ mod tests {
             "message should explain this was a probe error"
         );
         assert_eq!(computation.metrics.skipped_native_limits, 0);
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ProbeInvalidInputSim {
+        max_in: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for ProbeInvalidInputSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in > self.max_in {
+                return Err(SimulationError::InvalidInput(
+                    "token_in invalid for probe".to_string(),
+                    None,
+                ));
+            }
+            Ok(GetAmountOutResult::new(
+                BigUint::zero(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_non_limit_invalid_input_is_not_reported_as_limits_skip() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = ProbeInvalidInputSim {
+            max_in: BigUint::from(10u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(
+            "pool-1".to_string(),
+            Arc::new(sim),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
+            BigUint::from(11u8),
+            2,
+            Instant::now() + Duration::from_secs(1),
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "probe-only");
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert!(result.amounts_out.is_empty());
+                assert!(!result.timed_out);
+                assert_eq!(result.errors.len(), 1);
+                assert!(result.errors[0].contains("Probe quote failed"));
+                assert!(result.errors[0].contains("Invalid input"));
+            }
+            PoolSimOutcome::SkippedDueToLimits { .. } => {
+                panic!("non-limit invalid input should not be treated as limits skip")
+            }
+        }
     }
 }
