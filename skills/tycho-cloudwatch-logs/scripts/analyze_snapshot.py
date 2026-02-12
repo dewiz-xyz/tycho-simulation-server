@@ -8,7 +8,7 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
@@ -206,6 +206,34 @@ def parse_minute(value: str) -> str:
     return value[-8:-3] if len(value) >= 5 else value
 
 
+def format_timestamp_utc(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def fenced_text(block: str | list[str]) -> str:
+    text = block if isinstance(block, str) else "\n".join(block)
+    return f"```text\n{text}\n```"
+
+
+def render_distribution_compact(label: str, values: list[float]) -> list[str]:
+    s = stats(values)
+    return [
+        f"{label:<10} min {fmt_int(s['min']):>6}  p25 {fmt_int(s['p25']):>6}  p50 {fmt_int(s['p50']):>6}  mean {fmt_float(s['mean'], 1):>7}",
+        f"{'':<10} p75 {fmt_int(s['p75']):>6}  p90 {fmt_int(s['p90']):>6}  p99 {fmt_int(s['p99']):>6}  max  {fmt_int(s['max']):>6}",
+    ]
+
+
 # Known Curve pool name prefixes (these don't use the protocol::pair format)
 _VM_CURVE_PREFIXES = (
     "crvUSD", "Trycrypto", "TricryptoUSD", "tricrypto", "3pool", "steth",
@@ -376,9 +404,27 @@ def build_report(input_dir: Path, period: str) -> str:
     latency_stats = stats([float(v) for v in latency_values])
 
     protocol_total = sum(protocol_counter.values())
-    top_protocols = protocol_counter.most_common(8)
-    top_pools = pool_counter.most_common(10)
+    top_protocols = protocol_counter.most_common()
+    top_pools = pool_counter.most_common(20)
     top_pairs = pair_counter.most_common(10)
+
+    # Ensure maverick doesn't disappear in any non-zero sample.
+    if any(proto != "vm:maverick_v2" for proto, _ in top_protocols):
+        maverick_wins = protocol_counter.get("vm:maverick_v2", 0)
+        if maverick_wins:
+            top_protocols.append(("vm:maverick_v2", maverick_wins))
+            protocol_order = [protocol for protocol, _ in top_protocols]
+            dedup_protocols: list[tuple[str, int]] = []
+            seen_protocols = set()
+            for proto, wins in top_protocols:
+                if proto in seen_protocols:
+                    continue
+                seen_protocols.add(proto)
+                dedup_protocols.append((proto, wins))
+            top_protocols = dedup_protocols
+
+    # Keep protocol report stable and inclusive: show all winners sorted by count.
+    top_protocols = sorted(top_protocols, key=lambda item: item[1], reverse=True)
 
     max_protocol = top_protocols[0][1] if top_protocols else 0
     max_pair = top_pairs[0][1] if top_pairs else 0
@@ -404,23 +450,26 @@ def build_report(input_dir: Path, period: str) -> str:
     status_total = sum(status_counts.values())
     ready_count = status_counts.get("Ready", 0)
     partial_count = status_counts.get("PartialFailure", 0)
+    other_count = max(0, status_total - ready_count - partial_count)
     status_bar_width = 48
     if status_total:
-        other_count = status_total - ready_count - partial_count
         ready_share = ready_count / status_total * 100
         partial_share = partial_count / status_total * 100
-        other_share = max(0.0, 100.0 - ready_share - partial_share)
-
         ready_w = int(round(ready_share / 100 * status_bar_width))
         partial_w = int(round(partial_share / 100 * status_bar_width))
-        other_w = max(0, status_bar_width - ready_w - partial_w)
-        status_bar = ("█" * ready_w) + ("▓" * partial_w) + ("░" * other_w)
+        if ready_w + partial_w > status_bar_width:
+            partial_w = max(0, status_bar_width - ready_w)
+        status_bar = ("█" * ready_w) + ("░" * partial_w) + (" " * (status_bar_width - ready_w - partial_w))
     else:
-        other_count = 0
         ready_share = 0.0
         partial_share = 0.0
-        other_share = 0.0
         status_bar = " " * status_bar_width
+
+    other_status_parts = [
+        f"{status}={fmt_int(count)}"
+        for status, count in status_counts.most_common()
+        if status not in ("Ready", "PartialFailure")
+    ]
 
     coverage_notes = []
     runs_matched = to_int(str(runs_raw.get("statistics", {}).get("recordsMatched", 0)))
@@ -450,12 +499,12 @@ def build_report(input_dir: Path, period: str) -> str:
     protocol_lines = []
     for protocol, wins in top_protocols:
         pct = (wins / protocol_total * 100) if protocol_total else 0.0
-        protocol_lines.append(f"{protocol:<16} {hbar(wins, max_protocol, width=24)}  {pct:5.1f}%")
+        protocol_lines.append(f"  {protocol:<20s}  {hbar(wins, max_protocol, width=28):<28s}  {pct:5.1f}%")
 
     pair_lines = []
     for pair, count in top_pairs:
         pct = (count / (sum(pair_counter.values()) or 1) * 100)
-        pair_lines.append(f"{pair:<20} {hbar(count, max_pair, width=22)}  {pct:5.1f}%")
+        pair_lines.append(f"  {pair:<20s}  {hbar(count, max_pair, width=28):<28s}  {pct:5.1f}%")
 
     status_latency_lines = []
     max_status_p95 = 0.0
@@ -472,12 +521,31 @@ def build_report(input_dir: Path, period: str) -> str:
             f"{status:<16} p50 {fmt_int(p50):>5} ms, p95 {fmt_int(p95):>5} ms, n={fmt_int(count):>6}  {hbar(p95, max_status_p95, width=16)}"
         )
 
+    window_since = format_timestamp_utc(metrics.get("meta", {}).get("since"))
+    window_until = format_timestamp_utc(metrics.get("meta", {}).get("until"))
+
+    split_width = 40
+    native_w = int(round(native_share / 100 * split_width)) if total_scheduled_pools else 0
+    native_w = max(0, min(split_width, native_w))
+    vm_w = split_width - native_w
+    native_vm_bar = "[" + ("█" * native_w) + ("▓" * vm_w) + "]"
+
+    latency_ladder_values = [
+        fmt_int(latency_stats["min"]),
+        fmt_int(latency_stats["p50"]),
+        fmt_int(latency_stats["p75"]),
+        fmt_int(latency_stats["p90"]),
+        fmt_int(latency_stats["p95"]),
+        fmt_int(latency_stats["p99"]),
+        fmt_int(latency_stats["max"]),
+    ]
+    latency_ladder = "  " + "─────".join(latency_ladder_values)
+    latency_ladder_labels = "        p50      p75      p90      p95      p99      max"
+
     report_lines: list[str] = []
     report_lines.append(f"# Tycho Simulation Production Snapshot ({period})")
     report_lines.append("")
-    report_lines.append(
-        f"Window: {metrics.get('meta', {}).get('since', 'unknown')} to {metrics.get('meta', {}).get('until', 'unknown')}."
-    )
+    report_lines.append(f"Window: {window_since} to {window_until}.")
     if coverage_notes:
         report_lines.append("")
         report_lines.append("Coverage notes:")
@@ -488,37 +556,44 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append("## 1. Volume at a glance")
     report_lines.append("")
     report_lines.append(
-        summary_box(
-            [
-                f"Requests: {fmt_int(total_requests)}  |  Simulation runs: {fmt_int(total_runs)}",
-                f"Runs/request: {fmt_float(runs_per_request, 2)}  |  Unique auctions: {fmt_int(unique_auctions)}",
-                f"Per-request sample size for deep stats: {fmt_int(sample_request_count)}",
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    f"Requests: {fmt_int(total_requests)}  |  Simulation runs: {fmt_int(total_runs)}",
+                    f"Runs/request: {fmt_float(runs_per_request, 2)}  |  Unique auctions: {fmt_int(unique_auctions)}",
+                    f"Per-request sample size for deep stats: {fmt_int(sample_request_count)}",
+                ]
+            )
         )
     )
 
     report_lines.append("")
     report_lines.append("## 2. Throughput over time")
     report_lines.append("")
-    report_lines.append(f"Runs/min sparkline      {sparkline([float(v) for v in runs_per_minute], max_points=48)}")
-    report_lines.append(f"Requests/min sparkline  {sparkline([float(v) for v in requests_per_minute], max_points=48)}")
-    report_lines.append("")
-    report_lines.append("Runs per minute bars:")
-    report_lines.extend(run_lines if run_lines else ["(no per-minute data)"])
+    throughput_block = [
+        f"Runs/min sparkline      {sparkline([float(v) for v in runs_per_minute], max_points=48)}",
+        f"Requests/min sparkline  {sparkline([float(v) for v in requests_per_minute], max_points=48)}",
+        "",
+        "Runs per minute bars:",
+        *(run_lines if run_lines else ["(no per-minute data)"]),
+    ]
+    report_lines.append(fenced_text(throughput_block))
     report_lines.append("")
     report_lines.append(
-        summary_box(
-            [
-                render_distribution("Runs/min", [float(v) for v in runs_per_minute], ["min", "p25", "p50", "mean", "p75", "p90", "p99", "max"]),
-                render_distribution("Reqs/min", [float(v) for v in requests_per_minute], ["min", "p25", "p50", "mean", "p75", "p90", "p99", "max"]),
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    *render_distribution_compact("Runs/min", [float(v) for v in runs_per_minute]),
+                    *render_distribution_compact("Reqs/min", [float(v) for v in requests_per_minute]),
+                ]
+            )
         )
     )
 
     report_lines.append("")
     report_lines.append("## 3. Protocol win rates")
     report_lines.append("")
-    report_lines.extend(protocol_lines if protocol_lines else ["No top pool winners in sample."])
+    report_lines.append(fenced_text(protocol_lines if protocol_lines else ["No top pool winners in sample."]))
 
     report_lines.append("")
     report_lines.append("## 4. Top winning pools")
@@ -535,39 +610,44 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append("## 5. Pools per request")
     report_lines.append("")
     report_lines.append(
-        summary_box(
-            [
-                render_distribution(
-                    "sim_runs",
-                    [float(v) for v in run_count_values],
-                    ["p10", "p25", "p50", "p75", "p90", "p95", "max"],
-                ),
-                f"Native scheduled pools: {fmt_int(total_native_pools)} ({native_share:.1f}%)",
-                f"VM scheduled pools:     {fmt_int(total_vm_pools)} ({vm_share:.1f}%)",
-                f"Requests with VM pools: {fmt_int(requests_with_vm)} / {fmt_int(sample_request_count)} ({vm_request_share:.1f}%)",
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    render_distribution(
+                        "sim_runs",
+                        [float(v) for v in run_count_values],
+                        ["p10", "p25", "p50", "p75", "p90", "p95", "max"],
+                    ),
+                    f"Native scheduled pools: {fmt_int(total_native_pools)} ({native_share:.1f}%)",
+                    f"VM scheduled pools:     {fmt_int(total_vm_pools)} ({vm_share:.1f}%)",
+                    f"Requests with VM pools: {fmt_int(requests_with_vm)} / {fmt_int(sample_request_count)} ({vm_request_share:.1f}%)",
+                ]
+            )
         )
     )
     report_lines.append("")
     report_lines.append(
-        f"Native vs VM split  {'█' * int(round(native_share / 100 * 34))}{'░' * int(round(vm_share / 100 * 34))}  (native {native_share:.1f}%, vm {vm_share:.1f}%)"
+        fenced_text(
+            [
+                f"Native vs VM split {native_vm_bar}",
+                f"(native {native_share:.1f}%, vm {vm_share:.1f}%)",
+            ]
+        )
     )
 
     report_lines.append("")
     report_lines.append("## 6. Latency")
     report_lines.append("")
-    report_lines.append(
-        f"  {fmt_int(latency_stats['min'])}────────{fmt_int(latency_stats['p50'])}────────{fmt_int(latency_stats['p90'])}────────{fmt_int(latency_stats['p99'])}────────{fmt_int(latency_stats['max'])}"
-    )
-    report_lines.append("           |                                |")
-    report_lines.append("         p50                              p99")
+    report_lines.append(fenced_text([latency_ladder, latency_ladder_labels]))
     report_lines.append("")
     report_lines.append(
-        summary_box(
-            [
-                f"Latency ms  p50: {fmt_int(latency_stats['p50'])}  p75: {fmt_int(latency_stats['p75'])}  p90: {fmt_int(latency_stats['p90'])}",
-                f"            p95: {fmt_int(latency_stats['p95'])}  p99: {fmt_int(latency_stats['p99'])}  max: {fmt_int(latency_stats['max'])}",
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    f"Latency ms  p50: {fmt_int(latency_stats['p50'])}  p75: {fmt_int(latency_stats['p75'])}  p90: {fmt_int(latency_stats['p90'])}",
+                    f"            p95: {fmt_int(latency_stats['p95'])}  p99: {fmt_int(latency_stats['p99'])}  max: {fmt_int(latency_stats['max'])}",
+                ]
+            )
         )
     )
     report_lines.append("")
@@ -577,23 +657,19 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.extend(rendered_bucket_rows)
     report_lines.append("")
     report_lines.append("Latency by status:")
-    report_lines.extend(status_latency_lines if status_latency_lines else ["No latency data by status."])
+    report_lines.append(fenced_text(status_latency_lines if status_latency_lines else ["No latency data by status."]))
 
     report_lines.append("")
     report_lines.append("## 7. Reliability")
     report_lines.append("")
-    report_lines.append(f"  [{status_bar}]")
-    report_lines.append(
-        f"   Ready: {ready_share:.1f}% ({fmt_int(ready_count)})"
-        f"          Partial: {partial_share:.1f}% ({fmt_int(partial_count)})"
-    )
-    if other_count > 0:
-        minor_parts = [
-            f"{st}={fmt_int(ct)}"
-            for st, ct in status_counts.most_common()
-            if st not in ("Ready", "PartialFailure")
-        ]
-        report_lines.append(f"   Other: {', '.join(minor_parts)}")
+    reliability_lines = [
+        f"  [{status_bar}]",
+        f"   Ready: {ready_share:5.1f}% ({fmt_int(ready_count)})          Partial: {partial_share:5.1f}% ({fmt_int(partial_count)})",
+    ]
+    if other_status_parts:
+        reliability_lines.append(f"   Other: {', '.join(other_status_parts)}")
+    report_lines.append(fenced_text(reliability_lines))
+
     failure_lines = [
         f"Total failures reported: {fmt_int(sum(failures_by_status.values()))}",
         f"Non-ready requests in sample: {fmt_int(status_total - ready_count)} / {fmt_int(status_total)}",
@@ -603,19 +679,21 @@ def build_report(input_dir: Path, period: str) -> str:
             failure_lines.append(
                 f"{status}: {fmt_int(count)} requests, {fmt_int(failures_by_status.get(status, 0))} failures"
             )
-    report_lines.append(summary_box(failure_lines))
+    report_lines.append(fenced_text(summary_box(failure_lines)))
 
     report_lines.append("")
     report_lines.append("## 8. Auction structure")
     report_lines.append("")
     auctions_per_min = (unique_auctions / len(rpm_rows)) if rpm_rows else 0.0
     report_lines.append(
-        summary_box(
-            [
-                f"Auction cadence: {fmt_float(auctions_per_min, 2)} unique auctions/minute",
-                render_distribution("runs/auction", [float(v) for v in runs_per_auction], ["min", "p25", "p50", "mean", "p75", "p90", "p99", "max"]),
-                f"Runs/request per auction, p50: {fmt_float(ratio_auction_stats['p50'], 2)}, p90: {fmt_float(ratio_auction_stats['p90'], 2)}, max: {fmt_float(ratio_auction_stats['max'], 2)}",
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    f"Auction cadence: {fmt_float(auctions_per_min, 2)} unique auctions/minute",
+                    *render_distribution_compact("runs/auction", [float(v) for v in runs_per_auction]),
+                    f"Runs/request per auction p50: {fmt_float(ratio_auction_stats['p50'], 2)}, p90: {fmt_float(ratio_auction_stats['p90'], 2)}, max: {fmt_float(ratio_auction_stats['max'], 2)}",
+                ]
+            )
         )
     )
     report_lines.append("")
@@ -628,22 +706,31 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append("")
     report_lines.append("## 9. Token pair traffic")
     report_lines.append("")
-    report_lines.extend(pair_lines if pair_lines else ["No token pair data."])
+    report_lines.append(fenced_text(pair_lines if pair_lines else ["No token pair data."]))
 
     report_lines.append("")
     report_lines.append("## 10. ECS Resource Utilization")
     report_lines.append("")
     report_lines.append(
-        summary_box(
-            [
-                f"CPU%    min: {fmt_float(cpu_agg['min'], 2)}  mean: {fmt_float(cpu_agg['mean'], 2)}  p90: {fmt_float(cpu_agg['p90'], 2)}  max: {fmt_float(cpu_agg['max'], 2)}",
-                f"Memory% min: {fmt_float(mem_agg['min'], 2)}  mean: {fmt_float(mem_agg['mean'], 2)}  p90: {fmt_float(mem_agg['p90'], 2)}  max: {fmt_float(mem_agg['max'], 2)}",
-            ]
+        fenced_text(
+            summary_box(
+                [
+                    f"CPU%    min: {fmt_float(cpu_agg['min'], 2)}  mean: {fmt_float(cpu_agg['mean'], 2)}  p90: {fmt_float(cpu_agg['p90'], 2)}  max: {fmt_float(cpu_agg['max'], 2)}",
+                    f"Memory% min: {fmt_float(mem_agg['min'], 2)}  mean: {fmt_float(mem_agg['mean'], 2)}  p90: {fmt_float(mem_agg['p90'], 2)}  max: {fmt_float(mem_agg['max'], 2)}",
+                ]
+            )
         )
     )
     report_lines.append("")
-    report_lines.append(f"Fleet avg CPU (5m):    {sparkline(cpu_series, max_points=48)}")
-    report_lines.append(f"Fleet avg Memory (5m): {sparkline(mem_series, max_points=48)}")
+    report_lines.append(
+        fenced_text(
+            [
+                f"Fleet avg CPU (5m):    {sparkline(cpu_series, max_points=48)}",
+                f"Fleet avg Memory (5m): {sparkline(mem_series, max_points=48)}",
+                f"{window_since} -> {window_until}",
+            ]
+        )
+    )
     report_lines.append("")
     if high_cpu_tasks or high_mem_tasks:
         report_lines.append("Sustained high-utilization tasks:")
