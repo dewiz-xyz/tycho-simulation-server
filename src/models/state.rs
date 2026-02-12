@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
-use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
+
+const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -176,6 +177,22 @@ pub struct UpdateMetrics {
     pub new_pairs: usize,
     pub removed_pairs: usize,
     pub total_pairs: usize,
+    pub new_pairs_missing_state: usize,
+    pub unknown_protocol_new_pairs: usize,
+    pub updates_for_unknown_pair: usize,
+    pub states_missing_in_shard: usize,
+    pub removed_unknown_pair: usize,
+    pub anomaly_samples: Vec<String>,
+}
+
+impl UpdateMetrics {
+    pub fn has_anomalies(&self) -> bool {
+        self.new_pairs_missing_state > 0
+            || self.unknown_protocol_new_pairs > 0
+            || self.updates_for_unknown_pair > 0
+            || self.states_missing_in_shard > 0
+            || self.removed_unknown_pair > 0
+    }
 }
 
 pub struct StateStore {
@@ -283,8 +300,11 @@ impl StateStore {
 
         let mut index_additions: Vec<(Bytes, String)> = Vec::new();
         let mut index_removals: Vec<(Bytes, String)> = Vec::new();
+        let mut anomaly_samples = Vec::new();
 
         let mut new_pairs_count = 0;
+        let mut new_pairs_missing_state = 0;
+        let mut unknown_protocol_new_pairs = 0;
         let mut tokens_to_cache: Vec<Token> = Vec::new();
         for (id, component) in update.new_pairs.into_iter() {
             match ProtocolKind::from_component(&component) {
@@ -304,13 +324,20 @@ impl StateStore {
                             new_pairs_count += 1;
                         }
                     } else {
-                        warn!("new pair {} missing state on update", id);
+                        new_pairs_missing_state += 1;
+                        add_anomaly_sample(
+                            &mut anomaly_samples,
+                            "new_pairs_missing_state",
+                            id.as_str(),
+                        );
                     }
                 }
                 None => {
-                    warn!(
-                        "ignoring new pair with unknown protocol: {}",
-                        component.protocol_type_name
+                    unknown_protocol_new_pairs += 1;
+                    add_anomaly_sample(
+                        &mut anomaly_samples,
+                        "unknown_protocol_new_pairs",
+                        id.as_str(),
                     );
                 }
             }
@@ -321,6 +348,8 @@ impl StateStore {
         }
 
         let mut updated_states = 0;
+        let mut updates_for_unknown_pair = 0;
+        let mut states_missing_in_shard = 0;
         for (id, state) in update.states.into_iter() {
             let kind_opt = { self.id_to_kind.read().await.get(&id).copied() };
             if let Some(kind) = kind_opt {
@@ -328,15 +357,26 @@ impl StateStore {
                     if shard.update_state(&id, Arc::from(state)).await {
                         updated_states += 1;
                     } else {
-                        warn!("state missing in shard for id {}", id);
+                        states_missing_in_shard += 1;
+                        add_anomaly_sample(
+                            &mut anomaly_samples,
+                            "states_missing_in_shard",
+                            id.as_str(),
+                        );
                     }
                 }
             } else {
-                warn!("update for unknown pair {}; dropping", id);
+                updates_for_unknown_pair += 1;
+                add_anomaly_sample(
+                    &mut anomaly_samples,
+                    "updates_for_unknown_pair",
+                    id.as_str(),
+                );
             }
         }
 
         let mut removed_pairs_count = 0;
+        let mut removed_unknown_pair = 0;
         for (id, component) in update.removed_pairs.into_iter() {
             for token in component.tokens.iter() {
                 index_removals.push((token.address.clone(), id.clone()));
@@ -353,10 +393,8 @@ impl StateStore {
                     removed_pairs_count += 1;
                 }
             } else {
-                debug!(
-                    "received removal for unknown pair {} ({})",
-                    id, component.protocol_type_name
-                );
+                removed_unknown_pair += 1;
+                add_anomaly_sample(&mut anomaly_samples, "removed_unknown_pair", id.as_str());
             }
         }
 
@@ -386,6 +424,12 @@ impl StateStore {
             new_pairs: new_pairs_count,
             removed_pairs: removed_pairs_count,
             total_pairs,
+            new_pairs_missing_state,
+            unknown_protocol_new_pairs,
+            updates_for_unknown_pair,
+            states_missing_in_shard,
+            removed_unknown_pair,
+            anomaly_samples,
         }
     }
 
@@ -524,6 +568,13 @@ fn apply_token_index_changes(
             }
         }
     }
+}
+
+fn add_anomaly_sample(samples: &mut Vec<String>, kind: &str, value: &str) {
+    if samples.len() >= UPDATE_ANOMALY_SAMPLE_CAP {
+        return;
+    }
+    samples.push(format!("{kind}:{value}"));
 }
 
 #[cfg(test)]
@@ -725,6 +776,146 @@ mod tests {
         }
 
         assert_eq!(batched, sequential);
+    }
+
+    #[tokio::test]
+    async fn apply_update_tracks_anomaly_counters_and_samples() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let token_a = mk_token(20, "TKNA");
+        let token_b = mk_token(21, "TKNB");
+
+        let missing_state_component = mk_component(
+            30,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let unknown_protocol_component = mk_component(
+            31,
+            "mystery_exchange",
+            "mystery_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let removed_unknown_component =
+            mk_component(32, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
+
+        store
+            .id_to_kind
+            .write()
+            .await
+            .insert("stale-shard".to_string(), ProtocolKind::UniswapV2);
+
+        let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
+        states.insert("unknown-update".to_string(), Box::new(DummySim));
+        states.insert("stale-shard".to_string(), Box::new(DummySim));
+
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("missing-state".to_string(), missing_state_component);
+        new_pairs.insert("unknown-proto".to_string(), unknown_protocol_component);
+
+        let mut removed_pairs = HashMap::new();
+        removed_pairs.insert("missing-removal".to_string(), removed_unknown_component);
+
+        let metrics = store
+            .apply_update(Update::new(2, states, new_pairs).set_removed_pairs(removed_pairs))
+            .await;
+
+        assert_eq!(metrics.new_pairs_missing_state, 1);
+        assert_eq!(metrics.unknown_protocol_new_pairs, 1);
+        assert_eq!(metrics.updates_for_unknown_pair, 1);
+        assert_eq!(metrics.states_missing_in_shard, 1);
+        assert_eq!(metrics.removed_unknown_pair, 1);
+        assert!(metrics.has_anomalies());
+
+        assert_eq!(metrics.anomaly_samples.len(), 5);
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "new_pairs_missing_state:missing-state"));
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample.starts_with("unknown_protocol_new_pairs:")));
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "updates_for_unknown_pair:unknown-update"));
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "states_missing_in_shard:stale-shard"));
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "removed_unknown_pair:missing-removal"));
+    }
+
+    #[tokio::test]
+    async fn apply_update_caps_anomaly_samples() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
+        for idx in 0..10 {
+            states.insert(format!("unknown-{idx}"), Box::new(DummySim));
+        }
+
+        let metrics = store
+            .apply_update(Update::new(7, states, HashMap::new()))
+            .await;
+
+        assert_eq!(metrics.updates_for_unknown_pair, 10);
+        assert_eq!(metrics.anomaly_samples.len(), UPDATE_ANOMALY_SAMPLE_CAP);
+        assert!(metrics
+            .anomaly_samples
+            .iter()
+            .all(|sample| sample.starts_with("updates_for_unknown_pair:")));
+    }
+
+    #[tokio::test]
+    async fn apply_update_without_anomalies_has_zero_counters() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let token_a = mk_token(40, "TKNA");
+        let token_b = mk_token(41, "TKNB");
+        let component = mk_component(42, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
+
+        let metrics = store
+            .apply_update(mk_update(vec![(
+                "pool-1".to_string(),
+                component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        assert_eq!(metrics.new_pairs_missing_state, 0);
+        assert_eq!(metrics.unknown_protocol_new_pairs, 0);
+        assert_eq!(metrics.updates_for_unknown_pair, 0);
+        assert_eq!(metrics.states_missing_in_shard, 0);
+        assert_eq!(metrics.removed_unknown_pair, 0);
+        assert!(metrics.anomaly_samples.is_empty());
+        assert!(!metrics.has_anomalies());
     }
 
     #[tokio::test]

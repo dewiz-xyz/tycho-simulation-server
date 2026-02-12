@@ -25,6 +25,12 @@ use tycho_simulation::{
 
 use crate::models::tokens::TokenStore;
 
+#[derive(Clone, Copy)]
+enum StreamDecodePolicy {
+    Native,
+    Vm,
+}
+
 pub async fn build_native_stream(
     tycho_url: &str,
     api_key: &str,
@@ -40,8 +46,13 @@ pub async fn build_native_stream(
         > + Unpin
         + Send,
 > {
-    let (mut builder, tvl_filter) =
-        base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
+    let (mut builder, tvl_filter) = base_builder(
+        tycho_url,
+        api_key,
+        tvl_add_threshold,
+        tvl_keep_threshold,
+        decode_skip_state_failures(StreamDecodePolicy::Native),
+    );
 
     builder = builder.exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None);
     builder = builder.exchange::<UniswapV2State>("sushiswap_v2", tvl_filter.clone(), None);
@@ -83,8 +94,13 @@ pub async fn build_vm_stream(
         > + Unpin
         + Send,
 > {
-    let (mut builder, tvl_filter) =
-        base_builder(tycho_url, api_key, tvl_add_threshold, tvl_keep_threshold);
+    let (mut builder, tvl_filter) = base_builder(
+        tycho_url,
+        api_key,
+        tvl_add_threshold,
+        tvl_keep_threshold,
+        decode_skip_state_failures(StreamDecodePolicy::Vm),
+    );
 
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
         "vm:curve",
@@ -110,6 +126,7 @@ fn base_builder(
     api_key: &str,
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
+    skip_state_decode_failures: bool,
 ) -> (ProtocolStreamBuilder, ComponentFilter) {
     let add_tvl = tvl_add_threshold;
     let keep_tvl = tvl_keep_threshold.min(add_tvl);
@@ -122,7 +139,29 @@ fn base_builder(
     let builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
         .latency_buffer(15)
         .auth_key(Some(api_key.to_string()))
-        .skip_state_decode_failures(true);
+        .skip_state_decode_failures(skip_state_decode_failures);
 
     (builder, tvl_filter)
+}
+
+fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
+    match policy {
+        StreamDecodePolicy::Native => true,
+        StreamDecodePolicy::Vm => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_skip_state_failures, StreamDecodePolicy};
+
+    #[test]
+    fn native_stream_keeps_decode_skip_enabled() {
+        assert!(decode_skip_state_failures(StreamDecodePolicy::Native));
+    }
+
+    #[test]
+    fn vm_stream_uses_strict_decode_failures() {
+        assert!(!decode_skip_state_failures(StreamDecodePolicy::Vm));
+    }
 }

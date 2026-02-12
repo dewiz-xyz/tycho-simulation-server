@@ -25,8 +25,11 @@ use crate::models::messages::{
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
 
+const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
+const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
+
 // Per-request scheduling metrics (logged once by the handler).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
@@ -37,6 +40,11 @@ pub struct QuoteMetrics {
     pub skipped_vm_deadline: usize,
     pub skipped_native_limits: usize,
     pub skipped_vm_limits: usize,
+    pub vm_completed_pools: usize,
+    pub vm_median_first_gas: Option<u64>,
+    pub vm_low_first_gas_count: usize,
+    pub vm_low_first_gas_ratio: Option<f64>,
+    pub vm_low_first_gas_samples: Vec<String>,
 }
 
 pub struct QuoteComputation {
@@ -391,6 +399,7 @@ pub async fn get_amounts_out(
         .map(CancellationToken::child_token)
         .unwrap_or_default();
     let mut tasks = FuturesUnordered::new();
+    let mut vm_first_gases = Vec::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
     // Stable scheduling to reduce jitter under contention
@@ -549,6 +558,13 @@ pub async fn get_amounts_out(
                                     // Classify before moving fields to avoid clones
                                     let had_timeout = result.timed_out;
                                     let is_partial = result.amounts_out.len() < expected_len;
+                                    record_vm_first_gas_metrics(
+                                        &mut metrics,
+                                        &mut vm_first_gases,
+                                        result.protocol.as_str(),
+                                        result.pool.as_str(),
+                                        result.gas_used.first().copied(),
+                                    );
                                     if !result.errors.is_empty() || is_partial {
                                         let context = FailureContext {
                                             pool_id: &result.pool,
@@ -623,6 +639,7 @@ pub async fn get_amounts_out(
     }
 
     drop(tasks);
+    finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
 
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
     if metrics.skipped_native_concurrency > 0
@@ -1122,6 +1139,57 @@ fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> 
     limit_signal
 }
 
+fn record_vm_first_gas_metrics(
+    metrics: &mut QuoteMetrics,
+    vm_first_gases: &mut Vec<u64>,
+    protocol: &str,
+    pool_id: &str,
+    first_gas: Option<u64>,
+) {
+    if !protocol.starts_with("vm:") {
+        return;
+    }
+
+    let Some(first_gas) = first_gas else {
+        return;
+    };
+
+    metrics.vm_completed_pools += 1;
+    vm_first_gases.push(first_gas);
+    if first_gas < VM_LOW_FIRST_GAS_THRESHOLD {
+        metrics.vm_low_first_gas_count += 1;
+        if metrics.vm_low_first_gas_samples.len() < VM_LOW_FIRST_GAS_SAMPLE_CAP {
+            metrics
+                .vm_low_first_gas_samples
+                .push(format!("{protocol}:{pool_id}:{first_gas}"));
+        }
+    }
+}
+
+fn finalize_vm_first_gas_metrics(metrics: &mut QuoteMetrics, vm_first_gases: &mut [u64]) {
+    let Some(median_gas) = median_u64(vm_first_gases) else {
+        return;
+    };
+
+    metrics.vm_median_first_gas = Some(median_gas);
+    metrics.vm_low_first_gas_ratio =
+        Some(metrics.vm_low_first_gas_count as f64 / metrics.vm_completed_pools as f64);
+}
+
+fn median_u64(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[mid])
+    } else {
+        Some(((values[mid - 1] as u128 + values[mid] as u128) / 2) as u64)
+    }
+}
+
 fn format_pool_descriptor(context: &FailureContext<'_>) -> String {
     let mut head = Vec::new();
     if let Some(protocol) = context.protocol {
@@ -1255,6 +1323,99 @@ mod tests {
 
     fn default_calls() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    #[test]
+    fn median_u64_handles_odd_and_even_inputs() {
+        let mut odd = vec![9, 1, 3];
+        assert_eq!(median_u64(&mut odd), Some(3));
+
+        let mut even = vec![10, 2, 6, 4];
+        assert_eq!(median_u64(&mut even), Some(5));
+    }
+
+    #[test]
+    fn median_u64_returns_none_for_empty_input() {
+        let mut values: Vec<u64> = Vec::new();
+        assert_eq!(median_u64(&mut values), None);
+    }
+
+    #[test]
+    fn vm_first_gas_metrics_aggregate_median_ratio_and_samples() {
+        let mut metrics = QuoteMetrics::default();
+        let mut vm_first_gases = Vec::new();
+
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "vm:curve",
+            "pool-a",
+            Some(400_000),
+        );
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "vm:curve",
+            "pool-b",
+            Some(900_000),
+        );
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "vm:curve",
+            "pool-c",
+            Some(500_000),
+        );
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "vm:curve",
+            "pool-d",
+            Some(550_000),
+        );
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "vm:curve",
+            "pool-e",
+            Some(580_000),
+        );
+
+        finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
+
+        assert_eq!(metrics.vm_completed_pools, 5);
+        assert_eq!(metrics.vm_low_first_gas_count, 4);
+        assert_eq!(metrics.vm_median_first_gas, Some(550_000));
+        let ratio = metrics.vm_low_first_gas_ratio.expect("ratio should be set");
+        assert!((ratio - 0.8).abs() < 1e-9);
+        assert_eq!(
+            metrics.vm_low_first_gas_samples.len(),
+            VM_LOW_FIRST_GAS_SAMPLE_CAP
+        );
+        assert_eq!(
+            metrics.vm_low_first_gas_samples[0],
+            "vm:curve:pool-a:400000".to_string()
+        );
+    }
+
+    #[test]
+    fn vm_first_gas_metrics_ignore_non_vm_protocols() {
+        let mut metrics = QuoteMetrics::default();
+        let mut vm_first_gases = Vec::new();
+
+        record_vm_first_gas_metrics(
+            &mut metrics,
+            &mut vm_first_gases,
+            "uniswap_v3",
+            "pool-native",
+            Some(120_000),
+        );
+        finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
+
+        assert_eq!(metrics.vm_completed_pools, 0);
+        assert_eq!(metrics.vm_median_first_gas, None);
+        assert_eq!(metrics.vm_low_first_gas_ratio, None);
+        assert!(metrics.vm_low_first_gas_samples.is_empty());
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
