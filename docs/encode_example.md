@@ -197,4 +197,6 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 - The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` based on route shape and splits.
 - `poolAddress` is optional and may be omitted when unavailable.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
-- The settlement encoding expects ERC20 `tokenIn` and `tokenOut`. Use wrapped native tokens for ETH.
+- Native `tokenIn`/`tokenOut` is supported only for allowlisted protocols (currently `rocketpool`).
+  - Native `tokenIn` routes emit a `CALL`-only interaction with `value=amountIn` (no ERC20 approvals).
+  - Native usage on non-allowlisted protocols is rejected as an invalid request.

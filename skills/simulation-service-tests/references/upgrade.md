@@ -22,9 +22,11 @@ Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or
 3. Run latency percentiles (keep the config with results):
    - `python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50`
 
-## VM pools (Curve/Balancer)
+## VM pools (Curve/Balancer/Maverick)
 VM pools are enabled by default; keep a run with them disabled for comparison:
 - `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
+
+Core coverage should exercise representative native/VM pairs in normal runs (`GHO:USDC`, `ETH:RETH`, `RETH:ETH`).
 
 ## Load testing / regressions
 - Prefer `scripts/run_suite.sh` and/or `scripts/latency_percentiles.py` with higher `--requests`/`--concurrency`.
