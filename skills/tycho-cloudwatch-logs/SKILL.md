@@ -61,7 +61,16 @@ Simulate completion logs are now emitted at `info` level for successful requests
 - `scripts/cw_filter.zsh`: time-window search with filter patterns.
 - `scripts/cw_query.zsh`: Logs Insights queries with presets and JSON parsing.
 - `scripts/cw_metrics.zsh`: memory/cpu metrics summaries and time series.
+- `scripts/analyze_snapshot.py`: render a production snapshot markdown report from query + metrics JSON outputs.
 - `scripts/cw_time.py`: time parsing helper for `cw_filter`, `cw_query`, and `cw_metrics`.
+
+## Snapshot report workflow
+- Prompt source: `~/.codex/prompts/sim-report.md`.
+- Default period in the prompt is `12h` when no argument is provided.
+- Required generated files for the analyzer:
+  `simulate-runs-per-minute.json`, `simulate-runs-per-auction.json`,
+  `simulate-runs.json`, `simulate-requests-per-auction.json`,
+  `simulate-completions.json`, `cw-metrics.json`.
 
 ## Metrics
 Quick checks for memory and CPU utilization using ECS ContainerInsights.
