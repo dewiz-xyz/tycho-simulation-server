@@ -109,7 +109,13 @@ pub(super) fn build_route_calldata_tx(
         ));
     }
 
-    let calldata = encode_route_calldata(&encoded_solution, &solution, &receiver)?;
+    let is_transfer_from_allowed = !context.is_native_input;
+    let calldata = encode_route_calldata(
+        &encoded_solution,
+        &solution,
+        &receiver,
+        is_transfer_from_allowed,
+    )?;
     let value = if context.is_native_input {
         context.amount_in.clone()
     } else {
@@ -190,13 +196,14 @@ fn encode_route_calldata(
     encoded_solution: &EncodedSolution,
     solution: &Solution,
     receiver: &Bytes,
+    is_transfer_from_allowed: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     let signature = encoded_solution.function_signature.as_str();
-    // `/encode` does not auto-wrap/unwrap native tokens; routes are expected to already match
-    // protocol/token expectations.
+    // `/encode` preserves route token semantics and does not inject wrap/unwrap steps.
+    // Routes must already be protocol-compatible, and native-input routes must disable router
+    // `transferFrom`.
     let is_wrap = false;
     let is_unwrap = false;
-    let is_transfer_from_allowed = true;
     let given_amount = biguint_to_u256_checked(&solution.given_amount, "amountIn")?;
     let checked_amount = biguint_to_u256_checked(&solution.checked_amount, "minAmountOut")?;
 
@@ -270,6 +277,20 @@ mod tests {
     use crate::services::encode::test_support::{
         dummy_component, pool_ref, MockProtocolSim, MockTychoEncoder,
     };
+
+    fn decode_transfer_from_allowed(calldata: &[u8]) -> bool {
+        const SELECTOR_BYTES: usize = 4;
+        const ABI_WORD_BYTES: usize = 32;
+        const TRANSFER_FROM_ALLOWED_INDEX: usize = 7;
+
+        let value_offset =
+            SELECTOR_BYTES + (TRANSFER_FROM_ALLOWED_INDEX * ABI_WORD_BYTES) + (ABI_WORD_BYTES - 1);
+        calldata
+            .get(value_offset)
+            .copied()
+            .expect("single-swap calldata should include transferFrom flag")
+            == 1
+    }
 
     #[test]
     fn build_settlement_interactions_with_reset_approval() {
@@ -423,6 +444,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&calldata.calldata[..4], &selector);
+        assert!(
+            decode_transfer_from_allowed(&calldata.calldata),
+            "ERC20 input should allow router transferFrom"
+        );
     }
 
     #[test]
@@ -491,6 +516,10 @@ mod tests {
 
         assert_eq!(calldata.target, router);
         assert_eq!(calldata.value, amount_in);
+        assert!(
+            !decode_transfer_from_allowed(&calldata.calldata),
+            "native input should disable router transferFrom"
+        );
     }
 
     #[test]
@@ -611,8 +640,8 @@ mod tests {
         };
         let receiver = Bytes::from_str("0x0000000000000000000000000000000000000033").unwrap();
 
-        let calldata =
-            encode_route_calldata(&encoded_solution, &solution, &receiver).expect("route calldata");
+        let calldata = encode_route_calldata(&encoded_solution, &solution, &receiver, true)
+            .expect("route calldata");
         let expected = alloy_primitives::U256::from(1u32).to_be_bytes::<32>();
 
         assert!(calldata.len() >= 36);
@@ -646,7 +675,7 @@ mod tests {
         };
         let receiver = Bytes::from_str("0x0000000000000000000000000000000000000033").unwrap();
 
-        let err = encode_route_calldata(&encoded_solution, &solution, &receiver).unwrap_err();
+        let err = encode_route_calldata(&encoded_solution, &solution, &receiver, true).unwrap_err();
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest

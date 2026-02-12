@@ -97,6 +97,20 @@ fn hex_to_bytes(value: &str) -> Vec<u8> {
     alloy_primitives::hex::decode(stripped).expect("valid hex")
 }
 
+fn decode_transfer_from_allowed(calldata: &[u8]) -> bool {
+    const SELECTOR_BYTES: usize = 4;
+    const ABI_WORD_BYTES: usize = 32;
+    const TRANSFER_FROM_ALLOWED_INDEX: usize = 7;
+
+    let value_offset =
+        SELECTOR_BYTES + (TRANSFER_FROM_ALLOWED_INDEX * ABI_WORD_BYTES) + (ABI_WORD_BYTES - 1);
+    calldata
+        .get(value_offset)
+        .copied()
+        .expect("single-swap calldata should include transferFrom flag")
+        == 1
+}
+
 struct EncodeFixtureConfig<'a> {
     min_amount_out: &'a str,
     token_in_hex: &'a str,
@@ -473,6 +487,11 @@ async fn encode_route_succeeds_for_rocketpool_native_input() {
     assert_eq!(response.interactions.len(), 1);
     assert_eq!(response.interactions[0].kind, InteractionKind::Call);
     assert_eq!(response.interactions[0].value, "10");
+    let router_calldata = hex_to_bytes(&response.interactions[0].calldata);
+    assert!(
+        !decode_transfer_from_allowed(&router_calldata),
+        "native-input router calldata must disable transferFrom"
+    );
 }
 
 #[tokio::test]
