@@ -17,7 +17,7 @@ pub fn router_timeout_result() -> QuoteResult {
         protocol: None,
     };
     let meta = QuoteMeta {
-        status: QuoteStatus::PartialFailure,
+        status: QuoteStatus::PartialSuccess,
         result_quality: QuoteResultQuality::RequestLevelFailure,
         block_number: 0,
         vm_block_number: None,
@@ -54,7 +54,7 @@ mod tests {
         let result = router_timeout_result();
         assert_eq!(result.request_id, "");
         assert!(result.data.is_empty());
-        assert!(matches!(result.meta.status, QuoteStatus::PartialFailure));
+        assert!(matches!(result.meta.status, QuoteStatus::PartialSuccess));
         assert_eq!(
             result.meta.result_quality,
             QuoteResultQuality::RequestLevelFailure

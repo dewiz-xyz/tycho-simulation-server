@@ -90,7 +90,7 @@ pub async fn get_amounts_out(
         .map(|token| token.is_cancelled())
         .unwrap_or(false)
     {
-        meta.status = QuoteStatus::PartialFailure;
+        meta.status = QuoteStatus::PartialSuccess;
         meta.result_quality = QuoteResultQuality::RequestLevelFailure;
         meta.pool_results = pool_results;
         meta.vm_unavailable = metrics.skipped_vm_unavailable;
@@ -629,11 +629,11 @@ pub async fn get_amounts_out(
                         quote_timeout.as_millis()
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
-                    meta.status = QuoteStatus::PartialFailure;
+                    meta.status = QuoteStatus::PartialSuccess;
                     break;
                 }
                 _ = cancel_token.cancelled() => {
-                    meta.status = QuoteStatus::PartialFailure;
+                    meta.status = QuoteStatus::PartialSuccess;
                     break;
                 }
                 maybe_outcome = tasks.next() => {
@@ -783,7 +783,7 @@ pub async fn get_amounts_out(
             None,
         ));
         if matches!(meta.status, QuoteStatus::Ready) {
-            meta.status = QuoteStatus::PartialFailure;
+            meta.status = QuoteStatus::PartialSuccess;
         }
     }
 
@@ -801,7 +801,7 @@ pub async fn get_amounts_out(
             ));
         } else {
             if matches!(meta.status, QuoteStatus::Ready) {
-                meta.status = QuoteStatus::PartialFailure;
+                meta.status = QuoteStatus::PartialSuccess;
             }
             if failures.is_empty() {
                 failures.push(make_failure(
@@ -841,7 +841,7 @@ pub async fn get_amounts_out(
         );
 
         if !failures.is_empty() && matches!(meta.status, QuoteStatus::Ready) {
-            meta.status = QuoteStatus::PartialFailure;
+            meta.status = QuoteStatus::PartialSuccess;
         }
     }
 
@@ -2250,7 +2250,7 @@ mod tests {
         );
         assert!(matches!(
             computation.meta.status,
-            QuoteStatus::PartialFailure
+            QuoteStatus::PartialSuccess
         ));
         assert_eq!(computation.meta.failures.len(), 1);
         assert_eq!(computation.meta.pool_results.len(), 1);
@@ -2493,7 +2493,7 @@ mod tests {
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert!(matches!(
             computation.meta.status,
-            QuoteStatus::PartialFailure
+            QuoteStatus::PartialSuccess
         ));
         assert!(computation
             .meta
@@ -2590,7 +2590,7 @@ mod tests {
         );
         assert!(matches!(
             computation.meta.status,
-            QuoteStatus::PartialFailure
+            QuoteStatus::PartialSuccess
         ));
         assert_eq!(computation.metrics.skipped_native_concurrency, 1);
         assert!(computation
@@ -2693,7 +2693,7 @@ mod tests {
         );
         assert!(matches!(
             computation.meta.status,
-            QuoteStatus::PartialFailure
+            QuoteStatus::PartialSuccess
         ));
         assert_eq!(computation.metrics.skipped_native_deadline, 1);
         assert!(computation

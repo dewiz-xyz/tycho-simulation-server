@@ -76,7 +76,7 @@ pub async fn simulate(
                 timeout_ms,
             );
 
-            emit_simulate_completion(QuoteStatus::PartialFailure, true);
+            emit_simulate_completion(QuoteStatus::PartialSuccess, true);
             emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
             emit_simulate_timeout(TimeoutKind::RequestGuard);
 
@@ -315,7 +315,7 @@ fn build_request_guard_timeout_meta(
     };
 
     QuoteMeta {
-        status: QuoteStatus::PartialFailure,
+        status: QuoteStatus::PartialSuccess,
         result_quality: QuoteResultQuality::RequestLevelFailure,
         block_number,
         vm_block_number,
@@ -450,7 +450,7 @@ mod tests {
     fn request_guard_timeout_meta_uses_request_level_failure_quality() {
         let meta =
             build_request_guard_timeout_meta(12, Some(11), 42, Some("auction-1".to_string()), 1500);
-        assert!(matches!(meta.status, QuoteStatus::PartialFailure));
+        assert!(matches!(meta.status, QuoteStatus::PartialSuccess));
         assert_eq!(meta.result_quality, QuoteResultQuality::RequestLevelFailure);
         assert_eq!(meta.block_number, 12);
         assert_eq!(meta.vm_block_number, Some(11));

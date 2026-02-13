@@ -31,7 +31,7 @@ pub enum QuoteStatus {
     WarmingUp,
     TokenMissing,
     NoLiquidity,
-    PartialFailure,
+    PartialSuccess,
     InvalidRequest,
     InternalError,
 }

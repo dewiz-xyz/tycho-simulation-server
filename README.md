@@ -147,7 +147,7 @@ Mixed-outcome example (one usable result + one anomalous pool):
     }
   ],
   "meta": {
-    "status": "partial_failure",
+    "status": "partial_success",
     "result_quality": "partial",
     "block_number": 19876543,
     "vm_block_number": 19876540,
@@ -181,8 +181,8 @@ Mixed-outcome example (one usable result + one anomalous pool):
 ```
 
 Timeout behavior:
-- `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
-- `/simulate` router-level timeouts return `200 OK` with `partial_failure`. Logs include `scope="router_timeout"`.
+- `/simulate` handler-level timeouts return `200 OK` with `partial_success`, including a `timeout` failure.
+- `/simulate` router-level timeouts return `200 OK` with `partial_success`. Logs include `scope="router_timeout"`.
 - `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
   - `/status` is not subject to router-level timeouts.
 

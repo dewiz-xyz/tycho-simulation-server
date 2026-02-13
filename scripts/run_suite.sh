@@ -21,7 +21,7 @@ Options:
   --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default)
   --wait-vm-ready    Wait for vm_status=ready after /status is ready (only when VM pools are enabled)
   --allow-no-liquidity  Allow no_liquidity responses with only no_pools failures
-  --allow-partial    Allow partial_failure responses (and their failures)
+  --allow-partial    Allow partial_success responses (and their failures)
   --stop             Stop server when done (only if started by this script)
   -h, --help         Show this help
 
@@ -107,7 +107,7 @@ echo "Suite: $suite"
 echo "Enable VM pools: $enable_vm_pools"
 echo "Wait VM ready: $wait_vm_ready"
 echo "Allow no_liquidity: $allow_no_liquidity"
-echo "Allow partial_failure: $allow_partial"
+echo "Allow partial_success: $allow_partial"
 
 simulate_allow_status="ready"
 coverage_allow_status="ready"
@@ -116,9 +116,9 @@ allow_failures_flag=""
 allow_no_pools_flag=""
 
 if [[ "$allow_partial" == "true" ]]; then
-  simulate_allow_status="${simulate_allow_status},partial_failure"
-  coverage_allow_status="${coverage_allow_status},partial_failure"
-  latency_allow_status="${latency_allow_status},partial_failure"
+  simulate_allow_status="${simulate_allow_status},partial_success"
+  coverage_allow_status="${coverage_allow_status},partial_success"
+  latency_allow_status="${latency_allow_status},partial_success"
   allow_failures_flag="--allow-failures"
 fi
 
