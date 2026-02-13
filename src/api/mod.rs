@@ -12,7 +12,7 @@ use tower::{
 };
 use tracing::warn;
 
-use crate::handlers::{quote::simulate, readiness::status};
+use crate::handlers::{pools::pools, quote::simulate, readiness::status};
 use crate::metrics::{emit_simulate_completion, emit_simulate_timeout, TimeoutKind};
 use crate::models::factories::router_timeout_result;
 use crate::models::messages::QuoteStatus;
@@ -34,6 +34,7 @@ pub fn create_router(app_state: AppState) -> Router {
                 })),
         )
         .route("/status", get(status))
+        .route("/pools", get(pools))
         .with_state(app_state)
 }
 

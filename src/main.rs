@@ -1,13 +1,16 @@
+use std::collections::HashSet;
+use std::fs::File;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use serde::Serialize;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
 use tycho_simulation_server::api::create_router;
-use tycho_simulation_server::config::{init_logging, load_config};
+use tycho_simulation_server::config::{init_logging, load_config, AppConfig};
 use tycho_simulation_server::handlers::stream::{
     supervise_native_stream, supervise_vm_stream, StreamSupervisorConfig, VmStreamControls,
 };
@@ -28,6 +31,14 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = load_config();
     info!("Initializing price service...");
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("token-diff") {
+        let output_path = parse_token_diff_output(&args[2..]);
+        run_token_diff(&config, &output_path).await?;
+        info!("Wrote token diff report to {}", output_path);
+        return Ok(());
+    }
 
     info!(
         event = "memory_config",
@@ -62,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         Some(&config.api_key),
         true,
         Chain::Ethereum,
-        Some(10),
+        Some(0),
         None,
     )
     .await?;
@@ -240,5 +251,89 @@ async fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("Failed to start server: {}", e)
         })?;
 
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct TokenDiffReport {
+    min_quality_0_count: usize,
+    min_quality_10_count: usize,
+    only_in_min_quality_0_symbols: Vec<String>,
+    only_in_min_quality_10_symbols: Vec<String>,
+}
+
+fn parse_token_diff_output(args: &[String]) -> String {
+    let mut output = "token_diff.json".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--out" && index + 1 < args.len() {
+            output = args[index + 1].clone();
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    output
+}
+
+async fn run_token_diff(config: &AppConfig, output_path: &str) -> anyhow::Result<()> {
+    let tokens_min_0 = load_all_tokens(
+        &config.tycho_url,
+        false,
+        Some(&config.api_key),
+        true,
+        Chain::Ethereum,
+        Some(0),
+        None,
+    )
+    .await?;
+    let tokens_min_10 = load_all_tokens(
+        &config.tycho_url,
+        false,
+        Some(&config.api_key),
+        true,
+        Chain::Ethereum,
+        Some(10),
+        None,
+    )
+    .await?;
+
+    let set_min_0: HashSet<String> = tokens_min_0
+        .iter()
+        .map(|(address, _)| address.to_string())
+        .collect();
+    let set_min_10: HashSet<String> = tokens_min_10
+        .iter()
+        .map(|(address, _)| address.to_string())
+        .collect();
+    let symbol_by_address_min_0: std::collections::HashMap<String, String> = tokens_min_0
+        .iter()
+        .map(|(address, token)| (address.to_string(), token.symbol.clone()))
+        .collect();
+    let symbol_by_address_min_10: std::collections::HashMap<String, String> = tokens_min_10
+        .iter()
+        .map(|(address, token)| (address.to_string(), token.symbol.clone()))
+        .collect();
+
+    let mut only_in_min_0: Vec<String> = set_min_0
+        .difference(&set_min_10)
+        .filter_map(|address| symbol_by_address_min_0.get(address).cloned())
+        .collect();
+    let mut only_in_min_10: Vec<String> = set_min_10
+        .difference(&set_min_0)
+        .filter_map(|address| symbol_by_address_min_10.get(address).cloned())
+        .collect();
+    only_in_min_0.sort_unstable();
+    only_in_min_10.sort_unstable();
+
+    let report = TokenDiffReport {
+        min_quality_0_count: set_min_0.len(),
+        min_quality_10_count: set_min_10.len(),
+        only_in_min_quality_0_symbols: only_in_min_0,
+        only_in_min_quality_10_symbols: only_in_min_10,
+    };
+
+    let file = File::create(output_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
     Ok(())
 }

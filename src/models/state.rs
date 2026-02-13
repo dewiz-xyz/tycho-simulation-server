@@ -395,6 +395,34 @@ impl StateStore {
         self.id_to_kind.read().await.contains_key(id)
     }
 
+    pub async fn pool_components_by_kind(
+        &self,
+        kind: ProtocolKind,
+    ) -> Vec<(String, Arc<ProtocolComponent>)> {
+        let Some(shard) = self.shards.get(&kind) else {
+            return Vec::new();
+        };
+        let guard = shard.states.read().await;
+        guard
+            .iter()
+            .map(|(id, (_, component))| (id.clone(), Arc::clone(component)))
+            .collect()
+    }
+
+    pub async fn pool_entries_by_kind(
+        &self,
+        kind: ProtocolKind,
+    ) -> Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> {
+        let Some(shard) = self.shards.get(&kind) else {
+            return Vec::new();
+        };
+        let guard = shard.states.read().await;
+        guard
+            .iter()
+            .map(|(id, (state, component))| (id.clone(), Arc::clone(state), Arc::clone(component)))
+            .collect()
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
@@ -864,6 +892,47 @@ mod tests {
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn pool_components_by_kind_filters_protocol() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let token_a = mk_token(10, "TKNA");
+        let token_b = mk_token(11, "TKNB");
+        let token_c = mk_token(12, "TKNC");
+
+        let curve_component = mk_component(
+            30,
+            "vm:curve",
+            "curve_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let v2_component =
+            mk_component(31, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_c]);
+
+        store
+            .apply_update(mk_update(vec![
+                (
+                    "pool-curve".to_string(),
+                    curve_component,
+                    Box::new(DummySim),
+                ),
+                ("pool-v2".to_string(), v2_component, Box::new(DummySim)),
+            ]))
+            .await;
+
+        let curve_pools = store.pool_components_by_kind(ProtocolKind::Curve).await;
+        assert_eq!(curve_pools.len(), 1);
+        assert_eq!(curve_pools[0].0, "pool-curve");
+        assert_eq!(curve_pools[0].1.protocol_system, "vm:curve");
     }
 
     async fn matching_pools_includes_native_for_wrapped_native() {

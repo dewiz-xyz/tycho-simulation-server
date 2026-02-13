@@ -129,6 +129,41 @@ Returns readiness information for health checks and pollers:
 
 If the service is still ingesting initial state the endpoint responds with `503 Service Unavailable` and `"status": "warming_up"`.
 
+### `GET /pools?protocol=curve&source=vm`
+
+Returns the requested protocol pools currently present in the VM or native state store, including pool address and token metadata, to help diagnose stream coverage. Use `source=vm` (default), `source=native`, or `source=both`. Omit `protocol` to return all protocols. Limits are computed using the first two tokens in `token_addresses`.
+
+Example:
+
+```json
+{
+  "source": "vm",
+  "vm_enabled": true,
+  "vm_status": "ready",
+  "vm_block": 19876540,
+  "vm_pools": 412,
+  "native_status": "ready",
+  "native_block": 19876543,
+  "native_pools": 310,
+  "protocol": "curve",
+  "protocol_pools": 115,
+  "data": [
+    {
+      "source": "vm",
+      "pair_id": "0x...",
+      "pool_address": "0x...",
+      "pool_name": "Curve.fi DAI/USDC/USDT",
+      "protocol_system": "vm:curve",
+      "protocol_type_name": "curve_pool",
+      "token_addresses": ["0x...", "0x..."],
+      "token_symbols": ["DAI", "USDC"],
+      "limit_in": "12345",
+      "limit_out": "67890"
+    }
+  ]
+}
+```
+
 ## Usage
 
 Launch the server after exporting the necessary environment variables:
