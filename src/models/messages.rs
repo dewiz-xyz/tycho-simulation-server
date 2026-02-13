@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize, Serializer};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AmountOutRequest {
     pub request_id: String,
@@ -29,6 +33,28 @@ pub enum QuoteStatus {
     NoLiquidity,
     PartialFailure,
     InvalidRequest,
+    InternalError,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteResultQuality {
+    Complete,
+    Partial,
+    NoResults,
+    RequestLevelFailure,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolOutcomeKind {
+    PartialOutput,
+    ZeroOutput,
+    SkippedConcurrency,
+    SkippedDeadline,
+    SkippedPrecheck,
+    TimedOut,
+    SimulatorError,
     InternalError,
 }
 
@@ -89,8 +115,22 @@ pub struct QuoteFailure {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct PoolSimulationOutcome {
+    pub pool: String,
+    pub pool_name: String,
+    pub pool_address: String,
+    pub protocol: String,
+    pub outcome: PoolOutcomeKind,
+    pub reported_steps: usize,
+    pub expected_steps: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct QuoteMeta {
     pub status: QuoteStatus,
+    pub result_quality: QuoteResultQuality,
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
@@ -100,6 +140,10 @@ pub struct QuoteMeta {
     pub total_pools: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_results: Vec<PoolSimulationOutcome>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vm_unavailable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<QuoteFailure>,
 }
@@ -219,4 +263,33 @@ pub struct EncodeErrorResponse {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PoolOutcomeKind, QuoteResultQuality};
+
+    #[test]
+    fn quote_result_quality_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&QuoteResultQuality::RequestLevelFailure).unwrap(),
+            "\"request_level_failure\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QuoteResultQuality::NoResults).unwrap(),
+            "\"no_results\""
+        );
+    }
+
+    #[test]
+    fn pool_outcome_kind_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PoolOutcomeKind::SkippedPrecheck).unwrap(),
+            "\"skipped_precheck\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PoolOutcomeKind::PartialOutput).unwrap(),
+            "\"partial_output\""
+        );
+    }
 }

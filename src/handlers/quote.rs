@@ -6,10 +6,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    metrics::{emit_simulate_completion, emit_simulate_timeout, TimeoutKind},
+    metrics::{
+        emit_simulate_completion, emit_simulate_result_quality, emit_simulate_timeout, TimeoutKind,
+    },
     models::{
         messages::{
-            AmountOutRequest, QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResult, QuoteStatus,
+            AmountOutRequest, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
+            QuoteFailureKind, QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus,
         },
         state::AppState,
     },
@@ -65,27 +68,16 @@ pub async fn simulate(
                 "Simulate request timed out at request-level guard"
             );
 
-            let failure = QuoteFailure {
-                kind: QuoteFailureKind::Timeout,
-                message: format!("Simulate request timed out after {}ms", timeout_ms),
-                pool: None,
-                pool_name: None,
-                pool_address: None,
-                protocol: None,
-            };
-
-            let meta = QuoteMeta {
-                status: QuoteStatus::PartialFailure,
+            let meta = build_request_guard_timeout_meta(
                 block_number,
                 vm_block_number,
-                matching_pools: 0,
-                candidate_pools: 0,
-                total_pools: Some(total_pools),
-                auction_id: request.auction_id.clone(),
-                failures: vec![failure],
-            };
+                total_pools,
+                request.auction_id.clone(),
+                timeout_ms,
+            );
 
             emit_simulate_completion(QuoteStatus::PartialFailure, true);
+            emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
             emit_simulate_timeout(TimeoutKind::RequestGuard);
 
             return Json(QuoteResult {
@@ -113,6 +105,7 @@ pub async fn simulate(
     let top_gas_used = top_response.and_then(|response| response.gas_used.first().copied());
 
     let failure_summary = summarize_failures(&computation.meta.failures);
+    let pool_outcome_summary = summarize_pool_outcomes(&computation.meta.pool_results);
 
     macro_rules! log_completion {
         ($level:expr, $scope:expr, $msg:expr) => {
@@ -123,8 +116,11 @@ pub async fn simulate(
                 auction_id,
                 latency_ms,
                 status = ?computation.meta.status,
+                result_quality = ?computation.meta.result_quality,
+                vm_unavailable = computation.meta.vm_unavailable,
                 responses = computation.responses.len(),
                 failures = computation.meta.failures.len(),
+                pool_results = computation.meta.pool_results.len(),
                 scheduled_native_pools = computation.metrics.scheduled_native_pools,
                 scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
                 simulation_runs = computation.metrics.scheduled_native_pools + computation.metrics.scheduled_vm_pools,
@@ -152,6 +148,9 @@ pub async fn simulate(
                 failure_protocols = ?failure_summary.protocol_counts,
                 failure_pool_kinds = ?failure_summary.pool_kind_counts,
                 failure_samples = ?failure_summary.samples,
+                outcome_kinds = ?pool_outcome_summary.kind_counts,
+                outcome_protocols = ?pool_outcome_summary.protocol_counts,
+                outcome_samples = ?pool_outcome_summary.samples,
                 $msg
             );
         };
@@ -172,6 +171,7 @@ pub async fn simulate(
     }
 
     emit_simulate_completion(computation.meta.status, timed_out);
+    emit_simulate_result_quality(computation.meta.result_quality);
 
     Json(QuoteResult {
         request_id: request.request_id,
@@ -237,9 +237,96 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
     }
 }
 
+#[derive(Debug, Default)]
+struct PoolOutcomeSummary {
+    kind_counts: Vec<(String, usize)>,
+    protocol_counts: Vec<(String, usize)>,
+    samples: Vec<String>,
+}
+
+fn summarize_pool_outcomes(outcomes: &[PoolSimulationOutcome]) -> PoolOutcomeSummary {
+    if outcomes.is_empty() {
+        return PoolOutcomeSummary::default();
+    }
+
+    let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut protocol_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut samples = Vec::new();
+
+    for outcome in outcomes {
+        *kind_counts
+            .entry(pool_outcome_kind_label(outcome.outcome).to_string())
+            .or_insert(0) += 1;
+        *protocol_counts.entry(outcome.protocol.clone()).or_insert(0) += 1;
+
+        if samples.len() < 5 {
+            samples.push(format!(
+                "outcome={:?} protocol={} pool={} pool_name={} reported_steps={} expected_steps={} reason={:?}",
+                outcome.outcome,
+                outcome.protocol,
+                outcome.pool,
+                outcome.pool_name,
+                outcome.reported_steps,
+                outcome.expected_steps,
+                outcome.reason
+            ));
+        }
+    }
+
+    PoolOutcomeSummary {
+        kind_counts: kind_counts.into_iter().collect(),
+        protocol_counts: protocol_counts.into_iter().collect(),
+        samples,
+    }
+}
+
+fn pool_outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
+    match kind {
+        PoolOutcomeKind::PartialOutput => "partial_output",
+        PoolOutcomeKind::ZeroOutput => "zero_output",
+        PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
+        PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
+        PoolOutcomeKind::SkippedPrecheck => "skipped_precheck",
+        PoolOutcomeKind::TimedOut => "timed_out",
+        PoolOutcomeKind::SimulatorError => "simulator_error",
+        PoolOutcomeKind::InternalError => "internal_error",
+    }
+}
+
 struct CancelOnDrop {
     token: CancellationToken,
     armed: bool,
+}
+
+fn build_request_guard_timeout_meta(
+    block_number: u64,
+    vm_block_number: Option<u64>,
+    total_pools: usize,
+    auction_id: Option<String>,
+    timeout_ms: u64,
+) -> QuoteMeta {
+    let failure = QuoteFailure {
+        kind: QuoteFailureKind::Timeout,
+        message: format!("Simulate request timed out after {}ms", timeout_ms),
+        pool: None,
+        pool_name: None,
+        pool_address: None,
+        protocol: None,
+    };
+
+    QuoteMeta {
+        status: QuoteStatus::PartialFailure,
+        result_quality: QuoteResultQuality::RequestLevelFailure,
+        block_number,
+        vm_block_number,
+        matching_pools: 0,
+        candidate_pools: 0,
+        total_pools: Some(total_pools),
+        auction_id,
+        pool_results: Vec::new(),
+        vm_unavailable: false,
+        failures: vec![failure],
+    }
 }
 
 impl CancelOnDrop {
@@ -263,7 +350,7 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::messages::{QuoteFailure, QuoteFailureKind};
+    use crate::models::messages::{PoolOutcomeKind, QuoteFailure, QuoteFailureKind};
 
     fn make_failure(kind: QuoteFailureKind, protocol: Option<&str>) -> QuoteFailure {
         QuoteFailure {
@@ -357,5 +444,71 @@ mod tests {
             .map(|(k, _)| k.clone())
             .collect();
         assert_eq!(protocol_keys, vec!["aave_v3", "balancer_v2", "vm:curve"]);
+    }
+
+    #[test]
+    fn request_guard_timeout_meta_uses_request_level_failure_quality() {
+        let meta =
+            build_request_guard_timeout_meta(12, Some(11), 42, Some("auction-1".to_string()), 1500);
+        assert!(matches!(meta.status, QuoteStatus::PartialFailure));
+        assert_eq!(meta.result_quality, QuoteResultQuality::RequestLevelFailure);
+        assert_eq!(meta.block_number, 12);
+        assert_eq!(meta.vm_block_number, Some(11));
+        assert_eq!(meta.total_pools, Some(42));
+        assert_eq!(meta.auction_id.as_deref(), Some("auction-1"));
+        assert!(meta.pool_results.is_empty());
+        assert!(!meta.vm_unavailable);
+        assert_eq!(meta.failures.len(), 1);
+        assert!(matches!(meta.failures[0].kind, QuoteFailureKind::Timeout));
+    }
+
+    #[test]
+    fn summarize_pool_outcomes_groups_by_kind_and_protocol() {
+        let outcomes = vec![
+            PoolSimulationOutcome {
+                pool: "pool-1".to_string(),
+                pool_name: "pool one".to_string(),
+                pool_address: "0x1".to_string(),
+                protocol: "vm:curve".to_string(),
+                outcome: PoolOutcomeKind::SkippedDeadline,
+                reported_steps: 0,
+                expected_steps: 2,
+                reason: Some("deadline reached".to_string()),
+            },
+            PoolSimulationOutcome {
+                pool: "pool-2".to_string(),
+                pool_name: "pool two".to_string(),
+                pool_address: "0x2".to_string(),
+                protocol: "vm:curve".to_string(),
+                outcome: PoolOutcomeKind::SkippedDeadline,
+                reported_steps: 0,
+                expected_steps: 2,
+                reason: None,
+            },
+            PoolSimulationOutcome {
+                pool: "pool-3".to_string(),
+                pool_name: "pool three".to_string(),
+                pool_address: "0x3".to_string(),
+                protocol: "uniswap_v3".to_string(),
+                outcome: PoolOutcomeKind::PartialOutput,
+                reported_steps: 1,
+                expected_steps: 2,
+                reason: Some("partial ladder".to_string()),
+            },
+        ];
+
+        let summary = summarize_pool_outcomes(&outcomes);
+        assert_eq!(
+            summary.kind_counts,
+            vec![
+                ("partial_output".to_string(), 1),
+                ("skipped_deadline".to_string(), 2),
+            ]
+        );
+        assert_eq!(
+            summary.protocol_counts,
+            vec![("uniswap_v3".to_string(), 1), ("vm:curve".to_string(), 2)]
+        );
+        assert_eq!(summary.samples.len(), 3);
     }
 }
