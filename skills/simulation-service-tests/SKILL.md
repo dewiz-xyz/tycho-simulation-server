@@ -1,6 +1,6 @@
 ---
 name: simulation-service-tests
-description: Run, test, benchmark, upgrade, and deploy the Tycho simulation server in this repo (tycho-simulation-server). Use when starting/stopping the service, waiting for /status readiness, validating /simulate across many token pairs/pools/protocols (including VM pools like curve/balancer), computing p50/p90/p99 latencies, running load/stress tests, or verifying upgrades and deployments (cargo fmt/clippy/test, docker build, CDK synth/diff/deploy).
+description: Run, test, benchmark, upgrade, and deploy the Tycho simulation server in this repo (tycho-simulation-server). Use when starting/stopping the service, waiting for /status readiness, validating /simulate across many token pairs/pools/protocols (including VM pools like curve/balancer/maverick), computing p50/p90/p99 latencies, running load/stress tests, or verifying upgrades and deployments (cargo fmt/clippy/test, docker build, CDK synth/diff/deploy).
 metadata:
   short-description: Tycho simulation service tests
 ---
@@ -30,7 +30,7 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
-VM pools (Curve/Balancer feeds) are enabled by default. To exclude them:
+VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
 ```bash
 scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop
 ```
@@ -84,11 +84,11 @@ python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json
 python3 scripts/coverage_sweep.py --suite v4_candidates
 ```
 
-VM pool feeds (Curve/Balancer) are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
+VM pool feeds (Curve/Balancer/Maverick) are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
 
 To assert specific protocol presence (derived from `pool_name` prefixes), use:
 ```bash
-python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4
+python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,rocketpool,maverick_v2
 ```
 
 Allow `no_liquidity` responses with only `no_pools` failures:

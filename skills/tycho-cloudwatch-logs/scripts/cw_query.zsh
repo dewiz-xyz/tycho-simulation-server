@@ -176,7 +176,7 @@ fields @timestamp, @logStream
 | parse @message /"auction_id":"(?<auction_id>[^"]+)"/
 | parse @message /"token_in":"(?<token_in>[^"]+)"/
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
-| parse @message /"amounts":(?<amounts>\[[^\]]*\])/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
 | filter msg like /Received simulate request/
 | sort @timestamp desc
 | display @timestamp, request_id, auction_id, token_in, token_out, amounts, msg, @logStream
