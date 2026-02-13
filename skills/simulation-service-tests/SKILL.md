@@ -59,7 +59,7 @@ python3 scripts/simulate_smoke.py --suite smoke --require-data --validate-data
 
 Allow partial responses explicitly:
 ```bash
-python3 scripts/simulate_smoke.py --suite smoke --allow-status ready,partial_failure --allow-failures
+python3 scripts/simulate_smoke.py --suite smoke --allow-status ready,partial_success --allow-failures
 ```
 
 ## Smoke test /encode
@@ -73,7 +73,7 @@ Examples:
 python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .
 ```
 ```bash
-python3 scripts/encode_smoke.py --allow-status ready,partial_failure --allow-failures --verbose
+python3 scripts/encode_smoke.py --allow-status ready,partial_success --allow-failures --verbose
 ```
 
 ## Pool/protocol coverage sweeps

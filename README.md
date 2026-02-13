@@ -74,7 +74,7 @@ The following environment variables are read at startup:
 - `STREAM_MEM_LOG_MIN_NEW_PAIRS` – Only snapshot on stream updates with at least this many new pairs (default: `1000`)
 - `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
-Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The response `meta.status` may become `partial_failure` with a `concurrency_limit` failure describing skipped counts.
+Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. `meta.status` remains an operational/reliability signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
 
 ## Docs
 
@@ -114,6 +114,7 @@ Response body:
   ],
   "meta": {
     "status": "ready",
+    "result_quality": "complete",
     "block_number": 19876543,
     "vm_block_number": 19876540,
     "matching_pools": 4,
@@ -124,11 +125,64 @@ Response body:
 }
 ```
 
-`QuoteMeta.status` communicates warm-up, validation, and partial-failure states—HTTP status codes remain `200 OK`. `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
+`QuoteMeta.status` communicates warm-up, validation, and request reliability states. `meta.result_quality` communicates quote completeness (`complete`, `partial`, `no_results`, `request_level_failure`). HTTP status codes remain `200 OK`.
+
+`meta.pool_results` contains anomaly-only per-pool outcomes (`partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `skipped_precheck`, `timed_out`, `simulator_error`, `internal_error`). `meta.vm_unavailable=true` indicates VM pools were skipped because VM state was not ready.
+
+`block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
+
+Mixed-outcome example (one usable result + one anomalous pool):
+
+```json
+{
+  "request_id": "req-456",
+  "data": [
+    {
+      "pool": "pool-good",
+      "pool_name": "uniswap_v2::DAI/USDC",
+      "pool_address": "0x1111...",
+      "amounts_out": ["100", "990"],
+      "gas_used": [120000, 120000],
+      "block_number": 19876543
+    }
+  ],
+  "meta": {
+    "status": "partial_success",
+    "result_quality": "partial",
+    "block_number": 19876543,
+    "vm_block_number": 19876540,
+    "matching_pools": 2,
+    "candidate_pools": 2,
+    "total_pools": 412,
+    "pool_results": [
+      {
+        "pool": "pool-bad",
+        "pool_name": "uniswap_v2::DAI/USDC",
+        "pool_address": "0x2222...",
+        "protocol": "uniswap_v2",
+        "outcome": "simulator_error",
+        "reported_steps": 0,
+        "expected_steps": 2,
+        "reason": "Probe quote failed..."
+      }
+    ],
+    "failures": [
+      {
+        "kind": "simulator",
+        "message": "...",
+        "pool": "pool-bad",
+        "pool_name": "uniswap_v2::DAI/USDC",
+        "pool_address": "0x2222...",
+        "protocol": "uniswap_v2"
+      }
+    ]
+  }
+}
+```
 
 Timeout behavior:
-- `/simulate` handler-level timeouts return `200 OK` with `partial_failure`, including a `timeout` failure.
-- `/simulate` router-level timeouts return `200 OK` with `partial_failure`. Logs include `scope="router_timeout"`.
+- `/simulate` handler-level timeouts return `200 OK` with `partial_success`, including a `timeout` failure.
+- `/simulate` router-level timeouts return `200 OK` with `partial_success`. Logs include `scope="router_timeout"`.
 - `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
   - `/status` is not subject to router-level timeouts.
 

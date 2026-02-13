@@ -167,8 +167,28 @@ pub async fn process_stream(
                         new_pairs = metrics.new_pairs,
                         removed_pairs = metrics.removed_pairs,
                         total_pairs = metrics.total_pairs,
+                        new_pairs_missing_state = metrics.new_pairs_missing_state,
+                        unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
+                        updates_for_unknown_pair = metrics.updates_for_unknown_pair,
+                        states_missing_in_shard = metrics.states_missing_in_shard,
+                        removed_unknown_pair = metrics.removed_unknown_pair,
+                        anomaly_samples = ?metrics.anomaly_samples,
                         "Stream update processed"
                     );
+                    if metrics.has_anomalies() {
+                        warn!(
+                            event = "stream_update_anomaly",
+                            stream = kind.as_str(),
+                            block = metrics.block_number,
+                            new_pairs_missing_state = metrics.new_pairs_missing_state,
+                            unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
+                            updates_for_unknown_pair = metrics.updates_for_unknown_pair,
+                            states_missing_in_shard = metrics.states_missing_in_shard,
+                            removed_unknown_pair = metrics.removed_unknown_pair,
+                            anomaly_samples = ?metrics.anomaly_samples,
+                            "Stream update contained ingest anomalies"
+                        );
+                    }
                     maybe_log_memory_snapshot(
                         kind.as_str(),
                         "stream_update",
@@ -189,6 +209,7 @@ pub async fn process_stream(
                 }
                 Err(err) => {
                     let err_msg = err.to_string();
+                    let error_kind = classify_stream_error(&err_msg);
                     if is_missing_block_error(&err_msg) {
                         health.set_last_error(Some(err_msg.clone())).await;
                         let now = Instant::now();
@@ -199,6 +220,8 @@ pub async fn process_stream(
                             info!(
                                 event = "stream_missing_block",
                                 stream = kind.as_str(),
+                                error_kind,
+                                error = %err_msg,
                                 missing_block_total = burst.total_count,
                                 burst_count = burst.burst_count,
                                 window_secs = cfg.missing_block_window.as_secs(),
@@ -217,6 +240,7 @@ pub async fn process_stream(
                         health.set_last_error(Some(err_msg.clone())).await;
                         warn!(
                             stream = kind.as_str(),
+                            error_kind,
                             error = %err_msg,
                             error_total = burst.total_count,
                             burst_count = burst.burst_count,
@@ -455,6 +479,19 @@ fn is_missing_block_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("missing block")
 }
 
+fn classify_stream_error(message: &str) -> &'static str {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("statedecodingfailure") {
+        "state_decoding_failure"
+    } else if lowered.contains("missingcode") {
+        "missing_code"
+    } else if lowered.contains("missing block") {
+        "missing_block"
+    } else {
+        "other"
+    }
+}
+
 fn next_backoff(current: Duration, max: Duration) -> Duration {
     let doubled = current.saturating_mul(2);
     if doubled > max {
@@ -470,4 +507,33 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
     let jitter = rand::thread_rng().gen_range(-clamped..=clamped);
     let adjusted = (base_ms * (1.0 + jitter)).max(1.0);
     adjusted.round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_stream_error;
+
+    #[test]
+    fn classifies_state_decoding_failure_messages() {
+        let kind = classify_stream_error("StateDecodingFailure: vm:curve failed to decode");
+        assert_eq!(kind, "state_decoding_failure");
+    }
+
+    #[test]
+    fn classifies_missing_code_messages() {
+        let kind = classify_stream_error("Bad account update: MissingCode for 0xabc");
+        assert_eq!(kind, "missing_code");
+    }
+
+    #[test]
+    fn classifies_missing_block_messages() {
+        let kind = classify_stream_error("Missing block detected");
+        assert_eq!(kind, "missing_block");
+    }
+
+    #[test]
+    fn classifies_other_messages() {
+        let kind = classify_stream_error("stream closed by peer");
+        assert_eq!(kind, "other");
+    }
 }

@@ -70,9 +70,9 @@ python3 scripts/latency_percentiles.py --suite core --requests 200 --concurrency
   - `scripts/start_server.sh --repo .`
   - `scripts/stop_server.sh --repo .`
 - **Readiness timeouts**: check `logs/tycho-sim-server.log` for startup errors.
-- **Partial failures**: `/simulate` returns `200 OK` even when `meta.status=partial_failure`. The suite requires `ready` by default.
+- **Partial successes**: `/simulate` returns `200 OK` even when `meta.status=partial_success`. The suite requires `ready` by default.
 
 ## Customization Notes
 
-- Use `--allow-status ready,partial_failure` and `--allow-failures` on the Python scripts if you want to tolerate partial failures.
+- Use `--allow-status ready,partial_success` and `--allow-failures` on the Python scripts if you want to tolerate partial successes.
 - Change suites or token lists in `scripts/presets.py` to match your coverage needs.
