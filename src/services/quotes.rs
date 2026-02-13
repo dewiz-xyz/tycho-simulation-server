@@ -369,7 +369,7 @@ pub async fn get_amounts_out(
         .await;
 
     let vm_ready = state.vm_ready().await;
-    if !vm_ready {
+    if state.enable_vm_pools && !vm_ready {
         metrics.skipped_vm_unavailable = true;
     }
     let vm_candidates_raw = if vm_ready {
@@ -976,11 +976,14 @@ async fn simulate_pool(
         // Short-circuit when the request exceeds pool limits to avoid wasted compute.
         //
         // Note: `get_limits` can be a "soft" limit (advisory). When the request exceeds the
-        // reported limit, we do a single probe at the maximum amount. If that probe fails with a
-        // clear limits signal, we only skip the whole pool when every requested amount exceeds
-        // that limit; otherwise we continue to quote the lower ladder amounts.
-        let mut probed_max: Option<(String, u64)> = None;
-        let mut probed_max_error: Option<String> = None;
+        // reported limit, we do a single probe before quoting the whole ladder:
+        // - If some requested amounts are within the reported max, probe the max requested amount
+        //   to avoid wasted compute for the largest step.
+        // - If every requested amount exceeds the reported max, probe the smallest requested
+        //   amount and only skip the whole pool if that also fails with a clear limits signal.
+        let mut probed_amount_in: Option<BigUint> = None;
+        let mut probed_amount: Option<(String, u64)> = None;
+        let mut probed_amount_error: Option<String> = None;
         if !requested_max_in.is_zero() {
             match pool_state.get_limits(
                 token_in_clone.address.clone(),
@@ -988,14 +991,28 @@ async fn simulate_pool(
             ) {
                 Ok((max_in, _max_out)) => {
                     if requested_max_in > max_in {
+                        let all_amounts_exceed_limit =
+                            amounts_clone.iter().all(|amount| amount > &max_in);
+                        let probe_amount_in = if all_amounts_exceed_limit {
+                            // Prefer probing the smallest requested amount when every request is
+                            // above the reported limit: `max_in` can be conservative.
+                            amounts_clone
+                                .iter()
+                                .min()
+                                .cloned()
+                                .unwrap_or_else(|| requested_max_in.clone())
+                        } else {
+                            requested_max_in.clone()
+                        };
                         match pool_state.get_amount_out(
-                            requested_max_in.clone(),
+                            probe_amount_in.clone(),
                             &token_in_clone,
                             &token_out_clone,
                         ) {
                             Ok(result) => {
                                 if let Some(gas_u64) = result.gas.to_u64() {
-                                    probed_max = Some((result.amount.to_string(), gas_u64));
+                                    probed_amount_in = Some(probe_amount_in);
+                                    probed_amount = Some((result.amount.to_string(), gas_u64));
                                 } else {
                                     return PoolSimOutcome::Simulated(PoolQuoteResult {
                                         pool: pool_id,
@@ -1006,7 +1023,7 @@ async fn simulate_pool(
                                         gas_used: Vec::new(),
                                         errors: vec![format!(
                                             "Probe quote returned gas that does not fit u64 (amount_in={}, max_in={})",
-                                            requested_max_in, max_in,
+                                            probe_amount_in, max_in,
                                         )],
                                         timed_out: false,
                                     });
@@ -1015,14 +1032,12 @@ async fn simulate_pool(
                             Err(SimulationError::InvalidInput(message, maybe_result)) => {
                                 let probe_error = format!(
                                     "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
-                                    requested_max_in, max_in, message,
+                                    probe_amount_in, max_in, message,
                                 );
                                 if is_limits_exhaustion_probe_error(
                                     &message,
                                     maybe_result.is_some(),
                                 ) {
-                                    let all_amounts_exceed_limit =
-                                        amounts_clone.iter().all(|amount| amount > &max_in);
                                     if all_amounts_exceed_limit {
                                         debug!(
                                             scope = "limits_precheck",
@@ -1030,7 +1045,7 @@ async fn simulate_pool(
                                             protocol = %pool_protocol,
                                             pool_name = %pool_name,
                                             pool_address = %pool_address,
-                                            amount_in = %requested_max_in,
+                                            amount_in = %probe_amount_in,
                                             max_in = %max_in,
                                             "Skipping pool due to get_limits precheck: {}",
                                             message,
@@ -1042,7 +1057,7 @@ async fn simulate_pool(
                                             protocol: pool_protocol.clone(),
                                             reason: Some(format!(
                                                 "Exceeded pool limits during precheck (amount_in={}, max_in={}): {}",
-                                                requested_max_in, max_in, message
+                                                probe_amount_in, max_in, message
                                             )),
                                         };
                                     }
@@ -1052,12 +1067,13 @@ async fn simulate_pool(
                                         protocol = %pool_protocol,
                                         pool_name = %pool_name,
                                         pool_address = %pool_address,
-                                        amount_in = %requested_max_in,
+                                        amount_in = %probe_amount_in,
                                         max_in = %max_in,
                                         "Probe indicates limit on max amount; continuing with lower amounts: {}",
                                         message,
                                     );
-                                    probed_max_error = Some(probe_error);
+                                    probed_amount_in = Some(probe_amount_in);
+                                    probed_amount_error = Some(probe_error);
                                 } else {
                                     return PoolSimOutcome::Simulated(PoolQuoteResult {
                                         pool: pool_id,
@@ -1081,7 +1097,7 @@ async fn simulate_pool(
                                     gas_used: Vec::new(),
                                     errors: vec![format!(
                                         "Probe quote failed (amount_in={}, max_in={}): {}",
-                                        requested_max_in, max_in, other,
+                                        probe_amount_in, max_in, other,
                                     )],
                                     timed_out: false,
                                 });
@@ -1127,17 +1143,17 @@ async fn simulate_pool(
                 break;
             }
 
-            if let Some((amount_out, gas_u64)) = &probed_max {
-                if amount_in == &requested_max_in {
-                    amounts_out.push(amount_out.clone());
-                    gas_used.push(*gas_u64);
-                    continue;
-                }
-            }
-            if let Some(probe_error) = &probed_max_error {
-                if amount_in == &requested_max_in {
-                    errors.push(probe_error.clone());
-                    continue;
+            if let Some(probed_amount_in_value) = probed_amount_in.as_ref() {
+                if amount_in == probed_amount_in_value {
+                    if let Some((amount_out, gas_u64)) = &probed_amount {
+                        amounts_out.push(amount_out.clone());
+                        gas_used.push(*gas_u64);
+                        continue;
+                    }
+                    if let Some(probe_error) = &probed_amount_error {
+                        errors.push(probe_error.clone());
+                        continue;
+                    }
                 }
             }
 
@@ -1775,8 +1791,169 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ConservativeLimitSim {
+        reported_max_in: BigUint,
+        actual_max_in: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for ConservativeLimitSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in > self.actual_max_in {
+                return Err(SimulationError::InvalidInput(
+                    format!("Sell amount exceeds limit {}", self.actual_max_in),
+                    None,
+                ));
+            }
+            Ok(GetAmountOutResult::new(
+                BigUint::zero(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.reported_max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     fn make_token(address: &Bytes, symbol: &str) -> Token {
         Token::new(address, symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    #[tokio::test]
+    async fn vm_unavailable_is_false_when_vm_pools_disabled() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(token_in.clone(), make_token(&token_in, "TK1"));
+        initial_tokens.insert(token_out.clone(), make_token(&token_out, "TK2"));
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        // Ensure the native store is ready so `get_amounts_out` reaches the vm readiness logic
+        // instead of returning early with `QuoteStatus::WarmingUp`.
+        let ready_token_a_hex = "0x0000000000000000000000000000000000000003";
+        let ready_token_b_hex = "0x0000000000000000000000000000000000000004";
+        let ready_token_a = Bytes::from_str(ready_token_a_hex).expect("valid address");
+        let ready_token_b = Bytes::from_str(ready_token_b_hex).expect("valid address");
+        let ready_component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![
+                make_token(&ready_token_a, "RDY1"),
+                make_token(&ready_token_b, "RDY2"),
+            ],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let mut ready_states = HashMap::new();
+        ready_states.insert(
+            "pool-ready".to_string(),
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(1u8),
+                calls: default_calls(),
+            }) as Box<dyn ProtocolSim>,
+        );
+        let mut ready_pairs = HashMap::new();
+        ready_pairs.insert("pool-ready".to_string(), ready_component);
+        native_state_store
+            .apply_update(Update::new(1, ready_states, ready_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store,
+            vm_state_store,
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-vm-disabled".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert!(!computation.meta.vm_unavailable);
     }
 
     #[tokio::test]
@@ -1928,6 +2105,59 @@ mod tests {
             }
             PoolSimOutcome::SkippedDueToLimits { .. } => {
                 panic!("mixed ladder should still quote lower amounts")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_skip_when_all_amounts_exceed_reported_limit_but_some_are_quotable() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = ConservativeLimitSim {
+            reported_max_in: BigUint::from(10u8),
+            actual_max_in: BigUint::from(15u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(
+            "pool-1".to_string(),
+            Arc::new(sim),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(11u8), BigUint::from(20u8)]),
+            BigUint::from(20u8),
+            2,
+            Instant::now() + Duration::from_secs(1),
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + remaining amount");
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(result.amounts_out.len(), 1);
+                assert_eq!(result.gas_used.len(), 1);
+                assert_eq!(result.errors.len(), 1);
+                assert!(result.errors[0]
+                    .to_ascii_lowercase()
+                    .contains("sell amount exceeds limit"));
+            }
+            PoolSimOutcome::SkippedDueToLimits { .. } => {
+                panic!("min-amount probe should prevent conservative get_limits skip")
             }
         }
     }
