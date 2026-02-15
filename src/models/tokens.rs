@@ -63,6 +63,15 @@ impl TokenStore {
         self.tokens.read().await.get(address).cloned()
     }
 
+    pub fn wrapped_native_token(&self) -> Option<Bytes> {
+        let address = self.chain.wrapped_native_token().address;
+        if address == Bytes::from([0u8; 20]) {
+            None
+        } else {
+            Some(address)
+        }
+    }
+
     /// Ensure the token metadata exists. If missing, fetch just that token via
     /// the Tycho RPC instead of refreshing the full list.
     pub async fn ensure(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
