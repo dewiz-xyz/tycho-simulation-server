@@ -34,3 +34,5 @@ tycho_node.log
 # Environment
 .env
 *.pdb 
+src/.DS_Store
+.DS_Store
