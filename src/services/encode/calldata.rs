@@ -686,4 +686,16 @@ mod tests {
             err.message()
         );
     }
+
+    #[test]
+    fn default_registry_supports_ekubo_v3() {
+        let registry = SwapEncoderRegistry::new(Chain::Ethereum)
+            .add_default_encoders(None)
+            .expect("default encoder registry should initialize");
+
+        assert!(
+            registry.get_encoder("ekubo_v3").is_some(),
+            "expected ekubo_v3 encoder in default registry"
+        );
+    }
 }
