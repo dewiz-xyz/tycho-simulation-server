@@ -167,6 +167,16 @@ pub async fn process_stream(
                         new_pairs = metrics.new_pairs,
                         removed_pairs = metrics.removed_pairs,
                         total_pairs = metrics.total_pairs,
+                        dropped_new_pairs_unknown_protocol =
+                            metrics.dropped_new_pairs_unknown_protocol,
+                        dropped_new_pairs_missing_state = metrics.dropped_new_pairs_missing_state,
+                        dropped_state_updates_unknown_pair =
+                            metrics.dropped_state_updates_unknown_pair,
+                        dropped_state_updates_missing_in_shard =
+                            metrics.dropped_state_updates_missing_in_shard,
+                        dropped_removals_unknown_pair = metrics.dropped_removals_unknown_pair,
+                        dropped_pools_total = metrics.dropped_pools_total,
+                        failed_pools_total = metrics.dropped_pools_total,
                         "Stream update processed"
                     );
                     maybe_log_memory_snapshot(

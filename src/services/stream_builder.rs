@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -20,17 +21,18 @@ use tycho_simulation::{
         stream::ProtocolStreamBuilder,
     },
     tycho_client::feed::component_tracker::ComponentFilter,
-    tycho_common::models::Chain,
+    tycho_common::{
+        models::{token::Token, Chain},
+        Bytes,
+    },
 };
-
-use crate::models::tokens::TokenStore;
 
 pub async fn build_native_stream(
     tycho_url: &str,
     api_key: &str,
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
-    tokens: Arc<TokenStore>,
+    stream_tokens: Arc<HashMap<Bytes, Token>>,
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -57,8 +59,11 @@ pub async fn build_native_stream(
     );
     builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
 
-    let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
+    let stream = builder
+        .set_tokens((*stream_tokens).clone())
+        .await
+        .build()
+        .await?;
 
     Ok(stream.map(|item| {
         item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
@@ -70,7 +75,7 @@ pub async fn build_vm_stream(
     api_key: &str,
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
-    tokens: Arc<TokenStore>,
+    stream_tokens: Arc<HashMap<Bytes, Token>>,
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -96,8 +101,11 @@ pub async fn build_vm_stream(
     builder =
         builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
-    let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
+    let stream = builder
+        .set_tokens((*stream_tokens).clone())
+        .await
+        .build()
+        .await?;
 
     Ok(stream.map(|item| {
         item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
