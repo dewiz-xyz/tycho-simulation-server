@@ -176,6 +176,12 @@ pub struct UpdateMetrics {
     pub new_pairs: usize,
     pub removed_pairs: usize,
     pub total_pairs: usize,
+    pub dropped_new_pairs_unknown_protocol: usize,
+    pub dropped_new_pairs_missing_state: usize,
+    pub dropped_state_updates_unknown_pair: usize,
+    pub dropped_state_updates_missing_in_shard: usize,
+    pub dropped_removals_unknown_pair: usize,
+    pub dropped_pools_total: usize,
 }
 
 pub struct StateStore {
@@ -285,6 +291,11 @@ impl StateStore {
         let mut index_removals: Vec<(Bytes, String)> = Vec::new();
 
         let mut new_pairs_count = 0;
+        let mut dropped_new_pairs_unknown_protocol = 0;
+        let mut dropped_new_pairs_missing_state = 0;
+        let mut dropped_state_updates_unknown_pair = 0;
+        let mut dropped_state_updates_missing_in_shard = 0;
+        let mut dropped_removals_unknown_pair = 0;
         let mut tokens_to_cache: Vec<Token> = Vec::new();
         for (id, component) in update.new_pairs.into_iter() {
             match ProtocolKind::from_component(&component) {
@@ -304,10 +315,12 @@ impl StateStore {
                             new_pairs_count += 1;
                         }
                     } else {
+                        dropped_new_pairs_missing_state += 1;
                         warn!("new pair {} missing state on update", id);
                     }
                 }
                 None => {
+                    dropped_new_pairs_unknown_protocol += 1;
                     warn!(
                         "ignoring new pair with unknown protocol: {}",
                         component.protocol_type_name
@@ -328,10 +341,12 @@ impl StateStore {
                     if shard.update_state(&id, Arc::from(state)).await {
                         updated_states += 1;
                     } else {
+                        dropped_state_updates_missing_in_shard += 1;
                         warn!("state missing in shard for id {}", id);
                     }
                 }
             } else {
+                dropped_state_updates_unknown_pair += 1;
                 warn!("update for unknown pair {}; dropping", id);
             }
         }
@@ -353,6 +368,7 @@ impl StateStore {
                     removed_pairs_count += 1;
                 }
             } else {
+                dropped_removals_unknown_pair += 1;
                 debug!(
                     "received removal for unknown pair {} ({})",
                     id, component.protocol_type_name
@@ -380,12 +396,24 @@ impl StateStore {
             let _ = self.ready_tx.send(value);
         }
 
+        let dropped_pools_total = dropped_new_pairs_unknown_protocol
+            + dropped_new_pairs_missing_state
+            + dropped_state_updates_unknown_pair
+            + dropped_state_updates_missing_in_shard
+            + dropped_removals_unknown_pair;
+
         UpdateMetrics {
             block_number,
             updated_states,
             new_pairs: new_pairs_count,
             removed_pairs: removed_pairs_count,
             total_pairs,
+            dropped_new_pairs_unknown_protocol,
+            dropped_new_pairs_missing_state,
+            dropped_state_updates_unknown_pair,
+            dropped_state_updates_missing_in_shard,
+            dropped_removals_unknown_pair,
+            dropped_pools_total,
         }
     }
 

@@ -67,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     info!("Loaded {} tokens", all_tokens.len());
+    let stream_decode_tokens = Arc::new(all_tokens.clone());
+    info!(
+        stream_decode_tokens = stream_decode_tokens.len(),
+        "Initialized deterministic stream decode token snapshot"
+    );
 
     // Create shared state
     // Shared token cache across native + VM stores to avoid duplicate fetches and keep metadata consistent.
@@ -136,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // Build protocol streams in background and start processing
     {
         let cfg = config.clone();
-        let tokens_bg = Arc::clone(&tokens);
+        let stream_tokens_bg = Arc::clone(&stream_decode_tokens);
         let state_store_bg = Arc::clone(&native_state_store);
         let health_bg = Arc::clone(&native_stream_health);
         let tycho_url = cfg.tycho_url.clone();
@@ -147,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Starting native protocol stream supervisor...");
             supervise_native_stream(
                 move || {
-                    let tokens = Arc::clone(&tokens_bg);
+                    let stream_tokens = Arc::clone(&stream_tokens_bg);
                     let tycho_url = tycho_url.clone();
                     let api_key = api_key.clone();
                     async move {
@@ -156,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                             &api_key,
                             tvl_threshold,
                             tvl_keep_threshold,
-                            tokens,
+                            stream_tokens,
                         )
                         .await
                     }
@@ -172,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
 
     if config.enable_vm_pools {
         let cfg = config.clone();
-        let tokens_bg = Arc::clone(&tokens);
+        let stream_tokens_bg = Arc::clone(&stream_decode_tokens);
         let state_store_bg = Arc::clone(&vm_state_store);
         let health_bg = Arc::clone(&vm_stream_health);
         let vm_stream_bg = Arc::clone(&vm_stream);
@@ -188,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Starting VM protocol stream supervisor...");
             supervise_vm_stream(
                 move || {
-                    let tokens = Arc::clone(&tokens_bg);
+                    let stream_tokens = Arc::clone(&stream_tokens_bg);
                     let tycho_url = tycho_url.clone();
                     let api_key = api_key.clone();
                     async move {
@@ -197,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
                             &api_key,
                             tvl_threshold,
                             tvl_keep_threshold,
-                            tokens,
+                            stream_tokens,
                         )
                         .await
                     }
