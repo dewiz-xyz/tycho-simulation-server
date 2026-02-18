@@ -15,6 +15,7 @@ use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 use crate::api::create_router;
 use crate::config::{init_logging, load_config};
 use crate::handlers::stream::process_stream;
+use crate::models::rfq::RFQConfig;
 use crate::models::state::{AppState, StateStore};
 use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_merged_streams;
@@ -56,25 +57,31 @@ async fn main() -> anyhow::Result<()> {
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
     let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
+    let pool_timeout_rfq = Duration::from_millis(config.pool_timeout_rfq_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
 
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
+    let rfq_sim_concurrency = config.global_rfq_sim_concurrency;
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
         state_store: Arc::clone(&state_store),
         quote_timeout,
         pool_timeout_native,
         pool_timeout_vm,
+        pool_timeout_rfq,
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
     };
 
     info!(
         native_sim_concurrency,
         vm_sim_concurrency,
+        rfq_sim_concurrency,
         enable_vm_pools = config.enable_vm_pools,
+        enable_rfq_pools = config.enable_rfq_pools,
         "Initialized simulation concurrency limits"
     );
 
@@ -83,6 +90,12 @@ async fn main() -> anyhow::Result<()> {
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&state_store);
+        let rfq_config = RFQConfig {
+            bebop_user: cfg.bebop_user,
+            bebop_key: cfg.bebop_key,
+            hashflow_user: cfg.hashflow_user,
+            hashflow_key: cfg.hashflow_key,
+        };
         tokio::spawn(async move {
             info!("Starting merged protocol streams in background...");
             match build_merged_streams(
@@ -92,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
                 cfg.tvl_keep_threshold,
                 tokens_bg,
                 cfg.enable_vm_pools,
+                cfg.enable_rfq_pools,
+                rfq_config,
             )
             .await
             {

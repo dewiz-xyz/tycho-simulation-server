@@ -19,9 +19,11 @@ pub struct AppState {
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
+    pub pool_timeout_rfq: Duration,
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -53,6 +55,10 @@ impl AppState {
         self.pool_timeout_vm
     }
 
+    pub fn pool_timeout_rfq(&self) -> Duration {
+        self.pool_timeout_rfq
+    }
+
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -63,6 +69,10 @@ impl AppState {
 
     pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.vm_sim_semaphore)
+    }
+
+    pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.rfq_sim_semaphore)
     }
 }
 

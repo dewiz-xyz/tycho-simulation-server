@@ -10,6 +10,7 @@ use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use tycho_simulation::rfq;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
@@ -26,10 +27,13 @@ use crate::models::tokens::TokenStoreError;
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub scheduled_rfq_pools: usize,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
+    pub skipped_rfq_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+    pub skipped_rfq_deadline: usize,
 }
 
 pub struct QuoteComputation {
@@ -312,15 +316,18 @@ pub async fn get_amounts_out(
 
     let mut native_candidates = Vec::new();
     let mut vm_candidates = Vec::new();
+    let mut rfq_candidates = Vec::new();
     for (id, (pool_state, component)) in candidates_raw.into_iter() {
         if component.protocol_system.starts_with("vm:") {
             vm_candidates.push((id, pool_state, component));
+        } else if component.protocol_system.starts_with("rfq:") {
+            rfq_candidates.push((id, pool_state, component));
         } else {
             native_candidates.push((id, pool_state, component));
         }
     }
 
-    let total_candidates = native_candidates.len() + vm_candidates.len();
+    let total_candidates = native_candidates.len() + vm_candidates.len() + rfq_candidates.len();
     meta.matching_pools = total_candidates;
     meta.candidate_pools = total_candidates;
 
@@ -366,9 +373,11 @@ pub async fn get_amounts_out(
     let mut tasks = FuturesUnordered::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
+    let rfq_semaphore = state.rfq_sim_semaphore();
     // Stable scheduling to reduce jitter under contention
     native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
     vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    rfq_candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Native first
     for (id, pool_state, component) in native_candidates.into_iter() {
@@ -488,6 +497,66 @@ pub async fn get_amounts_out(
         ));
     }
 
+    // RFQ Third
+    for (id, pool_state, component) in rfq_candidates.into_iter() {
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        let now = Instant::now();
+        let proposed_deadline = now + state.pool_timeout_rfq();
+        let pool_deadline = if proposed_deadline <= quote_deadline {
+            proposed_deadline
+        } else {
+            quote_deadline
+        };
+
+        if pool_deadline <= now {
+            metrics.skipped_rfq_deadline += 1;
+            continue;
+        }
+
+        let permit = match rfq_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                metrics.skipped_rfq_concurrency += 1;
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                failures.push(make_failure(
+                    QuoteFailureKind::Internal,
+                    "RFQ pool semaphore closed".to_string(),
+                    None,
+                ));
+                meta.status = QuoteStatus::InternalError;
+                break;
+            }
+        };
+
+        let pool_address = component.id.to_string();
+        let pool_protocol = component.protocol_system.clone();
+        let pool_name = derive_pool_name(&component);
+
+        let pool_cancel = cancel_token.child_token();
+        metrics.scheduled_rfq_pools += 1;
+
+        tasks.push(simulate_pool(
+            id,
+            pool_state,
+            pool_address,
+            pool_name,
+            pool_protocol,
+            Arc::clone(&token_in),
+            Arc::clone(&token_out),
+            Arc::clone(&amounts_in),
+            expected_len,
+            pool_deadline,
+            pool_cancel,
+            permit,
+        ));
+    }
+    // End of RFQ
+
     if !tasks.is_empty() {
         let remaining = quote_deadline
             .checked_duration_since(Instant::now())
@@ -589,17 +658,21 @@ pub async fn get_amounts_out(
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
     if metrics.skipped_native_concurrency > 0
         || metrics.skipped_vm_concurrency > 0
+        || metrics.skipped_rfq_concurrency > 0
         || metrics.skipped_native_deadline > 0
         || metrics.skipped_vm_deadline > 0
+        || metrics.skipped_rfq_deadline > 0
     {
         failures.push(make_failure(
             QuoteFailureKind::ConcurrencyLimit,
             format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} rfq_concurrency={} native_deadline={} vm_deadline={} rfq_deadline={}",
                 metrics.skipped_native_concurrency,
                 metrics.skipped_vm_concurrency,
+                metrics.skipped_rfq_concurrency,
                 metrics.skipped_native_deadline,
-                metrics.skipped_vm_deadline
+                metrics.skipped_vm_deadline,
+                metrics.skipped_rfq_deadline
             ),
             None,
         ));

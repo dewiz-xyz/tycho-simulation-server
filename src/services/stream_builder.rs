@@ -1,9 +1,19 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
+use tycho_simulation::protocol::models::Update;
+use tycho_simulation::rfq::protocols::bebop::client_builder::BebopClientBuilder;
+use tycho_simulation::rfq::protocols::bebop::state::BebopState;
+use tycho_simulation::rfq::protocols::hashflow::client_builder::HashflowClientBuilder;
+use tycho_simulation::rfq::protocols::hashflow::state::HashflowState;
+use tycho_simulation::rfq::stream::RFQStreamBuilder;
 use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
@@ -24,6 +34,7 @@ use tycho_simulation::{
     tycho_common::models::Chain,
 };
 
+use crate::models::rfq::RFQConfig;
 use crate::models::tokens::TokenStore;
 
 static UNISWAP_V4_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
@@ -37,6 +48,8 @@ pub async fn build_merged_streams(
     tvl_keep_threshold: f64,
     tokens: Arc<TokenStore>,
     enable_vm_pools: bool,
+    enable_rfq_pools: bool,
+    rfq_config: RFQConfig,
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -58,7 +71,9 @@ pub async fn build_merged_streams(
     );
     let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
 
-    let mut builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
+    let chain = Chain::Ethereum;
+
+    let mut builder = ProtocolStreamBuilder::new(tycho_url, chain)
         .latency_buffer(15)
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(true);
@@ -99,9 +114,52 @@ pub async fn build_merged_streams(
     // builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
 
-    Ok(stream.map(|item| {
+    // The RFQStreamBuilder handles registration of multiple RFQ clients and merges their message streams
+    //  It merges updates from one or more RFQ clients and decodes them into Update messages:
+    let mut rfq_builder;
+
+    let rfq_stream = if enable_rfq_pools {
+        // TODO Set up RFQ client using the builder pattern
+        // let mut rfq_tokens = HashSet::new();
+        //rfq_tokens.insert(sell_token_address.clone());
+        // rfq_tokens.insert(buy_token_address.clone());
+
+        rfq_builder = RFQStreamBuilder::new().set_tokens(snapshot.clone()).await;
+        let (user, key) = (rfq_config.bebop_user, rfq_config.bebop_key);
+        println!("Setting up Bebop RFQ client...\n");
+        let bebop_client = BebopClientBuilder::new(chain, user, key)
+            // .tokens(rfq_tokens.clone())
+            .tvl_threshold(tvl_add_threshold)
+            .build()
+            .expect("Failed to create Bebop RFQ client");
+        rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
+        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+        println!("Setting up Hashflow RFQ client...\n");
+        let hashflow_client = HashflowClientBuilder::new(chain, user, key)
+            //.tokens(rfq_tokens)
+            .tvl_threshold(tvl_add_threshold)
+            .poll_time(Duration::from_secs(5))
+            .build()
+            .expect("Failed to create Hashflow RFQ client");
+        rfq_builder =
+            rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
+        let (tx, rx) = mpsc::channel::<Update>(100);
+        rfq_builder = rfq_builder.set_tokens(snapshot.clone()).await;
+        info!("RFQ pool feeds enabled");
+        tokio::spawn(rfq_builder.build(tx));
+        info!("Connected to RFQs! Streaming live price levels...\n");
+
+        ReceiverStream::new(rx).map(Ok).boxed()
+    } else {
+        info!("RFQ pool feeds disabled");
+        stream::empty().boxed()
+    };
+
+    let stream = builder.set_tokens(snapshot).await.build().await?;
+    let merged = stream::select(stream.boxed(), rfq_stream);
+
+    Ok(merged.map(|item| {
         if UNISWAP_V4_LOGGED
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
