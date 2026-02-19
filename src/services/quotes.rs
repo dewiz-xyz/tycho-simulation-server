@@ -1075,16 +1075,19 @@ async fn simulate_pool(
                                     probed_amount_in = Some(probe_amount_in);
                                     probed_amount_error = Some(probe_error);
                                 } else {
-                                    return PoolSimOutcome::Simulated(PoolQuoteResult {
-                                        pool: pool_id,
-                                        pool_name,
-                                        pool_address,
-                                        protocol: pool_protocol,
-                                        amounts_out: Vec::new(),
-                                        gas_used: Vec::new(),
-                                        errors: vec![probe_error],
-                                        timed_out: false,
-                                    });
+                                    debug!(
+                                        scope = "limits_precheck",
+                                        pool_id = %pool_id,
+                                        protocol = %pool_protocol,
+                                        pool_name = %pool_name,
+                                        pool_address = %pool_address,
+                                        amount_in = %probe_amount_in,
+                                        max_in = %max_in,
+                                        "Probe invalid-input was not a limits signal; continuing ladder: {}",
+                                        message,
+                                    );
+                                    probed_amount_in = Some(probe_amount_in);
+                                    probed_amount_error = Some(probe_error);
                                 }
                             }
                             Err(other) => {
@@ -2569,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_non_limit_invalid_input_is_not_reported_as_limits_skip() {
+    async fn probe_non_limit_invalid_input_continues_ladder() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -2604,10 +2607,11 @@ mod tests {
         .await
         .expect("simulate_pool should return outcome");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "probe-only");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
         match outcome {
             PoolSimOutcome::Simulated(result) => {
-                assert!(result.amounts_out.is_empty());
+                assert_eq!(result.amounts_out.len(), 1);
+                assert_eq!(result.gas_used.len(), 1);
                 assert!(!result.timed_out);
                 assert_eq!(result.errors.len(), 1);
                 assert!(result.errors[0].contains("Probe quote failed"));
@@ -2617,6 +2621,110 @@ mod tests {
                 panic!("non-limit invalid input should not be treated as limits skip")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_lower_quotes_on_non_limit_probe_error() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let token_in_meta = make_token(&token_in, "TK1");
+        let token_out_meta = make_token(&token_out, "TK2");
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let pool_id = "pool-1".to_string();
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![token_in_meta, token_out_meta],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = ProbeInvalidInputSim {
+            max_in: BigUint::from(10u8),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(pool_id.clone(), Box::new(sim) as Box<dyn ProtocolSim>);
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(pool_id, component);
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-non-limit-probe".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string(), "11".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert!(matches!(
+            computation.meta.status,
+            QuoteStatus::PartialSuccess
+        ));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::InconsistentResult
+        ));
+        assert_eq!(computation.meta.pool_results.len(), 1);
+        assert_eq!(
+            computation.meta.pool_results[0].outcome,
+            PoolOutcomeKind::SimulatorError
+        );
+        assert_eq!(computation.metrics.skipped_native_limits, 0);
     }
 
     #[tokio::test]
