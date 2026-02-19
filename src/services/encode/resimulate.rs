@@ -21,6 +21,7 @@ use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
 };
+use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
 use super::EncodeError;
 
 pub(super) async fn resimulate_route(
@@ -93,8 +94,17 @@ pub(super) async fn resimulate_route(
                     entry
                 };
 
-                let sim_token_in = map_swap_token(&allocated.token_in, chain);
-                let sim_token_out = map_swap_token(&allocated.token_out, chain);
+                let keep_native_unwrapped = ensure_native_swap_supported(
+                    chain,
+                    &allocated.token_in,
+                    &allocated.token_out,
+                    &pool_entry.1,
+                    &allocated.pool.component_id,
+                )?;
+                let sim_token_in =
+                    map_swap_token(&allocated.token_in, chain, keep_native_unwrapped);
+                let sim_token_out =
+                    map_swap_token(&allocated.token_out, chain, keep_native_unwrapped);
                 let token_in = token_cache.get(&sim_token_in).await?;
                 let token_out = token_cache.get(&sim_token_out).await?;
 
@@ -258,8 +268,30 @@ pub(super) async fn resimulate_route(
     })
 }
 
-fn map_swap_token(address: &Bytes, chain: Chain) -> Bytes {
-    if *address == chain.native_token().address {
+fn ensure_native_swap_supported(
+    chain: Chain,
+    token_in: &Bytes,
+    token_out: &Bytes,
+    component: &ProtocolComponent,
+    component_id: &str,
+) -> Result<bool, EncodeError> {
+    let native_address = chain.native_token().address;
+    let swap_uses_native = *token_in == native_address || *token_out == native_address;
+    let protocol_supports_native = is_native_protocol_allowlisted(&component.protocol_system);
+
+    if swap_uses_native && !protocol_supports_native {
+        let supported = native_protocol_allowlist().join(", ");
+        return Err(EncodeError::invalid(format!(
+            "native tokenIn/tokenOut is only supported for protocols [{}]; pool {} uses {}",
+            supported, component_id, component.protocol_system
+        )));
+    }
+
+    Ok(protocol_supports_native)
+}
+
+fn map_swap_token(address: &Bytes, chain: Chain, keep_native_unwrapped: bool) -> Bytes {
+    if !keep_native_unwrapped && *address == chain.native_token().address {
         chain.wrapped_native_token().address
     } else {
         address.clone()
@@ -320,6 +352,22 @@ mod tests {
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct SlowProtocolSim {
         sleep_for: Duration,
+    }
+
+    #[test]
+    fn map_swap_token_wraps_native_for_non_allowlisted_protocols() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token().address;
+        let mapped = map_swap_token(&native, chain, false);
+        assert_eq!(mapped, chain.wrapped_native_token().address);
+    }
+
+    #[test]
+    fn map_swap_token_keeps_native_for_allowlisted_protocols() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token().address;
+        let mapped = map_swap_token(&native, chain, true);
+        assert_eq!(mapped, native);
     }
 
     #[typetag::serde]

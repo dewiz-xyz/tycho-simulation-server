@@ -34,8 +34,9 @@
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
   - `scripts/run_suite.sh --repo . --suite core --stop`
-  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer).
+  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
+  - Core coverage now includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH`.
 - Individual runners:
   - `python3 scripts/simulate_smoke.py --suite smoke`
   - `python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`

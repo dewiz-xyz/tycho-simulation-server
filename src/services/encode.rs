@@ -32,9 +32,9 @@ pub async fn encode_route(
     // Guard against panics in downstream EVM encoding (uint256 inputs).
     wire::biguint_to_u256_checked(&amount_in, "amountIn")?;
     wire::biguint_to_u256_checked(&min_amount_out, "minAmountOut")?;
-    request::ensure_erc20_tokens(chain, &token_in, &token_out)?;
 
     let native_address = chain.native_token().address;
+    let is_native_input = token_in == native_address;
     let normalized =
         normalize::normalize_route(&request, &token_in, &token_out, &amount_in, &native_address)?;
     let resimulated =
@@ -53,6 +53,7 @@ pub async fn encode_route(
         token_out: &token_out,
         amount_in: &amount_in,
         router_address: &router_address,
+        is_native_input,
     };
     let router_call = calldata::build_route_calldata_tx(
         &route_context,
@@ -67,6 +68,7 @@ pub async fn encode_route(
         &amount_in,
         router_call,
         reset_approval,
+        is_native_input,
     )?;
 
     let debug = response::build_debug(&state, &request).await;

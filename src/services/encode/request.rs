@@ -6,6 +6,8 @@ use crate::models::messages::{RouteEncodeRequest, SegmentDraft, SwapKind};
 
 use super::EncodeError;
 
+const NATIVE_PROTOCOL_ALLOWLIST: &[&str] = &["rocketpool"];
+
 pub(super) fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
     let chain = Chain::Ethereum;
     if chain.id() != chain_id {
@@ -17,18 +19,22 @@ pub(super) fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
     Ok(chain)
 }
 
-pub(super) fn ensure_erc20_tokens(
-    chain: Chain,
-    token_in: &Bytes,
-    token_out: &Bytes,
-) -> Result<(), EncodeError> {
-    let native = chain.native_token().address;
-    if *token_in == native || *token_out == native {
-        return Err(EncodeError::invalid(
-            "tokenIn/tokenOut must be ERC20 addresses; use wrapped native token instead",
-        ));
-    }
-    Ok(())
+pub(super) fn normalize_protocol_id(protocol_id: &str) -> String {
+    protocol_id
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
+pub(super) fn is_native_protocol_allowlisted(protocol_id: &str) -> bool {
+    let normalized = normalize_protocol_id(protocol_id);
+    NATIVE_PROTOCOL_ALLOWLIST
+        .iter()
+        .any(|candidate| normalize_protocol_id(candidate) == normalized)
+}
+
+pub(super) fn native_protocol_allowlist() -> &'static [&'static str] {
+    NATIVE_PROTOCOL_ALLOWLIST
 }
 
 pub(super) fn should_reset_allowance(
@@ -93,8 +99,6 @@ pub(super) fn validate_swap_kinds(request: &RouteEncodeRequest) -> Result<(), En
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use super::*;
 
     #[test]
@@ -151,16 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn ensure_erc20_tokens_rejects_native() {
-        let native = Chain::Ethereum.native_token().address;
-        let erc20 = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
+    fn normalize_protocol_id_handles_whitespace_and_casing() {
+        assert_eq!(normalize_protocol_id(" RocketPool "), "rocketpool");
+        assert_eq!(normalize_protocol_id("ROCKET-POOL"), "rocket_pool");
+    }
 
-        match ensure_erc20_tokens(Chain::Ethereum, &native, &erc20) {
-            Err(err) => assert_eq!(
-                err.kind(),
-                crate::services::encode::EncodeErrorKind::InvalidRequest
-            ),
-            Ok(_) => panic!("native token should be rejected for settlement encoding"),
-        }
+    #[test]
+    fn native_protocol_allowlist_matches_rocketpool_only() {
+        assert!(is_native_protocol_allowlisted("rocketpool"));
+        assert!(is_native_protocol_allowlisted("ROCKETPOOL"));
+        assert!(!is_native_protocol_allowlisted("uniswap_v2"));
+        assert_eq!(native_protocol_allowlist(), &["rocketpool"]);
     }
 }

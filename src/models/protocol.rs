@@ -64,7 +64,9 @@ impl ProtocolKind {
             "pancakeswap_v3" | "pancakeswapv3" => return Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => return Some(ProtocolKind::EkuboV2),
             "sushiswap_v2" | "sushiswapv2" => return Some(ProtocolKind::SushiswapV2),
-            "maverick_v2" | "maverickv2" => return Some(ProtocolKind::MaverickV2),
+            "maverick_v2" | "maverickv2" | "vm:maverick_v2" => {
+                return Some(ProtocolKind::MaverickV2)
+            }
             "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
             "rocketpool" => return Some(ProtocolKind::Rocketpool),
@@ -80,7 +82,7 @@ impl ProtocolKind {
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
             "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
-            "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
+            "maverick_v2" | "maverickv2" | "vm:maverick_v2" => Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
@@ -100,7 +102,7 @@ impl ProtocolKind {
             "pancakeswap_v3" | "pancakeswapv3" => Some(ProtocolKind::PancakeswapV3),
             "ekubo_v2" | "ekubov2" => Some(ProtocolKind::EkuboV2),
             "sushiswap_v2" | "sushiswapv2" => Some(ProtocolKind::SushiswapV2),
-            "maverick_v2" | "maverickv2" => Some(ProtocolKind::MaverickV2),
+            "maverick_v2" | "maverickv2" | "vm:maverick_v2" => Some(ProtocolKind::MaverickV2),
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
@@ -145,6 +147,34 @@ mod tests {
         assert_eq!(
             ProtocolKind::from_component(&component),
             Some(ProtocolKind::Curve)
+        );
+    }
+
+    #[test]
+    fn recognizes_vm_maverick_component() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "vm:maverick_v2".to_string(),
+            "maverick_v2".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::MaverickV2)
+        );
+    }
+
+    #[test]
+    fn recognizes_vm_maverick_sync_key() {
+        assert_eq!(
+            ProtocolKind::from_sync_state_key("vm:maverick_v2"),
+            Some(ProtocolKind::MaverickV2)
         );
     }
 

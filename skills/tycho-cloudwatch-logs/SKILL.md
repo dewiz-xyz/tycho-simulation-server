@@ -65,6 +65,8 @@ Simulate completion logs are now emitted at `info` level for successful requests
 - `scripts/cw_time.py`: time parsing helper for `cw_filter`, `cw_query`, and `cw_metrics`.
 
 ## Snapshot report workflow
+- Prompt source: `~/.codex/prompts/sim-report.md`.
+- Default period in the prompt is `12h` when no argument is provided.
 - Required generated files for the analyzer:
   `simulate-runs-per-minute.json`, `simulate-runs-per-auction.json`,
   `simulate-runs.json`, `simulate-requests-per-auction.json`,

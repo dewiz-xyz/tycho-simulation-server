@@ -31,8 +31,13 @@ def protocol_from_pool_name(pool_name: str | None) -> str:
     if not pool_name:
         return "unknown"
     if "::" in pool_name:
-        return pool_name.split("::", 1)[0]
-    return pool_name
+        protocol = pool_name.split("::", 1)[0]
+    else:
+        protocol = pool_name
+    # VM pools can use prefixes like vm:maverick_v2; normalize for stable assertions.
+    if protocol.startswith("vm:"):
+        return protocol.split(":", 1)[1]
+    return protocol
 
 
 def main() -> int:

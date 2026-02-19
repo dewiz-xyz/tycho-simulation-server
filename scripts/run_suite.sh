@@ -143,7 +143,14 @@ else
 fi
 
 echo "Waiting for readiness..."
-"$script_dir/wait_ready.sh" --url "$status_url" --timeout 300 --interval 2
+wait_timeout=300
+wait_args=(--url "$status_url" --timeout "$wait_timeout" --interval 2)
+if [[ "$enable_vm_pools" == "true" ]]; then
+  # VM protocols can take much longer to ingest than native pools.
+  wait_timeout=600
+  wait_args=(--url "$status_url" --timeout "$wait_timeout" --interval 2 --require-vm-ready --require-vm-pools-min 1)
+fi
+"$script_dir/wait_ready.sh" "${wait_args[@]}"
 
 if [[ "$enable_vm_pools" == "true" ]] && [[ "$wait_vm_ready" == "true" ]]; then
   echo "Waiting for VM pool readiness..."
@@ -181,6 +188,20 @@ python3 "$script_dir/encode_smoke.py" --encode-url "$encode_url" --simulate-url 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
 python3 "$script_dir/coverage_sweep.py" --url "$simulate_url" --suite "$suite" --allow-status "$coverage_allow_status" $allow_failures_flag $allow_no_pools_flag --out "$repo/logs/coverage_sweep.json"
+
+if [[ "$enable_vm_pools" == "true" ]]; then
+  echo "Protocol presence checks (Maverick + Rocketpool)..."
+  python3 "$script_dir/coverage_sweep.py" \
+    --url "$simulate_url" \
+    --pair USDC:USDT \
+    --pair USDT:USDC \
+    --pair ETH:RETH \
+    --allow-status "$coverage_allow_status" \
+    $allow_failures_flag \
+    $allow_no_pools_flag \
+    --expect-protocols rocketpool,maverick_v2 \
+    --out "$repo/logs/coverage_protocol_presence.json"
+fi
 
 echo "Latency percentiles..."
 latency_requests="${LATENCY_REQUESTS:-200}"
