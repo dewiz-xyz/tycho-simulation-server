@@ -3,16 +3,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
-use crate::models::messages::QuoteStatus;
+use crate::models::messages::{QuoteResultQuality, QuoteStatus};
 
 const METRIC_NAMESPACE: &str = "Tycho/Simulation";
 const METRIC_SIMULATE_COMPLETION: &str = "SimulateCompletion";
+const METRIC_SIMULATE_RESULT_QUALITY: &str = "SimulateResultQuality";
 const METRIC_SIMULATE_TIMEOUT: &str = "SimulateRequestTimeout";
 const METRIC_JEMALLOC_ALLOCATED_BYTES: &str = "JemallocAllocatedBytes";
 const METRIC_JEMALLOC_RESIDENT_BYTES: &str = "JemallocResidentBytes";
 const DIM_STATUS: &str = "Status";
 const DIM_TIMED_OUT: &str = "TimedOut";
 const DIM_TIMEOUT_KIND: &str = "TimeoutKind";
+const DIM_RESULT_QUALITY: &str = "ResultQuality";
 const DIM_LABEL: &str = "Label";
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +49,13 @@ pub fn emit_simulate_timeout(kind: TimeoutKind) {
     emit_count_metric(
         METRIC_SIMULATE_TIMEOUT,
         &[(DIM_TIMEOUT_KIND, json!(kind.as_str()))],
+    );
+}
+
+pub fn emit_simulate_result_quality(quality: QuoteResultQuality) {
+    emit_count_metric(
+        METRIC_SIMULATE_RESULT_QUALITY,
+        &[(DIM_RESULT_QUALITY, json!(quality))],
     );
 }
 

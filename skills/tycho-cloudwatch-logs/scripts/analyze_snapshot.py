@@ -449,7 +449,7 @@ def build_report(input_dir: Path, period: str) -> str:
 
     status_total = sum(status_counts.values())
     ready_count = status_counts.get("Ready", 0)
-    partial_count = status_counts.get("PartialFailure", 0)
+    partial_count = status_counts.get("PartialSuccess", 0)
     other_count = max(0, status_total - ready_count - partial_count)
     status_bar_width = 48
     if status_total:
@@ -468,7 +468,7 @@ def build_report(input_dir: Path, period: str) -> str:
     other_status_parts = [
         f"{status}={fmt_int(count)}"
         for status, count in status_counts.most_common()
-        if status not in ("Ready", "PartialFailure")
+        if status not in ("Ready", "PartialSuccess")
     ]
 
     coverage_notes = []
@@ -766,7 +766,7 @@ def build_report(input_dir: Path, period: str) -> str:
         f"Throughput was bursty, runs/min ranged from {fmt_int(runs_minute_stats['min'])} to {fmt_int(runs_minute_stats['max'])} with p50 {fmt_int(runs_minute_stats['p50'])}, and request/min p50 was {fmt_int(req_minute_stats['p50'])}."
     )
     report_lines.append(
-        f"Latency stayed tight with p50 {fmt_int(latency_stats['p50'])} ms and p99 {fmt_int(latency_stats['p99'])} ms (max {fmt_int(latency_stats['max'])} ms), while status mix was Ready {ready_share:.1f}% and PartialFailure {partial_share:.1f}%."
+        f"Latency stayed tight with p50 {fmt_int(latency_stats['p50'])} ms and p99 {fmt_int(latency_stats['p99'])} ms (max {fmt_int(latency_stats['max'])} ms), while status mix was Ready {ready_share:.1f}% and PartialSuccess {partial_share:.1f}%."
     )
     report_lines.append(
         f"Top quote wins were led by {top_protocol} at {top_protocol_share}, and the busiest token pair in the sample was {top_pair}."
