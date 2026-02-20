@@ -11,7 +11,7 @@ use tycho_simulation::{
             filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
-            rocketpool::state::RocketpoolState,
+            // rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
@@ -66,7 +66,7 @@ pub async fn build_native_stream(
         tvl_filter.clone(),
         Some(fluid_v1_paused_pools_filter),
     );
-    builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
+    // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
