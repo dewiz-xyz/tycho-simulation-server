@@ -146,7 +146,7 @@ fn base_builder(
 fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
     match policy {
         StreamDecodePolicy::Native => true,
-        StreamDecodePolicy::Vm => false,
+        StreamDecodePolicy::Vm => true,
     }
 }
 

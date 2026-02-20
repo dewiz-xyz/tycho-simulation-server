@@ -79,6 +79,9 @@ Note: when concurrency caps are saturated or a pool would exceed the quote deadl
 ## Docs
 
 - `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request/response examples.
+- `docs/high-level-architecture.md` – high-level system architecture and data flow overview.
+- `docs/state-anchor-architecture.md` – implementation design where ingest provides full-state bootstrap and live deltas (no bus/snapshot store).
+- `docs/stream-worker-architecture.md` – proposed architecture for single Tycho ingest + scalable simulation workers.
 
 ## HTTP API
 
