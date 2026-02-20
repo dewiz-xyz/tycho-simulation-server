@@ -12,7 +12,9 @@ use tower::{
 };
 use tracing::warn;
 
-use crate::handlers::{encode::encode, quote::simulate, readiness::status};
+use crate::handlers::{
+    encode::encode, quote::simulate, quote_rfq::simulate_rfq, readiness::status,
+};
 use crate::metrics::{
     emit_simulate_completion, emit_simulate_result_quality, emit_simulate_timeout, TimeoutKind,
 };
@@ -29,6 +31,15 @@ pub fn create_router(app_state: AppState) -> Router {
         .route(
             "/simulate",
             post(simulate)
+                .layer(TimeoutLayer::new(router_timeout))
+                .layer(HandleErrorLayer::new({
+                    let timeout_ms = router_timeout_ms;
+                    move |err: BoxError| async move { handle_timeout_error(err, timeout_ms).await }
+                })),
+        )
+        .route(
+            "/simulate-rfq",
+            post(simulate_rfq)
                 .layer(TimeoutLayer::new(router_timeout))
                 .layer(HandleErrorLayer::new({
                     let timeout_ms = router_timeout_ms;

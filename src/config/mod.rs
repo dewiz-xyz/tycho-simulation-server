@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -13,23 +14,23 @@ pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
     let tycho_url =
-        std::env::var("TYCHO_URL").unwrap_or_else(|_| "tycho-beta.propellerheads.xyz".to_string());
-    let api_key = std::env::var("TYCHO_API_KEY").expect("TYCHO_API_KEY must be set");
-    let tvl_threshold: f64 = std::env::var("TVL_THRESHOLD")
+        env::var("TYCHO_URL").unwrap_or_else(|_| "tycho-beta.propellerheads.xyz".to_string());
+    let api_key = env::var("TYCHO_API_KEY").expect("TYCHO_API_KEY must be set");
+    let tvl_threshold: f64 = env::var("TVL_THRESHOLD")
         .unwrap_or_else(|_| "100".to_string())
         .parse()
         .expect("Invalid TVL_THRESHOLD");
     // Keep/remove ratio: defaults to 20% of add threshold; clamp to <= add
-    let tvl_keep_ratio: f64 = std::env::var("TVL_KEEP_RATIO")
+    let tvl_keep_ratio: f64 = env::var("TVL_KEEP_RATIO")
         .unwrap_or_else(|_| "0.2".to_string())
         .parse()
         .expect("Invalid TVL_KEEP_RATIO");
     let tvl_keep_threshold: f64 = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
-    let port = std::env::var("PORT")
+    let port = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
         .expect("Invalid PORT");
-    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     // Create socket address from host and port
     let addr = host.to_string();
@@ -47,20 +48,24 @@ pub fn load_config() -> AppConfig {
         "Derived TVL keep threshold must be > 0"
     );
 
-    let quote_timeout_ms: u64 = std::env::var("QUOTE_TIMEOUT_MS")
+    let quote_timeout_ms: u64 = env::var("QUOTE_TIMEOUT_MS")
         .unwrap_or_else(|_| "150".to_string())
         .parse()
         .expect("Invalid QUOTE_TIMEOUT_MS");
-    let pool_timeout_native_ms: u64 = std::env::var("POOL_TIMEOUT_NATIVE_MS")
+    let pool_timeout_native_ms: u64 = env::var("POOL_TIMEOUT_NATIVE_MS")
         .unwrap_or_else(|_| "20".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_NATIVE_MS");
-    let pool_timeout_vm_ms: u64 = std::env::var("POOL_TIMEOUT_VM_MS")
+    let pool_timeout_vm_ms: u64 = env::var("POOL_TIMEOUT_VM_MS")
         .unwrap_or_else(|_| "150".to_string())
         .parse()
         .expect("Invalid POOL_TIMEOUT_VM_MS");
+    let pool_timeout_rfq_ms: u64 = env::var("POOL_TIMEOUT_RFQ_MS")
+        .unwrap_or_else(|_| "150".to_string())
+        .parse()
+        .expect("Invalid POOL_TIMEOUT_RFQ_MS");
 
-    let request_timeout_ms: u64 = std::env::var("REQUEST_TIMEOUT_MS")
+    let request_timeout_ms: u64 = env::var("REQUEST_TIMEOUT_MS")
         .unwrap_or_else(|_| "4000".to_string())
         .parse()
         .expect("Invalid REQUEST_TIMEOUT_MS");
@@ -70,7 +75,8 @@ pub fn load_config() -> AppConfig {
         "POOL_TIMEOUT_NATIVE_MS must be > 0"
     );
     assert!(pool_timeout_vm_ms > 0, "POOL_TIMEOUT_VM_MS must be > 0");
-    let token_refresh_timeout_ms: u64 = std::env::var("TOKEN_REFRESH_TIMEOUT_MS")
+    assert!(pool_timeout_rfq_ms > 0, "POOL_TIMEOUT_RFQ_MS must be > 0");
+    let token_refresh_timeout_ms: u64 = env::var("TOKEN_REFRESH_TIMEOUT_MS")
         .unwrap_or_else(|_| "1000".to_string())
         .parse()
         .expect("Invalid TOKEN_REFRESH_TIMEOUT_MS");
@@ -79,10 +85,15 @@ pub fn load_config() -> AppConfig {
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
     );
 
-    let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
+    let enable_vm_pools: bool = env::var("ENABLE_VM_POOLS")
         .unwrap_or_else(|_| "true".to_string())
         .parse()
         .expect("Invalid ENABLE_VM_POOLS");
+
+    let enable_rfq_pools: bool = env::var("ENABLE_RFQ_POOLS")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse()
+        .expect("Invalid ENABLE_RFQ_POOLS");
 
     let reset_allowance_tokens = Arc::new(default_reset_allowance_tokens());
 
@@ -92,8 +103,9 @@ pub fn load_config() -> AppConfig {
 
     let default_native = (cpu_count.saturating_mul(4)).max(1);
     let default_vm = cpu_count.max(1);
+    let default_rfq = cpu_count.max(1);
 
-    let global_native_sim_concurrency: usize = std::env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
+    let global_native_sim_concurrency: usize = env::var("GLOBAL_NATIVE_SIM_CONCURRENCY")
         .ok()
         .map(|value| {
             value
@@ -102,49 +114,54 @@ pub fn load_config() -> AppConfig {
         })
         .unwrap_or(default_native)
         .max(1);
-    let global_vm_sim_concurrency: usize = std::env::var("GLOBAL_VM_SIM_CONCURRENCY")
+    let global_vm_sim_concurrency: usize = env::var("GLOBAL_VM_SIM_CONCURRENCY")
         .ok()
         .map(|value| value.parse().expect("Invalid GLOBAL_VM_SIM_CONCURRENCY"))
         .unwrap_or(default_vm)
         .max(1);
+    let global_rfq_sim_concurrency: usize = env::var("GLOBAL_RFQ_SIM_CONCURRENCY")
+        .ok()
+        .map(|value| value.parse().expect("Invalid GLOBAL_RFQ_SIM_CONCURRENCY"))
+        .unwrap_or(default_rfq)
+        .max(1);
 
-    let stream_stale_secs: u64 = std::env::var("STREAM_STALE_SECS")
+    let stream_stale_secs: u64 = env::var("STREAM_STALE_SECS")
         .unwrap_or_else(|_| "120".to_string())
         .parse()
         .expect("Invalid STREAM_STALE_SECS");
-    let stream_missing_block_burst: u64 = std::env::var("STREAM_MISSING_BLOCK_BURST")
+    let stream_missing_block_burst: u64 = env::var("STREAM_MISSING_BLOCK_BURST")
         .unwrap_or_else(|_| "3".to_string())
         .parse()
         .expect("Invalid STREAM_MISSING_BLOCK_BURST");
-    let stream_missing_block_window_secs: u64 = std::env::var("STREAM_MISSING_BLOCK_WINDOW_SECS")
+    let stream_missing_block_window_secs: u64 = env::var("STREAM_MISSING_BLOCK_WINDOW_SECS")
         .unwrap_or_else(|_| "60".to_string())
         .parse()
         .expect("Invalid STREAM_MISSING_BLOCK_WINDOW_SECS");
-    let stream_error_burst: u64 = std::env::var("STREAM_ERROR_BURST")
+    let stream_error_burst: u64 = env::var("STREAM_ERROR_BURST")
         .unwrap_or_else(|_| "3".to_string())
         .parse()
         .expect("Invalid STREAM_ERROR_BURST");
-    let stream_error_window_secs: u64 = std::env::var("STREAM_ERROR_WINDOW_SECS")
+    let stream_error_window_secs: u64 = env::var("STREAM_ERROR_WINDOW_SECS")
         .unwrap_or_else(|_| "60".to_string())
         .parse()
         .expect("Invalid STREAM_ERROR_WINDOW_SECS");
-    let resync_grace_secs: u64 = std::env::var("RESYNC_GRACE_SECS")
+    let resync_grace_secs: u64 = env::var("RESYNC_GRACE_SECS")
         .unwrap_or_else(|_| "60".to_string())
         .parse()
         .expect("Invalid RESYNC_GRACE_SECS");
-    let stream_restart_backoff_min_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MIN_MS")
+    let stream_restart_backoff_min_ms: u64 = env::var("STREAM_RESTART_BACKOFF_MIN_MS")
         .unwrap_or_else(|_| "500".to_string())
         .parse()
         .expect("Invalid STREAM_RESTART_BACKOFF_MIN_MS");
-    let stream_restart_backoff_max_ms: u64 = std::env::var("STREAM_RESTART_BACKOFF_MAX_MS")
+    let stream_restart_backoff_max_ms: u64 = env::var("STREAM_RESTART_BACKOFF_MAX_MS")
         .unwrap_or_else(|_| "30000".to_string())
         .parse()
         .expect("Invalid STREAM_RESTART_BACKOFF_MAX_MS");
-    let stream_restart_backoff_jitter_pct: f64 = std::env::var("STREAM_RESTART_BACKOFF_JITTER_PCT")
+    let stream_restart_backoff_jitter_pct: f64 = env::var("STREAM_RESTART_BACKOFF_JITTER_PCT")
         .unwrap_or_else(|_| "0.2".to_string())
         .parse()
         .expect("Invalid STREAM_RESTART_BACKOFF_JITTER_PCT");
-    let readiness_stale_secs: u64 = std::env::var("READINESS_STALE_SECS")
+    let readiness_stale_secs: u64 = env::var("READINESS_STALE_SECS")
         .unwrap_or_else(|_| "120".to_string())
         .parse()
         .expect("Invalid READINESS_STALE_SECS");
@@ -184,6 +201,15 @@ pub fn load_config() -> AppConfig {
 
     let memory = MemoryConfig::from_env();
 
+    let (bebop_user, bebop_key) = (
+        env::var("BEBOP_USER").expect("BEBOP_USER must be set"),
+        env::var("BEBOP_KEY").expect("BEBOP_KEY must be set"),
+    );
+    let (hashflow_user, hashflow_key) = (
+        env::var("HASHFLOW_USER").expect("HASHFLOW_USER must be set"),
+        env::var("HASHFLOW_KEY").expect("HASHFLOW_KEY must be set"),
+    );
+
     AppConfig {
         tycho_url,
         api_key,
@@ -194,11 +220,14 @@ pub fn load_config() -> AppConfig {
         quote_timeout_ms,
         pool_timeout_native_ms,
         pool_timeout_vm_ms,
+        pool_timeout_rfq_ms,
         request_timeout_ms,
         token_refresh_timeout_ms,
         enable_vm_pools,
+        enable_rfq_pools,
         global_native_sim_concurrency,
         global_vm_sim_concurrency,
+        global_rfq_sim_concurrency,
         reset_allowance_tokens,
         stream_stale_secs,
         stream_missing_block_burst,
@@ -211,6 +240,10 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_jitter_pct,
         readiness_stale_secs,
         memory,
+        bebop_key,
+        bebop_user,
+        hashflow_key,
+        hashflow_user,
     }
 }
 
@@ -225,11 +258,14 @@ pub struct AppConfig {
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,
+    pub pool_timeout_rfq_ms: u64,
     pub request_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
     pub enable_vm_pools: bool,
+    pub enable_rfq_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
+    pub global_rfq_sim_concurrency: usize,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
@@ -242,6 +278,10 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
 }
 
 const ETHEREUM_CHAIN_ID: u64 = 1;

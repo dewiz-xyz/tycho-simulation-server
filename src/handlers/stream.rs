@@ -13,6 +13,7 @@ use tycho_simulation::{
 
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
+use crate::models::state::RfqStreamStatus;
 use crate::models::{
     state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
@@ -22,6 +23,7 @@ use crate::models::{
 pub enum StreamKind {
     Native,
     Vm,
+    Rfq,
 }
 
 impl StreamKind {
@@ -29,6 +31,7 @@ impl StreamKind {
         match self {
             StreamKind::Native => "native",
             StreamKind::Vm => "vm",
+            StreamKind::Rfq => "rfq",
         }
     }
 }
@@ -80,6 +83,12 @@ pub struct VmStreamControls {
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub vm_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_concurrency: u32,
+}
+
+pub struct RfqStreamControls {
+    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_concurrency: u32,
 }
 
 pub async fn process_stream(
@@ -405,12 +414,96 @@ pub async fn supervise_vm_stream<F, Fut, S>(
     }
 }
 
+pub async fn supervise_rfq_stream<F, Fut, S>(
+    build_stream: F,
+    state_store: Arc<StateStore>,
+    health: Arc<StreamHealth>,
+    cfg: StreamSupervisorConfig,
+    controls: RfqStreamControls,
+) where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
+    S: futures::Stream<
+            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
+        > + Unpin
+        + Send,
+{
+    let mut backoff = cfg.restart_backoff_min;
+    let mut pending_rebuild: Option<RfqRebuildState> = None;
+
+    loop {
+        let stream = match build_stream().await {
+            Ok(stream) => {
+                if let Some(rebuild) = pending_rebuild.take() {
+                    finish_rfq_rebuild(&controls, rebuild, cfg.memory).await;
+                }
+                stream
+            }
+            Err(err) => {
+                warn!(
+                    event = "stream_build_failed",
+                    stream = StreamKind::Rfq.as_str(),
+                    error = %err,
+                    "Failed to build RFQ stream"
+                );
+                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff = next_backoff(backoff, cfg.restart_backoff_max);
+                continue;
+            }
+        };
+
+        let exit = process_stream(
+            StreamKind::Rfq,
+            stream,
+            Arc::clone(&state_store),
+            Arc::clone(&health),
+            cfg,
+        )
+        .await;
+
+        let restart_count = health.increment_restart().await;
+        health.reset_bursts().await;
+        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+        let last_block = health.last_block().await;
+
+        let rebuild_state = begin_rfq_rebuild(
+            &controls,
+            Arc::clone(&state_store),
+            exit.reason,
+            exit.last_error,
+            cfg.memory,
+        )
+        .await;
+        pending_rebuild = Some(rebuild_state);
+
+        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+        warn!(
+            event = "stream_restart",
+            stream = StreamKind::Vm.as_str(),
+            reason = exit.reason.as_str(),
+            restart_count,
+            backoff_ms,
+            last_block,
+            last_update_age_ms,
+            "Restarting VM stream"
+        );
+
+        sleep(Duration::from_millis(backoff_ms)).await;
+        backoff = next_backoff(backoff, cfg.restart_backoff_max);
+    }
+}
+
 struct VmRebuildState {
     guard: tokio::sync::OwnedSemaphorePermit,
     rebuild_id: u64,
     started_at: Instant,
 }
-
+struct RfqRebuildState {
+    guard: tokio::sync::OwnedSemaphorePermit,
+    rebuild_id: u64,
+    started_at: Instant,
+}
 async fn begin_vm_rebuild(
     controls: &VmStreamControls,
     state_store: Arc<StateStore>,
@@ -473,6 +566,73 @@ async fn finish_vm_rebuild(
         "VM rebuild completed"
     );
     maybe_log_memory_snapshot("vm", "vm_rebuild_success", None, memory_cfg, true);
+}
+
+async fn begin_rfq_rebuild(
+    controls: &RfqStreamControls,
+    state_store: Arc<StateStore>,
+    reason: StreamRestartReason,
+    last_error: Option<String>,
+    memory_cfg: MemoryConfig,
+) -> RfqRebuildState {
+    let rebuild_id = {
+        let mut status = controls.rfq_stream.write().await;
+        status.rebuilding = true;
+        status.restart_count = status.restart_count.saturating_add(1);
+        status.rebuild_started_at = Some(Instant::now());
+        status.last_error = last_error.or_else(|| Some(reason.as_str().to_string()));
+        status.restart_count
+    };
+
+    info!(
+        event = "rfq_rebuild_start",
+        rebuild_id, "RFQ rebuild started"
+    );
+    maybe_log_memory_snapshot("rfq", "rfq_rebuild_start", None, memory_cfg, true);
+
+    state_store.reset().await;
+
+    let guard = controls
+        .rfq_sim_semaphore
+        .clone()
+        .acquire_many_owned(controls.rfq_sim_concurrency)
+        .await
+        .expect("rfq semaphore closed during rebuild");
+
+    if let Err(err) = SHARED_TYCHO_DB.clear() {
+        warn!(error = %err, "Failed clearing TychoDB during RFQ rebuild");
+    }
+    maybe_purge_allocator("rfq_rebuild", memory_cfg);
+    maybe_log_memory_snapshot("rfq", "rfq_rebuild_after_clear", None, memory_cfg, true);
+
+    RfqRebuildState {
+        guard,
+        rebuild_id,
+        started_at: Instant::now(),
+    }
+}
+
+async fn finish_rfq_rebuild(
+    controls: &RfqStreamControls,
+    rebuild: RfqRebuildState,
+    memory_cfg: MemoryConfig,
+) {
+    drop(rebuild.guard);
+
+    let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
+    {
+        let mut status = controls.rfq_stream.write().await;
+        status.rebuilding = false;
+        status.rebuild_started_at = None;
+    }
+
+    info!(
+        event = "rfq_rebuild_success",
+        rebuild_id = rebuild.rebuild_id,
+        duration_ms,
+        "RFQ rebuild completed"
+    );
+    maybe_log_memory_snapshot("rfq", "rfq_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {

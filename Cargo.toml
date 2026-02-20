@@ -2,7 +2,7 @@
 name = "tycho-simulation-server"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89.0"
+rust-version = "1.91.0"
 description = "Tycho simulation HTTP quote service"
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/tycho-simulation-server"
@@ -12,8 +12,8 @@ name = "tycho-price-service"
 path = "src/main.rs"
 
 [dependencies]
-tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.240.1" }
-tycho-execution = "0.158.0"
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.243.0" }
+tycho-execution = "0.160.0"
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
@@ -24,7 +24,7 @@ axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenv = "0.15.0"
-alloy-primitives = "1.5.4"
+alloy-primitives = "1.5.7"
 alloy-sol-types = "1.5.2"
 # Logging
 tracing = "0.1"
@@ -34,6 +34,10 @@ tower = { version = "0.5", features = ["timeout", "util"] }
 rand = "0.8"
 jemalloc-ctl = "0.5"
 jemallocator = "0.5"
+alloy = "1.6.3"
+tycho-common = "0.143.1"
+alloy-chains = "0.2.30"
+tokio-stream = "0.1.18"
 
 [dev-dependencies]
 chrono = "0.4"

@@ -19,20 +19,27 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
+    pub rfq_state_store: Arc<StateStore>,
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
+    pub rfq_stream_health: Arc<StreamHealth>,
+    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub enable_vm_pools: bool,
+    pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
+    pub pool_timeout_rfq: Duration,
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
+    pub rfq_sim_concurrency: usize,
 }
 
 impl AppState {
@@ -84,9 +91,19 @@ impl AppState {
         Arc::clone(&self.vm_sim_semaphore)
     }
 
+    pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.vm_sim_semaphore)
+    }
+
     pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         if let Some(entry) = self.native_state_store.pool_by_id(id).await {
             return Some(entry);
+        }
+
+        if self.rfq_ready().await {
+            if let Some(entry) = self.rfq_state_store.pool_by_id(id).await {
+                return Some(entry);
+            }
         }
 
         if !self.vm_ready().await {
@@ -106,21 +123,51 @@ impl AppState {
         self.vm_state_store.is_ready()
     }
 
+    pub async fn rfq_ready(&self) -> bool {
+        if !self.enable_rfq_pools {
+            return false;
+        }
+        if self.rfq_rebuilding().await {
+            return false;
+        }
+        self.rfq_state_store.is_ready()
+    }
+
     pub async fn vm_rebuilding(&self) -> bool {
         self.vm_stream.read().await.rebuilding
+    }
+
+    pub async fn rfq_rebuilding(&self) -> bool {
+        self.rfq_stream.read().await.rebuilding
     }
 
     pub async fn vm_block(&self) -> u64 {
         self.vm_state_store.current_block().await
     }
 
+    pub async fn rfq_block(&self) -> u64 {
+        self.rfq_state_store.current_block().await
+    }
+
     pub async fn vm_pools(&self) -> usize {
         self.vm_state_store.total_states().await
+    }
+
+    pub async fn rfq_pools(&self) -> usize {
+        self.rfq_state_store.total_states().await
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStreamStatus {
+    pub rebuilding: bool,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RfqStreamStatus {
     pub rebuilding: bool,
     pub restart_count: u64,
     pub last_error: Option<String>,
