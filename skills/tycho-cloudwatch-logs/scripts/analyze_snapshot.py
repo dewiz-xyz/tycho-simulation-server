@@ -272,16 +272,84 @@ def build_report(input_dir: Path, period: str) -> str:
     _, rpm_rows = load_query(input_dir / "simulate-runs-per-minute.json")
     _, runs_auction_rows = load_query(input_dir / "simulate-runs-per-auction.json")
     _, requests_auction_rows = load_query(input_dir / "simulate-requests-per-auction.json")
+    workload_summary_row: dict[str, str] = {}
+    workload_summary_path = input_dir / "simulate-workload-summary.json"
+    if workload_summary_path.exists():
+        _, workload_rows = load_query(workload_summary_path)
+        if workload_rows:
+            workload_summary_row = workload_rows[0]
     metrics = json.loads((input_dir / "cw-metrics.json").read_text())
 
     requests_per_minute = [to_int(row.get("requests")) for row in rpm_rows]
-    runs_per_minute = [to_int(row.get("total_runs")) for row in rpm_rows]
+    scheduled_pool_runs_per_minute = [to_int(row.get("total_runs")) for row in rpm_rows]
     minutes = [parse_minute(row.get("minute", "")) for row in rpm_rows]
 
     total_requests = sum(requests_per_minute)
-    total_runs = sum(runs_per_minute)
+    total_scheduled_pool_runs = sum(scheduled_pool_runs_per_minute)
     unique_auctions = len({row.get("auction_id", "") for row in requests_auction_rows if row.get("auction_id")})
-    runs_per_request = (total_runs / total_requests) if total_requests else 0.0
+    scheduled_pools_per_request = (total_scheduled_pool_runs / total_requests) if total_requests else 0.0
+
+    sample_amounts_simulated = [to_int(row.get("amounts")) for row in completions_rows if row.get("amounts")]
+    sample_simulation_runs = []
+    for row in completions_rows:
+        amounts = to_int(row.get("amounts"))
+        scheduled = to_int(row.get("scheduled_native_pools")) + to_int(row.get("scheduled_vm_pools"))
+        if amounts > 0:
+            sample_simulation_runs.append(amounts * scheduled)
+
+    amount_stats_sample = stats([float(v) for v in sample_amounts_simulated])
+    simulation_run_stats_sample = stats([float(v) for v in sample_simulation_runs])
+    amounts_simulated_per_request = amount_stats_sample["mean"]
+    simulation_runs_per_request = simulation_run_stats_sample["mean"]
+    p50_simulation_runs = simulation_run_stats_sample["p50"]
+    p90_simulation_runs = simulation_run_stats_sample["p90"]
+    max_simulation_runs = simulation_run_stats_sample["max"]
+    total_simulation_runs = total_scheduled_pool_runs * amounts_simulated_per_request
+    workload_source = "estimated from sampled completions"
+
+    if workload_summary_row:
+        total_requests = to_int(workload_summary_row.get("requests"), total_requests)
+        total_scheduled_pool_runs = to_int(
+            workload_summary_row.get("pool_simulation_runs")
+            or workload_summary_row.get("scheduled_pool_runs"),
+            total_scheduled_pool_runs,
+        )
+        scheduled_pools_per_request = to_float(
+            workload_summary_row.get("pool_simulation_runs_per_request")
+            or workload_summary_row.get("avg_scheduled_pools"),
+            scheduled_pools_per_request,
+        )
+        amounts_simulated_per_request = to_float(
+            workload_summary_row.get("amounts_simulated_per_request")
+            or workload_summary_row.get("avg_amounts"),
+            amounts_simulated_per_request,
+        )
+        total_simulation_runs = to_float(
+            workload_summary_row.get("simulation_runs_total")
+            or workload_summary_row.get("amount_pool_eval_total"),
+            total_simulation_runs,
+        )
+        simulation_runs_per_request = to_float(
+            workload_summary_row.get("simulation_runs_per_request")
+            or workload_summary_row.get("avg_amount_pool_evals_per_request"),
+            simulation_runs_per_request,
+        )
+        p50_simulation_runs = to_float(
+            workload_summary_row.get("p50_simulation_runs")
+            or workload_summary_row.get("p50_amount_pool_evals"),
+            p50_simulation_runs,
+        )
+        p90_simulation_runs = to_float(
+            workload_summary_row.get("p90_simulation_runs")
+            or workload_summary_row.get("p90_amount_pool_evals"),
+            p90_simulation_runs,
+        )
+        max_simulation_runs = to_float(
+            workload_summary_row.get("max_simulation_runs")
+            or workload_summary_row.get("max_amount_pool_evals"),
+            max_simulation_runs,
+        )
+        workload_source = "full-window aggregate"
 
     run_count_values = [to_int(row.get("simulation_runs")) for row in runs_rows]
     native_pool_values = [to_int(row.get("scheduled_native_pools")) for row in runs_rows]
@@ -396,9 +464,8 @@ def build_report(input_dir: Path, period: str) -> str:
     memory_growth = (mem_series[-1] - mem_series[0]) if len(mem_series) >= 2 else 0.0
     memory_leak_signal = memory_monotonic and memory_growth > 1.0
 
-    runs_minute_stats = stats([float(v) for v in runs_per_minute])
+    scheduled_pool_runs_minute_stats = stats([float(v) for v in scheduled_pool_runs_per_minute])
     req_minute_stats = stats([float(v) for v in requests_per_minute])
-    runs_per_request_stats = stats([float(v) for v in run_count_values])
     runs_auction_stats = stats([float(v) for v in runs_per_auction])
     ratio_auction_stats = stats(ratio_per_auction)
     latency_stats = stats([float(v) for v in latency_values])
@@ -482,6 +549,30 @@ def build_report(input_dir: Path, period: str) -> str:
         coverage_notes.append(
             f"`simulate-completions` returned {fmt_int(len(completions_rows))} rows out of {fmt_int(completions_matched)} matched (CloudWatch row cap)."
         )
+    runs_pagination = runs_raw.get("meta", {}).get("pagination", {})
+    if runs_pagination:
+        if runs_pagination.get("truncated"):
+            coverage_notes.append(
+                f"`simulate-runs` pagination stopped early ({runs_pagination.get('truncated_reason', 'unknown')}); rows={fmt_int(runs_pagination.get('rows_returned', 0))}, capped_windows={fmt_int(runs_pagination.get('capped_windows', 0))}."
+            )
+        elif to_int(str(runs_pagination.get("capped_windows", 0))) > 0:
+            coverage_notes.append(
+                f"`simulate-runs` used window pagination and hit per-window row caps ({fmt_int(runs_pagination.get('capped_windows', 0))} windows)."
+            )
+    completions_pagination = completions_raw.get("meta", {}).get("pagination", {})
+    if completions_pagination:
+        if completions_pagination.get("truncated"):
+            coverage_notes.append(
+                f"`simulate-completions` pagination stopped early ({completions_pagination.get('truncated_reason', 'unknown')}); rows={fmt_int(completions_pagination.get('rows_returned', 0))}, capped_windows={fmt_int(completions_pagination.get('capped_windows', 0))}."
+            )
+        elif to_int(str(completions_pagination.get("capped_windows", 0))) > 0:
+            coverage_notes.append(
+                f"`simulate-completions` used window pagination and hit per-window row caps ({fmt_int(completions_pagination.get('capped_windows', 0))} windows)."
+            )
+    if not workload_summary_row:
+        coverage_notes.append(
+            "`simulate-workload-summary` is missing, simulation run totals are estimated from sampled completions."
+        )
 
     run_lines = []
     if minutes:
@@ -490,10 +581,10 @@ def build_report(input_dir: Path, period: str) -> str:
             step = len(idxs) / 16
             idxs = [min(len(minutes) - 1, int(i * step)) for i in range(16)]
             idxs = sorted(set(idxs))
-        max_runs_minute = max(runs_per_minute) if runs_per_minute else 0
+        max_runs_minute = max(scheduled_pool_runs_per_minute) if scheduled_pool_runs_per_minute else 0
         for idx in idxs:
             run_lines.append(
-                f"{minutes[idx]}  {hbar(runs_per_minute[idx], max_runs_minute, width=30)}  {fmt_int(runs_per_minute[idx])}"
+                f"{minutes[idx]}  {hbar(scheduled_pool_runs_per_minute[idx], max_runs_minute, width=30)}  {fmt_int(scheduled_pool_runs_per_minute[idx])}"
             )
 
     protocol_lines = []
@@ -527,8 +618,10 @@ def build_report(input_dir: Path, period: str) -> str:
     split_width = 40
     native_w = int(round(native_share / 100 * split_width)) if total_scheduled_pools else 0
     native_w = max(0, min(split_width, native_w))
-    vm_w = split_width - native_w
-    native_vm_bar = "[" + ("█" * native_w) + ("▓" * vm_w) + "]"
+    vm_w = int(round(vm_share / 100 * split_width)) if total_scheduled_pools else 0
+    vm_w = max(0, min(split_width, vm_w))
+    native_vm_bar = "[" + ("█" * native_w) + (" " * (split_width - native_w)) + "]"
+    vm_bar = "[" + ("█" * vm_w) + (" " * (split_width - vm_w)) + "]"
 
     latency_ladder_values = [
         fmt_int(latency_stats["min"]),
@@ -559,8 +652,11 @@ def build_report(input_dir: Path, period: str) -> str:
         fenced_text(
             summary_box(
                 [
-                    f"Requests: {fmt_int(total_requests)}  |  Simulation runs: {fmt_int(total_runs)}",
-                    f"Runs/request: {fmt_float(runs_per_request, 2)}  |  Unique auctions: {fmt_int(unique_auctions)}",
+                    f"Requests: {fmt_int(total_requests)}  |  Pool simulation runs: {fmt_int(total_scheduled_pool_runs)}",
+                    f"Pool simulation runs/request: {fmt_float(scheduled_pools_per_request, 2)}  |  Unique auctions: {fmt_int(unique_auctions)}",
+                    f"Amounts simulated/request: {fmt_float(amounts_simulated_per_request, 2)}  |  Simulation runs/request: {fmt_float(simulation_runs_per_request, 2)}",
+                    f"Simulation runs/request p50: {fmt_int(p50_simulation_runs)}  |  p90: {fmt_int(p90_simulation_runs)}  |  max: {fmt_int(max_simulation_runs)}",
+                    f"Total simulation runs: {fmt_int(total_simulation_runs)} ({workload_source})",
                     f"Per-request sample size for deep stats: {fmt_int(sample_request_count)}",
                 ]
             )
@@ -571,10 +667,10 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append("## 2. Throughput over time")
     report_lines.append("")
     throughput_block = [
-        f"Runs/min sparkline      {sparkline([float(v) for v in runs_per_minute], max_points=48)}",
+        f"Simulation-runs/min sparkline {sparkline([float(v) for v in scheduled_pool_runs_per_minute], max_points=48)}",
         f"Requests/min sparkline  {sparkline([float(v) for v in requests_per_minute], max_points=48)}",
         "",
-        "Runs per minute bars:",
+        "Pool simulation runs per minute bars:",
         *(run_lines if run_lines else ["(no per-minute data)"]),
     ]
     report_lines.append(fenced_text(throughput_block))
@@ -583,7 +679,7 @@ def build_report(input_dir: Path, period: str) -> str:
         fenced_text(
             summary_box(
                 [
-                    *render_distribution_compact("Runs/min", [float(v) for v in runs_per_minute]),
+                    *render_distribution_compact("PoolRuns/min", [float(v) for v in scheduled_pool_runs_per_minute]),
                     *render_distribution_compact("Reqs/min", [float(v) for v in requests_per_minute]),
                 ]
             )
@@ -614,7 +710,7 @@ def build_report(input_dir: Path, period: str) -> str:
             summary_box(
                 [
                     render_distribution(
-                        "sim_runs",
+                        "sched_pools",
                         [float(v) for v in run_count_values],
                         ["p10", "p25", "p50", "p75", "p90", "p95", "max"],
                     ),
@@ -629,8 +725,8 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append(
         fenced_text(
             [
-                f"Native vs VM split {native_vm_bar}",
-                f"(native {native_share:.1f}%, vm {vm_share:.1f}%)",
+                f"Native share {native_vm_bar} {native_share:.1f}%",
+                f"VM share     {vm_bar} {vm_share:.1f}%",
             ]
         )
     )
@@ -691,13 +787,13 @@ def build_report(input_dir: Path, period: str) -> str:
                 [
                     f"Auction cadence: {fmt_float(auctions_per_min, 2)} unique auctions/minute",
                     *render_distribution_compact("runs/auction", [float(v) for v in runs_per_auction]),
-                    f"Runs/request per auction p50: {fmt_float(ratio_auction_stats['p50'], 2)}, p90: {fmt_float(ratio_auction_stats['p90'], 2)}, max: {fmt_float(ratio_auction_stats['max'], 2)}",
+                    f"Pool simulation runs/request per auction p50: {fmt_float(ratio_auction_stats['p50'], 2)}, p90: {fmt_float(ratio_auction_stats['p90'], 2)}, max: {fmt_float(ratio_auction_stats['max'], 2)}",
                 ]
             )
         )
     )
     report_lines.append("")
-    report_lines.append("Top auctions by simulation runs:")
+    report_lines.append("Top auctions by pool simulation runs:")
     report_lines.append("| Auction | Runs | Requests | Runs/Req |")
     report_lines.append("| :--- | ---: | ---: | ---: |")
     for auction_id, runs, req, ratio in top_auctions_rows[:10]:
@@ -760,10 +856,13 @@ def build_report(input_dir: Path, period: str) -> str:
     )
     top_pair = top_pairs[0][0] if top_pairs else "n/a"
     report_lines.append(
-        f"Traffic in this {period} window was {fmt_int(total_requests)} requests and {fmt_int(total_runs)} simulation runs, averaging {runs_per_request:.2f} runs per request across {fmt_int(unique_auctions)} auctions."
+        f"Traffic in this {period} window was {fmt_int(total_requests)} requests and {fmt_int(total_scheduled_pool_runs)} pool simulation runs, averaging {scheduled_pools_per_request:.2f} pool simulation runs per request across {fmt_int(unique_auctions)} auctions."
     )
     report_lines.append(
-        f"Throughput was bursty, runs/min ranged from {fmt_int(runs_minute_stats['min'])} to {fmt_int(runs_minute_stats['max'])} with p50 {fmt_int(runs_minute_stats['p50'])}, and request/min p50 was {fmt_int(req_minute_stats['p50'])}."
+        f"Amount fanout averaged {fmt_float(amounts_simulated_per_request, 2)} amounts simulated per request and {fmt_float(simulation_runs_per_request, 2)} simulation runs per request ({workload_source})."
+    )
+    report_lines.append(
+        f"Throughput was bursty, simulation-runs/min ranged from {fmt_int(scheduled_pool_runs_minute_stats['min'])} to {fmt_int(scheduled_pool_runs_minute_stats['max'])} with p50 {fmt_int(scheduled_pool_runs_minute_stats['p50'])}, and request/min p50 was {fmt_int(req_minute_stats['p50'])}."
     )
     report_lines.append(
         f"Latency stayed tight with p50 {fmt_int(latency_stats['p50'])} ms and p99 {fmt_int(latency_stats['p99'])} ms (max {fmt_int(latency_stats['max'])} ms), while status mix was Ready {ready_share:.1f}% and PartialSuccess {partial_share:.1f}%."

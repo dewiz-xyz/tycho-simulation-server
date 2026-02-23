@@ -44,6 +44,7 @@ Simulate completion logs are now emitted at `info` level for successful requests
 | simulate-runs | Per-request detail with simulation_runs count. |
 | simulate-runs-per-minute | Total pool simulation runs per minute. |
 | simulate-runs-per-auction | Total pool simulation runs per auction_id. |
+| simulate-workload-summary | Full-window amount and pool workload aggregate (requests, pool simulation runs, amounts simulated, simulation runs). |
 | token-metadata | Token metadata fetch errors. |
 | token-rpc-fetch | Single-token RPC fetch path. |
 | state-anomalies | Missing/unknown state warnings. |
@@ -60,6 +61,7 @@ Simulate completion logs are now emitted at `info` level for successful requests
 - `scripts/cw_tail.zsh`: live tail with optional filter and stream prefix (default format: json).
 - `scripts/cw_filter.zsh`: time-window search with filter patterns.
 - `scripts/cw_query.zsh`: Logs Insights queries with presets and JSON parsing.
+- `scripts/cw_query_ceiling.py`: windowed preset runner with safety ceilings (`max_rows`, `max_scanned_gb`, `max_queries`).
 - `scripts/cw_metrics.zsh`: memory/cpu metrics summaries and time series.
 - `scripts/analyze_snapshot.py`: render a production snapshot markdown report from query + metrics JSON outputs.
 - `scripts/cw_time.py`: time parsing helper for `cw_filter`, `cw_query`, and `cw_metrics`.
@@ -67,10 +69,16 @@ Simulate completion logs are now emitted at `info` level for successful requests
 ## Snapshot report workflow
 - Prompt source: `~/.codex/prompts/sim-report.md`.
 - Default period in the prompt is `12h` when no argument is provided.
+- Default sampling mode for snapshot reports uses a single query with `--limit 10000` for `simulate-runs` and `simulate-completions`, regardless of time window.
+- Use `cw_query_ceiling.py` for `simulate-runs` and `simulate-completions` only when the user explicitly requests broader sampling coverage.
+- Explicit coverage directives can be expressed as `sample 50%`, `up to 1m logs`, or `sample 50% up to 1m logs`.
+- When expanded coverage is explicitly requested, keep safety ceilings enabled:
+  `max_rows=6000000`, `max_scanned_gb=60`, `max_queries=1200`, `window_seconds=900`.
 - Required generated files for the analyzer:
   `simulate-runs-per-minute.json`, `simulate-runs-per-auction.json`,
   `simulate-runs.json`, `simulate-requests-per-auction.json`,
-  `simulate-completions.json`, `cw-metrics.json`.
+  `simulate-completions.json`, `simulate-workload-summary.json`,
+  `cw-metrics.json`.
 
 ## Metrics
 Quick checks for memory and CPU utilization using ECS ContainerInsights.
