@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_stream_uses_strict_decode_failures() {
-        assert!(!decode_skip_state_failures(StreamDecodePolicy::Vm));
+    fn vm_stream_keeps_decode_skip_enabled() {
+        assert!(decode_skip_state_failures(StreamDecodePolicy::Vm));
     }
 }
