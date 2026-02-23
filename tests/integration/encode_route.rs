@@ -118,6 +118,7 @@ struct EncodeFixtureConfig<'a> {
     request_pool_protocol: &'a str,
     component_protocol_system: &'a str,
     component_protocol_type_name: &'a str,
+    component_static_attributes: HashMap<String, Bytes>,
     vm_pool: bool,
     enable_vm_pools: bool,
     reset_allowance: bool,
@@ -133,6 +134,7 @@ impl Default for EncodeFixtureConfig<'_> {
             request_pool_protocol: "uniswap_v2",
             component_protocol_system: "uniswap_v2",
             component_protocol_type_name: "uniswap_v2",
+            component_static_attributes: HashMap::new(),
             vm_pool: false,
             enable_vm_pools: false,
             reset_allowance: true,
@@ -180,7 +182,7 @@ async fn setup_app_state_and_request(
         Chain::Ethereum,
         vec![token_in_meta.clone(), token_out_meta.clone()],
         Vec::new(),
-        HashMap::new(),
+        config.component_static_attributes.clone(),
         Bytes::default(),
         NaiveDateTime::default(),
     );
@@ -417,6 +419,52 @@ async fn encode_route_succeeds_for_vm_maverick_v2_pool() {
         component_protocol_type_name: "maverick_v2",
         vm_pool: true,
         enable_vm_pools: true,
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.interactions.len(), 2);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
+    assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+}
+
+#[tokio::test]
+async fn encode_route_succeeds_for_ekubo_v3_pool() {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "ekubo_v3",
+        component_protocol_system: "ekubo_v3",
+        component_protocol_type_name: "ekubo_v3",
+        component_static_attributes: HashMap::from([
+            (
+                "extension".to_string(),
+                Bytes::from_str("0x517e506700271aea091b02f42756f5e174af5230").unwrap(),
+            ),
+            ("fee".to_string(), Bytes::from(0_u64)),
+            ("pool_type_config".to_string(), Bytes::from(0_u32)),
+        ]),
         reset_allowance: false,
         ..EncodeFixtureConfig::default()
     };
