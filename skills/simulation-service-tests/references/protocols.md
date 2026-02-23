@@ -10,6 +10,7 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - `pancakeswap_v3`
 - `uniswap_v4`
 - `ekubo_v2`
+- `ekubo_v3`
 - `fluid_v1`
 - `rocketpool`
 
@@ -32,4 +33,4 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - **Protocol names in reports**: `coverage_sweep.py` derives “protocol” from `pool_name` (the prefix before `::`).
   - Treat it as best-effort labeling; if upstream changes formatting, update `protocol_from_pool_name`.
   - When using `--expect-protocols`, use the lowercased `pool_name` prefixes from the sweep output, not request protocol IDs like `uniswap_v3`.
-  - For core coverage checks, include Rocketpool/Maverick expectations (for example: `uniswap_v3,uniswap_v4,rocketpool,maverick_v2`).
+  - For hard CI/local gates, prefer stable expectations for your probe pairs (for example: `maverick_v2`).

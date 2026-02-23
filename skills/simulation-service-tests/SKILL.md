@@ -88,7 +88,7 @@ VM pool feeds (Curve/Balancer/Maverick) are controlled by `ENABLE_VM_POOLS` (def
 
 To assert specific protocol presence (derived from `pool_name` prefixes), use:
 ```bash
-python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,rocketpool,maverick_v2
+python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,maverick_v2
 ```
 
 Allow `no_liquidity` responses with only `no_pools` failures:
