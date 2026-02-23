@@ -33,6 +33,7 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | simulate-runs | Per-request simulation runs detail | Shows simulation_runs (scheduled pools) alongside key metrics. |
 | simulate-runs-per-minute | Pool simulation runs per minute | Sum of scheduled pools per minute; distinguishes runs from requests. |
 | simulate-runs-per-auction | Pool simulation runs per auction_id | Sum of scheduled pools per auction; distinguishes runs from requests. |
+| simulate-workload-summary | Full-window workload aggregate | Computes requests, pool simulation runs, amounts simulated, and simulation run totals. |
 | token-metadata | Token metadata fetch errors | Timeout and failure messages. |
 | token-rpc-fetch | Single token RPC fetch | Rare fetch path and failures. |
 | state-anomalies | State store warnings | Missing state, unknown protocol/pair. |
@@ -384,6 +385,27 @@ fields @timestamp
 | stats sum(simulation_runs) as total_runs, count() as requests by auction_id
 | sort total_runs desc
 | limit 100
+```
+
+### simulate-workload-summary
+```
+fields @timestamp
+| parse @message '"message":"*"' as msg
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"scheduled_native_pools":(?<scheduled_native_pools>[0-9]+)/
+| parse @message /"scheduled_vm_pools":(?<scheduled_vm_pools>[0-9]+)/
+| filter msg like /Simulate computation completed/
+| fields scheduled_native_pools + scheduled_vm_pools as scheduled_pools
+| fields scheduled_pools * amounts as simulation_runs
+| stats count() as requests,
+        sum(scheduled_pools) as pool_simulation_runs,
+        avg(scheduled_pools) as pool_simulation_runs_per_request,
+        avg(amounts) as amounts_simulated_per_request,
+        sum(simulation_runs) as simulation_runs_total,
+        avg(simulation_runs) as simulation_runs_per_request,
+        pct(simulation_runs, 50) as p50_simulation_runs,
+        pct(simulation_runs, 90) as p90_simulation_runs,
+        max(simulation_runs) as max_simulation_runs
 ```
 
 ### token-metadata
