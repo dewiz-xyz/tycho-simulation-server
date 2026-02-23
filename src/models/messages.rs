@@ -134,6 +134,7 @@ pub struct QuoteMeta {
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
+    pub rfq_block_number: Option<u64>,
     pub matching_pools: usize,
     pub candidate_pools: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +145,8 @@ pub struct QuoteMeta {
     pub pool_results: Vec<PoolSimulationOutcome>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vm_unavailable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rfq_unavailable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<QuoteFailure>,
 }

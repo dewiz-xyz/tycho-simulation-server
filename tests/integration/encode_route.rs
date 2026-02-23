@@ -24,7 +24,9 @@ use tycho_simulation_server::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
+use tycho_simulation_server::models::state::{
+    AppState, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 
@@ -119,7 +121,9 @@ struct EncodeFixtureConfig<'a> {
     component_protocol_system: &'a str,
     component_protocol_type_name: &'a str,
     vm_pool: bool,
+    rfq_pool: bool,
     enable_vm_pools: bool,
+    enable_rfq_pools: bool,
     reset_allowance: bool,
     request_id: &'a str,
 }
@@ -134,7 +138,9 @@ impl Default for EncodeFixtureConfig<'_> {
             component_protocol_system: "uniswap_v2",
             component_protocol_type_name: "uniswap_v2",
             vm_pool: false,
+            rfq_pool: false,
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             reset_allowance: true,
             request_id: "req-1",
         }
@@ -172,6 +178,7 @@ async fn setup_app_state_and_request(
 
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
     let component = ProtocolComponent::new(
         Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -214,20 +221,27 @@ async fn setup_app_state_and_request(
         tokens: Arc::clone(&tokens_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: config.enable_vm_pools,
+        enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_secs(1),
         pool_timeout_vm: Duration::from_secs(1),
+        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
 
     let request = RouteEncodeRequest {
@@ -416,7 +430,9 @@ async fn encode_route_succeeds_for_vm_maverick_v2_pool() {
         component_protocol_system: "vm:maverick_v2",
         component_protocol_type_name: "maverick_v2",
         vm_pool: true,
+        rfq_pool: false,
         enable_vm_pools: true,
+        enable_rfq_pools: false,
         reset_allowance: false,
         ..EncodeFixtureConfig::default()
     };

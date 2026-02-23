@@ -85,7 +85,7 @@ mod tests {
 
     use super::*;
     use crate::models::messages::SwapKind;
-    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
 
@@ -102,6 +102,8 @@ mod tests {
             std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
         let vm_state_store =
             std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
+        let rfq_state_store =
+            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -111,20 +113,27 @@ mod tests {
             tokens: std::sync::Arc::clone(&tokens_store),
             native_state_store: std::sync::Arc::clone(&native_state_store),
             vm_state_store: std::sync::Arc::clone(&vm_state_store),
+            rfq_state_store: std::sync::Arc::clone(&rfq_state_store),
             native_stream_health: std::sync::Arc::new(StreamHealth::new()),
             vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
+            rfq_stream_health: std::sync::Arc::new(StreamHealth::new()),
             vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: std::sync::Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
             native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = RouteEncodeRequest {
@@ -156,6 +165,8 @@ mod tests {
             std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
         let vm_state_store =
             std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
+        let rfq_state_store =
+            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -165,20 +176,27 @@ mod tests {
             tokens: std::sync::Arc::clone(&tokens_store),
             native_state_store: std::sync::Arc::clone(&native_state_store),
             vm_state_store: std::sync::Arc::clone(&vm_state_store),
+            rfq_state_store: std::sync::Arc::clone(&rfq_state_store),
             native_stream_health: std::sync::Arc::new(StreamHealth::new()),
             vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
+            rfq_stream_health: std::sync::Arc::new(StreamHealth::new()),
             vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: std::sync::Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
             native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = RouteEncodeRequest {

@@ -30,7 +30,9 @@ use tycho_simulation_server::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
 use tycho_simulation_server::models::messages::AmountOutRequest;
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
+use tycho_simulation_server::models::state::{
+    AppState, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 use tycho_simulation_server::services::quotes::get_amounts_out;
@@ -453,6 +455,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
 
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
     let native_component = make_component(
         10,
@@ -488,20 +491,27 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         tokens: Arc::clone(&token_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: true,
+        enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_millis(100),
         pool_timeout_native: Duration::from_millis(50),
         pool_timeout_vm: Duration::from_millis(50),
+        pool_timeout_rfq: Duration::from_millis(50),
         request_timeout: Duration::from_millis(1000),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 4,
+        rfq_sim_concurrency: 4,
     };
 
     assert!(app_state.vm_ready().await);

@@ -137,6 +137,7 @@ pub async fn process_stream(
             }
             Ok(Some(msg)) => match msg {
                 Ok(update) => {
+                    info!("update: {:?}", update);
                     let now = Instant::now();
                     let has_advanced = update
                         .sync_states

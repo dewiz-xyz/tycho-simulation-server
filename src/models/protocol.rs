@@ -16,10 +16,12 @@ pub enum ProtocolKind {
     BalancerV2,
     FluidV1,
     Rocketpool,
+    Hashflow,
+    Bebop,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 12] = [
+    pub const ALL: [ProtocolKind; 14] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -32,6 +34,8 @@ impl ProtocolKind {
         ProtocolKind::BalancerV2,
         ProtocolKind::FluidV1,
         ProtocolKind::Rocketpool,
+        ProtocolKind::Hashflow,
+        ProtocolKind::Bebop,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -48,6 +52,8 @@ impl ProtocolKind {
             ProtocolKind::BalancerV2 => "balancer_v2",
             ProtocolKind::FluidV1 => "fluid_v1",
             ProtocolKind::Rocketpool => "rocketpool",
+            ProtocolKind::Hashflow => "hashflow",
+            ProtocolKind::Bebop => "bebop_pool",
         }
     }
 
@@ -70,6 +76,8 @@ impl ProtocolKind {
             "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
             "rocketpool" => return Some(ProtocolKind::Rocketpool),
+            "hashflow" | "hashflow_pool" => return Some(ProtocolKind::Hashflow),
+            "bebop" | "bebop_pool" => return Some(ProtocolKind::Bebop),
             _ => {}
         }
 
@@ -86,6 +94,8 @@ impl ProtocolKind {
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
+            "rfq:hashflow" => return Some(ProtocolKind::Hashflow),
+            "rfq:bebop" => return Some(ProtocolKind::Bebop),
             _ => None,
         }
     }
@@ -106,6 +116,8 @@ impl ProtocolKind {
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
+            "hashflow" | "hashflow_pool" | "rfq:hashflow" => return Some(ProtocolKind::Hashflow),
+            "bebop" | "bebop_pool" | "rfq:bebop" => return Some(ProtocolKind::Bebop),
             _ => None,
         }
     }
@@ -181,5 +193,45 @@ mod tests {
     #[test]
     fn does_not_recognize_v4_hooks_sync_key() {
         assert_eq!(ProtocolKind::from_sync_state_key("uniswap_v4_hooks"), None);
+    }
+
+    #[test]
+    fn recognizes_rfq_bebop_component() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "rfq:bebop".to_string(),
+            "bebop_pool".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::Bebop)
+        );
+    }
+
+    #[test]
+    fn recognizes_rfq_hashflow_component() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "rfq:hashflow".to_string(),
+            "hashflow_pool".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::Hashflow)
+        );
     }
 }

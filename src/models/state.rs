@@ -54,10 +54,18 @@ impl AppState {
         Some(self.vm_state_store.current_block().await)
     }
 
+    pub async fn current_rfq_block(&self) -> Option<u64> {
+        if !self.rfq_ready().await {
+            return None;
+        }
+        Some(self.rfq_state_store.current_block().await)
+    }
+
     pub async fn total_pools(&self) -> usize {
         let native = self.native_state_store.total_states().await;
         let vm = self.vm_state_store.total_states().await;
-        native + vm
+        let rfq = self.rfq_state_store.total_states().await;
+        native + vm + rfq
     }
 
     pub fn is_ready(&self) -> bool {
@@ -80,6 +88,10 @@ impl AppState {
         self.pool_timeout_vm
     }
 
+    pub fn pool_timeout_rfq(&self) -> Duration {
+        self.pool_timeout_rfq
+    }
+
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -92,7 +104,7 @@ impl AppState {
     }
 
     pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.vm_sim_semaphore)
+        Arc::clone(&self.rfq_sim_semaphore)
     }
 
     pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
@@ -584,6 +596,8 @@ impl StateStore {
             }
         }
 
+        // info!("result in matching pool: {:?}", result);
+
         result
     }
 
@@ -1061,6 +1075,7 @@ mod tests {
         ));
         let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         let token_a = mk_token(7, "TKNA");
         let token_b = mk_token(8, "TKNB");
@@ -1092,23 +1107,33 @@ mod tests {
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_store),
             vm_state_store: Arc::clone(&vm_store),
+            rfq_state_store: Arc::clone(&rfq_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: true,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+        assert_eq!(app_state.current_rfq_block().await, None);
     }
+
+    // todo add rfq test
 }
