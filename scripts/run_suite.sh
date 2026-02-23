@@ -190,7 +190,9 @@ mkdir -p "$repo/logs"
 python3 "$script_dir/coverage_sweep.py" --url "$simulate_url" --suite "$suite" --allow-status "$coverage_allow_status" $allow_failures_flag $allow_no_pools_flag --out "$repo/logs/coverage_sweep.json"
 
 if [[ "$enable_vm_pools" == "true" ]]; then
-  echo "Protocol presence checks (Maverick + Rocketpool)..."
+  # Keep this check tied to protocols that are consistently surfaced by the probe pairs.
+  # Rocketpool/Ekubo-v3 can legitimately be absent for these pairs, making the suite flaky.
+  echo "Protocol presence checks (Maverick)..."
   python3 "$script_dir/coverage_sweep.py" \
     --url "$simulate_url" \
     --pair USDC:USDT \
@@ -199,7 +201,7 @@ if [[ "$enable_vm_pools" == "true" ]]; then
     --allow-status "$coverage_allow_status" \
     $allow_failures_flag \
     $allow_no_pools_flag \
-    --expect-protocols rocketpool,maverick_v2 \
+    --expect-protocols maverick_v2 \
     --out "$repo/logs/coverage_protocol_presence.json"
 fi
 

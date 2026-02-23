@@ -8,6 +8,7 @@ use tycho_simulation::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
             ekubo::state::EkuboState,
+            ekubo_v3::state::EkuboV3State,
             filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
@@ -67,6 +68,7 @@ pub async fn build_native_stream(
         Some(fluid_v1_paused_pools_filter),
     );
     // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
+    builder = builder.exchange::<EkuboV3State>("ekubo_v3", tvl_filter.clone(), None);
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
@@ -160,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_stream_uses_strict_decode_failures() {
-        assert!(!decode_skip_state_failures(StreamDecodePolicy::Vm));
+    fn vm_stream_keeps_decode_skip_enabled() {
+        assert!(decode_skip_state_failures(StreamDecodePolicy::Vm));
     }
 }

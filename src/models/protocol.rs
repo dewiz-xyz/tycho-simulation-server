@@ -16,10 +16,11 @@ pub enum ProtocolKind {
     BalancerV2,
     FluidV1,
     Rocketpool,
+    EkuboV3,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 12] = [
+    pub const ALL: [ProtocolKind; 13] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -32,6 +33,7 @@ impl ProtocolKind {
         ProtocolKind::BalancerV2,
         ProtocolKind::FluidV1,
         ProtocolKind::Rocketpool,
+        ProtocolKind::EkuboV3,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -48,6 +50,7 @@ impl ProtocolKind {
             ProtocolKind::BalancerV2 => "balancer_v2",
             ProtocolKind::FluidV1 => "fluid_v1",
             ProtocolKind::Rocketpool => "rocketpool",
+            ProtocolKind::EkuboV3 => "ekubo_v3",
         }
     }
 
@@ -70,6 +73,7 @@ impl ProtocolKind {
             "balancer_v2" | "balancerv2_pool" => return Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => return Some(ProtocolKind::FluidV1),
             "rocketpool" => return Some(ProtocolKind::Rocketpool),
+            "ekubo_v3" | "ekubov3" => return Some(ProtocolKind::EkuboV3),
             _ => {}
         }
 
@@ -86,6 +90,7 @@ impl ProtocolKind {
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
+            "ekubo_v3" | "ekubov3" => Some(ProtocolKind::EkuboV3),
             _ => None,
         }
     }
@@ -106,6 +111,7 @@ impl ProtocolKind {
             "balancer_v2" | "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "fluid_v1" | "fluidv1" => Some(ProtocolKind::FluidV1),
             "rocketpool" => Some(ProtocolKind::Rocketpool),
+            "ekubo_v3" | "ekubov3" => Some(ProtocolKind::EkuboV3),
             _ => None,
         }
     }
@@ -175,6 +181,34 @@ mod tests {
         assert_eq!(
             ProtocolKind::from_sync_state_key("vm:maverick_v2"),
             Some(ProtocolKind::MaverickV2)
+        );
+    }
+
+    #[test]
+    fn recognizes_ekubo_v3_component_by_system() {
+        let component = ProtocolComponent::new(
+            Bytes::default(),
+            "ekubo_v3".to_string(),
+            "base_pool".to_string(),
+            Chain::Ethereum,
+            Vec::<Token>::new(),
+            Vec::<Bytes>::new(),
+            HashMap::<String, Bytes>::new(),
+            Bytes::default(),
+            Default::default(),
+        );
+
+        assert_eq!(
+            ProtocolKind::from_component(&component),
+            Some(ProtocolKind::EkuboV3)
+        );
+    }
+
+    #[test]
+    fn recognizes_ekubo_v3_sync_key() {
+        assert_eq!(
+            ProtocolKind::from_sync_state_key("ekubo_v3"),
+            Some(ProtocolKind::EkuboV3)
         );
     }
 
