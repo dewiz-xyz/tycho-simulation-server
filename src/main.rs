@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         native_stream_health: Arc::clone(&native_stream_health),
         vm_stream_health: Arc::clone(&vm_stream_health),
         vm_stream: Arc::clone(&vm_stream),
+        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
         enable_vm_pools: config.enable_vm_pools,
         readiness_stale,
         quote_timeout,
@@ -131,14 +132,18 @@ async fn main() -> anyhow::Result<()> {
         restart_backoff_max: Duration::from_millis(config.stream_restart_backoff_max_ms),
         restart_backoff_jitter_pct: config.stream_restart_backoff_jitter_pct,
         memory: config.memory,
+        rpc_url: config.rpc_url.clone(),
+        rpc_client: reqwest::Client::new(),
     };
 
     // Build protocol streams in background and start processing
     {
+        let native_supervisor_cfg = supervisor_cfg.clone();
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&native_state_store);
         let health_bg = Arc::clone(&native_stream_health);
+        let app_state_bg = app_state.clone();
         let tycho_url = cfg.tycho_url.clone();
         let api_key = cfg.api_key.clone();
         let tvl_threshold = cfg.tvl_threshold;
@@ -163,7 +168,8 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_store_bg,
                 health_bg,
-                supervisor_cfg,
+                native_supervisor_cfg,
+                app_state_bg,
             )
             .await;
         });
@@ -171,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.enable_vm_pools {
+        let vm_supervisor_cfg = supervisor_cfg.clone();
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&vm_state_store);
@@ -204,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_store_bg,
                 health_bg,
-                supervisor_cfg,
+                vm_supervisor_cfg,
                 VmStreamControls {
                     vm_stream: vm_stream_bg,
                     vm_sim_semaphore: vm_semaphore_bg,

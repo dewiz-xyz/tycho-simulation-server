@@ -112,6 +112,7 @@ Response body:
       "pool_address": "0x...",
       "amounts_out": ["999000000", "4985000000"],
       "gas_used": [210000, 210000],
+      "gas_in_sell": "630000000000000",
       "block_number": 19876543
     }
   ],
@@ -132,6 +133,8 @@ Response body:
 
 `meta.pool_results` contains anomaly-only per-pool outcomes (`partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `skipped_precheck`, `timed_out`, `simulator_error`, `internal_error`). `meta.vm_unavailable=true` indicates VM pools were skipped because VM state was not ready.
 
+`gas_in_sell` is computed per pool from the latest native-stream cached `eth_gasPrice` (from `RPC_URL`), the request-scoped `spot_price(ETH, sellToken)`, and the pool's last `gas_used` ladder entry; it is returned in sell-token base units. When spot price, cached gas price, or gas usage is unavailable, it is `"0"`.
+
 `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
 Mixed-outcome example (one usable result + one anomalous pool):
@@ -146,6 +149,7 @@ Mixed-outcome example (one usable result + one anomalous pool):
       "pool_address": "0x1111...",
       "amounts_out": ["100", "990"],
       "gas_used": [120000, 120000],
+      "gas_in_sell": "360000000000000",
       "block_number": 19876543
     }
   ],

@@ -21,6 +21,7 @@ pub struct AmountOutResponse {
     pub pool_address: String,
     pub amounts_out: Vec<String>,
     pub gas_used: Vec<u64>,
+    pub gas_in_sell: String,
     pub block_number: u64,
 }
 
@@ -267,7 +268,7 @@ pub struct EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolOutcomeKind, QuoteResultQuality};
+    use super::{AmountOutResponse, PoolOutcomeKind, QuoteResultQuality};
 
     #[test]
     fn quote_result_quality_serializes_as_snake_case() {
@@ -291,5 +292,22 @@ mod tests {
             serde_json::to_string(&PoolOutcomeKind::PartialOutput).unwrap(),
             "\"partial_output\""
         );
+    }
+
+    #[test]
+    fn amount_out_response_serializes_gas_in_sell_snake_case() {
+        let response = AmountOutResponse {
+            pool: "pool-1".to_string(),
+            pool_name: "name".to_string(),
+            pool_address: "0x1".to_string(),
+            amounts_out: vec!["1".to_string()],
+            gas_used: vec![1],
+            gas_in_sell: "3000000".to_string(),
+            block_number: 1,
+        };
+
+        let value = serde_json::to_value(response).expect("serialize response");
+        assert_eq!(value["gas_in_sell"], "3000000");
+        assert!(value.get("gasInSellToken").is_none());
     }
 }

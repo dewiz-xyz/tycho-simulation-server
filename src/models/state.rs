@@ -22,6 +22,7 @@ pub struct AppState {
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
+    pub latest_native_gas_price_wei: Arc<RwLock<Option<u128>>>,
     pub enable_vm_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
@@ -116,6 +117,14 @@ impl AppState {
 
     pub async fn vm_pools(&self) -> usize {
         self.vm_state_store.total_states().await
+    }
+
+    pub async fn latest_native_gas_price_wei(&self) -> Option<u128> {
+        *self.latest_native_gas_price_wei.read().await
+    }
+
+    pub async fn set_latest_native_gas_price_wei(&self, value: Option<u128>) {
+        *self.latest_native_gas_price_wei.write().await = value;
     }
 }
 
@@ -1048,6 +1057,7 @@ mod tests {
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
             enable_vm_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
@@ -1063,5 +1073,94 @@ mod tests {
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn app_state_native_gas_price_defaults_to_none() {
+        let app_state = AppState {
+            tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        assert_eq!(app_state.latest_native_gas_price_wei().await, None);
+    }
+
+    #[tokio::test]
+    async fn app_state_native_gas_price_updates() {
+        let app_state = AppState {
+            tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        app_state.set_latest_native_gas_price_wei(Some(42)).await;
+        assert_eq!(app_state.latest_native_gas_price_wei().await, Some(42));
     }
 }
