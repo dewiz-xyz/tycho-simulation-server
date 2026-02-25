@@ -78,7 +78,9 @@ pub(super) fn build_route_swaps(
             swap.token_out.clone(),
         )
         .split(split)
-        .protocol_state(Arc::clone(&swap.pool_state));
+        .protocol_state(Arc::clone(&swap.pool_state))
+        .estimated_amount_in(swap.amount_in.clone()); // RFQ NEEDS ThiS
+
         swaps.push(swap_data);
     }
 
