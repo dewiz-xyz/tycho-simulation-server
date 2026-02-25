@@ -2,14 +2,13 @@ use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 
 use crate::models::tokens::TokenStore;
 use anyhow::Result;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use tycho_common::Bytes;
 use tycho_simulation::{
     evm::{
-        decoder::StreamDecodeError,
         engine_db::tycho_db::PreCachedDB,
         protocol::{
             ekubo::state::EkuboState,
@@ -95,10 +94,7 @@ pub struct RFQConfig {
 }
 
 pub async fn build_rfq_stream(
-    tycho_url: &str,
-    api_key: &str,
     tvl_add_threshold: f64,
-    tvl_keep_threshold: f64,
     tokens: Arc<TokenStore>,
     rfq_config: RFQConfig,
 ) -> Result<
@@ -113,28 +109,30 @@ pub async fn build_rfq_stream(
     let mut rfq_builder;
     let snapshot = tokens.snapshot().await;
 
-    // TODO Set up RFQ client using the builder pattern
     let mut rfq_tokens = HashSet::new();
 
-    rfq_tokens.insert(Bytes::from_str("0x6b175474e89094c44da98b954eedeac495271d0f").unwrap());
-    rfq_tokens.insert(Bytes::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap());
-    // rfq_tokens.insert(Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap());
-    // rfq_tokens.insert(Bytes::from_str("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9").unwrap());
-    // rfq_tokens.insert(Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap());
-    // rfq_tokens.insert(Bytes::from_str("0xB8c77482e45F1F44dE1745F52C74426C631bDD52").unwrap());
-    // rfq_tokens.insert(Bytes::from_str("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84").unwrap());
+    // todo: verify the supported tokens for both clients
+    rfq_tokens.insert(Bytes::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap()); // DAI
+    rfq_tokens.insert(Bytes::from_str("0x6b175474e89094c44da98b954eedeac495271d0f").unwrap()); // USDC
+                                                                                               // rfq_tokens.insert(Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap());
+                                                                                               // rfq_tokens.insert(Bytes::from_str("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9").unwrap());
+                                                                                               // rfq_tokens.insert(Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap());
+                                                                                               // rfq_tokens.insert(Bytes::from_str("0xB8c77482e45F1F44dE1745F52C74426C631bDD52").unwrap());
+                                                                                               // rfq_tokens.insert(Bytes::from_str("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84").unwrap());
 
-    rfq_builder = RFQStreamBuilder::new().set_tokens(snapshot.clone()).await;
+    rfq_builder = RFQStreamBuilder::new();
+
+    info!("Setting up Bebop RFQ client...\n");
     let (user, key) = (rfq_config.bebop_user, rfq_config.bebop_key);
-    println!("Setting up Bebop RFQ client...\n");
     let bebop_client = BebopClientBuilder::new(Chain::Ethereum, user, key)
         .tokens(rfq_tokens.clone())
         .tvl_threshold(tvl_add_threshold)
         .build()
         .expect("Failed to create Bebop RFQ client");
     rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
+
+    info!("Setting up Hashflow RFQ client...\n");
     let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
-    println!("Setting up Hashflow RFQ client...\n");
     let hashflow_client = HashflowClientBuilder::new(Chain::Ethereum, user, key)
         .tokens(rfq_tokens)
         .tvl_threshold(tvl_add_threshold)
@@ -142,27 +140,15 @@ pub async fn build_rfq_stream(
         .build()
         .expect("Failed to create Hashflow RFQ client");
     rfq_builder = rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
-    let (tx, mut rx) = mpsc::channel::<Update>(100);
+
+    // Built stream
+    let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
     rfq_builder = rfq_builder.set_tokens(snapshot.clone()).await;
     info!("RFQ pool feeds enabled");
     tokio::spawn(rfq_builder.build(tx));
     info!("Connected to RFQs! Streaming live price levels...\n");
 
-    //let rfq_stream = ReceiverStream::new(rx).map(Ok).boxed();
-
-    // Ok(rx.recv().map(|item| {
-    //      item.map_err(|err: StreamDecodeError| {
-    //          Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>
-    //      })))
-
     Ok(ReceiverStream::new(rx).map(Ok).boxed())
-
-    //let stream = builder.set_tokens(snapshot).await.build().await?;
-    // Ok(rfq_stream.map(|item| {
-    //     item.map_err(|err: StreamDecodeError| {
-    //         Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>
-    //     })
-    // }))
 }
 
 pub async fn build_vm_stream(

@@ -203,6 +203,10 @@ async fn setup_app_state_and_request(
         vm_state_store
             .apply_update(Update::new(42, states, new_pairs))
             .await;
+    } else if config.rfq_pool {
+        rfq_state_store
+            .apply_update(Update::new(42, states, new_pairs))
+            .await;
     } else {
         native_state_store
             .apply_update(Update::new(42, states, new_pairs))

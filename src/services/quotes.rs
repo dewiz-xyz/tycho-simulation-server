@@ -10,6 +10,8 @@ use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use tycho_simulation::rfq::protocols::bebop::state::BebopState;
+use tycho_simulation::rfq::protocols::hashflow::state::HashflowState;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
@@ -110,6 +112,7 @@ pub async fn get_amounts_out(
         meta.result_quality = QuoteResultQuality::RequestLevelFailure;
         meta.pool_results = pool_results;
         meta.vm_unavailable = metrics.skipped_vm_unavailable;
+        meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
         return QuoteComputation {
             responses,
             meta,
@@ -134,6 +137,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -155,6 +159,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -179,6 +184,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -439,6 +445,25 @@ pub async fn get_amounts_out(
     let mut rfq_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
         rfq_candidates_raw
             .into_iter()
+            .filter(|(_, (pool_state, component))| {
+                if component.protocol_system == "rfq:hashflow" {
+                    // Downcast to HashflowState
+                    if let Some(hashflow) = pool_state.as_any().downcast_ref::<HashflowState>() {
+                        hashflow.base_token.symbol == "DAI"
+                    } else {
+                        false
+                    }
+                } else if component.protocol_system == "rfq:bebop" {
+                    // Downcast to BebopState
+                    if let Some(hashflow) = pool_state.as_any().downcast_ref::<BebopState>() {
+                        hashflow.base_token.symbol == "DAI"
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
 
@@ -669,7 +694,6 @@ pub async fn get_amounts_out(
     info!("rfq candidates: {:?}", rfq_candidates);
     // RFQ third
     for (id, pool_state, component) in rfq_candidates.into_iter() {
-        info!("inside rfq candidates");
         if cancel_token.is_cancelled() {
             break;
         }

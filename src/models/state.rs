@@ -596,8 +596,6 @@ impl StateStore {
             }
         }
 
-        // info!("result in matching pool: {:?}", result);
-
         result
     }
 

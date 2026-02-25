@@ -71,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
         None,
     )
     .await?;
-    info!("Loaded {} tokens", all_tokens.len());
 
     // Create shared state
     // Shared token cache across native + VM stores + RFQ stores to avoid duplicate fetches and keep metadata consistent.
@@ -244,10 +243,7 @@ async fn main() -> anyhow::Result<()> {
         let health_bg = Arc::clone(&rfq_stream_health);
         let rfq_stream_bg = Arc::clone(&rfq_stream);
         let rfq_semaphore_bg = app_state.rfq_sim_semaphore();
-        let tycho_url = cfg.tycho_url.clone();
-        let api_key = cfg.api_key.clone();
         let tvl_threshold = cfg.tvl_threshold;
-        let tvl_keep_threshold = cfg.tvl_keep_threshold;
         let rfq_sim_concurrency = u32::try_from(rfq_sim_concurrency)
             .expect("RFQ simulation concurrency exceeds u32 range");
 
@@ -260,25 +256,13 @@ async fn main() -> anyhow::Result<()> {
             supervise_rfq_stream(
                 move || {
                     let tokens = Arc::clone(&tokens_bg);
-                    let tycho_url = tycho_url.clone();
-                    let api_key = api_key.clone();
                     let rfq_config = RFQConfig {
                         bebop_user: bebop_user.clone(),
                         bebop_key: bebop_key.clone(),
                         hashflow_user: hashflow_user.clone(),
                         hashflow_key: hashflow_key.clone(),
                     };
-                    async move {
-                        build_rfq_stream(
-                            &tycho_url,
-                            &api_key,
-                            tvl_threshold,
-                            tvl_keep_threshold,
-                            tokens,
-                            rfq_config,
-                        )
-                        .await
-                    }
+                    async move { build_rfq_stream(tvl_threshold, tokens, rfq_config).await }
                 },
                 state_store_bg,
                 health_bg,

@@ -481,13 +481,13 @@ pub async fn supervise_rfq_stream<F, Fut, S>(
         let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
         warn!(
             event = "stream_restart",
-            stream = StreamKind::Vm.as_str(),
+            stream = StreamKind::Rfq.as_str(),
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
             last_block,
             last_update_age_ms,
-            "Restarting VM stream"
+            "Restarting RFQ stream"
         );
 
         sleep(Duration::from_millis(backoff_ms)).await;
