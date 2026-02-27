@@ -20,6 +20,10 @@ DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
 DEFAULT_SLIPPAGE_BPS = 25
 
 
+def is_int_string(value: object) -> bool:
+    return isinstance(value, str) and value.isdigit()
+
+
 def request_json(url: str, payload: dict, timeout: float) -> tuple[int, dict, float]:
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -72,6 +76,8 @@ def select_pool(response: dict, label: str) -> dict:
     for key in required:
         if key not in pool:
             raise AssertionError(f"{label}: missing {key}")
+    if not is_int_string(pool.get("gas_in_sell")):
+        raise AssertionError(f'{label}: gas_in_sell must be an integer string ("0" is valid)')
     return pool
 
 

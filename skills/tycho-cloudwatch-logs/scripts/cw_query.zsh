@@ -28,6 +28,10 @@ Presets: block-updates, block-updates-window, block-updates-count,
          simulate-runs-per-auction, simulate-workload-summary,
          uniswap-v4-filter, warn-error, storage-errors, delta-transition,
          stream-update-stats
+
+Privacy: prefer aggregate presets for shared outputs (simulate-rpm,
+         simulate-runs-per-minute, simulate-workload-summary, block-updates-count).
+         Presets exposing request_id/auction_id/token or pool addresses are for internal triage.
 USAGE
 }
 
