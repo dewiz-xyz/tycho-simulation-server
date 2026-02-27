@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
-use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
+use tycho_simulation::utils::load_all_tokens;
 
 use tycho_simulation_server::api::create_router;
 use tycho_simulation_server::config::{init_logging, load_config};
@@ -28,7 +28,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = load_config();
-    info!("Initializing price service...");
+    let chain = config.chain_profile.chain;
+    info!(
+        chain_id = chain.id(),
+        chain = %chain,
+        "Initializing price service..."
+    );
 
     info!(
         event = "memory_config",
@@ -62,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         false,
         Some(&config.api_key),
         true,
-        Chain::Ethereum,
+        chain,
         Some(10),
         None,
     )
@@ -75,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         all_tokens,
         config.tycho_url.clone(),
         config.api_key.clone(),
-        Chain::Ethereum,
+        chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
     ));
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
@@ -94,7 +99,15 @@ async fn main() -> anyhow::Result<()> {
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
     let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
+    // VM is only effective when enabled AND the chain profile defines VM protocols.
+    let effective_vm_enabled =
+        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+
     let app_state = AppState {
+        chain,
+        native_token_protocol_allowlist: Arc::new(
+            config.chain_profile.native_token_protocol_allowlist.clone(),
+        ),
         tokens: Arc::clone(&tokens),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
@@ -103,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         vm_stream: Arc::clone(&vm_stream),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
         native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-        enable_vm_pools: config.enable_vm_pools,
+        enable_vm_pools: effective_vm_enabled,
         readiness_stale,
         quote_timeout,
         pool_timeout_native,
@@ -119,7 +132,8 @@ async fn main() -> anyhow::Result<()> {
     info!(
         native_sim_concurrency,
         vm_sim_concurrency,
-        enable_vm_pools = config.enable_vm_pools,
+        enable_vm_pools = effective_vm_enabled,
+        requested_vm_pools = config.enable_vm_pools,
         "Initialized simulation concurrency limits"
     );
 
@@ -170,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         let api_key = cfg.api_key.clone();
         let tvl_threshold = cfg.tvl_threshold;
         let tvl_keep_threshold = cfg.tvl_keep_threshold;
+        let native_protocols = cfg.chain_profile.native_protocols.clone();
         tokio::spawn(async move {
             info!("Starting native protocol stream supervisor...");
             supervise_native_stream(
@@ -177,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
                     let tokens = Arc::clone(&tokens_bg);
                     let tycho_url = tycho_url.clone();
                     let api_key = api_key.clone();
+                    let protocols = native_protocols.clone();
                     async move {
                         build_native_stream(
                             &tycho_url,
@@ -184,6 +200,8 @@ async fn main() -> anyhow::Result<()> {
                             tvl_threshold,
                             tvl_keep_threshold,
                             tokens,
+                            chain,
+                            &protocols,
                         )
                         .await
                     }
@@ -197,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
         debug!("Native stream supervisor task spawned");
     }
 
-    if config.enable_vm_pools {
+    if effective_vm_enabled {
         let vm_supervisor_cfg = supervisor_cfg.clone();
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
@@ -212,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         let vm_sim_concurrency =
             u32::try_from(vm_sim_concurrency).expect("VM simulation concurrency exceeds u32 range");
 
+        let vm_protocols = cfg.chain_profile.vm_protocols.clone();
         tokio::spawn(async move {
             info!("Starting VM protocol stream supervisor...");
             supervise_vm_stream(
@@ -219,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                     let tokens = Arc::clone(&tokens_bg);
                     let tycho_url = tycho_url.clone();
                     let api_key = api_key.clone();
+                    let protocols = vm_protocols.clone();
                     async move {
                         build_vm_stream(
                             &tycho_url,
@@ -226,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
                             tvl_threshold,
                             tvl_keep_threshold,
                             tokens,
+                            chain,
+                            &protocols,
                         )
                         .await
                     }
@@ -242,8 +264,13 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
         debug!("VM stream supervisor task spawned");
-    } else {
+    } else if !config.enable_vm_pools {
         info!("VM pool feeds disabled");
+    } else {
+        info!(
+            chain = %chain,
+            "VM pool feeds enabled but no VM protocols configured for this chain; skipping VM stream"
+        );
     }
 
     // Create router and start server

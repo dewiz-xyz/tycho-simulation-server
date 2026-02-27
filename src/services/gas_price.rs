@@ -214,6 +214,8 @@ mod tests {
         ));
 
         AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             vm_state_store: Arc::new(StateStore::new(token_store)),
