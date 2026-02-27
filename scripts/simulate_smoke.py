@@ -12,16 +12,16 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 
 from presets import (
-    TOKENS,
+    chain_label,
     default_amounts_for_token,
     list_suites,
     list_tokens,
     parse_amounts,
     parse_pairs,
+    resolve_chain_id,
     suite_pairs,
+    tokens_for_chain,
 )
-
-ADDRESS_TO_SYMBOL = {address: symbol for (symbol, address) in TOKENS.items()}
 
 
 def request_simulate(url, payload, timeout):
@@ -34,9 +34,9 @@ def request_simulate(url, payload, timeout):
         return response.status, body, elapsed
 
 
-def fmt_token(address: str) -> str:
+def fmt_token(address: str, address_to_symbol: dict[str, str]) -> str:
     address = address.lower()
-    symbol = ADDRESS_TO_SYMBOL.get(address)
+    symbol = address_to_symbol.get(address)
     if symbol:
         return symbol
     return address
@@ -85,6 +85,7 @@ def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke test POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--suite", default="smoke", help="Named pair suite from presets")
     parser.add_argument("--pair", action="append", help="token_in:token_out (symbol or address)")
     parser.add_argument("--pairs", help="Comma-separated token_in:token_out pairs")
@@ -109,25 +110,35 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    address_to_symbol = {
+        address.lower(): symbol for (symbol, address) in tokens_for_chain(chain_id).items()
+    }
+
     if args.list_suites:
-        for name in list_suites():
+        for name in list_suites(chain_id):
             print(name)
         return 0
 
     if args.list_tokens:
-        for symbol, address in list_tokens():
+        for symbol, address in list_tokens(chain_id):
             print(f"{symbol} {address}")
         return 0
 
     try:
-        pairs = parse_pairs(args.pair, args.pairs)
+        pairs = parse_pairs(args.pair, args.pairs, chain_id)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     if not pairs:
         try:
-            pairs = suite_pairs(args.suite)
+            pairs = suite_pairs(args.suite, chain_id)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
@@ -148,7 +159,7 @@ def main() -> int:
     for idx, pair in enumerate(pairs, start=1):
         token_in = pair.token_in
         token_out = pair.token_out
-        amounts = amounts_override or default_amounts_for_token(token_in)
+        amounts = amounts_override or default_amounts_for_token(token_in, chain_id)
         payload = {
             "request_id": f"{args.request_id_prefix}-{idx}-{uuid.uuid4().hex[:8]}",
             "token_in": token_in,
@@ -175,7 +186,7 @@ def main() -> int:
             failures += 1
             continue
 
-        pair_label = f"{fmt_token(token_in)}->{fmt_token(token_out)}"
+        pair_label = f"{fmt_token(token_in, address_to_symbol)}->{fmt_token(token_out, address_to_symbol)}"
 
         if status_code != 200:
             print(f"[FAIL] {pair_label} HTTP {status_code}")
@@ -234,7 +245,7 @@ def main() -> int:
 
     total = len(pairs)
     success = total - failures
-    print(f"\nSummary: {success}/{total} successful")
+    print(f"\nSummary ({chain_label(chain_id)}:{chain_id}): {success}/{total} successful")
     return 0 if failures == 0 else 1
 
 

@@ -13,7 +13,13 @@ from pathlib import Path
 from urllib import request
 from urllib.error import HTTPError, URLError
 
-from presets import TOKENS, default_amounts_for_token
+from presets import (
+    chain_label,
+    default_amounts_for_token,
+    default_encode_route,
+    resolve_chain_id,
+    resolve_token,
+)
 
 DEFAULT_SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
 DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
@@ -134,6 +140,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke test POST /encode (spec schema)")
     parser.add_argument("--encode-url", default="http://localhost:3000/encode")
     parser.add_argument("--simulate-url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--repo", default=".")
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
@@ -141,6 +148,12 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
+
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     repo = Path(args.repo)
     settlement = load_env_value(repo, "COW_SETTLEMENT_CONTRACT") or DEFAULT_SETTLEMENT
@@ -150,19 +163,17 @@ def main() -> int:
         print("Error: --allow-status produced no values", file=sys.stderr)
         return 2
 
-    dai = TOKENS.get("DAI")
-    usdc = TOKENS.get("USDC")
-    usdt = TOKENS.get("USDT")
-    if not dai or not usdc or not usdt:
-        print("Error: DAI/USDC/USDT must be present in presets", file=sys.stderr)
-        return 2
+    token_in_symbol, mid_symbol, token_out_symbol = default_encode_route(chain_id)
+    token_in = resolve_token(token_in_symbol, chain_id)
+    mid_token = resolve_token(mid_symbol, chain_id)
+    token_out = resolve_token(token_out_symbol, chain_id)
 
-    amounts = default_amounts_for_token(dai)
+    amounts = default_amounts_for_token(token_in, chain_id)
 
     simulate_payload = {
         "request_id": f"encode-smoke-{uuid.uuid4().hex[:8]}",
-        "token_in": dai,
-        "token_out": usdc,
+        "token_in": token_in,
+        "token_out": mid_token,
         "amounts": amounts,
     }
 
@@ -180,20 +191,22 @@ def main() -> int:
     status_value = meta.get("status") if isinstance(meta, dict) else None
     failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
     if status_value not in allowed_statuses:
-        print(f"[FAIL] simulate dai->usdc expected {sorted(allowed_statuses)}, got {status_value}")
+        print(
+            f"[FAIL] simulate {token_in_symbol}->{mid_symbol} expected {sorted(allowed_statuses)}, got {status_value}"
+        )
         return 1
     if failures_list and not args.allow_failures:
-        print(f"[FAIL] simulate dai->usdc had {len(failures_list)} failures")
+        print(f"[FAIL] simulate {token_in_symbol}->{mid_symbol} had {len(failures_list)} failures")
         return 1
 
-    pool_first = select_pool(response, "simulate dai->usdc")
+    pool_first = select_pool(response, f"simulate {token_in_symbol}->{mid_symbol}")
 
     hop_amounts_out = pool_first["amounts_out"]
     hop_amounts_in = [apply_slippage(value, DEFAULT_SLIPPAGE_BPS) for value in hop_amounts_out]
     simulate_payload_second = {
         "request_id": f"encode-smoke-hop-{uuid.uuid4().hex[:8]}",
-        "token_in": usdc,
-        "token_out": usdt,
+        "token_in": mid_token,
+        "token_out": token_out,
         "amounts": hop_amounts_in,
     }
 
@@ -213,13 +226,15 @@ def main() -> int:
     status_value = meta.get("status") if isinstance(meta, dict) else None
     failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
     if status_value not in allowed_statuses:
-        print(f"[FAIL] simulate usdc->usdt expected {sorted(allowed_statuses)}, got {status_value}")
+        print(
+            f"[FAIL] simulate {mid_symbol}->{token_out_symbol} expected {sorted(allowed_statuses)}, got {status_value}"
+        )
         return 1
     if failures_list and not args.allow_failures:
-        print(f"[FAIL] simulate usdc->usdt had {len(failures_list)} failures")
+        print(f"[FAIL] simulate {mid_symbol}->{token_out_symbol} had {len(failures_list)} failures")
         return 1
 
-    pool_second = select_pool(response_second, "simulate usdc->usdt")
+    pool_second = select_pool(response_second, f"simulate {mid_symbol}->{token_out_symbol}")
 
     protocol_first = protocol_from_pool_name(pool_first.get("pool_name", ""))
     protocol_second = protocol_from_pool_name(pool_second.get("pool_name", ""))
@@ -234,9 +249,9 @@ def main() -> int:
         return 1
 
     encode_request = {
-        "chainId": 1,
-        "tokenIn": dai,
-        "tokenOut": usdt,
+        "chainId": chain_id,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
         "amountIn": amounts[0],
         "minAmountOut": min_out_second,
         "settlementAddress": settlement,
@@ -248,8 +263,8 @@ def main() -> int:
                 "shareBps": 0,
                 "hops": [
                     {
-                        "tokenIn": dai,
-                        "tokenOut": usdc,
+                        "tokenIn": token_in,
+                        "tokenOut": mid_token,
                         "swaps": [
                             {
                                 "pool": {
@@ -257,15 +272,15 @@ def main() -> int:
                                     "componentId": pool_first["pool"],
                                     "poolAddress": pool_first["pool_address"],
                                 },
-                                "tokenIn": dai,
-                                "tokenOut": usdc,
+                                "tokenIn": token_in,
+                                "tokenOut": mid_token,
                                 "splitBps": 0,
                             }
                         ],
                     },
                     {
-                        "tokenIn": usdc,
-                        "tokenOut": usdt,
+                        "tokenIn": mid_token,
+                        "tokenOut": token_out,
                         "swaps": [
                             {
                                 "pool": {
@@ -273,8 +288,8 @@ def main() -> int:
                                     "componentId": pool_second["pool"],
                                     "poolAddress": pool_second["pool_address"],
                                 },
-                                "tokenIn": usdc,
-                                "tokenOut": usdt,
+                                "tokenIn": mid_token,
+                                "tokenOut": token_out,
                                 "splitBps": 0,
                             }
                         ],
@@ -301,7 +316,7 @@ def main() -> int:
         return 1
 
     try:
-        interactions_len = validate_encode_response(encode_response, tycho_router, dai)
+        interactions_len = validate_encode_response(encode_response, tycho_router, token_in)
     except AssertionError as exc:
         print(f"[FAIL] encode response validation failed: {exc}")
         return 1
@@ -309,7 +324,10 @@ def main() -> int:
     if args.verbose:
         print(json.dumps(encode_response, indent=2))
 
-    print(f"[OK] encode route {elapsed:.3f}s interactions={interactions_len}")
+    print(
+        f"[OK] encode route {elapsed:.3f}s chain={chain_label(chain_id)}:{chain_id} "
+        f"path={token_in_symbol}->{mid_symbol}->{token_out_symbol} interactions={interactions_len}"
+    )
     return 0
 
 
