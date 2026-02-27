@@ -11,19 +11,23 @@ import statistics
 import sys
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from urllib import request
 from urllib.error import HTTPError, URLError
 
 from presets import (
-    TOKENS,
-    default_amounts_for_token,
+    amounts_for_pair,
+    chain_label,
     list_suites,
     list_tokens,
     parse_amounts,
     parse_pairs,
+    resolve_chain_id,
     resolve_token,
     suite_pairs,
+    tokens_for_chain,
 )
 
 
@@ -51,18 +55,19 @@ def request_simulate(url, payload, timeout):
         return response.status, body, elapsed
 
 
-def parse_tokens(tokens_csv: str | None) -> list[str]:
+def parse_tokens(tokens_csv: str | None, chain_id: int) -> list[str]:
     if not tokens_csv:
-        return list(TOKENS.values())
+        return list(tokens_for_chain(chain_id).values())
     tokens = [token.strip() for token in tokens_csv.split(",") if token.strip()]
     if len(tokens) < 2:
         raise ValueError("Provide at least two tokens")
-    return [resolve_token(token) for token in tokens]
+    return [resolve_token(token, chain_id) for token in tokens]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Latency percentiles for POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--requests", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--suite", default="core", help="Named pair suite from presets (used unless --random)")
@@ -73,6 +78,11 @@ def main() -> int:
     parser.add_argument("--amounts", help="Comma-separated amounts in wei")
     parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
     parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
+    parser.add_argument(
+        "--allow-no-pools",
+        action="store_true",
+        help="Allow no_liquidity responses that only report no_pools failures",
+    )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
     parser.add_argument("--list-tokens", action="store_true", help="List available token symbols and exit")
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -82,13 +92,19 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     if args.list_suites:
-        for name in list_suites():
+        for name in list_suites(chain_id):
             print(name)
         return 0
 
     if args.list_tokens:
-        for symbol, address in list_tokens():
+        for symbol, address in list_tokens(chain_id):
             print(f"{symbol} {address}")
         return 0
 
@@ -103,9 +119,9 @@ def main() -> int:
         random.seed(args.seed)
 
     try:
-        explicit_pairs = parse_pairs(args.pair, args.pairs)
+        explicit_pairs = parse_pairs(args.pair, args.pairs, chain_id)
         amounts_override = parse_amounts(args.amounts) if args.amounts else None
-        tokens = parse_tokens(args.tokens)
+        tokens = parse_tokens(args.tokens, chain_id)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -124,7 +140,7 @@ def main() -> int:
         pairs = explicit_pairs
     elif not args.random:
         try:
-            pairs = suite_pairs(args.suite)
+            pairs = suite_pairs(args.suite, chain_id)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
@@ -135,8 +151,8 @@ def main() -> int:
             return pair.token_in, pair.token_out
         return tuple(random.sample(tokens, 2))
 
-    def amounts_for_token(token_in: str) -> list[str]:
-        return amounts_override or default_amounts_for_token(token_in)
+    def amounts_for_request(token_in: str, token_out: str) -> list[str]:
+        return amounts_override or amounts_for_pair(token_in, token_out, chain_id)
 
     if args.dry_run:
         sample_pair = pick_pair()
@@ -144,25 +160,31 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-sample",
             "token_in": sample_pair[0],
             "token_out": sample_pair[1],
-            "amounts": amounts_for_token(sample_pair[0]),
+            "amounts": amounts_for_request(sample_pair[0], sample_pair[1]),
         }
         print("Dry run configuration:")
-        print(json.dumps(
-            {
-                "url": args.url,
-                "requests": args.requests,
-                "concurrency": args.concurrency,
-                "timeout": args.timeout,
-                "sample_payload": payload,
-            },
-            indent=2,
-        ))
+        print(
+            json.dumps(
+                {
+                    "chain_id": chain_id,
+                    "chain": chain_label(chain_id),
+                    "url": args.url,
+                    "requests": args.requests,
+                    "concurrency": args.concurrency,
+                    "timeout": args.timeout,
+                    "sample_payload": payload,
+                },
+                indent=2,
+            )
+        )
         return 0
 
     start_time = time.perf_counter()
     response_times = []
     failures = 0
     failure_reasons: dict[str, int] = {}
+    status_counts: Counter[str] = Counter()
+    status_lock = Lock()
 
     def worker(index):
         token_in, token_out = pick_pair()
@@ -170,7 +192,7 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-{index}-{uuid.uuid4().hex[:8]}",
             "token_in": token_in,
             "token_out": token_out,
-            "amounts": amounts_for_token(token_in),
+            "amounts": amounts_for_request(token_in, token_out),
         }
         try:
             status_code, body, elapsed = request_simulate(args.url, payload, args.timeout)
@@ -185,11 +207,24 @@ def main() -> int:
             status = meta.get("status")
             failures_list = meta.get("failures", [])
 
+            with status_lock:
+                status_counts[str(status)] += 1
+
             if status not in allowed_statuses:
                 return None, f"meta_status:{status}"
 
             if failures_list and not args.allow_failures:
-                return None, "meta_failures"
+                if args.allow_no_pools and status == "no_liquidity":
+                    only_no_pools = all(
+                        isinstance(item, dict) and item.get("kind") == "no_pools"
+                        for item in failures_list
+                    )
+                    if only_no_pools:
+                        failures_list = []
+                    else:
+                        return None, "meta_failures"
+                else:
+                    return None, "meta_failures"
 
             return elapsed, None
         except HTTPError as exc:
@@ -213,7 +248,7 @@ def main() -> int:
     total_time = time.perf_counter() - start_time
 
     if not response_times:
-        print("No successful requests.")
+        print(f"No successful requests ({chain_label(chain_id)}:{chain_id}).")
         print(f"Failures: {failures}")
         return 1
 
@@ -223,7 +258,7 @@ def main() -> int:
     p90 = percentile(response_times, 0.90)
     p99 = percentile(response_times, 0.99)
 
-    print("Latency results (seconds)")
+    print(f"Latency results ({chain_label(chain_id)}:{chain_id})")
     print("========================")
     print(f"Requests: {args.requests}")
     print(f"Successes: {len(response_times)}")
@@ -243,6 +278,11 @@ def main() -> int:
         print("\nFailure reasons (top 8):")
         for reason, count in sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)[:8]:
             print(f"- {reason}: {count}")
+
+    if status_counts:
+        print("\nStatus counts:")
+        for status, count in status_counts.most_common():
+            print(f"- {status}: {count}")
 
     return 0 if failures == 0 else 1
 

@@ -3,21 +3,33 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: start_server.zsh [--repo <path>] [--log-file <path>] [--env KEY=VALUE] [--enable-vm-pools]
+Usage: start_server.zsh [--repo <path>] [--log-file <path>] [--chain-id <id>] [--env KEY=VALUE] [--enable-vm-pools]
 
 Start the tycho-simulation-server from a repo checkout.
 
 Options:
-  --repo       Path to repo root (default: current directory)
-  --log-file   Log file path (default: <repo>/logs/tycho-sim-server.log)
-  --env        Export KEY=VALUE before starting (repeatable)
+  --repo             Path to repo root (default: current directory)
+  --log-file         Log file path (default: <repo>/logs/tycho-sim-server.log)
+  --chain-id         Runtime chain id (1 or 8453). Overrides CHAIN_ID from env/.env.
+  --env              Export KEY=VALUE before starting (repeatable)
   --enable-vm-pools  Shortcut for --env ENABLE_VM_POOLS=true
-  -h, --help   Show this help
+  -h, --help         Show this help
 USAGE
+}
+
+validate_chain_id() {
+  case "$1" in
+    1|8453) ;;
+    *)
+      echo "Error: unsupported chain id '$1'. Supported values: 1 (Ethereum), 8453 (Base)." >&2
+      return 1
+      ;;
+  esac
 }
 
 repo="."
 log_file=""
+chain_id_arg=""
 typeset -a env_overrides=()
 
 while [[ $# -gt 0 ]]; do
@@ -28,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --log-file)
       log_file="$2"
+      shift 2
+      ;;
+    --chain-id)
+      chain_id_arg="$2"
       shift 2
       ;;
     --env)
@@ -58,6 +74,9 @@ if [[ -f "$repo_script" ]]; then
   if [[ -n "$log_file" ]]; then
     args+=(--log-file "$log_file")
   fi
+  if [[ -n "$chain_id_arg" ]]; then
+    args+=(--chain-id "$chain_id_arg")
+  fi
   for pair in "${env_overrides[@]}"; do
     args+=(--env "$pair")
   done
@@ -80,7 +99,6 @@ if [[ -f "$pid_file" ]]; then
 fi
 
 if [[ -f "$repo/.env" ]]; then
-  # Load .env into the environment without printing secrets.
   set -a
   source "$repo/.env"
   set +a
@@ -97,8 +115,18 @@ if [[ -z "${RUST_LOG:-}" ]]; then
 fi
 
 for pair in "${env_overrides[@]}"; do
-  export "${pair}"
+  export "$pair"
 done
+
+if [[ -n "$chain_id_arg" ]]; then
+  export CHAIN_ID="$chain_id_arg"
+fi
+
+if [[ -z "${CHAIN_ID:-}" ]]; then
+  echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
+  exit 2
+fi
+validate_chain_id "$CHAIN_ID"
 
 if [[ -z "$log_file" ]]; then
   mkdir -p "$repo/logs"
@@ -112,6 +140,7 @@ fi
 )
 
 echo "Started tycho-simulation-server."
+echo "Chain ID: $CHAIN_ID"
 echo "PID: $(cat "$pid_file")"
 echo "Log: $log_file"
 echo "Tip: tail -f $log_file"
