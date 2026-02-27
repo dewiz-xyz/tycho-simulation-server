@@ -373,6 +373,7 @@ async fn simulate_gas_in_sell_matches_gas_price_cost_in_usd_for_multiple_pairs()
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(GAS_PRICE_WEI))),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
         enable_vm_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
@@ -517,4 +518,140 @@ async fn simulate_gas_in_sell_matches_gas_price_cost_in_usd_for_multiple_pairs()
             case.request_id
         );
     }
+}
+
+#[tokio::test]
+async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() {
+    let usdt = Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap();
+    let usdc = Bytes::from_str("0xA0b86991c6218b36c1d19d4a2e9Eb0cE3606eB48").unwrap();
+    let weth = Chain::Ethereum.wrapped_native_token().address;
+
+    let usdt_token = make_token(&usdt, "USDT", 6);
+    let usdc_token = make_token(&usdc, "USDC", 6);
+    let weth_token = make_token(&weth, "WETH", 18);
+
+    let mut tokens = HashMap::new();
+    tokens.insert(usdt.clone(), usdt_token.clone());
+    tokens.insert(usdc.clone(), usdc_token.clone());
+    tokens.insert(weth.clone(), weth_token.clone());
+
+    let token_store = Arc::new(TokenStore::new(
+        tokens,
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+    let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
+    let mut new_pairs = HashMap::new();
+
+    states.insert(
+        "pool-usdt-usdc".to_string(),
+        Box::new(SimPool {
+            gas_ladder: vec![120_000, 150_000],
+            spot_quotes: Vec::new(),
+            calls: default_calls(),
+        }) as Box<dyn ProtocolSim>,
+    );
+    new_pairs.insert(
+        "pool-usdt-usdc".to_string(),
+        make_component(
+            "0x0000000000000000000000000000000000000301",
+            usdt_token.clone(),
+            usdc_token.clone(),
+            "uniswap_v2",
+            "uniswap_v2",
+        ),
+    );
+
+    states.insert(
+        "pool-spot-usdt-weth".to_string(),
+        Box::new(SimPool {
+            gas_ladder: vec![0],
+            spot_quotes: vec![(weth.clone(), usdt.clone(), ETH_USD_PRICE as f64)],
+            calls: default_calls(),
+        }) as Box<dyn ProtocolSim>,
+    );
+    new_pairs.insert(
+        "pool-spot-usdt-weth".to_string(),
+        make_component(
+            "0x0000000000000000000000000000000000000302",
+            usdt_token.clone(),
+            weth_token.clone(),
+            "uniswap_v2",
+            "uniswap_v2",
+        ),
+    );
+
+    native_state_store
+        .apply_update(Update::new(42, states, new_pairs))
+        .await;
+
+    let app_state = AppState {
+        tokens: Arc::clone(&token_store),
+        native_state_store: Arc::clone(&native_state_store),
+        vm_state_store: Arc::clone(&vm_state_store),
+        native_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(GAS_PRICE_WEI))),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+        enable_vm_pools: false,
+        readiness_stale: Duration::from_secs(120),
+        quote_timeout: Duration::from_secs(1),
+        pool_timeout_native: Duration::from_millis(200),
+        pool_timeout_vm: Duration::from_millis(200),
+        request_timeout: Duration::from_secs(2),
+        native_sim_semaphore: Arc::new(Semaphore::new(2)),
+        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
+        native_sim_concurrency: 2,
+        vm_sim_concurrency: 1,
+    };
+
+    let app = create_router(app_state);
+    let request = AmountOutRequest {
+        request_id: "reporting-disabled".to_string(),
+        auction_id: None,
+        token_in: "0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string(),
+        token_out: "0xA0b86991c6218b36c1d19d4a2e9Eb0cE3606eB48".to_string(),
+        amounts: vec!["1000000".to_string(), "2000000".to_string()],
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/simulate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("serialize simulate request"),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("simulate response");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("simulate response JSON");
+    let data = value["data"].as_array().expect("data must be array");
+    let entry = data
+        .iter()
+        .find(|item| item["pool"] == "pool-usdt-usdc")
+        .expect("quote pool not found");
+    assert_eq!(entry["gas_in_sell"], "0");
 }

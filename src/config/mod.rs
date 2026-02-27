@@ -19,6 +19,14 @@ pub fn load_config() -> AppConfig {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let gas_price_refresh_interval_ms: u64 = std::env::var("GAS_PRICE_REFRESH_INTERVAL_MS")
+        .unwrap_or_else(|_| "5000".to_string())
+        .parse()
+        .expect("Invalid GAS_PRICE_REFRESH_INTERVAL_MS");
+    let gas_price_failure_tolerance: u64 = std::env::var("GAS_PRICE_FAILURE_TOLERANCE")
+        .unwrap_or_else(|_| "50".to_string())
+        .parse()
+        .expect("Invalid GAS_PRICE_FAILURE_TOLERANCE");
     let tvl_threshold: f64 = std::env::var("TVL_THRESHOLD")
         .unwrap_or_else(|_| "100".to_string())
         .parse()
@@ -81,6 +89,10 @@ pub fn load_config() -> AppConfig {
     assert!(
         token_refresh_timeout_ms > 0,
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
+    );
+    assert!(
+        gas_price_refresh_interval_ms > 0,
+        "GAS_PRICE_REFRESH_INTERVAL_MS must be > 0"
     );
 
     let enable_vm_pools: bool = std::env::var("ENABLE_VM_POOLS")
@@ -192,6 +204,8 @@ pub fn load_config() -> AppConfig {
         tycho_url,
         api_key,
         rpc_url,
+        gas_price_refresh_interval_ms,
+        gas_price_failure_tolerance,
         tvl_threshold,
         tvl_keep_threshold,
         port,
@@ -224,6 +238,8 @@ pub struct AppConfig {
     pub tycho_url: String,
     pub api_key: String,
     pub rpc_url: Option<String>,
+    pub gas_price_refresh_interval_ms: u64,
+    pub gas_price_failure_tolerance: u64,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,

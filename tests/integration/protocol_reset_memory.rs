@@ -344,8 +344,6 @@ fn default_stream_config() -> StreamSupervisorConfig {
             snapshots_min_new_pairs: 1000,
             snapshots_emit_emf: false,
         },
-        rpc_url: None,
-        rpc_client: reqwest::Client::new(),
     }
 }
 
@@ -369,7 +367,6 @@ async fn missing_block_burst_does_not_restart_below_threshold() {
         state_store,
         health,
         default_stream_config(),
-        None,
     )
     .await;
 
@@ -400,7 +397,6 @@ async fn missing_block_burst_restarts_at_threshold() {
         state_store,
         health,
         default_stream_config(),
-        None,
     )
     .await;
 
@@ -429,7 +425,6 @@ async fn native_stream_restarts_on_stale() {
         state_store,
         health,
         cfg,
-        None,
     ));
 
     advance(Duration::from_secs(6)).await;
@@ -497,6 +492,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: true,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_millis(100),

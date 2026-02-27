@@ -469,7 +469,7 @@ pub async fn get_amounts_out(
 
     let eth_to_sell_spot_price =
         resolve_request_eth_to_sell_spot_price(&token_in_ref, &spot_native_candidates, &[]);
-    let gas_price_wei = state.latest_native_gas_price_wei().await;
+    let gas_price_wei = state.effective_native_gas_price_wei_for_quotes().await;
 
     let token_in = Arc::new(token_in_ref);
     let token_out = Arc::new(token_out_ref);
@@ -746,11 +746,11 @@ pub async fn get_amounts_out(
 
                                         if !result.amounts_out.is_empty() {
                                             let gas_in_sell = compute_gas_in_sell_base_units(
-                                                    gas_price_wei,
-                                                    result.gas_used.last().copied(),
-                                                    eth_to_sell_spot_price,
-                                                    sell_token_decimals,
-                                                );
+                                                gas_price_wei,
+                                                result.gas_used.last().copied(),
+                                                eth_to_sell_spot_price,
+                                                sell_token_decimals,
+                                            );
                                             responses.push(AmountOutResponse {
                                                 pool: result.pool,
                                                 pool_name: result.pool_name,
@@ -1820,7 +1820,7 @@ mod tests {
     use super::*;
 
     use std::any::Any;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2397,7 +2397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_amounts_out_reuses_single_spot_price_and_uses_cached_gas_price() {
+    async fn get_amounts_out_uses_request_scoped_gas_snapshot_across_all_pools() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -2491,6 +2491,7 @@ mod tests {
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
                 5_000_000_000_000_000_000,
             ))),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -2517,10 +2518,136 @@ mod tests {
         assert_eq!(pair_spot_price_calls.load(Ordering::SeqCst), 0);
         assert_eq!(spot_source_calls.load(Ordering::SeqCst), 1);
         assert_eq!(computation.responses.len(), 2);
+        let unique_gas_in_sell: HashSet<&str> = computation
+            .responses
+            .iter()
+            .map(|response| response.gas_in_sell.as_str())
+            .collect();
+        assert_eq!(unique_gas_in_sell.len(), 1);
         for response in &computation.responses {
             assert_eq!(response.gas_used, vec![2, 5]);
             assert_eq!(response.gas_in_sell, "3750");
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_sets_gas_in_sell_to_zero_when_reporting_disabled() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+
+        let token_in_meta = make_token_with_decimals(&token_in, "TK1", 6);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
+        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+        initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        states.insert(
+            "pool-a".to_string(),
+            Box::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.5),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-a".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000011")
+                    .expect("valid pool address"),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![token_in_meta.clone(), token_out_meta.clone()],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+        states.insert(
+            "pool-spot".to_string(),
+            Box::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.5),
+                max_in: 10_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-spot".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000013")
+                    .expect("valid pool address"),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![token_in_meta.clone(), wrapped_native_meta.clone()],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
+                5_000_000_000_000_000_000,
+            ))),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-reporting-disabled".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["2".to_string(), "5".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].gas_used, vec![2, 5]);
+        assert_eq!(computation.responses[0].gas_in_sell, "0");
     }
 
     #[tokio::test]
@@ -2589,6 +2716,7 @@ mod tests {
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
                 5_000_000_000_000_000_000,
             ))),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -2682,6 +2810,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -2769,6 +2898,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3041,6 +3171,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3205,6 +3336,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3436,6 +3568,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3559,6 +3692,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3654,6 +3788,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
@@ -3758,6 +3893,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(0),

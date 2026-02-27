@@ -220,6 +220,7 @@ async fn setup_app_state_and_request(
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: config.enable_vm_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),

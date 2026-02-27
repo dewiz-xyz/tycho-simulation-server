@@ -14,10 +14,9 @@ use tycho_simulation::{
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
-    state::{AppState, StateStore, VmStreamStatus},
+    state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
 };
-use crate::services::gas_price::fetch_eth_gas_price_wei;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -75,8 +74,6 @@ pub struct StreamSupervisorConfig {
     pub restart_backoff_max: Duration,
     pub restart_backoff_jitter_pct: f64,
     pub memory: MemoryConfig,
-    pub rpc_url: Option<String>,
-    pub rpc_client: reqwest::Client,
 }
 
 pub struct VmStreamControls {
@@ -94,7 +91,6 @@ pub async fn process_stream(
     state_store: Arc<StateStore>,
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
-    app_state: Option<AppState>,
 ) -> StreamExit {
     info!(stream = kind.as_str(), "Starting stream processing");
     health.mark_started().await;
@@ -162,7 +158,6 @@ pub async fn process_stream(
 
                     let metrics = state_store.apply_update(update).await;
                     health.record_update(metrics.block_number).await;
-                    maybe_refresh_native_gas_price(kind, &cfg, app_state.as_ref()).await;
 
                     info!(
                         event = "stream_update",
@@ -264,43 +259,11 @@ pub async fn process_stream(
     }
 }
 
-async fn maybe_refresh_native_gas_price(
-    kind: StreamKind,
-    cfg: &StreamSupervisorConfig,
-    app_state: Option<&AppState>,
-) {
-    if !matches!(kind, StreamKind::Native) {
-        return;
-    }
-
-    let Some(state) = app_state else {
-        return;
-    };
-
-    let Some(rpc_url) = cfg.rpc_url.as_deref() else {
-        return;
-    };
-
-    match fetch_eth_gas_price_wei(rpc_url, &cfg.rpc_client).await {
-        Ok(value) => {
-            state.set_latest_native_gas_price_wei(Some(value)).await;
-        }
-        Err(err) => {
-            warn!(
-                event = "native_gas_price_refresh_failed",
-                error = %err,
-                "Failed to refresh native gas price; keeping last successful value"
-            );
-        }
-    }
-}
-
 pub async fn supervise_native_stream<F, Fut, S>(
     build_stream: F,
     state_store: Arc<StateStore>,
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
-    app_state: AppState,
 ) where
     F: Fn() -> Fut + Send + Sync,
     Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
@@ -334,7 +297,6 @@ pub async fn supervise_native_stream<F, Fut, S>(
             Arc::clone(&state_store),
             Arc::clone(&health),
             cfg.clone(),
-            Some(app_state.clone()),
         )
         .await;
 
@@ -408,7 +370,6 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             Arc::clone(&state_store),
             Arc::clone(&health),
             cfg.clone(),
-            None,
         )
         .await;
 

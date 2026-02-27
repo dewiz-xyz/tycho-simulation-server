@@ -23,6 +23,7 @@ pub struct AppState {
     pub vm_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub latest_native_gas_price_wei: Arc<RwLock<Option<u128>>>,
+    pub native_gas_price_reporting_enabled: Arc<RwLock<bool>>,
     pub enable_vm_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
@@ -125,6 +126,25 @@ impl AppState {
 
     pub async fn set_latest_native_gas_price_wei(&self, value: Option<u128>) {
         *self.latest_native_gas_price_wei.write().await = value;
+    }
+
+    pub async fn native_gas_price_reporting_enabled(&self) -> bool {
+        *self.native_gas_price_reporting_enabled.read().await
+    }
+
+    pub async fn set_native_gas_price_reporting_enabled(&self, enabled: bool) {
+        *self.native_gas_price_reporting_enabled.write().await = enabled;
+    }
+
+    pub async fn effective_native_gas_price_wei_for_quotes(&self) -> Option<u128> {
+        // Keep the reporting flag read lock held while reading the cached value so a disable
+        // transition cannot interleave between the flag check and cached-gas lookup.
+        let reporting_enabled = self.native_gas_price_reporting_enabled.read().await;
+        if !*reporting_enabled {
+            return None;
+        }
+
+        *self.latest_native_gas_price_wei.read().await
     }
 }
 
@@ -1058,6 +1078,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
@@ -1103,6 +1124,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
@@ -1147,6 +1169,7 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
@@ -1162,5 +1185,71 @@ mod tests {
 
         app_state.set_latest_native_gas_price_wei(Some(42)).await;
         assert_eq!(app_state.latest_native_gas_price_wei().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn app_state_effective_native_gas_price_for_quotes_serializes_with_disable_transition() {
+        let app_state = AppState {
+            tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(Some(42))),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        assert_eq!(
+            app_state.effective_native_gas_price_wei_for_quotes().await,
+            Some(42)
+        );
+
+        let reporting_read_guard = app_state.native_gas_price_reporting_enabled.read().await;
+        let state_for_disable = app_state.clone();
+        let disable_task = tokio::spawn(async move {
+            state_for_disable
+                .set_native_gas_price_reporting_enabled(false)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!disable_task.is_finished());
+
+        drop(reporting_read_guard);
+        disable_task.await.expect("disable task should complete");
+
+        assert_eq!(
+            app_state.effective_native_gas_price_wei_for_quotes().await,
+            None
+        );
     }
 }
