@@ -43,13 +43,21 @@ load_chain_id_from_env_file() {
     return 1
   fi
   local raw
-  raw="$(grep -E '^[[:space:]]*CHAIN_ID=' "$env_file" | tail -n 1 || true)"
+  raw="$(grep -E '^[[:space:]]*(export[[:space:]]+)?CHAIN_ID[[:space:]]*=' "$env_file" | tail -n 1 || true)"
   if [[ -z "$raw" ]]; then
     return 1
   fi
   local value="${raw#*=}"
   value="${value%%#*}"
-  value="${value//[[:space:]]/}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "$value" == \"*\" ]]; then
+    value="${value#\"}"
+    value="${value%\"}"
+  elif [[ "$value" == \'*\' ]]; then
+    value="${value#\'}"
+    value="${value%\'}"
+  fi
   if [[ -z "$value" ]]; then
     return 1
   fi

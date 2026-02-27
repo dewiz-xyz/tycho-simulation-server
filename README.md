@@ -44,7 +44,7 @@ The following environment variables are read at startup:
 - `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
 - `CHAIN_ID` – Runtime chain ID (**required**); supported values: `1` (Ethereum), `8453` (Base)
-- `RPC_URL` – Optional Ethereum JSON-RPC endpoint used for background `eth_gasPrice` refresh
+- `RPC_URL` – Optional JSON-RPC endpoint matching `CHAIN_ID`, used for background `eth_gasPrice` refresh
 - `GAS_PRICE_REFRESH_INTERVAL_MS` – Poll interval for `eth_gasPrice` refresh task (default: `5000`)
 - `GAS_PRICE_FAILURE_TOLERANCE` – Disable gas reporting when consecutive refresh failures exceed this value (default: `50`)
 - `TVL_THRESHOLD` – Minimum TVL (in native units) for adding a pool to the stream (default: `100`)
