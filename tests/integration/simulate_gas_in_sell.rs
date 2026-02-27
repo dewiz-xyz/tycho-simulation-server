@@ -362,6 +362,8 @@ fn build_quote_app(
     reporting_enabled: bool,
 ) -> axum::Router {
     create_router(AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_state_store,
         vm_state_store,
@@ -639,6 +641,8 @@ async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() -> Result<()> {
         .await;
 
     let app_state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&token_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),

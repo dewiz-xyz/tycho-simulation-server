@@ -321,6 +321,8 @@ async fn setup_app_state_and_request(
     }
 
     let state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
@@ -784,6 +786,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_state_store,
         vm_state_store,

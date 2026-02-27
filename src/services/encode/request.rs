@@ -6,17 +6,15 @@ use crate::models::messages::{RouteEncodeRequest, SegmentDraft, SwapKind};
 
 use super::EncodeError;
 
-const NATIVE_PROTOCOL_ALLOWLIST: &[&str] = &["rocketpool"];
-
-pub(super) fn validate_chain(chain_id: u64) -> Result<Chain, EncodeError> {
-    let chain = Chain::Ethereum;
-    if chain.id() != chain_id {
+pub(super) fn validate_chain(chain_id: u64, expected: Chain) -> Result<Chain, EncodeError> {
+    if expected.id() != chain_id {
         return Err(EncodeError::invalid(format!(
-            "Unsupported chainId: {}",
-            chain_id
+            "Unsupported chainId: {} (this instance serves chain {})",
+            chain_id,
+            expected.id()
         )));
     }
-    Ok(chain)
+    Ok(expected)
 }
 
 pub(super) fn normalize_protocol_id(protocol_id: &str) -> String {
@@ -26,15 +24,15 @@ pub(super) fn normalize_protocol_id(protocol_id: &str) -> String {
         .replace(['-', ' '], "_")
 }
 
-pub(super) fn is_native_protocol_allowlisted(protocol_id: &str) -> bool {
+pub(super) fn is_native_protocol_allowlisted(protocol_id: &str, allowlist: &[String]) -> bool {
     let normalized = normalize_protocol_id(protocol_id);
-    NATIVE_PROTOCOL_ALLOWLIST
+    allowlist
         .iter()
         .any(|candidate| normalize_protocol_id(candidate) == normalized)
 }
 
-pub(super) fn native_protocol_allowlist() -> &'static [&'static str] {
-    NATIVE_PROTOCOL_ALLOWLIST
+pub(super) fn format_native_protocol_allowlist(allowlist: &[String]) -> String {
+    allowlist.join(", ")
 }
 
 pub(super) fn should_reset_allowance(
@@ -166,9 +164,36 @@ mod tests {
 
     #[test]
     fn native_protocol_allowlist_matches_rocketpool_only() {
-        assert!(is_native_protocol_allowlisted("rocketpool"));
-        assert!(is_native_protocol_allowlisted("ROCKETPOOL"));
-        assert!(!is_native_protocol_allowlisted("uniswap_v2"));
-        assert_eq!(native_protocol_allowlist(), &["rocketpool"]);
+        let allowlist = vec!["rocketpool".to_string()];
+        assert!(is_native_protocol_allowlisted("rocketpool", &allowlist));
+        assert!(is_native_protocol_allowlisted("ROCKETPOOL", &allowlist));
+        assert!(!is_native_protocol_allowlisted("uniswap_v2", &allowlist));
+    }
+
+    #[test]
+    fn empty_allowlist_rejects_everything() {
+        let allowlist: Vec<String> = vec![];
+        assert!(!is_native_protocol_allowlisted("rocketpool", &allowlist));
+    }
+
+    #[test]
+    fn validate_chain_accepts_matching_chain() {
+        let chain = validate_chain(1, Chain::Ethereum).unwrap();
+        assert_eq!(chain, Chain::Ethereum);
+    }
+
+    #[test]
+    fn validate_chain_rejects_mismatched_chain() {
+        let err = validate_chain(8453, Chain::Ethereum).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn validate_chain_accepts_base() {
+        let chain = validate_chain(8453, Chain::Base).unwrap();
+        assert_eq!(chain, Chain::Base);
     }
 }

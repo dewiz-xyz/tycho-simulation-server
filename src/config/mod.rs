@@ -3,24 +3,97 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tycho_simulation::tycho_common::Bytes;
+use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 mod logging;
 mod memory;
 pub use logging::init_logging;
 pub use memory::MemoryConfig;
 
+/// Per-chain runtime profile resolved from `CHAIN_ID`.
+#[derive(Clone, Debug)]
+pub struct ChainProfile {
+    pub chain: Chain,
+    pub native_protocols: Vec<String>,
+    pub vm_protocols: Vec<String>,
+    /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
+    pub native_token_protocol_allowlist: Vec<String>,
+    pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
+}
+
+fn ethereum_profile() -> ChainProfile {
+    let mut reset_tokens = HashMap::new();
+    let mut mainnet = HashSet::new();
+    mainnet.insert(parse_address(ETHEREUM_USDT));
+    reset_tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
+
+    ChainProfile {
+        chain: Chain::Ethereum,
+        native_protocols: vec![
+            "uniswap_v2".into(),
+            "sushiswap_v2".into(),
+            "pancakeswap_v2".into(),
+            "uniswap_v3".into(),
+            "pancakeswap_v3".into(),
+            "uniswap_v4".into(),
+            "ekubo_v2".into(),
+            "fluid_v1".into(),
+            "rocketpool".into(),
+            "ekubo_v3".into(),
+            "erc4626".into(),
+        ],
+        vm_protocols: vec![
+            "vm:curve".into(),
+            "vm:balancer_v2".into(),
+            "vm:maverick_v2".into(),
+        ],
+        native_token_protocol_allowlist: vec!["rocketpool".into()],
+        reset_allowance_tokens: reset_tokens,
+    }
+}
+
+fn base_profile() -> ChainProfile {
+    ChainProfile {
+        chain: Chain::Base,
+        native_protocols: vec![
+            "uniswap_v2".into(),
+            "uniswap_v3".into(),
+            "uniswap_v4".into(),
+            "pancakeswap_v3".into(),
+        ],
+        vm_protocols: vec![],
+        native_token_protocol_allowlist: vec![],
+        reset_allowance_tokens: HashMap::new(),
+    }
+}
+
+fn resolve_chain_profile(chain_id: u64) -> ChainProfile {
+    match chain_id {
+        1 => ethereum_profile(),
+        8453 => base_profile(),
+        other => panic!(
+            "Unsupported CHAIN_ID={}: supported values are 1 (Ethereum), 8453 (Base)",
+            other
+        ),
+    }
+}
+
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
+    let chain_id: u64 = require_env("CHAIN_ID")
+        .parse()
+        .expect("CHAIN_ID must be a valid u64");
+    let chain_profile = resolve_chain_profile(chain_id);
     let network = load_network_config();
     let timeouts = load_timeout_config();
     let concurrency = load_concurrency_config();
     let stream = load_stream_config();
-    let reset_allowance_tokens = Arc::new(default_reset_allowance_tokens());
+    let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
 
     AppConfig {
+        chain_profile,
         tycho_url: network.tycho_url,
         api_key: network.api_key,
         rpc_url: network.rpc_url,
@@ -242,6 +315,7 @@ fn load_stream_config() -> StreamConfig {
 
 #[derive(Clone)]
 pub struct AppConfig {
+    pub chain_profile: ChainProfile,
     pub tycho_url: String,
     pub api_key: String,
     pub rpc_url: Option<String>,
@@ -275,15 +349,6 @@ pub struct AppConfig {
 
 const ETHEREUM_CHAIN_ID: u64 = 1;
 const ETHEREUM_USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
-
-fn default_reset_allowance_tokens() -> HashMap<u64, HashSet<Bytes>> {
-    // Tokens that require approve(0) before approve(amount).
-    let mut tokens = HashMap::new();
-    let mut mainnet = HashSet::new();
-    mainnet.insert(parse_address(ETHEREUM_USDT));
-    tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
-    tokens
-}
 
 fn parse_address(value: &str) -> Bytes {
     let bytes: Bytes = parse_value_or_panic("reset_allowance_tokens address", value);
@@ -349,5 +414,46 @@ where
     match value.parse() {
         Ok(parsed) => parsed,
         Err(_) => panic!("Invalid {key}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ethereum_profile() {
+        let profile = resolve_chain_profile(1);
+        assert_eq!(profile.chain, Chain::Ethereum);
+        assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
+        assert!(profile.native_protocols.contains(&"rocketpool".to_string()));
+        assert!(profile.native_protocols.contains(&"erc4626".to_string()));
+        assert!(profile.vm_protocols.contains(&"vm:curve".to_string()));
+        assert!(profile
+            .native_token_protocol_allowlist
+            .contains(&"rocketpool".to_string()));
+        assert!(profile.reset_allowance_tokens.contains_key(&1));
+    }
+
+    #[test]
+    fn resolve_base_profile() {
+        let profile = resolve_chain_profile(8453);
+        assert_eq!(profile.chain, Chain::Base);
+        assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
+        assert!(profile.native_protocols.contains(&"uniswap_v3".to_string()));
+        assert!(profile.native_protocols.contains(&"uniswap_v4".to_string()));
+        assert!(profile
+            .native_protocols
+            .contains(&"pancakeswap_v3".to_string()));
+        assert_eq!(profile.native_protocols.len(), 4);
+        assert!(profile.vm_protocols.is_empty());
+        assert!(profile.native_token_protocol_allowlist.is_empty());
+        assert!(profile.reset_allowance_tokens.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Unsupported CHAIN_ID=999")]
+    fn resolve_unsupported_chain_panics() {
+        resolve_chain_profile(999);
     }
 }

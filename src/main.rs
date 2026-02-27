@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
-use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
+use tycho_simulation::utils::load_all_tokens;
 
 use tycho_simulation_server::api::create_router;
 use tycho_simulation_server::config::{init_logging, load_config};
@@ -25,7 +26,8 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 async fn main() -> anyhow::Result<()> {
     init_logging();
     let config = load_config();
-    info!("Initializing price service...");
+    let chain = config.chain_profile.chain;
+    info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
@@ -81,8 +83,7 @@ fn spawn_memory_snapshot_task(memory_cfg: tycho_simulation_server::config::Memor
     tokio::spawn(async move {
         let mut ticker =
             tokio::time::interval(Duration::from_secs(memory_cfg.snapshots_min_interval_secs));
-        // tokio::time::interval ticks immediately on first await; skip it so "startup"
-        // remains the first snapshot by default.
+        // `interval` ticks immediately on first await; skip it so "startup" remains first.
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -94,12 +95,13 @@ fn spawn_memory_snapshot_task(memory_cfg: tycho_simulation_server::config::Memor
 async fn load_token_store(
     config: &tycho_simulation_server::config::AppConfig,
 ) -> anyhow::Result<Arc<TokenStore>> {
+    let chain = config.chain_profile.chain;
     let all_tokens = load_all_tokens(
         &config.tycho_url,
         false,
         Some(&config.api_key),
         true,
-        Chain::Ethereum,
+        chain,
         Some(10),
         None,
     )
@@ -110,7 +112,7 @@ async fn load_token_store(
         all_tokens,
         config.tycho_url.clone(),
         config.api_key.clone(),
-        Chain::Ethereum,
+        chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
     )))
 }
@@ -137,10 +139,23 @@ fn build_app_state(
     tokens: &Arc<TokenStore>,
     resources: &StreamResources,
 ) -> AppState {
+    let chain = config.chain_profile.chain;
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
+    let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
+    let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
+    let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
+    let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
+    let request_timeout = Duration::from_millis(config.request_timeout_ms);
+    // VM is only effective when enabled and the selected chain exposes VM protocols.
+    let effective_vm_enabled =
+        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
 
     AppState {
+        chain,
+        native_token_protocol_allowlist: Arc::new(
+            config.chain_profile.native_token_protocol_allowlist.clone(),
+        ),
         tokens: Arc::clone(tokens),
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
@@ -149,12 +164,12 @@ fn build_app_state(
         vm_stream: Arc::clone(&resources.vm_stream),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
         native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-        enable_vm_pools: config.enable_vm_pools,
-        readiness_stale: Duration::from_secs(config.readiness_stale_secs),
-        quote_timeout: Duration::from_millis(config.quote_timeout_ms),
-        pool_timeout_native: Duration::from_millis(config.pool_timeout_native_ms),
-        pool_timeout_vm: Duration::from_millis(config.pool_timeout_vm_ms),
-        request_timeout: Duration::from_millis(config.request_timeout_ms),
+        enable_vm_pools: effective_vm_enabled,
+        readiness_stale,
+        quote_timeout,
+        pool_timeout_native,
+        pool_timeout_vm,
+        request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
         erc4626_deposits_enabled: config.rpc_url.is_some(),
@@ -190,10 +205,13 @@ fn build_supervisor_config(
 }
 
 fn log_concurrency_config(config: &tycho_simulation_server::config::AppConfig) {
+    let effective_vm_enabled =
+        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
     info!(
         native_sim_concurrency = config.global_native_sim_concurrency,
         vm_sim_concurrency = config.global_vm_sim_concurrency,
-        enable_vm_pools = config.enable_vm_pools,
+        enable_vm_pools = effective_vm_enabled,
+        requested_vm_pools = config.enable_vm_pools,
         "Initialized simulation concurrency limits"
     );
 }
@@ -233,6 +251,7 @@ fn spawn_native_stream_task(
     tokens: &Arc<TokenStore>,
     resources: &StreamResources,
 ) {
+    let chain = config.chain_profile.chain;
     let native_supervisor_cfg = supervisor_cfg.clone();
     let tokens_bg = Arc::clone(tokens);
     let state_store_bg = Arc::clone(&resources.native_state_store);
@@ -241,6 +260,7 @@ fn spawn_native_stream_task(
     let api_key = config.api_key.clone();
     let tvl_threshold = config.tvl_threshold;
     let tvl_keep_threshold = config.tvl_keep_threshold;
+    let native_protocols = config.chain_profile.native_protocols.clone();
 
     tokio::spawn(async move {
         info!("Starting native protocol stream supervisor...");
@@ -249,6 +269,7 @@ fn spawn_native_stream_task(
                 let tokens = Arc::clone(&tokens_bg);
                 let tycho_url = tycho_url.clone();
                 let api_key = api_key.clone();
+                let protocols = native_protocols.clone();
                 async move {
                     build_native_stream(
                         &tycho_url,
@@ -256,6 +277,8 @@ fn spawn_native_stream_task(
                         tvl_threshold,
                         tvl_keep_threshold,
                         tokens,
+                        chain,
+                        &protocols,
                     )
                     .await
                 }
@@ -276,8 +299,18 @@ fn spawn_vm_stream_task(
     resources: &StreamResources,
     app_state: &AppState,
 ) {
-    if !config.enable_vm_pools {
-        info!("VM pool feeds disabled");
+    let chain = config.chain_profile.chain;
+    let effective_vm_enabled =
+        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+    if !effective_vm_enabled {
+        if !config.enable_vm_pools {
+            info!("VM pool feeds disabled");
+        } else {
+            info!(
+                chain = %chain,
+                "VM pool feeds enabled but no VM protocols configured for this chain; skipping VM stream"
+            );
+        }
         return;
     }
 
@@ -291,6 +324,7 @@ fn spawn_vm_stream_task(
     let api_key = config.api_key.clone();
     let tvl_threshold = config.tvl_threshold;
     let tvl_keep_threshold = config.tvl_keep_threshold;
+    let vm_protocols = config.chain_profile.vm_protocols.clone();
     let vm_sim_concurrency = vm_sim_concurrency_u32(config.global_vm_sim_concurrency);
 
     tokio::spawn(async move {
@@ -300,6 +334,7 @@ fn spawn_vm_stream_task(
                 let tokens = Arc::clone(&tokens_bg);
                 let tycho_url = tycho_url.clone();
                 let api_key = api_key.clone();
+                let protocols = vm_protocols.clone();
                 async move {
                     build_vm_stream(
                         &tycho_url,
@@ -307,6 +342,8 @@ fn spawn_vm_stream_task(
                         tvl_threshold,
                         tvl_keep_threshold,
                         tokens,
+                        chain,
+                        &protocols,
                     )
                     .await
                 }

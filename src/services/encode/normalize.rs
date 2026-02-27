@@ -13,7 +13,7 @@ use super::model::{
     NormalizedHopInternal, NormalizedRouteInternal, NormalizedSegmentInternal,
     NormalizedSwapDraftInternal,
 };
-use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
+use super::request::{format_native_protocol_allowlist, is_native_protocol_allowlisted};
 use super::wire::parse_address;
 use super::EncodeError;
 
@@ -24,6 +24,7 @@ pub(super) fn normalize_route(
     total_amount_in: &BigUint,
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
@@ -43,13 +44,19 @@ pub(super) fn normalize_route(
 
     for (segment_index, segment) in request.segments.iter().enumerate() {
         validate_segment_shape(segment, segment_index)?;
-
         validate_hop_continuity(segment, request_token_in, request_token_out)?;
 
         let hops = segment
             .hops
             .iter()
-            .map(|hop| normalize_hop(hop, native_address, erc4626_deposits_enabled))
+            .map(|hop| {
+                normalize_hop(
+                    hop,
+                    native_address,
+                    erc4626_deposits_enabled,
+                    native_token_protocol_allowlist,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let segment_amount_in = segment_amounts
@@ -129,6 +136,7 @@ fn normalize_hop(
     hop: &HopDraft,
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
@@ -138,8 +146,9 @@ fn normalize_hop(
     let token_out = parse_address(&hop.token_out)?;
     if token_in == *native_address || token_out == *native_address {
         for swap in &hop.swaps {
-            if !is_native_protocol_allowlisted(&swap.pool.protocol) {
-                let supported = native_protocol_allowlist().join(", ");
+            if !is_native_protocol_allowlisted(&swap.pool.protocol, native_token_protocol_allowlist)
+            {
+                let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
                 return Err(EncodeError::invalid(format!(
                     "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
                     supported, swap.pool.protocol
@@ -244,12 +253,17 @@ fn validate_erc4626_swap_supported(
 mod tests {
     use std::str::FromStr;
 
+    use tycho_simulation::tycho_common::models::Chain;
+
     use super::*;
     use crate::models::messages::PoolRef;
     use crate::models::messages::{PoolSwapDraft, SwapKind};
     use crate::services::encode::fixtures::pool_ref;
     use crate::services::encode::wire::{format_address, parse_address, parse_amount};
-    use tycho_simulation::tycho_common::models::Chain;
+
+    fn allowlist() -> Vec<String> {
+        vec!["rocketpool".to_string()]
+    }
 
     #[test]
     fn normalize_route_computes_segment_amounts_from_share_bps() {
@@ -298,8 +312,8 @@ mod tests {
         let token_in = parse_address(&request.token_in).unwrap();
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
-
         let native_address = Chain::Ethereum.native_token().address;
+
         let normalized = normalize_route(
             &request,
             &token_in,
@@ -307,6 +321,7 @@ mod tests {
             &amount_in,
             &native_address,
             false,
+            &allowlist(),
         )
         .unwrap();
         assert_eq!(normalized.segments.len(), 2);
@@ -365,8 +380,15 @@ mod tests {
         let amount_in = BigUint::from(1u32);
         let native = Chain::Ethereum.native_token().address;
 
-        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false)
-        {
+        let err = match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            false,
+            &allowlist(),
+        ) {
             Ok(_) => panic!("Expected segment share rounding to zero to be rejected"),
             Err(err) => err,
         };
@@ -437,6 +459,7 @@ mod tests {
             &amount_in,
             &native_address,
             false,
+            &allowlist(),
         ) {
             Err(err) => assert_eq!(
                 err.kind(),
@@ -491,7 +514,15 @@ mod tests {
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false) {
+        match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            false,
+            &allowlist(),
+        ) {
             Err(err) => assert_eq!(
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -545,6 +576,7 @@ mod tests {
             &amount_in,
             &native,
             false,
+            &allowlist(),
         )
         .expect("rocketpool native route should normalize");
         assert_eq!(normalized.segments.len(), 1);
@@ -590,8 +622,15 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
         let native = Chain::Ethereum.native_token().address;
 
-        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false)
-        {
+        let err = match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            false,
+            &allowlist(),
+        ) {
             Ok(_) => panic!("allowlisted deposit should be rejected when deposits are disabled"),
             Err(err) => err,
         };
@@ -644,9 +683,16 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
         let native = Chain::Ethereum.native_token().address;
 
-        let normalized =
-            normalize_route(&request, &token_in, &token_out, &amount_in, &native, true)
-                .expect("allowlisted deposit should normalize when deposits are enabled");
+        let normalized = normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            true,
+            &allowlist(),
+        )
+        .expect("allowlisted deposit should normalize when deposits are enabled");
 
         assert_eq!(normalized.segments.len(), 1);
         assert_eq!(normalized.segments[0].hops.len(), 1);
