@@ -15,6 +15,7 @@ use tycho_simulation_server::memory::maybe_log_memory_snapshot;
 use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
+use tycho_simulation_server::services::gas_price::run_native_gas_price_refresh_loop;
 use tycho_simulation_server::services::stream_builder::{build_native_stream, build_vm_stream};
 
 #[global_allocator]
@@ -100,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         native_stream_health: Arc::clone(&native_stream_health),
         vm_stream_health: Arc::clone(&vm_stream_health),
         vm_stream: Arc::clone(&vm_stream),
+        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: config.enable_vm_pools,
         readiness_stale,
         quote_timeout,
@@ -133,8 +136,32 @@ async fn main() -> anyhow::Result<()> {
         memory: config.memory,
     };
 
+    if let Some(rpc_url) = config.rpc_url.clone() {
+        let app_state_bg = app_state.clone();
+        let refresh_interval = Duration::from_millis(config.gas_price_refresh_interval_ms);
+        let failure_tolerance = config.gas_price_failure_tolerance;
+
+        tokio::spawn(async move {
+            info!(
+                refresh_interval_ms = refresh_interval.as_millis() as u64,
+                failure_tolerance, "Starting native gas price refresh loop"
+            );
+            run_native_gas_price_refresh_loop(
+                app_state_bg,
+                rpc_url,
+                refresh_interval,
+                failure_tolerance,
+                reqwest::Client::new(),
+            )
+            .await;
+        });
+    } else {
+        info!("RPC_URL is not configured; gas-in-sell reporting remains disabled");
+    }
+
     // Build protocol streams in background and start processing
     {
+        let native_supervisor_cfg = supervisor_cfg.clone();
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&native_state_store);
@@ -163,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_store_bg,
                 health_bg,
-                supervisor_cfg,
+                native_supervisor_cfg,
             )
             .await;
         });
@@ -171,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.enable_vm_pools {
+        let vm_supervisor_cfg = supervisor_cfg.clone();
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
         let state_store_bg = Arc::clone(&vm_state_store);
@@ -204,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_store_bg,
                 health_bg,
-                supervisor_cfg,
+                vm_supervisor_cfg,
                 VmStreamControls {
                     vm_stream: vm_stream_bg,
                     vm_sim_semaphore: vm_semaphore_bg,

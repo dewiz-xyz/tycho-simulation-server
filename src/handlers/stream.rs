@@ -62,7 +62,7 @@ pub struct StreamExit {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StreamSupervisorConfig {
     pub stream_stale: Duration,
     pub missing_block_burst: u64,
@@ -296,7 +296,7 @@ pub async fn supervise_native_stream<F, Fut, S>(
             stream,
             Arc::clone(&state_store),
             Arc::clone(&health),
-            cfg,
+            cfg.clone(),
         )
         .await;
 
@@ -369,7 +369,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             stream,
             Arc::clone(&state_store),
             Arc::clone(&health),
-            cfg,
+            cfg.clone(),
         )
         .await;
 

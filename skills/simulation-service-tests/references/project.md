@@ -36,6 +36,7 @@
   - `scripts/run_suite.sh --repo . --suite core --stop`
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
+  - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
   - Core coverage now includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH`.
 - Individual runners:
   - `python3 scripts/simulate_smoke.py --suite smoke`

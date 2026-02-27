@@ -9,6 +9,11 @@
 Logs are JSON from `tracing_subscriber`. CloudWatch does not always flatten nested `fields`,
 so these queries parse `@message` to extract `msg`, `level`, and structured fields.
 
+## Privacy guidance
+- Treat `request_id`, `auction_id`, `token_in`, `token_out`, pool IDs/addresses, and token addresses as sensitive debugging context.
+- For shareable updates, prefer aggregate presets (`block-updates-count`, `simulate-rpm`, `simulate-runs-per-minute`, `simulate-workload-summary`) that avoid request-level identifiers.
+- Use identifier-heavy presets (`simulate-requests`, `simulate-completions`, `simulate-successes`, `simulate-runs`, `timeouts`, `token-metadata`) only for internal triage, and redact those fields before sharing externally.
+
 ## Preset index
 | Preset | Focus | Notes |
 | --- | --- | --- |
