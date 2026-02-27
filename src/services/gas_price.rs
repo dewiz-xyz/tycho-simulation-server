@@ -147,6 +147,41 @@ pub async fn run_native_gas_price_refresh_loop(
     }
 }
 
+pub fn spawn_gas_price_startup_task(
+    app_state: AppState,
+    chain: Chain,
+    rpc_url: String,
+    refresh_interval: Duration,
+    failure_tolerance: u64,
+    client: Client,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match wait_for_rpc_chain_match(&rpc_url, chain, refresh_interval, &client).await {
+            Ok(rpc_chain_id) => {
+                info!(
+                    refresh_interval_ms = refresh_interval.as_millis() as u64,
+                    failure_tolerance, rpc_chain_id, "Starting native gas price refresh loop"
+                );
+                run_native_gas_price_refresh_loop(
+                    app_state,
+                    rpc_url,
+                    refresh_interval,
+                    failure_tolerance,
+                    client,
+                )
+                .await;
+            }
+            Err(error) => {
+                error!(
+                    %error,
+                    expected_chain_id = chain.id(),
+                    "RPC_URL chain validation failed; gas-in-sell reporting remains disabled"
+                );
+            }
+        }
+    })
+}
+
 async fn process_refresh_result(
     app_state: &AppState,
     failure_tolerance: u64,
