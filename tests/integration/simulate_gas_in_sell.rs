@@ -53,7 +53,7 @@ impl ProtocolSim for SimPool {
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
         for (b, q, price) in &self.spot_quotes {
             if *b == base.address && *q == quote.address {
-                return Ok(*price as f64);
+                return Ok(*price);
             }
         }
         Err(SimulationError::FatalError(

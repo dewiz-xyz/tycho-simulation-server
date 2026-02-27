@@ -180,7 +180,7 @@ PY
 fi
 
 echo "Smoke testing /simulate..."
-python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status "$simulate_allow_status" $allow_failures_flag
+python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status "$simulate_allow_status" --require-data --validate-data $allow_failures_flag
 
 echo "Encode smoke testing..."
 python3 "$script_dir/encode_smoke.py" --encode-url "$encode_url" --simulate-url "$simulate_url" --repo "$repo" --allow-status "$simulate_allow_status" $allow_failures_flag

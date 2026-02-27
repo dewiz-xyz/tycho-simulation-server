@@ -64,6 +64,10 @@ def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
     if not all(isinstance(v, int) and v >= 0 for v in gas_used):
         return False, "gas_used contains non-integers"
 
+    gas_in_sell = entry.get("gas_in_sell")
+    if not is_int_string(gas_in_sell):
+        return False, "gas_in_sell must be an integer string"
+
     block_number = entry.get("block_number")
     if not isinstance(block_number, int) or block_number < 0:
         return False, "block_number is invalid"

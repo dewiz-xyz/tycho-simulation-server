@@ -68,7 +68,7 @@ def select_pool(response: dict, label: str) -> dict:
     if not isinstance(data, list) or not data:
         raise AssertionError(f"{label}: no pool data")
     pool = data[0]
-    required = ["pool", "amounts_out", "gas_used", "block_number", "pool_name", "pool_address"]
+    required = ["pool", "amounts_out", "gas_used", "gas_in_sell", "block_number", "pool_name", "pool_address"]
     for key in required:
         if key not in pool:
             raise AssertionError(f"{label}: missing {key}")

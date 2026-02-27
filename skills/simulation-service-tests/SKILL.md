@@ -30,6 +30,8 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
+`run_suite.sh` smoke checks now require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`).
+
 VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
 ```bash
 scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop
@@ -52,7 +54,7 @@ python3 scripts/simulate_smoke.py --pair DAI:USDC --pair WETH:USDC
 python3 scripts/simulate_smoke.py --list-tokens
 ```
 
-For stricter checks (fail on empty data and validate pool entries):
+For stricter checks (fail on empty data and validate pool entries, including `gas_in_sell`):
 ```bash
 python3 scripts/simulate_smoke.py --suite smoke --require-data --validate-data
 ```
