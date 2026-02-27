@@ -259,6 +259,7 @@ echo "Coverage suite: $coverage_suite"
 echo "Latency suite: $latency_suite"
 
 echo "Smoke testing /simulate..."
+# Bash 3.2 + nounset treats empty "${array[@]}" as unbound; guard optional args.
 python3 "$script_dir/simulate_smoke.py" \
   --url "$simulate_url" \
   --chain-id "$chain_id" \
@@ -266,7 +267,7 @@ python3 "$script_dir/simulate_smoke.py" \
   --allow-status "$simulate_allow_status" \
   --require-data \
   --validate-data \
-  "${simulate_flags[@]}"
+  ${simulate_flags[@]+"${simulate_flags[@]}"}
 
 echo "Encode smoke testing..."
 python3 "$script_dir/encode_smoke.py" \
@@ -275,7 +276,7 @@ python3 "$script_dir/encode_smoke.py" \
   --chain-id "$chain_id" \
   --repo "$repo" \
   --allow-status "$simulate_allow_status" \
-  "${simulate_flags[@]}"
+  ${simulate_flags[@]+"${simulate_flags[@]}"}
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
@@ -284,7 +285,7 @@ python3 "$script_dir/coverage_sweep.py" \
   --chain-id "$chain_id" \
   --suite "$coverage_suite" \
   --allow-status "$coverage_allow_status" \
-  "${coverage_flags[@]}" \
+  ${coverage_flags[@]+"${coverage_flags[@]}"} \
   --out "$repo/logs/coverage_sweep.json"
 
 if [[ "$runtime_vm_enabled" == "true" ]]; then
@@ -316,7 +317,7 @@ if [[ "$runtime_vm_enabled" == "true" ]]; then
       --pair USDT:USDC \
       --pair ETH:RETH \
       --allow-status "$coverage_allow_status" \
-      "${coverage_flags[@]}" \
+      ${coverage_flags[@]+"${coverage_flags[@]}"} \
       --expect-protocols "$expected_vm_protocols" \
       --out "$repo/logs/coverage_protocol_presence.json"
 
@@ -350,7 +351,7 @@ python3 "$script_dir/latency_percentiles.py" \
   --requests "$latency_requests" \
   --concurrency "$latency_concurrency" \
   --allow-status "$latency_allow_status" \
-  "${latency_flags[@]}"
+  ${latency_flags[@]+"${latency_flags[@]}"}
 
 if [[ "$stop_after" == "true" ]] && [[ "$started_by_me" == "true" ]]; then
   echo "Stopping server..."

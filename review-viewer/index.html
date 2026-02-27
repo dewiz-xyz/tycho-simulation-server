@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Review Guide Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (() => {
+        const savedTheme = localStorage.getItem('review-guide-theme');
+        document.documentElement.setAttribute('data-theme', savedTheme || 'dark');
+      })();
+    </script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="backdrop glow-one" aria-hidden="true"></div>
+    <div class="backdrop glow-two" aria-hidden="true"></div>
+
+    <main class="layout">
+      <header class="topbar">
+        <div class="brand">
+          <p class="eyebrow">dsolver-sdk</p>
+          <h1>Review Guide Studio</h1>
+          <p class="subtitle">Dark-first markdown renderer with grouped phases, risk cards, and diff hunk panels.</p>
+        </div>
+
+        <div class="topbar-actions">
+          <button id="theme-toggle" class="button button-ghost" type="button" aria-label="Switch theme">
+            Light mode
+          </button>
+          <a class="button" href="../review_guide.md" target="_blank" rel="noreferrer">Raw Markdown</a>
+        </div>
+      </header>
+
+      <aside class="sidebar" aria-label="Table of contents">
+        <div class="sidebar-title">Review Flow</div>
+        <nav id="toc" class="toc"></nav>
+      </aside>
+
+      <article id="content" class="content" aria-live="polite">
+        <p class="loading">Loading review guide...</p>
+      </article>
+    </main>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
