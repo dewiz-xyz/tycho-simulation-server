@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
+use tycho_simulation::tycho_common::models::Chain;
 
 use crate::models::state::AppState;
 
@@ -25,10 +26,32 @@ struct JsonRpcResponse {
 }
 
 pub async fn fetch_eth_gas_price_wei(rpc_url: &str, client: &Client) -> Result<u128> {
+    fetch_rpc_hex_value(rpc_url, "eth_gasPrice", client).await
+}
+
+pub async fn fetch_rpc_chain_id(rpc_url: &str, client: &Client) -> Result<u64> {
+    let chain_id = fetch_rpc_hex_value(rpc_url, "eth_chainId", client).await?;
+    u64::try_from(chain_id)
+        .with_context(|| format!("eth_chainId result {} exceeds u64 range", chain_id))
+}
+
+pub fn ensure_rpc_chain_matches(expected_chain: Chain, rpc_chain_id: u64) -> Result<()> {
+    let expected_chain_id = expected_chain.id();
+    if rpc_chain_id != expected_chain_id {
+        return Err(anyhow!(
+            "RPC chain mismatch: expected {}, got {}",
+            expected_chain_id,
+            rpc_chain_id
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_rpc_hex_value(rpc_url: &str, method: &str, client: &Client) -> Result<u128> {
     let request = JsonRpcRequest {
         jsonrpc: "2.0",
         id: 1,
-        method: "eth_gasPrice",
+        method,
         params: [],
     };
 
@@ -38,26 +61,26 @@ pub async fn fetch_eth_gas_price_wei(rpc_url: &str, client: &Client) -> Result<u
         .json(&request)
         .send()
         .await
-        .map_err(|err| anyhow!("failed to call eth_gasPrice: {}", err.without_url()))?;
+        .map_err(|err| anyhow!("failed to call {}: {}", method, err.without_url()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("eth_gasPrice returned HTTP {}: {}", status, body));
+        return Err(anyhow!("{} returned HTTP {}: {}", method, status, body));
     }
 
     let body: JsonRpcResponse = response
         .json()
         .await
-        .context("failed to decode eth_gasPrice response")?;
+        .with_context(|| format!("failed to decode {} response", method))?;
 
     if let Some(error) = body.error {
-        return Err(anyhow!("eth_gasPrice returned rpc error: {}", error));
+        return Err(anyhow!("{} returned rpc error: {}", method, error));
     }
 
     let value = body
         .result
-        .ok_or_else(|| anyhow!("eth_gasPrice response missing result field"))?;
+        .ok_or_else(|| anyhow!("{} response missing result field", method))?;
     parse_hex_u128(&value)
 }
 
@@ -197,6 +220,10 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::anyhow;
+    use axum::{routing::post, Json, Router};
+    use reqwest::Client;
+    use serde_json::json;
+    use tokio::net::TcpListener;
     use tokio::sync::{RwLock, Semaphore};
     use tycho_simulation::tycho_common::models::Chain;
 
@@ -206,7 +233,9 @@ mod tests {
         tokens::TokenStore,
     };
 
-    use super::{parse_hex_u128, process_refresh_result};
+    use super::{
+        ensure_rpc_chain_matches, fetch_rpc_chain_id, parse_hex_u128, process_refresh_result,
+    };
 
     fn build_test_app_state() -> AppState {
         let token_store = Arc::new(TokenStore::new(
@@ -254,6 +283,37 @@ mod tests {
         assert!(parse_hex_u128("1").is_err());
         assert!(parse_hex_u128("0x").is_err());
         assert!(parse_hex_u128("0xzz").is_err());
+    }
+
+    #[test]
+    fn ensure_rpc_chain_matches_accepts_equal_chain_id() {
+        let result = ensure_rpc_chain_matches(Chain::Base, 8453);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ensure_rpc_chain_matches_rejects_mismatched_chain_id() {
+        let error = ensure_rpc_chain_matches(Chain::Ethereum, 8453).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("RPC chain mismatch: expected 1, got 8453"));
+    }
+
+    #[tokio::test]
+    async fn fetch_rpc_chain_id_reads_eth_chain_id() {
+        let app = Router::new().route(
+            "/",
+            post(|| async { Json(json!({"jsonrpc":"2.0","id":1,"result":"0x2105"})) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{}", addr);
+
+        let chain_id = fetch_rpc_chain_id(&url, &Client::new()).await.unwrap();
+        assert_eq!(chain_id, 8453);
     }
 
     #[tokio::test]

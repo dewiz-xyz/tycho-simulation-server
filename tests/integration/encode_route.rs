@@ -488,6 +488,31 @@ async fn encode_route_rejects_when_min_amount_out_exceeds_expected() -> Result<(
 }
 
 #[tokio::test]
+async fn encode_route_rejects_when_request_chain_does_not_match_runtime_chain() -> Result<()> {
+    let (app, mut request) = setup_app_state_and_request(EncodeFixtureConfig::default()).await?;
+    request.chain_id = 8453;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response
+            .error
+            .contains("Unsupported chainId: 8453 (this instance serves chain 1)"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn encode_route_succeeds_for_vm_maverick_v2_pool() -> Result<()> {
     let config = EncodeFixtureConfig {
         request_pool_protocol: "vm:maverick_v2",
