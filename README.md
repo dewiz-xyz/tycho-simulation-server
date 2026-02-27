@@ -43,6 +43,7 @@ The following environment variables are read at startup:
 
 - `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
+- `CHAIN_ID` – Runtime chain ID (**required**); supported values: `1` (Ethereum), `8453` (Base)
 - `RPC_URL` – Optional Ethereum JSON-RPC endpoint used for background `eth_gasPrice` refresh
 - `GAS_PRICE_REFRESH_INTERVAL_MS` – Poll interval for `eth_gasPrice` refresh task (default: `5000`)
 - `GAS_PRICE_FAILURE_TOLERANCE` – Disable gas reporting when consecutive refresh failures exceed this value (default: `50`)
@@ -78,6 +79,19 @@ The following environment variables are read at startup:
 - `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
 Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. `meta.status` remains an operational/reliability signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
+
+## Scripted Testing
+
+Repo test scripts are chain-aware and require chain context via `--chain-id` or `CHAIN_ID`.
+
+Examples:
+
+```bash
+python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke
+python3 scripts/encode_smoke.py --chain-id 1 --repo .
+scripts/run_suite.sh --repo . --chain-id 1 --enable-vm-pools --stop
+scripts/run_suite.sh --repo . --chain-id 8453 --enable-vm-pools --stop
+```
 
 ## Docs
 
