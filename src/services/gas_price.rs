@@ -47,6 +47,32 @@ pub fn ensure_rpc_chain_matches(expected_chain: Chain, rpc_chain_id: u64) -> Res
     Ok(())
 }
 
+pub async fn wait_for_rpc_chain_match(
+    rpc_url: &str,
+    expected_chain: Chain,
+    retry_interval: Duration,
+    client: &Client,
+) -> Result<u64> {
+    loop {
+        match fetch_rpc_chain_id(rpc_url, client).await {
+            Ok(rpc_chain_id) => {
+                ensure_rpc_chain_matches(expected_chain, rpc_chain_id)?;
+                return Ok(rpc_chain_id);
+            }
+            Err(error) => {
+                // Keep trying when the endpoint is flaky during startup.
+                warn!(
+                    %error,
+                    expected_chain_id = expected_chain.id(),
+                    retry_interval_ms = retry_interval.as_millis() as u64,
+                    "Failed to read eth_chainId from RPC_URL; retrying chain validation"
+                );
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
+
 async fn fetch_rpc_hex_value(rpc_url: &str, method: &str, client: &Client) -> Result<u128> {
     let request = JsonRpcRequest {
         jsonrpc: "2.0",
@@ -216,11 +242,12 @@ fn parse_hex_u128(value: &str) -> Result<u128> {
 )]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::anyhow;
-    use axum::{routing::post, Json, Router};
+    use axum::{response::IntoResponse, routing::post, Json, Router};
     use reqwest::Client;
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -235,6 +262,7 @@ mod tests {
 
     use super::{
         ensure_rpc_chain_matches, fetch_rpc_chain_id, parse_hex_u128, process_refresh_result,
+        wait_for_rpc_chain_match,
     };
 
     fn build_test_app_state() -> AppState {
@@ -314,6 +342,80 @@ mod tests {
 
         let chain_id = fetch_rpc_chain_id(&url, &Client::new()).await.unwrap();
         assert_eq!(chain_id, 8453);
+    }
+
+    #[tokio::test]
+    async fn wait_for_rpc_chain_match_retries_after_transient_chain_id_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let attempts_for_handler = attempts_for_handler.clone();
+                async move {
+                    let attempt = attempts_for_handler.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "try again").into_response()
+                    } else {
+                        Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{}", addr);
+
+        let rpc_chain_id = wait_for_rpc_chain_match(
+            &url,
+            Chain::Ethereum,
+            Duration::from_millis(5),
+            &Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rpc_chain_id, 1);
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_rpc_chain_match_fails_fast_on_chain_mismatch() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let attempts_for_handler = attempts_for_handler.clone();
+                async move {
+                    attempts_for_handler.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"jsonrpc":"2.0","id":1,"result":"0x2105"})).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{}", addr);
+
+        let error = wait_for_rpc_chain_match(
+            &url,
+            Chain::Ethereum,
+            Duration::from_millis(5),
+            &Client::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC chain mismatch: expected 1, got 8453"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
