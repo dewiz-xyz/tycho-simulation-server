@@ -16,7 +16,7 @@ use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatu
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 use tycho_simulation_server::services::gas_price::{
-    ensure_rpc_chain_matches, fetch_rpc_chain_id, run_native_gas_price_refresh_loop,
+    run_native_gas_price_refresh_loop, wait_for_rpc_chain_match,
 };
 use tycho_simulation_server::services::stream_builder::{build_native_stream, build_vm_stream};
 
@@ -153,49 +153,36 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if let Some(rpc_url) = config.rpc_url.clone() {
+        let app_state_bg = app_state.clone();
         let refresh_interval = Duration::from_millis(config.gas_price_refresh_interval_ms);
         let failure_tolerance = config.gas_price_failure_tolerance;
         let client = reqwest::Client::new();
 
-        match fetch_rpc_chain_id(&rpc_url, &client).await {
-            Ok(rpc_chain_id) => match ensure_rpc_chain_matches(chain, rpc_chain_id) {
-                Ok(()) => {
-                    let app_state_bg = app_state.clone();
-                    let client_bg = client.clone();
-                    tokio::spawn(async move {
-                        info!(
-                            refresh_interval_ms = refresh_interval.as_millis() as u64,
-                            failure_tolerance,
-                            rpc_chain_id,
-                            "Starting native gas price refresh loop"
-                        );
-                        run_native_gas_price_refresh_loop(
-                            app_state_bg,
-                            rpc_url,
-                            refresh_interval,
-                            failure_tolerance,
-                            client_bg,
-                        )
-                        .await;
-                    });
+        tokio::spawn(async move {
+            match wait_for_rpc_chain_match(&rpc_url, chain, refresh_interval, &client).await {
+                Ok(rpc_chain_id) => {
+                    info!(
+                        refresh_interval_ms = refresh_interval.as_millis() as u64,
+                        failure_tolerance, rpc_chain_id, "Starting native gas price refresh loop"
+                    );
+                    run_native_gas_price_refresh_loop(
+                        app_state_bg,
+                        rpc_url,
+                        refresh_interval,
+                        failure_tolerance,
+                        client,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     error!(
                         %error,
                         expected_chain_id = chain.id(),
-                        rpc_chain_id,
                         "RPC_URL chain validation failed; gas-in-sell reporting remains disabled"
                     );
                 }
-            },
-            Err(error) => {
-                error!(
-                    %error,
-                    expected_chain_id = chain.id(),
-                    "Failed to validate RPC_URL chain via eth_chainId; gas-in-sell reporting remains disabled"
-                );
             }
-        }
+        });
     } else {
         info!("RPC_URL is not configured; gas-in-sell reporting remains disabled");
     }
