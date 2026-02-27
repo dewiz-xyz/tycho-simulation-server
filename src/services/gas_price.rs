@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const ETH_GAS_PRICE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<'a> {
@@ -26,6 +29,7 @@ pub async fn fetch_eth_gas_price_wei(rpc_url: &str, client: &Client) -> Result<u
 
     let response = client
         .post(rpc_url)
+        .timeout(ETH_GAS_PRICE_TIMEOUT)
         .json(&request)
         .send()
         .await
