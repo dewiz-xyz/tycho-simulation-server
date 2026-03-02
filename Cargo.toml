@@ -38,6 +38,7 @@ alloy = "1.6.3"
 tycho-common = "0.143.1"
 alloy-chains = "0.2.30"
 tokio-stream = "0.1.18"
+csv = "1"
 
 [dev-dependencies]
 chrono = "0.4"

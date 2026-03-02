@@ -209,6 +209,9 @@ pub fn load_config() -> AppConfig {
         env::var("HASHFLOW_USER").expect("HASHFLOW_USER must be set"),
         env::var("HASHFLOW_KEY").expect("HASHFLOW_KEY must be set"),
     );
+    let hashflow_filename =
+        env::var("HASHFLOW_FILENAME_CSV").expect("HASHFLOW_FILENAME_CSV must be set");
+    let bebop_url = env::var("BEBOP_URL").expect("BEBOP_URL must be set");
 
     AppConfig {
         tycho_url,
@@ -244,6 +247,8 @@ pub fn load_config() -> AppConfig {
         bebop_user,
         hashflow_key,
         hashflow_user,
+        bebop_url,
+        hashflow_filename,
     }
 }
 
@@ -282,6 +287,8 @@ pub struct AppConfig {
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
+    pub bebop_url: String,
+    pub hashflow_filename: String,
 }
 
 const ETHEREUM_CHAIN_ID: u64 = 1;

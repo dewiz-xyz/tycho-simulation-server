@@ -223,6 +223,8 @@ async fn setup_app_state_and_request(
 
     let state = AppState {
         tokens: Arc::clone(&tokens_store),
+        bebop_tokens: Arc::clone(&tokens_store),
+        hashflow_tokens: Arc::clone(&tokens_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),

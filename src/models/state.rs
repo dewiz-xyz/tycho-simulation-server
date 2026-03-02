@@ -17,13 +17,15 @@ const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
+    pub bebop_tokens: Arc<TokenStore>,
+    pub hashflow_tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
     pub rfq_state_store: Arc<StateStore>,
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
-    pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub rfq_stream_health: Arc<StreamHealth>,
+    pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
@@ -839,14 +841,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_tracks_anomaly_counters_and_samples() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(20, "TKNA");
         let token_b = mk_token(21, "TKNB");
@@ -919,14 +921,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_caps_anomaly_samples() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
         for idx in 0..10 {
@@ -947,14 +949,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_without_anomalies_has_zero_counters() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(40, "TKNA");
         let token_b = mk_token(41, "TKNB");
@@ -979,14 +981,14 @@ mod tests {
 
     #[tokio::test]
     async fn reset_protocols_preserves_unaffected_pools() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(1, "TKNA");
         let token_b = mk_token(2, "TKNB");
@@ -1034,14 +1036,14 @@ mod tests {
 
     #[tokio::test]
     async fn reset_protocols_updates_ready_when_empty() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(5, "TKN1");
         let token_b = mk_token(6, "TKN2");
@@ -1064,16 +1066,16 @@ mod tests {
 
     #[tokio::test]
     async fn total_pools_includes_vm_store() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let token_a = mk_token(7, "TKNA");
         let token_b = mk_token(8, "TKNB");
@@ -1102,7 +1104,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_store),
             vm_state_store: Arc::clone(&vm_store),
             rfq_state_store: Arc::clone(&rfq_store),
@@ -1133,5 +1137,77 @@ mod tests {
         assert_eq!(app_state.current_rfq_block().await, None);
     }
 
-    // todo add rfq test
+    #[tokio::test]
+    async fn total_pools_includes_rfq_store() {
+        let tokens_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let token_a = mk_token(7, "TKNA");
+        let token_b = mk_token(8, "TKNB");
+
+        let native_component = mk_component(
+            20,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let rfq_component = mk_component(21, "rfq:bebop", "bebop_pool", vec![token_a, token_b]);
+
+        native_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                native_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        rfq_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                rfq_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_store),
+            vm_state_store: Arc::clone(&vm_store),
+            rfq_state_store: Arc::clone(&rfq_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+            enable_vm_pools: false,
+            enable_rfq_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
+        };
+
+        assert_eq!(app_state.total_pools().await, 2);
+        assert_eq!(app_state.current_vm_block().await, None);
+        assert_eq!(app_state.current_rfq_block().await, Some(1));
+    }
 }

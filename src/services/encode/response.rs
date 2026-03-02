@@ -77,6 +77,7 @@ pub(super) async fn build_debug(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::sync::Semaphore;
@@ -91,34 +92,33 @@ mod tests {
 
     #[tokio::test]
     async fn build_debug_omits_when_request_id_missing() {
-        let tokens_store = std::sync::Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_millis(10),
         ));
-        let native_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let vm_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let rfq_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
             .await;
 
         let state = AppState {
-            tokens: std::sync::Arc::clone(&tokens_store),
-            native_state_store: std::sync::Arc::clone(&native_state_store),
-            vm_state_store: std::sync::Arc::clone(&vm_state_store),
-            rfq_state_store: std::sync::Arc::clone(&rfq_state_store),
-            native_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            rfq_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            rfq_stream: std::sync::Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: false,
             enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
@@ -127,10 +127,10 @@ mod tests {
             pool_timeout_vm: Duration::from_millis(10),
             pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            rfq_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
             rfq_sim_concurrency: 1,
@@ -154,34 +154,33 @@ mod tests {
 
     #[tokio::test]
     async fn build_debug_includes_block_when_request_id_present() {
-        let tokens_store = std::sync::Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_millis(10),
         ));
-        let native_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let vm_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let rfq_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
             .await;
 
         let state = AppState {
-            tokens: std::sync::Arc::clone(&tokens_store),
-            native_state_store: std::sync::Arc::clone(&native_state_store),
-            vm_state_store: std::sync::Arc::clone(&vm_state_store),
-            rfq_state_store: std::sync::Arc::clone(&rfq_state_store),
-            native_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            rfq_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            rfq_stream: std::sync::Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: false,
             enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
@@ -190,10 +189,10 @@ mod tests {
             pool_timeout_vm: Duration::from_millis(10),
             pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            rfq_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
             rfq_sim_concurrency: 1,

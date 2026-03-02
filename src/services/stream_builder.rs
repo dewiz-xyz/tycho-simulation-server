@@ -1,4 +1,4 @@
-use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use crate::models::tokens::TokenStore;
 use anyhow::Result;
@@ -6,7 +6,6 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
-use tycho_common::Bytes;
 use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
@@ -15,7 +14,7 @@ use tycho_simulation::{
             filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
-            rocketpool::state::RocketpoolState,
+            // rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
@@ -96,6 +95,8 @@ pub struct RFQConfig {
 pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
     tokens: Arc<TokenStore>,
+    bebop_tokens: Arc<TokenStore>,
+    hashflow_tokens: Arc<TokenStore>,
     rfq_config: RFQConfig,
 ) -> Result<
     impl futures::Stream<
@@ -106,26 +107,18 @@ pub async fn build_rfq_stream(
         > + Unpin
         + Send,
 > {
-    let mut rfq_builder;
     let snapshot = tokens.snapshot().await;
 
-    let mut rfq_tokens = HashSet::new();
-
-    // todo: verify the supported tokens for both clients
-    rfq_tokens.insert(Bytes::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap()); // DAI
-    rfq_tokens.insert(Bytes::from_str("0x6b175474e89094c44da98b954eedeac495271d0f").unwrap()); // USDC
-                                                                                               // rfq_tokens.insert(Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap());
-                                                                                               // rfq_tokens.insert(Bytes::from_str("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9").unwrap());
-                                                                                               // rfq_tokens.insert(Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap());
-                                                                                               // rfq_tokens.insert(Bytes::from_str("0xB8c77482e45F1F44dE1745F52C74426C631bDD52").unwrap());
-                                                                                               // rfq_tokens.insert(Bytes::from_str("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84").unwrap());
-
-    rfq_builder = RFQStreamBuilder::new();
+    let mut rfq_builder = RFQStreamBuilder::new();
 
     info!("Setting up Bebop RFQ client...\n");
     let (user, key) = (rfq_config.bebop_user, rfq_config.bebop_key);
+    let mut rfq_tokens_bebop = HashSet::new();
+    for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
+        rfq_tokens_bebop.insert(bebop_token_addr.clone());
+    }
     let bebop_client = BebopClientBuilder::new(Chain::Ethereum, user, key)
-        .tokens(rfq_tokens.clone())
+        .tokens(rfq_tokens_bebop)
         .tvl_threshold(tvl_add_threshold)
         .build()
         .expect("Failed to create Bebop RFQ client");
@@ -133,18 +126,21 @@ pub async fn build_rfq_stream(
 
     info!("Setting up Hashflow RFQ client...\n");
     let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+    let mut rfq_tokens_hashflow = HashSet::new();
+    for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
+        rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
+    }
     let hashflow_client = HashflowClientBuilder::new(Chain::Ethereum, user, key)
-        .tokens(rfq_tokens)
+        .tokens(rfq_tokens_hashflow)
         .tvl_threshold(tvl_add_threshold)
         .poll_time(Duration::from_secs(5))
         .build()
         .expect("Failed to create Hashflow RFQ client");
     rfq_builder = rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
 
-    // Built stream
+    info!("Building RFQ Stream...\n");
     let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
     rfq_builder = rfq_builder.set_tokens(snapshot.clone()).await;
-    info!("RFQ pool feeds enabled");
     tokio::spawn(rfq_builder.build(tx));
     info!("Connected to RFQs! Streaming live price levels...\n");
 

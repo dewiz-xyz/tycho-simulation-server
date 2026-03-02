@@ -1,8 +1,14 @@
+use reqwest::Client;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
+use tycho_common::models::token::Token;
+use tycho_common::Bytes;
+use tycho_simulation_server::models::rfq::bebop::BebopResponse;
+use tycho_simulation_server::models::rfq::hashflow::read_hashflow_csv;
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
@@ -72,6 +78,81 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    info!("all tokens: {:?}", all_tokens);
+
+    let bebop_tokens: Arc<TokenStore>;
+    let hashflow_tokens: Arc<TokenStore>;
+
+    // Only fetch if RFQ pools are enabled
+    if config.enable_rfq_pools {
+        let client = Client::new();
+
+        // Fetch Bebop tokens
+        let response: BebopResponse = client
+            .get(config.bebop_url.clone())
+            .query(&[
+                ("active_only", "true"),
+                ("gasless", "false"),
+                ("expiry_type", "standard"),
+            ])
+            .header("accept", "application/json")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let all_bebop_tokens: HashMap<Bytes, Token> = response
+            .tokens
+            .into_iter()
+            .filter_map(|(_ticker, token)| {
+                token.to_tycho_token().map(|new| (new.address.clone(), new))
+            })
+            .collect();
+
+        info!("all bebop tokens: {:?}", all_bebop_tokens);
+
+        let all_hashflow_tokens: HashMap<Bytes, Token> =
+            read_hashflow_csv(config.hashflow_filename.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to read hashflow CSV: {}", e))?;
+
+        info!("all_hashflow_tokens: {:?}", all_hashflow_tokens);
+
+        let bebop_store = Arc::new(TokenStore::new(
+            all_bebop_tokens.clone(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+
+        let hashflow_store = Arc::new(TokenStore::new(
+            all_hashflow_tokens.clone(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+
+        bebop_tokens = bebop_store;
+        hashflow_tokens = hashflow_store;
+    } else {
+        // RFQ disabled - Create empty stores
+        bebop_tokens = Arc::new(TokenStore::new(
+            HashMap::new(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+        hashflow_tokens = Arc::new(TokenStore::new(
+            HashMap::new(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+    }
+
     // Create shared state
     // Shared token cache across native + VM stores + RFQ stores to avoid duplicate fetches and keep metadata consistent.
     let tokens = Arc::new(TokenStore::new(
@@ -104,6 +185,8 @@ async fn main() -> anyhow::Result<()> {
     let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
+        bebop_tokens: Arc::clone(&bebop_tokens),
+        hashflow_tokens: Arc::clone(&hashflow_tokens),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -239,6 +322,8 @@ async fn main() -> anyhow::Result<()> {
     if config.enable_rfq_pools {
         let cfg = config.clone();
         let tokens_bg = Arc::clone(&tokens);
+        let bebop_tokens_bg = Arc::clone(&bebop_tokens);
+        let hashflow_tokens_bg = Arc::clone(&hashflow_tokens);
         let state_store_bg = Arc::clone(&rfq_state_store);
         let health_bg = Arc::clone(&rfq_stream_health);
         let rfq_stream_bg = Arc::clone(&rfq_stream);
@@ -256,13 +341,24 @@ async fn main() -> anyhow::Result<()> {
             supervise_rfq_stream(
                 move || {
                     let tokens = Arc::clone(&tokens_bg);
+                    let bebop_tokens = Arc::clone(&bebop_tokens_bg);
+                    let hashflow_tokens = Arc::clone(&hashflow_tokens_bg);
                     let rfq_config = RFQConfig {
                         bebop_user: bebop_user.clone(),
                         bebop_key: bebop_key.clone(),
                         hashflow_user: hashflow_user.clone(),
                         hashflow_key: hashflow_key.clone(),
                     };
-                    async move { build_rfq_stream(tvl_threshold, tokens, rfq_config).await }
+                    async move {
+                        build_rfq_stream(
+                            tvl_threshold,
+                            tokens,
+                            bebop_tokens,
+                            hashflow_tokens,
+                            rfq_config,
+                        )
+                        .await
+                    }
                 },
                 state_store_bg,
                 health_bg,

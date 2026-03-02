@@ -351,14 +351,14 @@ fn default_stream_config() -> StreamSupervisorConfig {
 
 #[tokio::test]
 async fn missing_block_burst_does_not_restart_below_threshold() {
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let state_store = Arc::new(StateStore::new(token_store));
+    let state_store = Arc::new(StateStore::new(tokens_store));
     let health = Arc::new(StreamHealth::new());
 
     let stream = stream::iter(vec![missing_block_error(), missing_block_error()]);
@@ -377,14 +377,14 @@ async fn missing_block_burst_does_not_restart_below_threshold() {
 
 #[tokio::test]
 async fn missing_block_burst_restarts_at_threshold() {
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let state_store = Arc::new(StateStore::new(token_store));
+    let state_store = Arc::new(StateStore::new(tokens_store));
     let health = Arc::new(StreamHealth::new());
 
     let stream = stream::iter(vec![
@@ -407,14 +407,14 @@ async fn missing_block_burst_restarts_at_threshold() {
 
 #[tokio::test(start_paused = true)]
 async fn native_stream_restarts_on_stale() {
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let state_store = Arc::new(StateStore::new(token_store));
+    let state_store = Arc::new(StateStore::new(tokens_store));
     let health = Arc::new(StreamHealth::new());
 
     let mut cfg = default_stream_config();
@@ -445,7 +445,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
     token_map.insert(token_a.address.clone(), token_a.clone());
     token_map.insert(token_b.address.clone(), token_b.clone());
 
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         token_map,
         "http://localhost".to_string(),
         "test".to_string(),
@@ -453,9 +453,9 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         Duration::from_secs(1),
     ));
 
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
     let native_component = make_component(
         10,
@@ -488,7 +488,9 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
     vm_state_store.apply_update(vm_update).await;
 
     let app_state = AppState {
-        tokens: Arc::clone(&token_store),
+        tokens: Arc::clone(&tokens_store),
+        bebop_tokens: Arc::clone(&tokens_store),
+        hashflow_tokens: Arc::clone(&tokens_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -545,14 +547,14 @@ async fn jemalloc_memory_plateau_after_reset() {
     const POOL_COUNT: usize = 64;
     const DRIFT_FLOOR_BYTES: usize = 8 * 1024 * 1024;
 
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let state_store = Arc::new(StateStore::new(token_store));
+    let state_store = Arc::new(StateStore::new(tokens_store));
 
     let mut initial_pairs = build_pairs("uniswap_v2", "uniswap_v2_pool", 1, POOL_COUNT);
     initial_pairs.extend(build_pairs(
@@ -606,14 +608,14 @@ async fn memory_spike_breakdown_harness() {
         .clear()
         .expect("clear TychoDB before harness");
 
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         HashMap::new(),
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let state_store = Arc::new(StateStore::new(token_store));
+    let state_store = Arc::new(StateStore::new(tokens_store));
 
     let baseline = jemalloc_allocated_bytes();
 

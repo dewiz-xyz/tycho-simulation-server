@@ -445,25 +445,23 @@ pub async fn get_amounts_out(
     let mut rfq_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
         rfq_candidates_raw
             .into_iter()
-            .filter(|(_, (pool_state, component))| {
-                if component.protocol_system == "rfq:hashflow" {
-                    // Downcast to HashflowState
-                    if let Some(hashflow) = pool_state.as_any().downcast_ref::<HashflowState>() {
-                        hashflow.base_token.symbol == "DAI"
-                    } else {
-                        false
-                    }
-                } else if component.protocol_system == "rfq:bebop" {
-                    // Downcast to BebopState
-                    if let Some(hashflow) = pool_state.as_any().downcast_ref::<BebopState>() {
-                        hashflow.base_token.symbol == "DAI"
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
+            .filter(
+                |(_, (pool_state, component))| match component.protocol_system.as_str() {
+                    "rfq:hashflow" => pool_state
+                        .as_any()
+                        .downcast_ref::<HashflowState>()
+                        .map(|s| s.base_token.symbol == token_in_ref.symbol)
+                        .unwrap_or(false),
+
+                    "rfq:bebop" => pool_state
+                        .as_any()
+                        .downcast_ref::<BebopState>()
+                        .map(|s| s.base_token.symbol == token_in_ref.symbol)
+                        .unwrap_or(false),
+
+                    _ => false,
+                },
+            )
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
 
@@ -691,7 +689,6 @@ pub async fn get_amounts_out(
         ));
     }
 
-    info!("rfq candidates: {:?}", rfq_candidates);
     // RFQ third
     for (id, pool_state, component) in rfq_candidates.into_iter() {
         if cancel_token.is_cancelled() {
@@ -2158,7 +2155,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), make_token(&token_in, "TK1"));
         initial_tokens.insert(token_out.clone(), make_token(&token_out, "TK2"));
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2166,9 +2163,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         // Ensure the native store is ready so `get_amounts_out` reaches the vm readiness logic
         // instead of returning early with `QuoteStatus::WarmingUp`.
@@ -2205,7 +2202,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store,
             vm_state_store,
             rfq_state_store,
@@ -2259,7 +2258,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2267,9 +2266,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -2300,7 +2299,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -2538,7 +2539,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2546,9 +2547,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -2579,7 +2580,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -2709,7 +2712,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2717,9 +2720,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -2750,7 +2753,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -2947,7 +2952,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2955,9 +2960,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -2988,7 +2993,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -3059,7 +3066,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3067,9 +3074,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component_good = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000011").unwrap(),
@@ -3118,7 +3125,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -3180,7 +3189,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3188,9 +3197,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000021").unwrap(),
@@ -3220,7 +3229,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
@@ -3291,7 +3302,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3299,9 +3310,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000022").unwrap(),
@@ -3331,7 +3342,9 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
             rfq_state_store: Arc::clone(&rfq_state_store),
