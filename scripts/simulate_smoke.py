@@ -64,6 +64,10 @@ def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
     if not all(isinstance(v, int) and v >= 0 for v in gas_used):
         return False, "gas_used contains non-integers"
 
+    gas_in_sell = entry.get("gas_in_sell")
+    if not is_int_string(gas_in_sell):
+        return False, 'gas_in_sell must be an integer string ("0" is valid)'
+
     block_number = entry.get("block_number")
     if not isinstance(block_number, int) or block_number < 0:
         return False, "block_number is invalid"
@@ -91,7 +95,10 @@ def main() -> int:
     parser.add_argument(
         "--validate-data",
         action="store_true",
-        help="Validate response pool entries (amounts_out/gas_used lengths, ints, monotonicity)",
+        help=(
+            "Validate response pool entries (amounts_out/gas_used lengths, gas_in_sell integer-string, "
+            "block_number, monotonicity)"
+        ),
     )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
     parser.add_argument("--list-tokens", action="store_true", help="List available token symbols and exit")

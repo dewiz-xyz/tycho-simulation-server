@@ -25,9 +25,13 @@ Presets: block-updates, block-updates-window, block-updates-count,
          token-rpc-fetch, state-anomalies, vm-pools, tvl-thresholds,
          simulate-rpm, simulate-rpm-by-auction,
          simulate-requests-per-auction, simulate-runs, simulate-runs-per-minute,
-         simulate-runs-per-auction,
+         simulate-runs-per-auction, simulate-workload-summary,
          uniswap-v4-filter, warn-error, storage-errors, delta-transition,
          stream-update-stats
+
+Privacy: prefer aggregate presets for shared outputs (simulate-rpm,
+         simulate-runs-per-minute, simulate-workload-summary, block-updates-count).
+         Presets exposing request_id/auction_id/token or pool addresses are for internal triage.
 USAGE
 }
 
@@ -478,6 +482,27 @@ fields @timestamp
 | stats sum(simulation_runs) as total_runs, count() as requests by auction_id
 | sort total_runs desc
 | limit ${limit}
+QUERY
+      ;;
+    simulate-workload-summary)
+      cat <<QUERY
+fields @timestamp
+| parse @message '"message":"*"' as msg
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"scheduled_native_pools":(?<scheduled_native_pools>[0-9]+)/
+| parse @message /"scheduled_vm_pools":(?<scheduled_vm_pools>[0-9]+)/
+| filter msg like /Simulate computation completed/
+| fields scheduled_native_pools + scheduled_vm_pools as scheduled_pools
+| fields scheduled_pools * amounts as simulation_runs
+| stats count() as requests,
+        sum(scheduled_pools) as pool_simulation_runs,
+        avg(scheduled_pools) as pool_simulation_runs_per_request,
+        avg(amounts) as amounts_simulated_per_request,
+        sum(simulation_runs) as simulation_runs_total,
+        avg(simulation_runs) as simulation_runs_per_request,
+        pct(simulation_runs, 50) as p50_simulation_runs,
+        pct(simulation_runs, 90) as p90_simulation_runs,
+        max(simulation_runs) as max_simulation_runs
 QUERY
       ;;
     *)

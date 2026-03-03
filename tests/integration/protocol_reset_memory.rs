@@ -499,6 +499,8 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: true,
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),

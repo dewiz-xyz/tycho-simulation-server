@@ -30,6 +30,8 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
+`run_suite.sh` smoke checks now require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
+
 VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
 ```bash
 scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop
@@ -52,7 +54,7 @@ python3 scripts/simulate_smoke.py --pair DAI:USDC --pair WETH:USDC
 python3 scripts/simulate_smoke.py --list-tokens
 ```
 
-For stricter checks (fail on empty data and validate pool entries):
+For stricter checks (fail on empty data and validate pool entries, including `gas_in_sell`; `"0"` is valid):
 ```bash
 python3 scripts/simulate_smoke.py --suite smoke --require-data --validate-data
 ```
@@ -88,7 +90,7 @@ VM pool feeds (Curve/Balancer/Maverick) are controlled by `ENABLE_VM_POOLS` (def
 
 To assert specific protocol presence (derived from `pool_name` prefixes), use:
 ```bash
-python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,rocketpool,maverick_v2
+python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,maverick_v2
 ```
 
 Allow `no_liquidity` responses with only `no_pools` failures:

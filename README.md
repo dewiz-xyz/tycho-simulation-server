@@ -43,6 +43,9 @@ The following environment variables are read at startup:
 
 - `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
+- `RPC_URL` – Optional Ethereum JSON-RPC endpoint used for background `eth_gasPrice` refresh
+- `GAS_PRICE_REFRESH_INTERVAL_MS` – Poll interval for `eth_gasPrice` refresh task (default: `5000`)
+- `GAS_PRICE_FAILURE_TOLERANCE` – Disable gas reporting when consecutive refresh failures exceed this value (default: `50`)
 - `TVL_THRESHOLD` – Minimum TVL (in native units) for adding a pool to the stream (default: `100`)
 - `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep/remove pools (default: `0.2`)
 - `PORT` – HTTP port (default: `3000`)
@@ -79,6 +82,9 @@ Note: when concurrency caps are saturated or a pool would exceed the quote deadl
 ## Docs
 
 - `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request/response examples.
+- `docs/high-level-architecture.md` – high-level system architecture and data flow overview.
+- `docs/state-anchor-architecture.md` – implementation design where ingest provides full-state bootstrap and live deltas (no bus/snapshot store).
+- `docs/stream-worker-architecture.md` – proposed architecture for single Tycho ingest + scalable simulation workers.
 
 ## HTTP API
 
@@ -109,6 +115,7 @@ Response body:
       "pool_address": "0x...",
       "amounts_out": ["999000000", "4985000000"],
       "gas_used": [210000, 210000],
+      "gas_in_sell": "630000000000000",
       "block_number": 19876543
     }
   ],
@@ -129,6 +136,8 @@ Response body:
 
 `meta.pool_results` contains anomaly-only per-pool outcomes (`partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `skipped_precheck`, `timed_out`, `simulator_error`, `internal_error`). `meta.vm_unavailable=true` indicates VM pools were skipped because VM state was not ready.
 
+`gas_in_sell` is computed per pool from the latest background-refreshed cached `eth_gasPrice` (from `RPC_URL`), the request-scoped `spot_price(ETH, sellToken)`, and the pool's last `gas_used` ladder entry; it is returned in sell-token base units. When spot price, gas reporting is disabled due to consecutive RPC failures, cached gas price, or gas usage is unavailable, it is `"0"`.
+
 `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
 Mixed-outcome example (one usable result + one anomalous pool):
@@ -143,6 +152,7 @@ Mixed-outcome example (one usable result + one anomalous pool):
       "pool_address": "0x1111...",
       "amounts_out": ["100", "990"],
       "gas_used": [120000, 120000],
+      "gas_in_sell": "360000000000000",
       "block_number": 19876543
     }
   ],
