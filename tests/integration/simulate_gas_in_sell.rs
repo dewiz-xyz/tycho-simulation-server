@@ -22,7 +22,9 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
 use tycho_simulation::tycho_common::Bytes;
 use tycho_simulation_server::api::create_router;
 use tycho_simulation_server::models::messages::AmountOutRequest;
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
+use tycho_simulation_server::models::state::{
+    AppState, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 
@@ -193,15 +195,16 @@ async fn simulate_gas_in_sell_matches_gas_price_cost_in_usd_for_multiple_pairs()
     tokens.insert(wbtc.clone(), wbtc_token.clone());
     tokens.insert(weth.clone(), weth_token.clone());
 
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         tokens,
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
     let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
     let mut new_pairs = HashMap::new();
@@ -366,25 +369,34 @@ async fn simulate_gas_in_sell_matches_gas_price_cost_in_usd_for_multiple_pairs()
         .await;
 
     let app_state = AppState {
-        tokens: Arc::clone(&token_store),
+        tokens: Arc::clone(&tokens_store),
+        bebop_tokens: Arc::clone(&tokens_store),
+        hashflow_tokens: Arc::clone(&tokens_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(GAS_PRICE_WEI))),
         native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
         enable_vm_pools: false,
+        enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_millis(200),
         pool_timeout_vm: Duration::from_millis(200),
+        pool_timeout_rfq: Duration::from_millis(50),
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(8)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
         reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
         native_sim_concurrency: 8,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
 
     let app = create_router(app_state);
@@ -535,15 +547,17 @@ async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() {
     tokens.insert(usdc.clone(), usdc_token.clone());
     tokens.insert(weth.clone(), weth_token.clone());
 
-    let token_store = Arc::new(TokenStore::new(
+    let tokens_store = Arc::new(TokenStore::new(
         tokens,
         "http://localhost".to_string(),
         "test".to_string(),
         Chain::Ethereum,
         Duration::from_secs(1),
     ));
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
     let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
     let mut new_pairs = HashMap::new();
@@ -591,25 +605,34 @@ async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() {
         .await;
 
     let app_state = AppState {
-        tokens: Arc::clone(&token_store),
+        tokens: Arc::clone(&tokens_store),
+        bebop_tokens: Arc::clone(&tokens_store),
+        hashflow_tokens: Arc::clone(&tokens_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(GAS_PRICE_WEI))),
         native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: false,
+        enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_millis(200),
         pool_timeout_vm: Duration::from_millis(200),
+        pool_timeout_rfq: Duration::from_millis(50),
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(2)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
         native_sim_concurrency: 2,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
 
     let app = create_router(app_state);

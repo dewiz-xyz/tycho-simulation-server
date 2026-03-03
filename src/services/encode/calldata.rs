@@ -80,6 +80,7 @@ pub(super) fn build_route_calldata_tx(
         checked_amount: min_amount_out.clone(),
         swaps,
         native_action: None,
+        ..Default::default()
     };
 
     let encoded_solution = encoder

@@ -339,7 +339,7 @@ mod tests {
     use tycho_simulation::tycho_common::models::Chain;
 
     use super::*;
-    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use crate::services::encode::model::{
@@ -464,6 +464,7 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -488,24 +489,33 @@ mod tests {
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {
@@ -569,6 +579,7 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component_a = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -596,24 +607,33 @@ mod tests {
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {
@@ -697,6 +717,7 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -724,24 +745,33 @@ mod tests {
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(1000),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(1000),
+            pool_timeout_rfq: Duration::from_millis(1000),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {
@@ -802,6 +832,7 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -830,24 +861,33 @@ mod tests {
 
         let app_state = AppState {
             tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(1000),
             pool_timeout_native: Duration::from_millis(1000),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let normalized = NormalizedRouteInternal {

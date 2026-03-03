@@ -10,7 +10,9 @@ use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+use tycho_simulation::rfq::protocols::bebop::state::BebopState;
+use tycho_simulation::rfq::protocols::hashflow::state::HashflowState;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
@@ -34,23 +36,36 @@ const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
 const MIN_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e-12;
 const MAX_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e12;
 
+const RFQ_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
+const RFQ_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
+
 // Per-request scheduling metrics (logged once by the handler).
 #[derive(Debug, Default, Clone)]
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub scheduled_rfq_pools: usize,
     pub skipped_vm_unavailable: bool,
+    pub skipped_rfq_unavailable: bool,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
+    pub skipped_rfq_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+    pub skipped_rfq_deadline: usize,
     pub skipped_native_limits: usize,
     pub skipped_vm_limits: usize,
+    pub skipped_rfq_limits: usize,
     pub vm_completed_pools: usize,
+    pub rfq_completed_pools: usize,
     pub vm_median_first_gas: Option<u64>,
+    pub rfq_median_first_gas: Option<u64>,
     pub vm_low_first_gas_count: usize,
+    pub rfq_low_first_gas_count: usize,
     pub vm_low_first_gas_ratio: Option<f64>,
+    pub rfq_low_first_gas_ratio: Option<f64>,
     pub vm_low_first_gas_samples: Vec<String>,
+    pub rfq_low_first_gas_samples: Vec<String>,
 }
 
 pub struct QuoteComputation {
@@ -74,6 +89,7 @@ pub async fn get_amounts_out(
 
     let mut current_block = state.current_block().await;
     let mut current_vm_block = state.current_vm_block().await;
+    let mut current_rfq_block = state.current_rfq_block().await;
     let mut total_pools = state.total_pools().await;
 
     let mut meta = QuoteMeta {
@@ -81,12 +97,14 @@ pub async fn get_amounts_out(
         result_quality: QuoteResultQuality::RequestLevelFailure,
         block_number: current_block,
         vm_block_number: current_vm_block,
+        rfq_block_number: current_rfq_block,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: Some(total_pools),
         auction_id: request.auction_id.clone(),
         pool_results: Vec::new(),
         vm_unavailable: false,
+        rfq_unavailable: false,
         failures: Vec::new(),
     };
 
@@ -99,6 +117,7 @@ pub async fn get_amounts_out(
         meta.result_quality = QuoteResultQuality::RequestLevelFailure;
         meta.pool_results = pool_results;
         meta.vm_unavailable = metrics.skipped_vm_unavailable;
+        meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
         return QuoteComputation {
             responses,
             meta,
@@ -107,7 +126,9 @@ pub async fn get_amounts_out(
     }
 
     let token_in_address = request.token_in.trim_start_matches("0x").to_lowercase();
+    info!("token in address: {}", token_in_address);
     let token_out_address = request.token_out.trim_start_matches("0x").to_lowercase();
+    info!("token out address: {}", token_out_address);
 
     let token_in_bytes = match Bytes::from_str(&token_in_address) {
         Ok(bytes) => bytes,
@@ -121,6 +142,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -142,6 +164,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -166,6 +189,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -175,9 +199,11 @@ pub async fn get_amounts_out(
         }
         current_block = state.current_block().await;
         current_vm_block = state.current_vm_block().await;
+        current_rfq_block = state.current_rfq_block().await;
         total_pools = state.total_pools().await;
         meta.block_number = current_block;
         meta.vm_block_number = current_vm_block;
+        meta.rfq_block_number = current_rfq_block;
         meta.total_pools = Some(total_pools);
     }
 
@@ -199,6 +225,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -227,6 +254,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -251,6 +279,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -272,6 +301,8 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
+
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -300,6 +331,8 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
+
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -324,6 +357,8 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
+
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -355,6 +390,7 @@ pub async fn get_amounts_out(
             meta.result_quality = QuoteResultQuality::RequestLevelFailure;
             meta.pool_results = pool_results;
             meta.vm_unavailable = metrics.skipped_vm_unavailable;
+            meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
             meta.failures = failures;
             return QuoteComputation {
                 responses,
@@ -377,9 +413,22 @@ pub async fn get_amounts_out(
     if state.enable_vm_pools && !vm_ready {
         metrics.skipped_vm_unavailable = true;
     }
+    let rfq_ready = state.rfq_ready().await;
+    if state.enable_rfq_pools && !rfq_ready {
+        metrics.skipped_rfq_unavailable = true;
+    }
     let vm_candidates_raw = if vm_ready {
         state
             .vm_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
+            .await
+    } else {
+        Vec::new()
+    };
+
+    let rfq_candidates_raw = if rfq_ready {
+        state
+            .rfq_state_store
             .matching_pools_by_addresses(&token_in_bytes, &token_out_bytes)
             .await
     } else {
@@ -398,7 +447,30 @@ pub async fn get_amounts_out(
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
 
-    let total_candidates = native_candidates.len() + vm_candidates.len();
+    let mut rfq_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        rfq_candidates_raw
+            .into_iter()
+            .filter(
+                |(_, (pool_state, component))| match component.protocol_system.as_str() {
+                    "rfq:hashflow" => pool_state
+                        .as_any()
+                        .downcast_ref::<HashflowState>()
+                        .map(|s| s.base_token.symbol == token_in_ref.symbol)
+                        .unwrap_or(false),
+
+                    "rfq:bebop" => pool_state
+                        .as_any()
+                        .downcast_ref::<BebopState>()
+                        .map(|s| s.base_token.symbol == token_in_ref.symbol)
+                        .unwrap_or(false),
+
+                    _ => false,
+                },
+            )
+            .map(|(id, (pool_state, component))| (id, pool_state, component))
+            .collect();
+
+    let total_candidates = native_candidates.len() + vm_candidates.len() + rfq_candidates.len();
     meta.matching_pools = total_candidates;
     meta.candidate_pools = total_candidates;
 
@@ -418,6 +490,7 @@ pub async fn get_amounts_out(
         meta.result_quality = QuoteResultQuality::NoResults;
         meta.pool_results = pool_results;
         meta.vm_unavailable = metrics.skipped_vm_unavailable;
+        meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
         meta.failures = failures;
         return QuoteComputation {
             responses,
@@ -481,8 +554,14 @@ pub async fn get_amounts_out(
         .unwrap_or_default();
     let mut tasks = FuturesUnordered::new();
     let mut vm_first_gases = Vec::new();
+    let mut rfq_first_gases = Vec::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
+    let rfq_semaphore = state.rfq_sim_semaphore();
+    // Stable scheduling to reduce jitter under contention
+    native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    rfq_candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Native first
     for (id, pool_state, component) in native_candidates.into_iter() {
@@ -650,6 +729,89 @@ pub async fn get_amounts_out(
         ));
     }
 
+    // RFQ third
+    for (id, pool_state, component) in rfq_candidates.into_iter() {
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        let pool_address = component.id.to_string();
+        let pool_protocol = component.protocol_system.clone();
+        let pool_name = derive_pool_name(&component);
+
+        let now = Instant::now();
+        let proposed_deadline = now + state.pool_timeout_rfq();
+        let pool_deadline = if proposed_deadline <= quote_deadline {
+            proposed_deadline
+        } else {
+            quote_deadline
+        };
+
+        if pool_deadline <= now {
+            metrics.skipped_rfq_deadline += 1;
+            pool_results.push(make_pool_outcome(
+                id.clone(),
+                pool_name.clone(),
+                pool_address.clone(),
+                pool_protocol.clone(),
+                PoolOutcomeKind::SkippedDeadline,
+                0,
+                expected_len,
+                Some("Pool scheduling skipped because request deadline was reached".to_string()),
+            ));
+            continue;
+        }
+
+        let permit = match rfq_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                metrics.skipped_rfq_concurrency += 1;
+                pool_results.push(make_pool_outcome(
+                    id.clone(),
+                    pool_name.clone(),
+                    pool_address.clone(),
+                    pool_protocol.clone(),
+                    PoolOutcomeKind::SkippedConcurrency,
+                    0,
+                    expected_len,
+                    Some(
+                        "Pool scheduling skipped because RFQ concurrency permits were exhausted"
+                            .to_string(),
+                    ),
+                ));
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                failures.push(make_failure(
+                    QuoteFailureKind::Internal,
+                    "RFQ pool semaphore closed".to_string(),
+                    None,
+                ));
+                meta.status = QuoteStatus::InternalError;
+                break;
+            }
+        };
+
+        let pool_cancel = cancel_token.child_token();
+        metrics.scheduled_rfq_pools += 1;
+
+        tasks.push(simulate_pool(
+            id,
+            pool_state,
+            pool_address,
+            pool_name,
+            pool_protocol,
+            Arc::clone(&token_in),
+            Arc::clone(&token_out),
+            Arc::clone(&amounts_in),
+            requested_max_in.clone(),
+            expected_len,
+            pool_deadline,
+            pool_cancel,
+            permit,
+        ));
+    }
+
     if !tasks.is_empty() {
         let remaining = quote_deadline
             .checked_duration_since(Instant::now())
@@ -684,6 +846,13 @@ pub async fn get_amounts_out(
                                         record_vm_first_gas_metrics(
                                             &mut metrics,
                                             &mut vm_first_gases,
+                                            result.protocol.as_str(),
+                                            result.pool.as_str(),
+                                            result.gas_used.first().copied(),
+                                        );
+                                        record_rfq_first_gas_metrics(
+                                            &mut metrics,
+                                            &mut rfq_first_gases,
                                             result.protocol.as_str(),
                                             result.pool.as_str(),
                                             result.gas_used.first().copied(),
@@ -771,6 +940,8 @@ pub async fn get_amounts_out(
                                     } => {
                                         if protocol.starts_with("vm:") {
                                             metrics.skipped_vm_limits += 1;
+                                        } else if protocol.starts_with("rfq:") {
+                                            metrics.skipped_rfq_limits += 1;
                                         } else {
                                             metrics.skipped_native_limits += 1;
                                         }
@@ -808,21 +979,26 @@ pub async fn get_amounts_out(
 
     drop(tasks);
     finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
+    finalize_rfq_first_gas_metrics(&mut metrics, &mut rfq_first_gases);
 
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
     if metrics.skipped_native_concurrency > 0
         || metrics.skipped_vm_concurrency > 0
+        || metrics.skipped_rfq_concurrency > 0
         || metrics.skipped_native_deadline > 0
         || metrics.skipped_vm_deadline > 0
+        || metrics.skipped_rfq_deadline > 0
     {
         failures.push(make_failure(
             QuoteFailureKind::ConcurrencyLimit,
             format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} rfq_concurrency={}  native_deadline={} vm_deadline={} rfq_deadline={}",
                 metrics.skipped_native_concurrency,
                 metrics.skipped_vm_concurrency,
+                metrics.skipped_rfq_concurrency,
                 metrics.skipped_native_deadline,
-                metrics.skipped_vm_deadline
+                metrics.skipped_vm_deadline,
+                metrics.skipped_rfq_deadline
             ),
             None,
         ));
@@ -834,7 +1010,9 @@ pub async fn get_amounts_out(
     if responses.is_empty() {
         if failures.is_empty()
             && matches!(meta.status, QuoteStatus::Ready)
-            && (metrics.skipped_native_limits > 0 || metrics.skipped_vm_limits > 0)
+            && (metrics.skipped_native_limits > 0
+                || metrics.skipped_vm_limits > 0
+                || metrics.skipped_rfq_limits > 0)
         {
             meta.status = QuoteStatus::NoLiquidity;
             failures.push(make_failure(
@@ -872,7 +1050,7 @@ pub async fn get_amounts_out(
 
         let top = &responses[0];
         debug!(
-            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={} vm_block={:?}",
+            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={} vm_block={:?} rfq_block={:?}",
             responses.len(),
             top.pool_name,
             top.pool_address,
@@ -881,7 +1059,8 @@ pub async fn get_amounts_out(
                 .cloned()
                 .unwrap_or_else(|| "0".to_string()),
             top.block_number,
-            meta.vm_block_number
+            meta.vm_block_number,
+            meta.rfq_block_number
         );
 
         if !failures.is_empty() && matches!(meta.status, QuoteStatus::Ready) {
@@ -906,6 +1085,7 @@ pub async fn get_amounts_out(
     };
     meta.pool_results = pool_results;
     meta.vm_unavailable = metrics.skipped_vm_unavailable;
+    meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
     meta.failures = failures;
     QuoteComputation {
         responses,
@@ -1686,6 +1866,33 @@ fn record_vm_first_gas_metrics(
     }
 }
 
+fn record_rfq_first_gas_metrics(
+    metrics: &mut QuoteMetrics,
+    rfq_first_gases: &mut Vec<u64>,
+    protocol: &str,
+    pool_id: &str,
+    first_gas: Option<u64>,
+) {
+    if !protocol.starts_with("rfq:") {
+        return;
+    }
+
+    let Some(first_gas) = first_gas else {
+        return;
+    };
+
+    metrics.rfq_completed_pools += 1;
+    rfq_first_gases.push(first_gas);
+    if first_gas < RFQ_LOW_FIRST_GAS_THRESHOLD {
+        metrics.rfq_low_first_gas_count += 1;
+        if metrics.rfq_low_first_gas_samples.len() < RFQ_LOW_FIRST_GAS_SAMPLE_CAP {
+            metrics
+                .rfq_low_first_gas_samples
+                .push(format!("{protocol}:{pool_id}:{first_gas}"));
+        }
+    }
+}
+
 fn finalize_vm_first_gas_metrics(metrics: &mut QuoteMetrics, vm_first_gases: &mut [u64]) {
     let Some(median_gas) = median_u64(vm_first_gases) else {
         return;
@@ -1694,6 +1901,16 @@ fn finalize_vm_first_gas_metrics(metrics: &mut QuoteMetrics, vm_first_gases: &mu
     metrics.vm_median_first_gas = Some(median_gas);
     metrics.vm_low_first_gas_ratio =
         Some(metrics.vm_low_first_gas_count as f64 / metrics.vm_completed_pools as f64);
+}
+
+fn finalize_rfq_first_gas_metrics(metrics: &mut QuoteMetrics, rfq_first_gases: &mut [u64]) {
+    let Some(median_gas) = median_u64(rfq_first_gases) else {
+        return;
+    };
+
+    metrics.rfq_median_first_gas = Some(median_gas);
+    metrics.rfq_low_first_gas_ratio =
+        Some(metrics.rfq_low_first_gas_count as f64 / metrics.rfq_completed_pools as f64);
 }
 
 fn median_u64(values: &mut [u64]) -> Option<u64> {
@@ -1837,7 +2054,7 @@ mod tests {
     };
     use tycho_simulation::tycho_common::Bytes;
 
-    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
 
@@ -1915,6 +2132,66 @@ mod tests {
         assert_eq!(
             metrics.vm_low_first_gas_samples[0],
             "vm:curve:pool-a:400000".to_string()
+        );
+    }
+
+    #[test]
+    fn rfq_first_gas_metrics_aggregate_median_ratio_and_samples() {
+        let mut metrics = QuoteMetrics::default();
+        let mut rfq_first_gases = Vec::new();
+
+        record_rfq_first_gas_metrics(
+            &mut metrics,
+            &mut rfq_first_gases,
+            "rfq:hashflow",
+            "pool-a",
+            Some(400_000),
+        );
+        record_rfq_first_gas_metrics(
+            &mut metrics,
+            &mut rfq_first_gases,
+            "rfq:hashflow",
+            "pool-b",
+            Some(900_000),
+        );
+        record_rfq_first_gas_metrics(
+            &mut metrics,
+            &mut rfq_first_gases,
+            "rfq:hashflow",
+            "pool-c",
+            Some(500_000),
+        );
+        record_rfq_first_gas_metrics(
+            &mut metrics,
+            &mut rfq_first_gases,
+            "rfq:hashflow",
+            "pool-d",
+            Some(550_000),
+        );
+        record_rfq_first_gas_metrics(
+            &mut metrics,
+            &mut rfq_first_gases,
+            "rfq:hashflow",
+            "pool-e",
+            Some(580_000),
+        );
+
+        finalize_rfq_first_gas_metrics(&mut metrics, &mut rfq_first_gases);
+
+        assert_eq!(metrics.rfq_completed_pools, 5);
+        assert_eq!(metrics.rfq_low_first_gas_count, 4);
+        assert_eq!(metrics.rfq_median_first_gas, Some(550_000));
+        let ratio = metrics
+            .rfq_low_first_gas_ratio
+            .expect("ratio should be set");
+        assert!((ratio - 0.8).abs() < 1e-9);
+        assert_eq!(
+            metrics.rfq_low_first_gas_samples.len(),
+            RFQ_LOW_FIRST_GAS_SAMPLE_CAP
+        );
+        assert_eq!(
+            metrics.rfq_low_first_gas_samples[0],
+            "rfq:hashflow:pool-a:400000".to_string()
         );
     }
 
@@ -2413,7 +2690,7 @@ mod tests {
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
         initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2421,8 +2698,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pair_spot_price_calls = Arc::new(AtomicUsize::new(0));
         let spot_source_calls = Arc::new(AtomicUsize::new(0));
@@ -2482,27 +2760,36 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
                 5_000_000_000_000_000_000,
             ))),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(2)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 2,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -2547,7 +2834,7 @@ mod tests {
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
         initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2555,8 +2842,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
@@ -2612,27 +2900,36 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
                 5_000_000_000_000_000_000,
             ))),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -2664,7 +2961,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2672,8 +2969,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let spot_price_calls = Arc::new(AtomicUsize::new(0));
         let mut states = HashMap::new();
@@ -2707,27 +3005,36 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
                 5_000_000_000_000_000_000,
             ))),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -2757,7 +3064,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), make_token(&token_in, "TK1"));
         initial_tokens.insert(token_out.clone(), make_token(&token_out, "TK2"));
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2765,8 +3072,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         // Ensure the native store is ready so `get_amounts_out` reaches the vm readiness logic
         // instead of returning early with `QuoteStatus::WarmingUp`.
@@ -2803,25 +3111,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -2835,6 +3152,7 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert!(!computation.meta.vm_unavailable);
+        assert!(!computation.meta.rfq_unavailable);
     }
 
     #[tokio::test]
@@ -2851,7 +3169,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -2859,8 +3177,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -2891,25 +3210,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3124,7 +3452,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3132,8 +3460,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -3164,25 +3493,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3289,7 +3627,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3297,8 +3635,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -3329,25 +3668,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3521,7 +3869,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3529,8 +3877,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let pool_id = "pool-1".to_string();
         let component = ProtocolComponent::new(
@@ -3561,25 +3910,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3627,7 +3985,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3635,8 +3993,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component_good = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000011").unwrap(),
@@ -3685,25 +4044,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(2)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 2,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3742,7 +4110,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3750,8 +4118,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000021").unwrap(),
@@ -3781,25 +4150,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_secs(1),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(0)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 0,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {
@@ -3847,7 +4225,7 @@ mod tests {
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
 
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
@@ -3855,8 +4233,9 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000022").unwrap(),
@@ -3886,25 +4265,34 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
+            rfq_state_store: Arc::clone(&rfq_state_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(0),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_secs(2),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         let request = AmountOutRequest {

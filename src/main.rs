@@ -1,22 +1,33 @@
+use reqwest::Client;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
+use tycho_common::models::token::Token;
+use tycho_common::Bytes;
+use tycho_simulation_server::models::rfq::bebop::BebopResponse;
+use tycho_simulation_server::models::rfq::hashflow::read_hashflow_csv;
 
 use tycho_simulation::{tycho_common::models::Chain, utils::load_all_tokens};
 
 use tycho_simulation_server::api::create_router;
 use tycho_simulation_server::config::{init_logging, load_config};
 use tycho_simulation_server::handlers::stream::{
-    supervise_native_stream, supervise_vm_stream, StreamSupervisorConfig, VmStreamControls,
+    supervise_native_stream, supervise_rfq_stream, supervise_vm_stream, RfqStreamControls,
+    StreamSupervisorConfig, VmStreamControls,
 };
 use tycho_simulation_server::memory::maybe_log_memory_snapshot;
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
+use tycho_simulation_server::models::state::{
+    AppState, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 use tycho_simulation_server::services::gas_price::run_native_gas_price_refresh_loop;
-use tycho_simulation_server::services::stream_builder::{build_native_stream, build_vm_stream};
+use tycho_simulation_server::services::stream_builder::{
+    build_native_stream, build_rfq_stream, build_vm_stream, RFQConfig,
+};
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -67,10 +78,84 @@ async fn main() -> anyhow::Result<()> {
         None,
     )
     .await?;
-    info!("Loaded {} tokens", all_tokens.len());
+
+    info!("all tokens: {:?}", all_tokens);
+
+    let bebop_tokens: Arc<TokenStore>;
+    let hashflow_tokens: Arc<TokenStore>;
+
+    // Only fetch if RFQ pools are enabled
+    if config.enable_rfq_pools {
+        let client = Client::new();
+
+        // Fetch Bebop tokens
+        let response: BebopResponse = client
+            .get(config.bebop_url.clone())
+            .query(&[
+                ("active_only", "true"),
+                ("gasless", "false"),
+                ("expiry_type", "standard"),
+            ])
+            .header("accept", "application/json")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let all_bebop_tokens: HashMap<Bytes, Token> = response
+            .tokens
+            .into_iter()
+            .filter_map(|(_ticker, token)| {
+                token.to_tycho_token().map(|new| (new.address.clone(), new))
+            })
+            .collect();
+
+        info!("all bebop tokens: {:?}", all_bebop_tokens);
+
+        let all_hashflow_tokens: HashMap<Bytes, Token> =
+            read_hashflow_csv(config.hashflow_filename.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to read hashflow CSV: {}", e))?;
+
+        info!("all_hashflow_tokens: {:?}", all_hashflow_tokens);
+
+        let bebop_store = Arc::new(TokenStore::new(
+            all_bebop_tokens.clone(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+
+        let hashflow_store = Arc::new(TokenStore::new(
+            all_hashflow_tokens.clone(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+
+        bebop_tokens = bebop_store;
+        hashflow_tokens = hashflow_store;
+    } else {
+        // RFQ disabled - Create empty stores
+        bebop_tokens = Arc::new(TokenStore::new(
+            HashMap::new(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+        hashflow_tokens = Arc::new(TokenStore::new(
+            HashMap::new(),
+            config.tycho_url.clone(),
+            config.api_key.clone(),
+            Chain::Ethereum,
+            Duration::from_millis(config.token_refresh_timeout_ms),
+        ));
+    }
 
     // Create shared state
-    // Shared token cache across native + VM stores to avoid duplicate fetches and keep metadata consistent.
+    // Shared token cache across native + VM stores + RFQ stores to avoid duplicate fetches and keep metadata consistent.
     let tokens = Arc::new(TokenStore::new(
         all_tokens,
         config.tycho_url.clone(),
@@ -80,46 +165,62 @@ async fn main() -> anyhow::Result<()> {
     ));
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
     let native_stream_health = Arc::new(StreamHealth::new());
     let vm_stream_health = Arc::new(StreamHealth::new());
+    let rfq_stream_health = Arc::new(StreamHealth::new());
     let vm_stream = Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default()));
+    let rfq_stream = Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default()));
     debug!("Created shared state");
 
     // Create app state
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
     let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
+    let pool_timeout_rfq = Duration::from_millis(config.pool_timeout_rfq_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
 
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
+    let rfq_sim_concurrency = config.global_rfq_sim_concurrency;
     let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
     let app_state = AppState {
         tokens: Arc::clone(&tokens),
+        bebop_tokens: Arc::clone(&bebop_tokens),
+        hashflow_tokens: Arc::clone(&hashflow_tokens),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::clone(&native_stream_health),
         vm_stream_health: Arc::clone(&vm_stream_health),
+        rfq_stream_health: Arc::clone(&rfq_stream_health),
         vm_stream: Arc::clone(&vm_stream),
+        rfq_stream: Arc::clone(&rfq_stream),
         latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
         native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: config.enable_vm_pools,
+        enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale,
         quote_timeout,
         pool_timeout_native,
         pool_timeout_vm,
+        pool_timeout_rfq,
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
         native_sim_concurrency,
         vm_sim_concurrency,
+        rfq_sim_concurrency,
     };
 
     info!(
         native_sim_concurrency,
         vm_sim_concurrency,
+        rfq_sim_concurrency,
         enable_vm_pools = config.enable_vm_pools,
+        enable_rfq_pools = config.enable_rfq_pools,
         "Initialized simulation concurrency limits"
     );
 
@@ -244,6 +345,63 @@ async fn main() -> anyhow::Result<()> {
         debug!("VM stream supervisor task spawned");
     } else {
         info!("VM pool feeds disabled");
+    }
+
+    if config.enable_rfq_pools {
+        let cfg = config.clone();
+        let tokens_bg = Arc::clone(&tokens);
+        let bebop_tokens_bg = Arc::clone(&bebop_tokens);
+        let hashflow_tokens_bg = Arc::clone(&hashflow_tokens);
+        let state_store_bg = Arc::clone(&rfq_state_store);
+        let health_bg = Arc::clone(&rfq_stream_health);
+        let rfq_stream_bg = Arc::clone(&rfq_stream);
+        let rfq_semaphore_bg = app_state.rfq_sim_semaphore();
+        let tvl_threshold = cfg.tvl_threshold;
+        let rfq_sim_concurrency = u32::try_from(rfq_sim_concurrency)
+            .expect("RFQ simulation concurrency exceeds u32 range");
+
+        let bebop_user = cfg.bebop_user.clone();
+        let bebop_key = cfg.bebop_key.clone();
+        let hashflow_user = cfg.hashflow_user.clone();
+        let hashflow_key = cfg.hashflow_key.clone();
+        tokio::spawn(async move {
+            info!("Starting RFQ protocol stream supervisor...");
+            supervise_rfq_stream(
+                move || {
+                    let tokens = Arc::clone(&tokens_bg);
+                    let bebop_tokens = Arc::clone(&bebop_tokens_bg);
+                    let hashflow_tokens = Arc::clone(&hashflow_tokens_bg);
+                    let rfq_config = RFQConfig {
+                        bebop_user: bebop_user.clone(),
+                        bebop_key: bebop_key.clone(),
+                        hashflow_user: hashflow_user.clone(),
+                        hashflow_key: hashflow_key.clone(),
+                    };
+                    async move {
+                        build_rfq_stream(
+                            tvl_threshold,
+                            tokens,
+                            bebop_tokens,
+                            hashflow_tokens,
+                            rfq_config,
+                        )
+                        .await
+                    }
+                },
+                state_store_bg,
+                health_bg,
+                supervisor_cfg,
+                RfqStreamControls {
+                    rfq_stream: rfq_stream_bg,
+                    rfq_sim_semaphore: rfq_semaphore_bg,
+                    rfq_sim_concurrency,
+                },
+            )
+            .await;
+        });
+        info!("RFQ stream supervisor task spawned");
+    } else {
+        info!("RFQ pool feeds disabled");
     }
 
     // Create router and start server

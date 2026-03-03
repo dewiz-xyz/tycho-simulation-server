@@ -17,24 +17,33 @@ const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<TokenStore>,
+    pub bebop_tokens: Arc<TokenStore>,
+    pub hashflow_tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
+    pub rfq_state_store: Arc<StateStore>,
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
+    pub rfq_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
+    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub latest_native_gas_price_wei: Arc<RwLock<Option<u128>>>,
     pub native_gas_price_reporting_enabled: Arc<RwLock<bool>>,
     pub enable_vm_pools: bool,
+    pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
+    pub pool_timeout_rfq: Duration,
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
+    pub rfq_sim_concurrency: usize,
 }
 
 impl AppState {
@@ -49,10 +58,18 @@ impl AppState {
         Some(self.vm_state_store.current_block().await)
     }
 
+    pub async fn current_rfq_block(&self) -> Option<u64> {
+        if !self.rfq_ready().await {
+            return None;
+        }
+        Some(self.rfq_state_store.current_block().await)
+    }
+
     pub async fn total_pools(&self) -> usize {
         let native = self.native_state_store.total_states().await;
         let vm = self.vm_state_store.total_states().await;
-        native + vm
+        let rfq = self.rfq_state_store.total_states().await;
+        native + vm + rfq
     }
 
     pub fn is_ready(&self) -> bool {
@@ -75,6 +92,10 @@ impl AppState {
         self.pool_timeout_vm
     }
 
+    pub fn pool_timeout_rfq(&self) -> Duration {
+        self.pool_timeout_rfq
+    }
+
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -86,9 +107,19 @@ impl AppState {
         Arc::clone(&self.vm_sim_semaphore)
     }
 
+    pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.rfq_sim_semaphore)
+    }
+
     pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         if let Some(entry) = self.native_state_store.pool_by_id(id).await {
             return Some(entry);
+        }
+
+        if self.rfq_ready().await {
+            if let Some(entry) = self.rfq_state_store.pool_by_id(id).await {
+                return Some(entry);
+            }
         }
 
         if !self.vm_ready().await {
@@ -108,16 +139,38 @@ impl AppState {
         self.vm_state_store.is_ready()
     }
 
+    pub async fn rfq_ready(&self) -> bool {
+        if !self.enable_rfq_pools {
+            return false;
+        }
+        if self.rfq_rebuilding().await {
+            return false;
+        }
+        self.rfq_state_store.is_ready()
+    }
+
     pub async fn vm_rebuilding(&self) -> bool {
         self.vm_stream.read().await.rebuilding
+    }
+
+    pub async fn rfq_rebuilding(&self) -> bool {
+        self.rfq_stream.read().await.rebuilding
     }
 
     pub async fn vm_block(&self) -> u64 {
         self.vm_state_store.current_block().await
     }
 
+    pub async fn rfq_block(&self) -> u64 {
+        self.rfq_state_store.current_block().await
+    }
+
     pub async fn vm_pools(&self) -> usize {
         self.vm_state_store.total_states().await
+    }
+
+    pub async fn rfq_pools(&self) -> usize {
+        self.rfq_state_store.total_states().await
     }
 
     pub async fn latest_native_gas_price_wei(&self) -> Option<u128> {
@@ -150,6 +203,14 @@ impl AppState {
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStreamStatus {
+    pub rebuilding: bool,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RfqStreamStatus {
     pub rebuilding: bool,
     pub restart_count: u64,
     pub last_error: Option<String>,
@@ -809,14 +870,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_tracks_anomaly_counters_and_samples() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(20, "TKNA");
         let token_b = mk_token(21, "TKNB");
@@ -889,14 +950,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_caps_anomaly_samples() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
         for idx in 0..10 {
@@ -917,14 +978,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_update_without_anomalies_has_zero_counters() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(40, "TKNA");
         let token_b = mk_token(41, "TKNB");
@@ -949,14 +1010,14 @@ mod tests {
 
     #[tokio::test]
     async fn reset_protocols_preserves_unaffected_pools() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(1, "TKNA");
         let token_b = mk_token(2, "TKNB");
@@ -1004,14 +1065,14 @@ mod tests {
 
     #[tokio::test]
     async fn reset_protocols_updates_ready_when_empty() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let store = StateStore::new(token_store);
+        let store = StateStore::new(tokens_store);
 
         let token_a = mk_token(5, "TKN1");
         let token_b = mk_token(6, "TKN2");
@@ -1034,15 +1095,16 @@ mod tests {
 
     #[tokio::test]
     async fn total_pools_includes_vm_store() {
-        let token_store = Arc::new(TokenStore::new(
+        let tokens_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
             Chain::Ethereum,
             Duration::from_secs(1),
         ));
-        let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
 
         let token_a = mk_token(7, "TKNA");
         let token_b = mk_token(8, "TKNB");
@@ -1071,35 +1133,135 @@ mod tests {
             .await;
 
         let app_state = AppState {
-            tokens: Arc::clone(&token_store),
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_store),
             vm_state_store: Arc::clone(&vm_store),
+            rfq_state_store: Arc::clone(&rfq_store),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
+            enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+        assert_eq!(app_state.current_rfq_block().await, None);
+    }
+
+    #[tokio::test]
+    async fn total_pools_includes_rfq_store() {
+        let tokens_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+        let token_a = mk_token(7, "TKNA");
+        let token_b = mk_token(8, "TKNB");
+
+        let native_component = mk_component(
+            20,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let rfq_component = mk_component(21, "rfq:bebop", "bebop_pool", vec![token_a, token_b]);
+
+        native_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                native_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        rfq_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                rfq_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&tokens_store),
+            bebop_tokens: Arc::clone(&tokens_store),
+            hashflow_tokens: Arc::clone(&tokens_store),
+            native_state_store: Arc::clone(&native_store),
+            vm_state_store: Arc::clone(&vm_store),
+            rfq_state_store: Arc::clone(&rfq_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: false,
+            enable_rfq_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
+        };
+
+        assert_eq!(app_state.total_pools().await, 2);
+        assert_eq!(app_state.current_vm_block().await, None);
+        assert_eq!(app_state.current_rfq_block().await, Some(1));
     }
 
     #[tokio::test]
     async fn app_state_native_gas_price_defaults_to_none() {
         let app_state = AppState {
             tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            bebop_tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            hashflow_tokens: Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),
                 "test".to_string(),
@@ -1120,22 +1282,35 @@ mod tests {
                 Chain::Ethereum,
                 Duration::from_millis(10),
             )))),
+            rfq_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
+            enable_rfq_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         assert_eq!(app_state.latest_native_gas_price_wei().await, None);
@@ -1151,6 +1326,20 @@ mod tests {
                 Chain::Ethereum,
                 Duration::from_millis(10),
             )),
+            bebop_tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            hashflow_tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
             native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),
@@ -1165,22 +1354,35 @@ mod tests {
                 Chain::Ethereum,
                 Duration::from_millis(10),
             )))),
+            rfq_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
             enable_vm_pools: true,
+            enable_rfq_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         app_state.set_latest_native_gas_price_wei(Some(42)).await;
@@ -1197,6 +1399,20 @@ mod tests {
                 Chain::Ethereum,
                 Duration::from_millis(10),
             )),
+            bebop_tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
+            hashflow_tokens: Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )),
             native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),
@@ -1211,22 +1427,35 @@ mod tests {
                 Chain::Ethereum,
                 Duration::from_millis(10),
             )))),
+            rfq_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            )))),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             latest_native_gas_price_wei: Arc::new(RwLock::new(Some(42))),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: true,
+            enable_rfq_pools: true,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         };
 
         assert_eq!(

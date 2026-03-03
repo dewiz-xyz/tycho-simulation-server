@@ -21,12 +21,14 @@ pub fn router_timeout_result() -> QuoteResult {
         result_quality: QuoteResultQuality::RequestLevelFailure,
         block_number: 0,
         vm_block_number: None,
+        rfq_block_number: None,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: None,
         auction_id: None,
         pool_results: Vec::new(),
         vm_unavailable: false,
+        rfq_unavailable: false,
         failures: vec![failure],
     };
     QuoteResult {
@@ -61,6 +63,7 @@ mod tests {
         );
         assert!(result.meta.pool_results.is_empty());
         assert!(!result.meta.vm_unavailable);
+        assert!(!result.meta.rfq_unavailable);
         assert_eq!(result.meta.failures.len(), 1);
     }
 }

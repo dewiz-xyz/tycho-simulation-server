@@ -56,6 +56,7 @@ pub async fn simulate(
             // Rely on CancelOnDrop to cancel outstanding work
             let block_number = state.current_block().await;
             let vm_block_number = state.current_vm_block().await;
+            let rfq_block_number = state.current_rfq_block().await;
             let total_pools = state.total_pools().await;
             let timeout_ms = request_timeout.as_millis() as u64;
 
@@ -71,6 +72,7 @@ pub async fn simulate(
             let meta = build_request_guard_timeout_meta(
                 block_number,
                 vm_block_number,
+                rfq_block_number,
                 total_pools,
                 request.auction_id.clone(),
                 timeout_ms,
@@ -118,6 +120,7 @@ pub async fn simulate(
                 status = ?computation.meta.status,
                 result_quality = ?computation.meta.result_quality,
                 vm_unavailable = computation.meta.vm_unavailable,
+                rfq_unavailable = computation.meta.rfq_unavailable,
                 responses = computation.responses.len(),
                 failures = computation.meta.failures.len(),
                 pool_results = computation.meta.pool_results.len(),
@@ -132,10 +135,15 @@ pub async fn simulate(
                 skipped_native_limits = computation.metrics.skipped_native_limits,
                 skipped_vm_limits = computation.metrics.skipped_vm_limits,
                 vm_completed_pools = computation.metrics.vm_completed_pools,
+                rfq_completed_pools = computation.metrics.rfq_completed_pools,
                 vm_median_first_gas = computation.metrics.vm_median_first_gas,
+                rfq_median_first_gas = computation.metrics.rfq_median_first_gas,
                 vm_low_first_gas_count = computation.metrics.vm_low_first_gas_count,
+                rfq_low_first_gas_count = computation.metrics.rfq_low_first_gas_count,
                 vm_low_first_gas_ratio = computation.metrics.vm_low_first_gas_ratio,
+                rfq_low_first_gas_ratio = computation.metrics.rfq_low_first_gas_ratio,
                 vm_low_first_gas_samples = ?computation.metrics.vm_low_first_gas_samples,
+                rfq_low_first_gas_samples = ?computation.metrics.rfq_low_first_gas_samples,
                 token_in = request.token_in.as_str(),
                 token_out = request.token_out.as_str(),
                 amounts = request.amounts.len(),
@@ -207,6 +215,8 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
             *protocol_counts.entry(protocol.to_string()).or_insert(0) += 1;
             let pool_kind = if protocol.starts_with("vm:") {
                 "vm"
+            } else if protocol.starts_with("rfq:") {
+                "rfq"
             } else {
                 "native"
             };
@@ -301,6 +311,7 @@ struct CancelOnDrop {
 fn build_request_guard_timeout_meta(
     block_number: u64,
     vm_block_number: Option<u64>,
+    rfq_block_number: Option<u64>,
     total_pools: usize,
     auction_id: Option<String>,
     timeout_ms: u64,
@@ -319,12 +330,14 @@ fn build_request_guard_timeout_meta(
         result_quality: QuoteResultQuality::RequestLevelFailure,
         block_number,
         vm_block_number,
+        rfq_block_number,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools: Some(total_pools),
         auction_id,
         pool_results: Vec::new(),
         vm_unavailable: false,
+        rfq_unavailable: false,
         failures: vec![failure],
     }
 }
@@ -390,6 +403,7 @@ mod tests {
             make_failure(QuoteFailureKind::Simulator, Some("vm:uniswap_v2")),
             make_failure(QuoteFailureKind::Timeout, Some("balancer_v2")),
             make_failure(QuoteFailureKind::Overflow, Some("balancer_v2")),
+            make_failure(QuoteFailureKind::Simulator, Some("rfq:hashflow")),
         ];
         let summary = summarize_failures(&failures);
 
@@ -397,7 +411,7 @@ mod tests {
             summary.kind_counts,
             vec![
                 ("overflow".to_string(), 1),
-                ("simulator".to_string(), 2),
+                ("simulator".to_string(), 3),
                 ("timeout".to_string(), 1),
             ]
         );
@@ -405,14 +419,19 @@ mod tests {
             summary.protocol_counts,
             vec![
                 ("balancer_v2".to_string(), 2),
+                ("rfq:hashflow".to_string(), 1),
                 ("vm:uniswap_v2".to_string(), 2),
             ]
         );
         assert_eq!(
             summary.pool_kind_counts,
-            vec![("native".to_string(), 2), ("vm".to_string(), 2)]
+            vec![
+                ("native".to_string(), 2),
+                ("rfq".to_string(), 1),
+                ("vm".to_string(), 2),
+            ]
         );
-        assert_eq!(summary.samples.len(), 4);
+        assert_eq!(summary.samples.len(), 5);
     }
 
     #[test]
@@ -448,16 +467,24 @@ mod tests {
 
     #[test]
     fn request_guard_timeout_meta_uses_request_level_failure_quality() {
-        let meta =
-            build_request_guard_timeout_meta(12, Some(11), 42, Some("auction-1".to_string()), 1500);
+        let meta = build_request_guard_timeout_meta(
+            12,
+            Some(11),
+            Some(10),
+            42,
+            Some("auction-1".to_string()),
+            1500,
+        );
         assert!(matches!(meta.status, QuoteStatus::PartialSuccess));
         assert_eq!(meta.result_quality, QuoteResultQuality::RequestLevelFailure);
         assert_eq!(meta.block_number, 12);
         assert_eq!(meta.vm_block_number, Some(11));
+        assert_eq!(meta.rfq_block_number, Some(10));
         assert_eq!(meta.total_pools, Some(42));
         assert_eq!(meta.auction_id.as_deref(), Some("auction-1"));
         assert!(meta.pool_results.is_empty());
         assert!(!meta.vm_unavailable);
+        assert!(!meta.rfq_unavailable);
         assert_eq!(meta.failures.len(), 1);
         assert!(matches!(meta.failures[0].kind, QuoteFailureKind::Timeout));
     }
