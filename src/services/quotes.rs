@@ -549,6 +549,20 @@ pub async fn get_amounts_out(
 
         let pool_cancel = cancel_token.child_token();
         metrics.scheduled_native_pools += 1;
+        let (sim_token_in, sim_token_out) =
+            simulation_tokens_for_pool(token_in.as_ref(), token_out.as_ref(), component.as_ref());
+        if sim_token_in.address != token_in.address || sim_token_out.address != token_out.address {
+            debug!(
+                scope = "native_wrapped_remap",
+                pool_id = %id,
+                protocol = %pool_protocol,
+                requested_token_in = %token_in.address,
+                simulation_token_in = %sim_token_in.address,
+                requested_token_out = %token_out.address,
+                simulation_token_out = %sim_token_out.address,
+                "Remapped request tokens for pool simulation"
+            );
+        }
 
         tasks.push(simulate_pool(
             id,
@@ -556,8 +570,8 @@ pub async fn get_amounts_out(
             pool_address,
             pool_name,
             pool_protocol,
-            Arc::clone(&token_in),
-            Arc::clone(&token_out),
+            Arc::new(sim_token_in),
+            Arc::new(sim_token_out),
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
@@ -632,6 +646,20 @@ pub async fn get_amounts_out(
 
         let pool_cancel = cancel_token.child_token();
         metrics.scheduled_vm_pools += 1;
+        let (sim_token_in, sim_token_out) =
+            simulation_tokens_for_pool(token_in.as_ref(), token_out.as_ref(), component.as_ref());
+        if sim_token_in.address != token_in.address || sim_token_out.address != token_out.address {
+            debug!(
+                scope = "native_wrapped_remap",
+                pool_id = %id,
+                protocol = %pool_protocol,
+                requested_token_in = %token_in.address,
+                simulation_token_in = %sim_token_in.address,
+                requested_token_out = %token_out.address,
+                simulation_token_out = %sim_token_out.address,
+                "Remapped request tokens for pool simulation"
+            );
+        }
 
         tasks.push(simulate_pool(
             id,
@@ -639,8 +667,8 @@ pub async fn get_amounts_out(
             pool_address,
             pool_name,
             pool_protocol,
-            Arc::clone(&token_in),
-            Arc::clone(&token_out),
+            Arc::new(sim_token_in),
+            Arc::new(sim_token_out),
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
@@ -912,6 +940,45 @@ pub async fn get_amounts_out(
         meta,
         metrics,
     }
+}
+
+fn simulation_tokens_for_pool(
+    request_token_in: &Token,
+    request_token_out: &Token,
+    component: &ProtocolComponent,
+) -> (Token, Token) {
+    (
+        remap_request_token_for_pool(request_token_in, component),
+        remap_request_token_for_pool(request_token_out, component),
+    )
+}
+
+fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolComponent) -> Token {
+    let native = request_token.chain.native_token();
+    let wrapped_native = request_token.chain.wrapped_native_token();
+
+    if native.address == wrapped_native.address {
+        return request_token.clone();
+    }
+
+    let pool_has_native = component
+        .tokens
+        .iter()
+        .any(|token| token.address == native.address);
+    let pool_has_wrapped = component
+        .tokens
+        .iter()
+        .any(|token| token.address == wrapped_native.address);
+
+    if request_token.address == wrapped_native.address && pool_has_native && !pool_has_wrapped {
+        return native;
+    }
+
+    if request_token.address == native.address && pool_has_wrapped && !pool_has_native {
+        return wrapped_native;
+    }
+
+    request_token.clone()
 }
 
 struct PoolQuoteResult {
@@ -1861,6 +1928,75 @@ mod tests {
     }
 
     #[test]
+    fn remap_request_token_for_pool_maps_wrapped_to_native_for_native_only_pool() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let wrapped = chain.wrapped_native_token();
+        let token_x = make_token(&Bytes::from([9u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([1u8; 20]),
+            "rocketpool".to_string(),
+            "rocketpool".to_string(),
+            chain,
+            vec![native.clone(), token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&wrapped, &component);
+
+        assert_eq!(mapped.address, native.address);
+    }
+
+    #[test]
+    fn remap_request_token_for_pool_maps_native_to_wrapped_for_wrapped_only_pool() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let wrapped = chain.wrapped_native_token();
+        let token_x = make_token(&Bytes::from([10u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([2u8; 20]),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            chain,
+            vec![wrapped.clone(), token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&native, &component);
+
+        assert_eq!(mapped.address, wrapped.address);
+    }
+
+    #[test]
+    fn remap_request_token_for_pool_keeps_non_native_tokens_unchanged() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let request_token = make_token(&Bytes::from([42u8; 20]), "USDC");
+        let token_x = make_token(&Bytes::from([11u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([3u8; 20]),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            chain,
+            vec![native, token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&request_token, &component);
+
+        assert_eq!(mapped.address, request_token.address);
+    }
+
+    #[test]
     fn vm_first_gas_metrics_aggregate_median_ratio_and_samples() {
         let mut metrics = QuoteMetrics::default();
         let mut vm_first_gases = Vec::new();
@@ -2267,6 +2403,95 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct StrictPairTokenSim {
+        expected_sell: Bytes,
+        expected_buy: Bytes,
+        #[serde(skip, default = "default_calls")]
+        limit_calls: Arc<AtomicUsize>,
+        #[serde(skip, default = "default_calls")]
+        quote_calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for StrictPairTokenSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Err(SimulationError::FatalError("spot unavailable".to_string()))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            token_in: &Token,
+            token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.quote_calls.fetch_add(1, Ordering::SeqCst);
+            if token_in.address != self.expected_sell || token_out.address != self.expected_buy {
+                return Err(SimulationError::InvalidInput(
+                    format!(
+                        "unexpected token pair for quote: {} -> {}",
+                        token_in.address, token_out.address
+                    ),
+                    None,
+                ));
+            }
+
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::from(21_000u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            sell_token: Bytes,
+            buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            self.limit_calls.fetch_add(1, Ordering::SeqCst);
+            if sell_token != self.expected_sell || buy_token != self.expected_buy {
+                return Err(SimulationError::InvalidInput(
+                    format!(
+                        "unexpected token pair for limits: {} -> {}",
+                        sell_token, buy_token
+                    ),
+                    None,
+                ));
+            }
+
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     #[test]
     fn resolve_request_eth_to_sell_spot_price_returns_one_for_wrapped_native_sell() {
         let sell_token = Chain::Ethereum.wrapped_native_token();
@@ -2528,6 +2753,336 @@ mod tests {
             assert_eq!(response.gas_used, vec![2, 5]);
             assert_eq!(response.gas_in_sell, "3750");
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_pool() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let native = Chain::Ethereum.native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(wrapped_native.clone(), wrapped_meta.clone());
+        initial_tokens.insert(native.clone(), native_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        states.insert(
+            "pool-native".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-native".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000011")
+                    .expect("valid pool address"),
+                "rocketpool".to_string(),
+                "rocketpool".to_string(),
+                Chain::Ethereum,
+                vec![native_meta, token_out_meta],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-remap-native-only".to_string(),
+            auction_id: None,
+            token_in: wrapped_native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["2".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert!(!computation.responses.is_empty());
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_wrapped_request_tokens_for_wrapped_only_pool() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000003").expect("valid address");
+
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK3", 6);
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(wrapped_native.clone(), wrapped_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        states.insert(
+            "pool-wrapped".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: wrapped_native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::new(AtomicUsize::new(0)),
+                quote_calls: Arc::clone(&quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-wrapped".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000012")
+                    .expect("valid pool address"),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![wrapped_meta, token_out_meta],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-keep-wrapped".to_string(),
+            auction_id: None,
+            token_in: wrapped_native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["3".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["3".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_vm_pool() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let native = Chain::Ethereum.native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
+
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK4", 6);
+
+        let mut initial_tokens = HashMap::new();
+        initial_tokens.insert(wrapped_native.clone(), wrapped_meta.clone());
+        initial_tokens.insert(native.clone(), native_meta.clone());
+        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
+
+        let token_store = Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        // Keep native store ready without creating any matching pools for the request pair.
+        let native_dummy_token_a =
+            Bytes::from_str("0x0000000000000000000000000000000000000010").expect("valid address");
+        let native_dummy_token_b =
+            Bytes::from_str("0x0000000000000000000000000000000000000011").expect("valid address");
+        let native_dummy_meta_a = make_token_with_decimals(&native_dummy_token_a, "NTA", 18);
+        let native_dummy_meta_b = make_token_with_decimals(&native_dummy_token_b, "NTB", 18);
+        let mut native_states = HashMap::new();
+        let mut native_pairs = HashMap::new();
+        native_states.insert(
+            "native-dummy".to_string(),
+            Box::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn ProtocolSim>,
+        );
+        native_pairs.insert(
+            "native-dummy".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000013")
+                    .expect("valid pool address"),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![native_dummy_meta_a, native_dummy_meta_b],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+        native_state_store
+            .apply_update(Update::new(1, native_states, native_pairs))
+            .await;
+
+        let vm_limit_calls = Arc::new(AtomicUsize::new(0));
+        let vm_quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut vm_states = HashMap::new();
+        let mut vm_pairs = HashMap::new();
+        vm_states.insert(
+            "vm-native".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&vm_limit_calls),
+                quote_calls: Arc::clone(&vm_quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        vm_pairs.insert(
+            "vm-native".to_string(),
+            ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000014")
+                    .expect("valid pool address"),
+                "vm:curve".to_string(),
+                "curve_pool".to_string(),
+                Chain::Ethereum,
+                vec![native_meta, token_out_meta],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        );
+        vm_state_store
+            .apply_update(Update::new(2, vm_states, vm_pairs))
+            .await;
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store: Arc::clone(&native_state_store),
+            vm_state_store: Arc::clone(&vm_state_store),
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: true,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let request = AmountOutRequest {
+            request_id: "req-remap-vm-native-only".to_string(),
+            auction_id: None,
+            token_in: wrapped_native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["2".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(vm_limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(computation.metrics.scheduled_vm_pools, 1);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
     }
 
     #[tokio::test]
