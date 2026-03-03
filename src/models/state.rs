@@ -510,13 +510,11 @@ impl StateStore {
 
     async fn ids_for_token(&self, token: &Bytes) -> Option<HashSet<String>> {
         let wrapped_native_token = self.tokens.wrapped_native_token();
-        let needs_native = wrapped_native_token
-            .as_ref()
-            .map_or(false, |weth| weth == token);
+        let needs_native = wrapped_native_token.as_ref() == Some(token);
         let native_address = Bytes::from([0u8; 20]);
 
         let index = self.token_index.read().await;
-        let mut ids = index.get(token).cloned()?;
+        let mut ids = index.get(token).cloned().unwrap_or_default();
 
         if needs_native {
             if let Some(native_ids) = index.get(&native_address) {
@@ -524,7 +522,7 @@ impl StateStore {
             }
         }
 
-        Some(ids)
+        (!ids.is_empty()).then_some(ids)
     }
 
     pub(crate) async fn matching_pools_by_addresses(
@@ -1163,6 +1161,83 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("pool-weth"));
         assert!(ids.contains("pool-native"));
+    }
+
+    #[tokio::test]
+    async fn matching_pools_includes_native_only_pool_for_wrapped_native() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let weth_address =
+            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let native_address = Bytes::from([0u8; 20]);
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let token_x = mk_token(9, "TKNX");
+
+        let component_native = mk_component(
+            21,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![native_token, token_x.clone()],
+        );
+
+        let update = mk_update(vec![(
+            "pool-native".to_string(),
+            component_native,
+            Box::new(DummySim),
+        )]);
+        store.apply_update(update).await;
+
+        let matches = store
+            .matching_pools_by_addresses(&weth_address, &token_x.address)
+            .await;
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("pool-native"));
+    }
+
+    #[tokio::test]
+    async fn matching_pools_does_not_include_native_for_non_wrapped_token() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let native_address = Bytes::from([0u8; 20]);
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let token_x = mk_token(9, "TKNX");
+        let token_y = mk_token(10, "TKNY");
+
+        let component_native = mk_component(
+            21,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![native_token, token_x.clone()],
+        );
+
+        let update = mk_update(vec![(
+            "pool-native".to_string(),
+            component_native,
+            Box::new(DummySim),
+        )]);
+        store.apply_update(update).await;
+
+        let matches = store
+            .matching_pools_by_addresses(&token_y.address, &token_x.address)
+            .await;
+
+        assert!(matches.is_empty());
     }
 
     #[tokio::test]
