@@ -126,6 +126,51 @@ mod tests {
 
     use super::*;
 
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 13] = [
+        ("uniswap_v2", ProtocolKind::UniswapV2),
+        ("sushiswap_v2", ProtocolKind::SushiswapV2),
+        ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
+        ("uniswap_v3", ProtocolKind::UniswapV3),
+        ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
+        ("uniswap_v4", ProtocolKind::UniswapV4),
+        ("ekubo_v2", ProtocolKind::EkuboV2),
+        ("ekubo_v3", ProtocolKind::EkuboV3),
+        ("fluid_v1", ProtocolKind::FluidV1),
+        ("rocketpool", ProtocolKind::Rocketpool),
+        ("vm:curve", ProtocolKind::Curve),
+        ("vm:balancer_v2", ProtocolKind::BalancerV2),
+        ("vm:maverick_v2", ProtocolKind::MaverickV2),
+    ];
+
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 12] = [
+        ("uniswap_v2_pool", ProtocolKind::UniswapV2),
+        ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
+        ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
+        ("uniswap_v3_pool", ProtocolKind::UniswapV3),
+        ("pancakeswap_v3_pool", ProtocolKind::PancakeswapV3),
+        ("uniswap_v4_pool", ProtocolKind::UniswapV4),
+        ("ekubo_v2_pool", ProtocolKind::EkuboV2),
+        ("ekubo_v3_pool", ProtocolKind::EkuboV3),
+        ("fluid_dex_pool", ProtocolKind::FluidV1),
+        ("curve_pool", ProtocolKind::Curve),
+        ("balancer_v2_pool", ProtocolKind::BalancerV2),
+        ("maverick_v2_pool", ProtocolKind::MaverickV2),
+    ];
+
+    const NON_CANONICAL_ALIASES: [&str; 11] = [
+        "uniswapv2",
+        "uniswapv3",
+        "uniswapv4",
+        "curve",
+        "balancer_v2",
+        "maverick_v2",
+        "ekubov3",
+        "fluidv1",
+        "balancerv2_pool",
+        "rocketpool_pool",
+        "base_pool",
+    ];
+
     fn protocol_component(protocol_system: &str, protocol_type_name: &str) -> ProtocolComponent {
         ProtocolComponent::new(
             Bytes::default(),
@@ -140,49 +185,40 @@ mod tests {
         )
     }
 
+    fn assert_rejected_everywhere(name: &str) {
+        let by_system = protocol_component(name, "");
+        let by_type = protocol_component("", name);
+        assert_eq!(ProtocolKind::from_component(&by_system), None);
+        assert_eq!(ProtocolKind::from_component(&by_type), None);
+        assert_eq!(ProtocolKind::from_sync_state_key(name), None);
+    }
+
     #[test]
     fn as_str_returns_canonical_protocol_systems() {
-        let cases = [
-            (ProtocolKind::UniswapV2, "uniswap_v2"),
-            (ProtocolKind::SushiswapV2, "sushiswap_v2"),
-            (ProtocolKind::PancakeswapV2, "pancakeswap_v2"),
-            (ProtocolKind::UniswapV3, "uniswap_v3"),
-            (ProtocolKind::PancakeswapV3, "pancakeswap_v3"),
-            (ProtocolKind::UniswapV4, "uniswap_v4"),
-            (ProtocolKind::EkuboV2, "ekubo_v2"),
-            (ProtocolKind::EkuboV3, "ekubo_v3"),
-            (ProtocolKind::FluidV1, "fluid_v1"),
-            (ProtocolKind::Rocketpool, "rocketpool"),
-            (ProtocolKind::Curve, "vm:curve"),
-            (ProtocolKind::BalancerV2, "vm:balancer_v2"),
-            (ProtocolKind::MaverickV2, "vm:maverick_v2"),
-        ];
-
-        for (kind, expected) in cases {
+        for (expected, kind) in CANONICAL_PROTOCOL_SYSTEM_CASES {
             assert_eq!(kind.as_str(), expected);
             assert_eq!(kind.to_string(), expected);
         }
     }
 
     #[test]
-    fn recognizes_canonical_protocol_systems_from_component() {
-        let cases = [
-            ("uniswap_v2", ProtocolKind::UniswapV2),
-            ("sushiswap_v2", ProtocolKind::SushiswapV2),
-            ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
-            ("uniswap_v3", ProtocolKind::UniswapV3),
-            ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
-            ("uniswap_v4", ProtocolKind::UniswapV4),
-            ("ekubo_v2", ProtocolKind::EkuboV2),
-            ("ekubo_v3", ProtocolKind::EkuboV3),
-            ("fluid_v1", ProtocolKind::FluidV1),
-            ("rocketpool", ProtocolKind::Rocketpool),
-            ("vm:curve", ProtocolKind::Curve),
-            ("vm:balancer_v2", ProtocolKind::BalancerV2),
-            ("vm:maverick_v2", ProtocolKind::MaverickV2),
-        ];
+    fn canonical_protocol_system_cases_cover_all_protocol_kinds() {
+        assert_eq!(
+            CANONICAL_PROTOCOL_SYSTEM_CASES.len(),
+            ProtocolKind::ALL.len()
+        );
+        for kind in ProtocolKind::ALL {
+            let count = CANONICAL_PROTOCOL_SYSTEM_CASES
+                .iter()
+                .filter(|(_, listed_kind)| *listed_kind == kind)
+                .count();
+            assert_eq!(count, 1, "missing or duplicate canonical system case");
+        }
+    }
 
-        for (protocol_system, expected) in cases {
+    #[test]
+    fn recognizes_canonical_protocol_systems_from_component() {
+        for (protocol_system, expected) in CANONICAL_PROTOCOL_SYSTEM_CASES {
             let component = protocol_component(protocol_system, "");
             assert_eq!(ProtocolKind::from_component(&component), Some(expected));
         }
@@ -190,22 +226,7 @@ mod tests {
 
     #[test]
     fn recognizes_canonical_protocol_type_names_from_component() {
-        let cases = [
-            ("uniswap_v2_pool", ProtocolKind::UniswapV2),
-            ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
-            ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
-            ("uniswap_v3_pool", ProtocolKind::UniswapV3),
-            ("pancakeswap_v3_pool", ProtocolKind::PancakeswapV3),
-            ("uniswap_v4_pool", ProtocolKind::UniswapV4),
-            ("ekubo_v2_pool", ProtocolKind::EkuboV2),
-            ("ekubo_v3_pool", ProtocolKind::EkuboV3),
-            ("fluid_dex_pool", ProtocolKind::FluidV1),
-            ("curve_pool", ProtocolKind::Curve),
-            ("balancer_v2_pool", ProtocolKind::BalancerV2),
-            ("maverick_v2_pool", ProtocolKind::MaverickV2),
-        ];
-
-        for (protocol_type_name, expected) in cases {
+        for (protocol_type_name, expected) in CANONICAL_PROTOCOL_TYPE_CASES {
             let component = protocol_component("", protocol_type_name);
             assert_eq!(ProtocolKind::from_component(&component), Some(expected));
         }
@@ -223,60 +244,20 @@ mod tests {
 
     #[test]
     fn from_sync_state_key_recognizes_canonical_protocol_systems_only() {
-        let cases = [
-            ("uniswap_v2", ProtocolKind::UniswapV2),
-            ("sushiswap_v2", ProtocolKind::SushiswapV2),
-            ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
-            ("uniswap_v3", ProtocolKind::UniswapV3),
-            ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
-            ("uniswap_v4", ProtocolKind::UniswapV4),
-            ("ekubo_v2", ProtocolKind::EkuboV2),
-            ("ekubo_v3", ProtocolKind::EkuboV3),
-            ("fluid_v1", ProtocolKind::FluidV1),
-            ("rocketpool", ProtocolKind::Rocketpool),
-            ("vm:curve", ProtocolKind::Curve),
-            ("vm:balancer_v2", ProtocolKind::BalancerV2),
-            ("vm:maverick_v2", ProtocolKind::MaverickV2),
-        ];
-
-        for (name, expected) in cases {
+        for (name, expected) in CANONICAL_PROTOCOL_SYSTEM_CASES {
             assert_eq!(ProtocolKind::from_sync_state_key(name), Some(expected));
         }
     }
 
     #[test]
     fn rejects_uniswap_v4_hooks() {
-        let by_system = protocol_component("uniswap_v4_hooks", "");
-        let by_type = protocol_component("", "uniswap_v4_hooks");
-        assert_eq!(ProtocolKind::from_component(&by_system), None);
-        assert_eq!(ProtocolKind::from_component(&by_type), None);
-        assert_eq!(ProtocolKind::from_sync_state_key("uniswap_v4_hooks"), None);
+        assert_rejected_everywhere("uniswap_v4_hooks");
     }
 
     #[test]
     fn rejects_non_canonical_aliases() {
-        let aliases = [
-            "uniswapv2",
-            "uniswapv3",
-            "uniswapv4",
-            "curve",
-            "balancer_v2",
-            "maverick_v2",
-            "ekubov3",
-            "fluidv1",
-            "balancerv2_pool",
-            "rocketpool_pool",
-            "base_pool",
-        ];
-
-        for alias in aliases {
-            let by_type = protocol_component("", alias);
-            assert_eq!(ProtocolKind::from_component(&by_type), None);
-
-            let by_system = protocol_component(alias, "");
-            assert_eq!(ProtocolKind::from_component(&by_system), None);
-
-            assert_eq!(ProtocolKind::from_sync_state_key(alias), None);
+        for alias in NON_CANONICAL_ALIASES {
+            assert_rejected_everywhere(alias);
         }
     }
 
@@ -297,8 +278,8 @@ mod tests {
             "maverick_v2_pool",
         ];
 
-        for name in type_names {
-            assert_eq!(ProtocolKind::from_sync_state_key(name), None);
+        for type_name in type_names {
+            assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
     }
 }
