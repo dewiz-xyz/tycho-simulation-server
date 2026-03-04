@@ -15,6 +15,11 @@ use tycho_simulation::tycho_common::{
 /// falls back to a single token fetch from the Tycho RPC when a miss occurs.
 type InflightRx = watch::Receiver<Option<Result<Option<Token>, TokenStoreError>>>;
 type InflightMap = HashMap<Bytes, InflightRx>;
+const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+
+fn native_token_address() -> Bytes {
+    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
+}
 
 pub struct TokenStore {
     tokens: RwLock<HashMap<Bytes, Token>>,
@@ -61,6 +66,11 @@ impl TokenStore {
 
     pub async fn get(&self, address: &Bytes) -> Option<Token> {
         self.tokens.read().await.get(address).cloned()
+    }
+
+    pub fn wrapped_native_token(&self) -> Option<Bytes> {
+        let address = self.chain.wrapped_native_token().address;
+        (address != native_token_address()).then_some(address)
     }
 
     /// Ensure the token metadata exists. If missing, fetch just that token via

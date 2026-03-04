@@ -13,6 +13,11 @@ use tycho_simulation::{
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
 
 const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
+const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+
+fn native_token_address() -> Bytes {
+    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -508,16 +513,47 @@ impl StateStore {
         }
     }
 
+    fn ids_for_token_from_index(
+        &self,
+        index: &HashMap<Bytes, HashSet<String>>,
+        token: &Bytes,
+    ) -> Option<HashSet<String>> {
+        let wrapped_native_token = self.tokens.wrapped_native_token();
+        let native_address = native_token_address();
+        let needs_native = wrapped_native_token.as_ref() == Some(token);
+        let needs_wrapped = *token == native_address;
+
+        let mut ids = index.get(token).cloned().unwrap_or_default();
+
+        if needs_native {
+            if let Some(native_ids) = index.get(&native_address) {
+                ids.extend(native_ids.iter().cloned());
+            }
+        }
+
+        if needs_wrapped {
+            if let Some(wrapped_address) = wrapped_native_token.as_ref() {
+                if let Some(wrapped_ids) = index.get(wrapped_address) {
+                    ids.extend(wrapped_ids.iter().cloned());
+                }
+            }
+        }
+
+        (!ids.is_empty()).then_some(ids)
+    }
+
     pub(crate) async fn matching_pools_by_addresses(
         &self,
         token_in: &Bytes,
         token_out: &Bytes,
     ) -> Vec<(String, PoolEntry)> {
+        // Keep both token ID lookups on the same index snapshot under concurrent updates.
         let (token_in_ids, token_out_ids) = {
             let index = self.token_index.read().await;
-            let token_in_ids = index.get(token_in).cloned();
-            let token_out_ids = index.get(token_out).cloned();
-            (token_in_ids, token_out_ids)
+            (
+                self.ids_for_token_from_index(&index, token_in),
+                self.ids_for_token_from_index(&index, token_out),
+            )
         };
 
         let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
@@ -1094,6 +1130,207 @@ mod tests {
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+    }
+    #[tokio::test]
+    async fn matching_pools_native_wrapped_aliasing_cases() {
+        enum RequestTokenIn {
+            Wrapped,
+            Native,
+            Other,
+        }
+
+        struct Case {
+            name: &'static str,
+            request_token_in: RequestTokenIn,
+            include_wrapped_pool: bool,
+            include_native_pool: bool,
+            expected_pool_ids: &'static [&'static str],
+        }
+
+        let wrapped_address =
+            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let native_address = native_token_address();
+        let token_x = mk_token(9, "TKNX");
+        let token_y = mk_token(10, "TKNY");
+        let wrapped_token = Token::new(&wrapped_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+
+        let cases = [
+            Case {
+                name: "wrapped request includes wrapped and native pools",
+                request_token_in: RequestTokenIn::Wrapped,
+                include_wrapped_pool: true,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-weth", "pool-native"],
+            },
+            Case {
+                name: "wrapped request includes native-only pool",
+                request_token_in: RequestTokenIn::Wrapped,
+                include_wrapped_pool: false,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-native"],
+            },
+            Case {
+                name: "native request includes wrapped and native pools",
+                request_token_in: RequestTokenIn::Native,
+                include_wrapped_pool: true,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-weth", "pool-native"],
+            },
+            Case {
+                name: "native request includes wrapped-only pool",
+                request_token_in: RequestTokenIn::Native,
+                include_wrapped_pool: true,
+                include_native_pool: false,
+                expected_pool_ids: &["pool-weth"],
+            },
+            Case {
+                name: "non wrapped request does not include native pool",
+                request_token_in: RequestTokenIn::Other,
+                include_wrapped_pool: false,
+                include_native_pool: true,
+                expected_pool_ids: &[],
+            },
+        ];
+
+        for case in cases {
+            let token_store = Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_secs(1),
+            ));
+            let store = StateStore::new(token_store);
+            let mut update_pairs = Vec::new();
+
+            if case.include_wrapped_pool {
+                update_pairs.push((
+                    "pool-weth".to_string(),
+                    mk_component(
+                        20,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![wrapped_token.clone(), token_x.clone()],
+                    ),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                ));
+            }
+
+            if case.include_native_pool {
+                update_pairs.push((
+                    "pool-native".to_string(),
+                    mk_component(
+                        21,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![native_token.clone(), token_x.clone()],
+                    ),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                ));
+            }
+
+            store.apply_update(mk_update(update_pairs)).await;
+
+            let request_token_in = match case.request_token_in {
+                RequestTokenIn::Wrapped => &wrapped_address,
+                RequestTokenIn::Native => &native_address,
+                RequestTokenIn::Other => &token_y.address,
+            };
+            let matches = store
+                .matching_pools_by_addresses(request_token_in, &token_x.address)
+                .await;
+            let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+            let expected: HashSet<String> = case
+                .expected_pool_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+
+            assert_eq!(ids, expected, "case {}", case.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_pools_reads_token_ids_from_single_snapshot() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = Arc::new(StateStore::new(token_store));
+
+        let token_a = mk_token(70, "TKNA");
+        let token_b = mk_token(71, "TKNB");
+
+        let component_v1 = mk_component(
+            40,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let component_v2 = mk_component(
+            41,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+
+        store
+            .apply_update(mk_update(vec![
+                ("pool-v1".to_string(), component_v1, Box::new(DummySim)),
+                ("pool-v2".to_string(), component_v2, Box::new(DummySim)),
+            ]))
+            .await;
+
+        let token_a_address = token_a.address.clone();
+        let token_b_address = token_b.address.clone();
+        let mut index_guard = store.token_index.write().await;
+        *index_guard = HashMap::from([
+            (
+                token_a_address.clone(),
+                HashSet::from(["pool-v1".to_string()]),
+            ),
+            (
+                token_b_address.clone(),
+                HashSet::from(["pool-v1".to_string()]),
+            ),
+        ]);
+
+        let query_store = Arc::clone(&store);
+        let query_token_a = token_a_address.clone();
+        let query_token_b = token_b_address.clone();
+        let query_task = tokio::spawn(async move {
+            query_store
+                .matching_pools_by_addresses(&query_token_a, &query_token_b)
+                .await
+        });
+
+        // Queue the reader before the writer while an external write lock is held.
+        // The previous two-read implementation could then observe v1 for token_a and v2
+        // for token_b, causing a transient empty intersection.
+        tokio::task::yield_now().await;
+
+        let writer_store = Arc::clone(&store);
+        let writer_token_a = token_a_address;
+        let writer_token_b = token_b_address;
+        let writer_task = tokio::spawn(async move {
+            let mut index = writer_store.token_index.write().await;
+            *index = HashMap::from([
+                (writer_token_a, HashSet::from(["pool-v2".to_string()])),
+                (writer_token_b, HashSet::from(["pool-v2".to_string()])),
+            ]);
+        });
+
+        drop(index_guard);
+
+        writer_task.await.expect("writer task should succeed");
+        let matches = query_task.await.expect("query task should succeed");
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(ids, HashSet::from(["pool-v1".to_string()]));
     }
 
     #[tokio::test]

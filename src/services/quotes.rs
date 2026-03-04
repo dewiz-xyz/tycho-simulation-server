@@ -33,6 +33,19 @@ const SPOT_PRICE_SCALE: u128 = 1_000_000_000;
 const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
 const MIN_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e-12;
 const MAX_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e12;
+const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+
+fn native_token_address() -> Bytes {
+    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpotProbeMode {
+    NativeOnly,
+    WrappedOnly,
+    Both,
+    None,
+}
 
 // Per-request scheduling metrics (logged once by the handler).
 #[derive(Debug, Default, Clone)]
@@ -150,6 +163,26 @@ pub async fn get_amounts_out(
             };
         }
     };
+
+    let wrapped_native = state.tokens.wrapped_native_token();
+    if is_direct_native_wrapped_pair(&token_in_bytes, &token_out_bytes, wrapped_native.as_ref()) {
+        failures.push(make_failure(
+            QuoteFailureKind::InvalidRequest,
+            "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
+                .to_string(),
+            None,
+        ));
+        meta.status = QuoteStatus::InvalidRequest;
+        meta.result_quality = QuoteResultQuality::RequestLevelFailure;
+        meta.pool_results = pool_results;
+        meta.vm_unavailable = metrics.skipped_vm_unavailable;
+        meta.failures = failures;
+        return QuoteComputation {
+            responses,
+            meta,
+            metrics,
+        };
+    }
 
     if !state.is_ready() {
         let ready = state.wait_for_readiness(readiness_wait).await;
@@ -444,18 +477,25 @@ pub async fn get_amounts_out(
     let native = token_in_ref.chain.native_token();
     let wrapped_native = token_in_ref.chain.wrapped_native_token();
 
-    let mut spot_native_candidates_raw = state
-        .native_state_store
-        .matching_pools_by_addresses(&token_in_bytes, &wrapped_native.address)
-        .await;
-    if native.address != wrapped_native.address {
-        spot_native_candidates_raw.extend(
-            state
-                .native_state_store
-                .matching_pools_by_addresses(&token_in_bytes, &native.address)
-                .await,
-        );
-    }
+    let mut spot_native_candidates_raw = if token_in_ref.address == native.address
+        || token_in_ref.address == wrapped_native.address
+    {
+        Vec::new()
+    } else {
+        let mut candidates = state
+            .native_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &wrapped_native.address)
+            .await;
+        if native.address != wrapped_native.address {
+            candidates.extend(
+                state
+                    .native_state_store
+                    .matching_pools_by_addresses(&token_in_bytes, &native.address)
+                    .await,
+            );
+        }
+        candidates
+    };
 
     let mut seen_spot_ids = HashSet::new();
     let mut spot_native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
@@ -549,6 +589,13 @@ pub async fn get_amounts_out(
 
         let pool_cancel = cancel_token.child_token();
         metrics.scheduled_native_pools += 1;
+        let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
+            token_in.as_ref(),
+            token_out.as_ref(),
+            component.as_ref(),
+            &id,
+            &pool_protocol,
+        );
 
         tasks.push(simulate_pool(
             id,
@@ -556,8 +603,8 @@ pub async fn get_amounts_out(
             pool_address,
             pool_name,
             pool_protocol,
-            Arc::clone(&token_in),
-            Arc::clone(&token_out),
+            sim_token_in,
+            sim_token_out,
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
@@ -632,6 +679,13 @@ pub async fn get_amounts_out(
 
         let pool_cancel = cancel_token.child_token();
         metrics.scheduled_vm_pools += 1;
+        let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
+            token_in.as_ref(),
+            token_out.as_ref(),
+            component.as_ref(),
+            &id,
+            &pool_protocol,
+        );
 
         tasks.push(simulate_pool(
             id,
@@ -639,8 +693,8 @@ pub async fn get_amounts_out(
             pool_address,
             pool_name,
             pool_protocol,
-            Arc::clone(&token_in),
-            Arc::clone(&token_out),
+            sim_token_in,
+            sim_token_out,
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
@@ -912,6 +966,86 @@ pub async fn get_amounts_out(
         meta,
         metrics,
     }
+}
+
+fn simulation_tokens_for_pool(
+    request_token_in: &Token,
+    request_token_out: &Token,
+    component: &ProtocolComponent,
+) -> (Token, Token) {
+    (
+        remap_request_token_for_pool(request_token_in, component),
+        remap_request_token_for_pool(request_token_out, component),
+    )
+}
+
+fn simulation_tokens_for_pool_with_remap_log(
+    request_token_in: &Token,
+    request_token_out: &Token,
+    component: &ProtocolComponent,
+    pool_id: &str,
+    pool_protocol: &str,
+) -> (Arc<Token>, Arc<Token>) {
+    let (sim_token_in, sim_token_out) =
+        simulation_tokens_for_pool(request_token_in, request_token_out, component);
+    if sim_token_in.address != request_token_in.address
+        || sim_token_out.address != request_token_out.address
+    {
+        debug!(
+            scope = "native_wrapped_remap",
+            pool_id = %pool_id,
+            protocol = %pool_protocol,
+            requested_token_in = %request_token_in.address,
+            simulation_token_in = %sim_token_in.address,
+            requested_token_out = %request_token_out.address,
+            simulation_token_out = %sim_token_out.address,
+            "Remapped request tokens for pool simulation"
+        );
+    }
+
+    (Arc::new(sim_token_in), Arc::new(sim_token_out))
+}
+
+fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolComponent) -> Token {
+    let native = request_token.chain.native_token();
+    let wrapped_native = request_token.chain.wrapped_native_token();
+
+    if native.address == wrapped_native.address {
+        return request_token.clone();
+    }
+
+    let pool_has_native = component
+        .tokens
+        .iter()
+        .any(|token| token.address == native.address);
+    let pool_has_wrapped = component
+        .tokens
+        .iter()
+        .any(|token| token.address == wrapped_native.address);
+
+    if request_token.address == wrapped_native.address && pool_has_native && !pool_has_wrapped {
+        return native;
+    }
+
+    if request_token.address == native.address && pool_has_wrapped && !pool_has_native {
+        return wrapped_native;
+    }
+
+    request_token.clone()
+}
+
+fn is_direct_native_wrapped_pair(
+    token_in: &Bytes,
+    token_out: &Bytes,
+    wrapped_native: Option<&Bytes>,
+) -> bool {
+    let native_address = native_token_address();
+    let Some(wrapped_native) = wrapped_native else {
+        return false;
+    };
+
+    (token_in == &native_address && token_out == wrapped_native)
+        || (token_in == wrapped_native && token_out == &native_address)
 }
 
 struct PoolQuoteResult {
@@ -1335,13 +1469,13 @@ fn resolve_request_eth_to_sell_spot_price(
         return Some(1.0);
     }
 
-    let mut fallback_pool_state: Option<&Arc<dyn ProtocolSim>> = None;
-    let mut selected_pool_state: Option<&Arc<dyn ProtocolSim>> = None;
+    let mut fallback_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
+    let mut selected_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
     let mut best_liquidity_score: Option<BigUint> = None;
 
-    for (_, pool_state, _) in native_candidates.iter().chain(vm_candidates.iter()) {
-        if fallback_pool_state.is_none() {
-            fallback_pool_state = Some(pool_state);
+    for (_, pool_state, component) in native_candidates.iter().chain(vm_candidates.iter()) {
+        if fallback_pool.is_none() {
+            fallback_pool = Some((pool_state, component));
         }
 
         let Some(liquidity_score) = spot_liquidity_score_in_sell_token(
@@ -1360,12 +1494,19 @@ fn resolve_request_eth_to_sell_spot_price(
 
         if should_replace {
             best_liquidity_score = Some(liquidity_score);
-            selected_pool_state = Some(pool_state);
+            selected_pool = Some((pool_state, component));
         }
     }
 
-    let pool_state = selected_pool_state.or(fallback_pool_state)?;
-    spot_price_eth_to_sell_from_pool(pool_state.as_ref(), sell_token, &wrapped_native, &native)
+    let (pool_state, component) = selected_pool.or(fallback_pool)?;
+    let probe_mode = spot_probe_mode(component.as_ref(), sell_token, &wrapped_native, &native);
+    spot_price_eth_to_sell_from_pool(
+        pool_state.as_ref(),
+        sell_token,
+        &wrapped_native,
+        &native,
+        probe_mode,
+    )
 }
 
 fn spot_liquidity_score_in_sell_token(
@@ -1423,41 +1564,80 @@ fn spot_price_eth_to_sell_from_pool(
     sell_token: &Token,
     wrapped_native: &Token,
     native: &Token,
+    probe_mode: SpotProbeMode,
 ) -> Option<f64> {
-    pool_state
-        .spot_price(wrapped_native, sell_token)
-        .ok()
-        .or_else(|| pool_state.spot_price(native, sell_token).ok())
+    match probe_mode {
+        SpotProbeMode::NativeOnly => {
+            spot_price_candidate(pool_state.spot_price(native, sell_token).ok(), false).or_else(
+                || spot_price_candidate(pool_state.spot_price(sell_token, native).ok(), true),
+            )
+        }
+        SpotProbeMode::WrappedOnly => spot_price_candidate(
+            pool_state.spot_price(wrapped_native, sell_token).ok(),
+            false,
+        )
         .or_else(|| {
-            pool_state
-                .spot_price(sell_token, wrapped_native)
-                .ok()
-                .and_then(|price| {
-                    if price.is_finite() && price > 0.0 {
-                        Some(1.0 / price)
-                    } else {
-                        None
-                    }
-                })
-        })
+            spot_price_candidate(pool_state.spot_price(sell_token, wrapped_native).ok(), true)
+        }),
+        SpotProbeMode::Both => spot_price_candidate(
+            pool_state.spot_price(wrapped_native, sell_token).ok(),
+            false,
+        )
+        .or_else(|| spot_price_candidate(pool_state.spot_price(native, sell_token).ok(), false))
         .or_else(|| {
-            pool_state
-                .spot_price(sell_token, native)
-                .ok()
-                .and_then(|price| {
-                    if price.is_finite() && price > 0.0 {
-                        Some(1.0 / price)
-                    } else {
-                        None
-                    }
-                })
+            spot_price_candidate(pool_state.spot_price(sell_token, wrapped_native).ok(), true)
         })
-        .filter(|price| {
-            price.is_finite()
-                && *price > 0.0
-                && *price >= MIN_REASONABLE_ETH_TO_SELL_SPOT
-                && *price <= MAX_REASONABLE_ETH_TO_SELL_SPOT
-        })
+        .or_else(|| spot_price_candidate(pool_state.spot_price(sell_token, native).ok(), true)),
+        SpotProbeMode::None => None,
+    }
+}
+
+fn spot_probe_mode(
+    component: &ProtocolComponent,
+    sell_token: &Token,
+    wrapped_native: &Token,
+    native: &Token,
+) -> SpotProbeMode {
+    let has_sell = component
+        .tokens
+        .iter()
+        .any(|token| token.address == sell_token.address);
+    if !has_sell {
+        return SpotProbeMode::None;
+    }
+
+    let has_wrapped = component
+        .tokens
+        .iter()
+        .any(|token| token.address == wrapped_native.address);
+    let has_native = component
+        .tokens
+        .iter()
+        .any(|token| token.address == native.address);
+    match (has_native, has_wrapped) {
+        (true, true) => SpotProbeMode::Both,
+        (true, false) => SpotProbeMode::NativeOnly,
+        (false, true) => SpotProbeMode::WrappedOnly,
+        (false, false) => SpotProbeMode::None,
+    }
+}
+
+fn spot_price_candidate(raw_price: Option<f64>, inverted: bool) -> Option<f64> {
+    let raw_spot_price = raw_price.filter(|price| price.is_finite() && *price > 0.0)?;
+    let eth_to_sell_spot_price = if inverted {
+        1.0 / raw_spot_price
+    } else {
+        raw_spot_price
+    };
+    if !eth_to_sell_spot_price.is_finite()
+        || eth_to_sell_spot_price <= 0.0
+        || !(MIN_REASONABLE_ETH_TO_SELL_SPOT..=MAX_REASONABLE_ETH_TO_SELL_SPOT)
+            .contains(&eth_to_sell_spot_price)
+    {
+        return None;
+    }
+
+    Some(eth_to_sell_spot_price)
 }
 
 fn compute_gas_in_sell_base_units(
@@ -1861,6 +2041,75 @@ mod tests {
     }
 
     #[test]
+    fn remap_request_token_for_pool_maps_wrapped_to_native_for_native_only_pool() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let wrapped = chain.wrapped_native_token();
+        let token_x = make_token(&Bytes::from([9u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([1u8; 20]),
+            "rocketpool".to_string(),
+            "rocketpool".to_string(),
+            chain,
+            vec![native.clone(), token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&wrapped, &component);
+
+        assert_eq!(mapped.address, native.address);
+    }
+
+    #[test]
+    fn remap_request_token_for_pool_maps_native_to_wrapped_for_wrapped_only_pool() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let wrapped = chain.wrapped_native_token();
+        let token_x = make_token(&Bytes::from([10u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([2u8; 20]),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            chain,
+            vec![wrapped.clone(), token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&native, &component);
+
+        assert_eq!(mapped.address, wrapped.address);
+    }
+
+    #[test]
+    fn remap_request_token_for_pool_keeps_non_native_tokens_unchanged() {
+        let chain = Chain::Ethereum;
+        let native = chain.native_token();
+        let request_token = make_token(&Bytes::from([42u8; 20]), "USDC");
+        let token_x = make_token(&Bytes::from([11u8; 20]), "TKX");
+        let component = ProtocolComponent::new(
+            Bytes::from([3u8; 20]),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            chain,
+            vec![native, token_x],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+
+        let mapped = remap_request_token_for_pool(&request_token, &component);
+
+        assert_eq!(mapped.address, request_token.address);
+    }
+
+    #[test]
     fn vm_first_gas_metrics_aggregate_median_ratio_and_samples() {
         let mut metrics = QuoteMetrics::default();
         let mut vm_first_gases = Vec::new();
@@ -2126,6 +2375,90 @@ mod tests {
         Token::new(address, symbol, decimals, 0, &[], Chain::Ethereum, 100)
     }
 
+    fn make_token_store(tokens: impl IntoIterator<Item = Token>) -> Arc<TokenStore> {
+        let initial_tokens = tokens
+            .into_iter()
+            .map(|token| (token.address.clone(), token))
+            .collect();
+        Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ))
+    }
+
+    fn make_pair_component(
+        address: &str,
+        protocol_system: &str,
+        protocol_type_name: &str,
+        tokens: Vec<Token>,
+    ) -> ProtocolComponent {
+        ProtocolComponent::new(
+            Bytes::from_str(address).expect("valid pool address"),
+            protocol_system.to_string(),
+            protocol_type_name.to_string(),
+            Chain::Ethereum,
+            tokens,
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        )
+    }
+
+    struct TestAppStateConfig {
+        enable_vm_pools: bool,
+        native_sim_concurrency: usize,
+        vm_sim_concurrency: usize,
+        gas_price_wei: Option<u128>,
+        gas_reporting_enabled: bool,
+    }
+
+    impl Default for TestAppStateConfig {
+        fn default() -> Self {
+            Self {
+                enable_vm_pools: false,
+                native_sim_concurrency: 1,
+                vm_sim_concurrency: 1,
+                gas_price_wei: None,
+                gas_reporting_enabled: false,
+            }
+        }
+    }
+
+    fn make_test_app_state(
+        token_store: Arc<TokenStore>,
+        native_state_store: Arc<StateStore>,
+        vm_state_store: Arc<StateStore>,
+        config: TestAppStateConfig,
+    ) -> AppState {
+        AppState {
+            tokens: token_store,
+            native_state_store,
+            vm_state_store,
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(config.gas_price_wei)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(
+                config.gas_reporting_enabled,
+            )),
+            enable_vm_pools: config.enable_vm_pools,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: config.native_sim_concurrency,
+            vm_sim_concurrency: config.vm_sim_concurrency,
+        }
+    }
+
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct SpotPriceCountingSim {
         spot_price_value: Option<f64>,
@@ -2267,6 +2600,191 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ProbeModeGuardSpotPriceSim {
+        sell_token: Bytes,
+        wrapped_native: Bytes,
+        native_token: Bytes,
+        native_price: f64,
+        wrapped_price: f64,
+        #[serde(skip, default = "default_calls")]
+        native_calls: Arc<AtomicUsize>,
+        #[serde(skip, default = "default_calls")]
+        wrapped_calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for ProbeModeGuardSpotPriceSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
+            let is_native_pair = (base.address == self.native_token
+                && quote.address == self.sell_token)
+                || (base.address == self.sell_token && quote.address == self.native_token);
+            if is_native_pair {
+                self.native_calls.fetch_add(1, Ordering::SeqCst);
+                return if base.address == self.sell_token {
+                    Ok(1.0 / self.native_price)
+                } else {
+                    Ok(self.native_price)
+                };
+            }
+
+            let is_wrapped_pair = (base.address == self.wrapped_native
+                && quote.address == self.sell_token)
+                || (base.address == self.sell_token && quote.address == self.wrapped_native);
+            if is_wrapped_pair {
+                self.wrapped_calls.fetch_add(1, Ordering::SeqCst);
+                return if base.address == self.sell_token {
+                    Ok(1.0 / self.wrapped_price)
+                } else {
+                    Ok(self.wrapped_price)
+                };
+            }
+
+            Err(SimulationError::FatalError(
+                "pair not supported".to_string(),
+            ))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                amount_in,
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct StrictPairTokenSim {
+        expected_sell: Bytes,
+        expected_buy: Bytes,
+        #[serde(skip, default = "default_calls")]
+        limit_calls: Arc<AtomicUsize>,
+        #[serde(skip, default = "default_calls")]
+        quote_calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for StrictPairTokenSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Err(SimulationError::FatalError("spot unavailable".to_string()))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            token_in: &Token,
+            token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.quote_calls.fetch_add(1, Ordering::SeqCst);
+            if token_in.address != self.expected_sell || token_out.address != self.expected_buy {
+                return Err(SimulationError::InvalidInput(
+                    format!(
+                        "unexpected token pair for quote: {} -> {}",
+                        token_in.address, token_out.address
+                    ),
+                    None,
+                ));
+            }
+
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::from(21_000u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            sell_token: Bytes,
+            buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            self.limit_calls.fetch_add(1, Ordering::SeqCst);
+            if sell_token != self.expected_sell || buy_token != self.expected_buy {
+                return Err(SimulationError::InvalidInput(
+                    format!(
+                        "unexpected token pair for limits: {} -> {}",
+                        sell_token, buy_token
+                    ),
+                    None,
+                ));
+            }
+
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     #[test]
     fn resolve_request_eth_to_sell_spot_price_returns_one_for_wrapped_native_sell() {
         let sell_token = Chain::Ethereum.wrapped_native_token();
@@ -2323,6 +2841,168 @@ mod tests {
                 .expect("spot price should resolve");
 
         assert!((price - 2_500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_request_eth_to_sell_spot_price_native_only_pool_ignores_wrapped_path() {
+        let sell_token = make_token_with_decimals(
+            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
+            "USDT",
+            6,
+        );
+        let wrapped_native = Chain::Ethereum.wrapped_native_token();
+        let native_token = Chain::Ethereum.native_token();
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let wrapped_calls = Arc::new(AtomicUsize::new(0));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x00000000000000000000000000000000000000b1")
+                .expect("valid pool address"),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![native_token.clone(), sell_token.clone()],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let sim = ProbeModeGuardSpotPriceSim {
+            sell_token: sell_token.address.clone(),
+            wrapped_native: wrapped_native.address.clone(),
+            native_token: native_token.address.clone(),
+            native_price: 2_500.0,
+            wrapped_price: 552_709_307.0,
+            native_calls: Arc::clone(&native_calls),
+            wrapped_calls: Arc::clone(&wrapped_calls),
+        };
+
+        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+            vec![(
+                "pool-a".to_string(),
+                Arc::new(sim) as Arc<dyn ProtocolSim>,
+                Arc::new(component),
+            )];
+        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
+
+        let price =
+            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
+                .expect("spot price should resolve");
+
+        assert!((price - 2_500.0).abs() < f64::EPSILON);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resolve_request_eth_to_sell_spot_price_wrapped_only_pool_ignores_native_path() {
+        let sell_token = make_token_with_decimals(
+            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
+            "USDT",
+            6,
+        );
+        let wrapped_native = Chain::Ethereum.wrapped_native_token();
+        let native_token = Chain::Ethereum.native_token();
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let wrapped_calls = Arc::new(AtomicUsize::new(0));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x00000000000000000000000000000000000000b2")
+                .expect("valid pool address"),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![wrapped_native.clone(), sell_token.clone()],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let sim = ProbeModeGuardSpotPriceSim {
+            sell_token: sell_token.address.clone(),
+            wrapped_native: wrapped_native.address.clone(),
+            native_token: native_token.address.clone(),
+            native_price: 552_709_307.0,
+            wrapped_price: 2_500.0,
+            native_calls: Arc::clone(&native_calls),
+            wrapped_calls: Arc::clone(&wrapped_calls),
+        };
+
+        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+            vec![(
+                "pool-a".to_string(),
+                Arc::new(sim) as Arc<dyn ProtocolSim>,
+                Arc::new(component),
+            )];
+        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
+
+        let price =
+            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
+                .expect("spot price should resolve");
+
+        assert!((price - 2_500.0).abs() < f64::EPSILON);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolve_request_eth_to_sell_spot_price_returns_none_when_probe_mode_is_none() {
+        let sell_token = make_token_with_decimals(
+            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
+            "USDT",
+            6,
+        );
+        let unrelated_a = make_token_with_decimals(
+            &Bytes::from_str("0x00000000000000000000000000000000000000d1").expect("valid address"),
+            "AAA",
+            18,
+        );
+        let unrelated_b = make_token_with_decimals(
+            &Bytes::from_str("0x00000000000000000000000000000000000000d2").expect("valid address"),
+            "BBB",
+            18,
+        );
+        let spot_price_calls = Arc::new(AtomicUsize::new(0));
+
+        let component = ProtocolComponent::new(
+            Bytes::from_str("0x00000000000000000000000000000000000000b3")
+                .expect("valid pool address"),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Chain::Ethereum,
+            vec![unrelated_a, unrelated_b],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        let sim = SpotPriceCountingSim {
+            spot_price_value: Some(2_500.0),
+            max_in: 1_000_000,
+            spot_price_calls: Arc::clone(&spot_price_calls),
+        };
+
+        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+            vec![(
+                "pool-a".to_string(),
+                Arc::new(sim) as Arc<dyn ProtocolSim>,
+                Arc::new(component),
+            )];
+        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
+
+        let spot_price =
+            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates);
+        assert_eq!(spot_price, None);
+        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            compute_gas_in_sell_base_units(
+                Some(1_000_000_000_000_000_000),
+                Some(21_000),
+                spot_price,
+                sell_token.decimals,
+            ),
+            "0"
+        );
     }
 
     #[test]
@@ -2528,6 +3208,233 @@ mod tests {
             assert_eq!(response.gas_used, vec![2, 5]);
             assert_eq!(response.gas_in_sell, "3750");
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
+        let token_store = make_token_store(Vec::new());
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let app_state = make_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
+
+        let native = Chain::Ethereum.native_token().address.to_string();
+        let wrapped = Chain::Ethereum.wrapped_native_token().address.to_string();
+        for (request_id, token_in, token_out) in [
+            ("req-native-to-wrapped", native.clone(), wrapped.clone()),
+            ("req-wrapped-to-native", wrapped.clone(), native.clone()),
+        ] {
+            let request = AmountOutRequest {
+                request_id: request_id.to_string(),
+                auction_id: None,
+                token_in,
+                token_out,
+                amounts: vec!["1".to_string()],
+            };
+
+            let computation = get_amounts_out(app_state.clone(), request, None).await;
+
+            assert!(computation.responses.is_empty());
+            assert!(matches!(
+                computation.meta.status,
+                QuoteStatus::InvalidRequest
+            ));
+            assert_eq!(
+                computation.meta.result_quality,
+                QuoteResultQuality::RequestLevelFailure
+            );
+            assert_eq!(computation.meta.matching_pools, 0);
+            assert_eq!(computation.meta.candidate_pools, 0);
+            assert!(computation
+                .meta
+                .failures
+                .iter()
+                .any(|failure| matches!(failure.kind, QuoteFailureKind::InvalidRequest)));
+            assert_eq!(computation.meta.failures.len(), 1);
+            assert_eq!(
+                computation.meta.failures[0].message,
+                "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_pool() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let native = Chain::Ethereum.native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
+        let token_store = make_token_store(vec![
+            wrapped_meta.clone(),
+            native_meta.clone(),
+            token_out_meta.clone(),
+        ]);
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        states.insert(
+            "pool-native".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-native".to_string(),
+            make_pair_component(
+                "0x0000000000000000000000000000000000000011",
+                "rocketpool",
+                "rocketpool",
+                vec![native_meta, token_out_meta],
+            ),
+        );
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig::default(),
+        );
+
+        let request = AmountOutRequest {
+            request_id: "req-remap-native-only".to_string(),
+            auction_id: None,
+            token_in: wrapped_native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["2".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert!(!computation.responses.is_empty());
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_vm_pool() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let native = Chain::Ethereum.native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
+
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK4", 6);
+        let token_store = make_token_store(vec![
+            wrapped_meta.clone(),
+            native_meta.clone(),
+            token_out_meta.clone(),
+        ]);
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        // Keep native store ready without creating any matching pools for the request pair.
+        let native_dummy_token_a =
+            Bytes::from_str("0x0000000000000000000000000000000000000010").expect("valid address");
+        let native_dummy_token_b =
+            Bytes::from_str("0x0000000000000000000000000000000000000011").expect("valid address");
+        let native_dummy_meta_a = make_token_with_decimals(&native_dummy_token_a, "NTA", 18);
+        let native_dummy_meta_b = make_token_with_decimals(&native_dummy_token_b, "NTB", 18);
+        let mut native_states = HashMap::new();
+        let mut native_pairs = HashMap::new();
+        native_states.insert(
+            "native-dummy".to_string(),
+            Box::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn ProtocolSim>,
+        );
+        native_pairs.insert(
+            "native-dummy".to_string(),
+            make_pair_component(
+                "0x0000000000000000000000000000000000000013",
+                "uniswap_v2",
+                "uniswap_v2",
+                vec![native_dummy_meta_a, native_dummy_meta_b],
+            ),
+        );
+        native_state_store
+            .apply_update(Update::new(1, native_states, native_pairs))
+            .await;
+
+        let vm_limit_calls = Arc::new(AtomicUsize::new(0));
+        let vm_quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut vm_states = HashMap::new();
+        let mut vm_pairs = HashMap::new();
+        vm_states.insert(
+            "vm-native".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&vm_limit_calls),
+                quote_calls: Arc::clone(&vm_quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        vm_pairs.insert(
+            "vm-native".to_string(),
+            make_pair_component(
+                "0x0000000000000000000000000000000000000014",
+                "vm:curve",
+                "curve_pool",
+                vec![native_meta, token_out_meta],
+            ),
+        );
+        vm_state_store
+            .apply_update(Update::new(2, vm_states, vm_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let request = AmountOutRequest {
+            request_id: "req-remap-vm-native-only".to_string(),
+            auction_id: None,
+            token_in: wrapped_native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["2".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(vm_limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(computation.metrics.scheduled_vm_pools, 1);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
     }
 
     #[tokio::test]
