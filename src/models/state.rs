@@ -13,6 +13,11 @@ use tycho_simulation::{
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
 
 const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
+const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+
+fn native_token_address() -> Bytes {
+    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -514,7 +519,7 @@ impl StateStore {
         token: &Bytes,
     ) -> Option<HashSet<String>> {
         let wrapped_native_token = self.tokens.wrapped_native_token();
-        let native_address = Bytes::from([0u8; 20]);
+        let native_address = native_token_address();
         let needs_native = wrapped_native_token.as_ref() == Some(token);
         let needs_wrapped = *token == native_address;
 
@@ -1127,230 +1132,123 @@ mod tests {
         assert_eq!(app_state.current_vm_block().await, Some(1));
     }
     #[tokio::test]
-    async fn matching_pools_includes_native_for_wrapped_native() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
+    async fn matching_pools_native_wrapped_aliasing_cases() {
+        enum RequestTokenIn {
+            Wrapped,
+            Native,
+            Other,
+        }
 
-        let weth_address =
+        struct Case {
+            name: &'static str,
+            request_token_in: RequestTokenIn,
+            include_wrapped_pool: bool,
+            include_native_pool: bool,
+            expected_pool_ids: &'static [&'static str],
+        }
+
+        let wrapped_address =
             Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
-        let weth_token = Token::new(&weth_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
-        let native_address = Bytes::from([0u8; 20]);
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
-        let token_x = mk_token(9, "TKNX");
-
-        let component_wrapped = mk_component(
-            20,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![weth_token, token_x.clone()],
-        );
-        let component_native = mk_component(
-            21,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token, token_x.clone()],
-        );
-
-        let update = mk_update(vec![
-            (
-                "pool-weth".to_string(),
-                component_wrapped,
-                Box::new(DummySim),
-            ),
-            (
-                "pool-native".to_string(),
-                component_native,
-                Box::new(DummySim),
-            ),
-        ]);
-        store.apply_update(update).await;
-
-        let matches = store
-            .matching_pools_by_addresses(&weth_address, &token_x.address)
-            .await;
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("pool-weth"));
-        assert!(ids.contains("pool-native"));
-    }
-
-    #[tokio::test]
-    async fn matching_pools_includes_native_only_pool_for_wrapped_native() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let weth_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
-        let native_address = Bytes::from([0u8; 20]);
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
-        let token_x = mk_token(9, "TKNX");
-
-        let component_native = mk_component(
-            21,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token, token_x.clone()],
-        );
-
-        let update = mk_update(vec![(
-            "pool-native".to_string(),
-            component_native,
-            Box::new(DummySim),
-        )]);
-        store.apply_update(update).await;
-
-        let matches = store
-            .matching_pools_by_addresses(&weth_address, &token_x.address)
-            .await;
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(ids.len(), 1);
-        assert!(ids.contains("pool-native"));
-    }
-
-    #[tokio::test]
-    async fn matching_pools_includes_wrapped_for_native_token() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let weth_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
-        let weth_token = Token::new(&weth_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
-        let native_address = Bytes::from([0u8; 20]);
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
-        let token_x = mk_token(9, "TKNX");
-
-        let component_wrapped = mk_component(
-            22,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![weth_token, token_x.clone()],
-        );
-        let component_native = mk_component(
-            23,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token, token_x.clone()],
-        );
-
-        let update = mk_update(vec![
-            (
-                "pool-weth".to_string(),
-                component_wrapped,
-                Box::new(DummySim),
-            ),
-            (
-                "pool-native".to_string(),
-                component_native,
-                Box::new(DummySim),
-            ),
-        ]);
-        store.apply_update(update).await;
-
-        let matches = store
-            .matching_pools_by_addresses(&native_address, &token_x.address)
-            .await;
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("pool-weth"));
-        assert!(ids.contains("pool-native"));
-    }
-
-    #[tokio::test]
-    async fn matching_pools_includes_wrapped_only_pool_for_native_token() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let weth_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
-        let weth_token = Token::new(&weth_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
-        let native_address = Bytes::from([0u8; 20]);
-        let token_x = mk_token(9, "TKNX");
-
-        let component_wrapped = mk_component(
-            24,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![weth_token, token_x.clone()],
-        );
-
-        let update = mk_update(vec![(
-            "pool-weth".to_string(),
-            component_wrapped,
-            Box::new(DummySim),
-        )]);
-        store.apply_update(update).await;
-
-        let matches = store
-            .matching_pools_by_addresses(&native_address, &token_x.address)
-            .await;
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(ids.len(), 1);
-        assert!(ids.contains("pool-weth"));
-    }
-
-    #[tokio::test]
-    async fn matching_pools_does_not_include_native_for_non_wrapped_token() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let native_address = Bytes::from([0u8; 20]);
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let native_address = native_token_address();
         let token_x = mk_token(9, "TKNX");
         let token_y = mk_token(10, "TKNY");
+        let wrapped_token = Token::new(&wrapped_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
 
-        let component_native = mk_component(
-            21,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token, token_x.clone()],
-        );
+        let cases = [
+            Case {
+                name: "wrapped request includes wrapped and native pools",
+                request_token_in: RequestTokenIn::Wrapped,
+                include_wrapped_pool: true,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-weth", "pool-native"],
+            },
+            Case {
+                name: "wrapped request includes native-only pool",
+                request_token_in: RequestTokenIn::Wrapped,
+                include_wrapped_pool: false,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-native"],
+            },
+            Case {
+                name: "native request includes wrapped and native pools",
+                request_token_in: RequestTokenIn::Native,
+                include_wrapped_pool: true,
+                include_native_pool: true,
+                expected_pool_ids: &["pool-weth", "pool-native"],
+            },
+            Case {
+                name: "native request includes wrapped-only pool",
+                request_token_in: RequestTokenIn::Native,
+                include_wrapped_pool: true,
+                include_native_pool: false,
+                expected_pool_ids: &["pool-weth"],
+            },
+            Case {
+                name: "non wrapped request does not include native pool",
+                request_token_in: RequestTokenIn::Other,
+                include_wrapped_pool: false,
+                include_native_pool: true,
+                expected_pool_ids: &[],
+            },
+        ];
 
-        let update = mk_update(vec![(
-            "pool-native".to_string(),
-            component_native,
-            Box::new(DummySim),
-        )]);
-        store.apply_update(update).await;
+        for case in cases {
+            let token_store = Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_secs(1),
+            ));
+            let store = StateStore::new(token_store);
+            let mut update_pairs = Vec::new();
 
-        let matches = store
-            .matching_pools_by_addresses(&token_y.address, &token_x.address)
-            .await;
+            if case.include_wrapped_pool {
+                update_pairs.push((
+                    "pool-weth".to_string(),
+                    mk_component(
+                        20,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![wrapped_token.clone(), token_x.clone()],
+                    ),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                ));
+            }
 
-        assert!(matches.is_empty());
+            if case.include_native_pool {
+                update_pairs.push((
+                    "pool-native".to_string(),
+                    mk_component(
+                        21,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![native_token.clone(), token_x.clone()],
+                    ),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                ));
+            }
+
+            store.apply_update(mk_update(update_pairs)).await;
+
+            let request_token_in = match case.request_token_in {
+                RequestTokenIn::Wrapped => &wrapped_address,
+                RequestTokenIn::Native => &native_address,
+                RequestTokenIn::Other => &token_y.address,
+            };
+            let matches = store
+                .matching_pools_by_addresses(request_token_in, &token_x.address)
+                .await;
+            let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+            let expected: HashSet<String> = case
+                .expected_pool_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+
+            assert_eq!(ids, expected, "case {}", case.name);
+        }
     }
 
     #[tokio::test]
