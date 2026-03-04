@@ -151,6 +151,26 @@ pub async fn get_amounts_out(
         }
     };
 
+    let wrapped_native = state.tokens.wrapped_native_token();
+    if is_direct_native_wrapped_pair(&token_in_bytes, &token_out_bytes, wrapped_native.as_ref()) {
+        failures.push(make_failure(
+            QuoteFailureKind::InvalidRequest,
+            "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
+                .to_string(),
+            None,
+        ));
+        meta.status = QuoteStatus::InvalidRequest;
+        meta.result_quality = QuoteResultQuality::RequestLevelFailure;
+        meta.pool_results = pool_results;
+        meta.vm_unavailable = metrics.skipped_vm_unavailable;
+        meta.failures = failures;
+        return QuoteComputation {
+            responses,
+            meta,
+            metrics,
+        };
+    }
+
     if !state.is_ready() {
         let ready = state.wait_for_readiness(readiness_wait).await;
         if !ready {
@@ -444,18 +464,25 @@ pub async fn get_amounts_out(
     let native = token_in_ref.chain.native_token();
     let wrapped_native = token_in_ref.chain.wrapped_native_token();
 
-    let mut spot_native_candidates_raw = state
-        .native_state_store
-        .matching_pools_by_addresses(&token_in_bytes, &wrapped_native.address)
-        .await;
-    if native.address != wrapped_native.address {
-        spot_native_candidates_raw.extend(
-            state
-                .native_state_store
-                .matching_pools_by_addresses(&token_in_bytes, &native.address)
-                .await,
-        );
-    }
+    let mut spot_native_candidates_raw = if token_in_ref.address == native.address
+        || token_in_ref.address == wrapped_native.address
+    {
+        Vec::new()
+    } else {
+        let mut candidates = state
+            .native_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &wrapped_native.address)
+            .await;
+        if native.address != wrapped_native.address {
+            candidates.extend(
+                state
+                    .native_state_store
+                    .matching_pools_by_addresses(&token_in_bytes, &native.address)
+                    .await,
+            );
+        }
+        candidates
+    };
 
     let mut seen_spot_ids = HashSet::new();
     let mut spot_native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
@@ -979,6 +1006,20 @@ fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolCompo
     }
 
     request_token.clone()
+}
+
+fn is_direct_native_wrapped_pair(
+    token_in: &Bytes,
+    token_out: &Bytes,
+    wrapped_native: Option<&Bytes>,
+) -> bool {
+    let native_address = Bytes::from([0u8; 20]);
+    let Some(wrapped_native) = wrapped_native else {
+        return false;
+    };
+
+    (token_in == &native_address && token_out == wrapped_native)
+        || (token_in == wrapped_native && token_out == &native_address)
 }
 
 struct PoolQuoteResult {
@@ -2752,6 +2793,79 @@ mod tests {
         for response in &computation.responses {
             assert_eq!(response.gas_used, vec![2, 5]);
             assert_eq!(response.gas_in_sell, "3750");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(60),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store,
+            vm_state_store,
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let native = Chain::Ethereum.native_token().address.to_string();
+        let wrapped = Chain::Ethereum.wrapped_native_token().address.to_string();
+        for (request_id, token_in, token_out) in [
+            ("req-native-to-wrapped", native.clone(), wrapped.clone()),
+            ("req-wrapped-to-native", wrapped.clone(), native.clone()),
+        ] {
+            let request = AmountOutRequest {
+                request_id: request_id.to_string(),
+                auction_id: None,
+                token_in,
+                token_out,
+                amounts: vec!["1".to_string()],
+            };
+
+            let computation = get_amounts_out(app_state.clone(), request, None).await;
+
+            assert!(computation.responses.is_empty());
+            assert!(matches!(
+                computation.meta.status,
+                QuoteStatus::InvalidRequest
+            ));
+            assert_eq!(
+                computation.meta.result_quality,
+                QuoteResultQuality::RequestLevelFailure
+            );
+            assert_eq!(computation.meta.matching_pools, 0);
+            assert_eq!(computation.meta.candidate_pools, 0);
+            assert!(computation
+                .meta
+                .failures
+                .iter()
+                .any(|failure| matches!(failure.kind, QuoteFailureKind::InvalidRequest)));
+            assert_eq!(computation.meta.failures.len(), 1);
+            assert_eq!(
+                computation.meta.failures[0].message,
+                "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
+            );
         }
     }
 

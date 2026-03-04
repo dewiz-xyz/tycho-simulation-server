@@ -537,16 +537,6 @@ impl StateStore {
         (!ids.is_empty()).then_some(ids)
     }
 
-    fn is_opposite_native_wrapped_pair(&self, token_in: &Bytes, token_out: &Bytes) -> bool {
-        let native_address = Bytes::from([0u8; 20]);
-        let Some(wrapped_address) = self.tokens.wrapped_native_token() else {
-            return false;
-        };
-
-        (token_in == &native_address && token_out == &wrapped_address)
-            || (token_in == &wrapped_address && token_out == &native_address)
-    }
-
     pub(crate) async fn matching_pools_by_addresses(
         &self,
         token_in: &Bytes,
@@ -555,14 +545,10 @@ impl StateStore {
         // Keep both token ID lookups on the same index snapshot under concurrent updates.
         let (token_in_ids, token_out_ids) = {
             let index = self.token_index.read().await;
-            if self.is_opposite_native_wrapped_pair(token_in, token_out) {
-                (index.get(token_in).cloned(), index.get(token_out).cloned())
-            } else {
-                (
-                    self.ids_for_token_from_index(&index, token_in),
-                    self.ids_for_token_from_index(&index, token_out),
-                )
-            }
+            (
+                self.ids_for_token_from_index(&index, token_in),
+                self.ids_for_token_from_index(&index, token_out),
+            )
         };
 
         let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
@@ -1365,81 +1351,6 @@ mod tests {
             .await;
 
         assert!(matches.is_empty());
-    }
-
-    #[tokio::test]
-    async fn matching_pools_does_not_union_native_wrapped_opposite_pair() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let native_address = Bytes::from([0u8; 20]);
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
-        let weth_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
-        let weth_token = Token::new(&weth_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
-        let token_x = mk_token(11, "TKNX");
-
-        let component_native_x = mk_component(
-            30,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token.clone(), token_x.clone()],
-        );
-        let component_weth_x = mk_component(
-            31,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![weth_token.clone(), token_x],
-        );
-        let component_native_weth = mk_component(
-            32,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![native_token, weth_token],
-        );
-
-        let update = mk_update(vec![
-            (
-                "pool-native-x".to_string(),
-                component_native_x,
-                Box::new(DummySim),
-            ),
-            (
-                "pool-weth-x".to_string(),
-                component_weth_x,
-                Box::new(DummySim),
-            ),
-            (
-                "pool-native-weth".to_string(),
-                component_native_weth,
-                Box::new(DummySim),
-            ),
-        ]);
-        store.apply_update(update).await;
-
-        let native_to_weth = store
-            .matching_pools_by_addresses(&native_address, &weth_address)
-            .await;
-        let native_to_weth_ids: HashSet<String> =
-            native_to_weth.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(native_to_weth_ids.len(), 1);
-        assert!(native_to_weth_ids.contains("pool-native-weth"));
-
-        let weth_to_native = store
-            .matching_pools_by_addresses(&weth_address, &native_address)
-            .await;
-        let weth_to_native_ids: HashSet<String> =
-            weth_to_native.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(weth_to_native_ids.len(), 1);
-        assert!(weth_to_native_ids.contains("pool-native-weth"));
     }
 
     #[tokio::test]
