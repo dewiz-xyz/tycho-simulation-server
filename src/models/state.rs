@@ -508,13 +508,16 @@ impl StateStore {
         }
     }
 
-    async fn ids_for_token(&self, token: &Bytes) -> Option<HashSet<String>> {
+    fn ids_for_token_from_index(
+        &self,
+        index: &HashMap<Bytes, HashSet<String>>,
+        token: &Bytes,
+    ) -> Option<HashSet<String>> {
         let wrapped_native_token = self.tokens.wrapped_native_token();
         let native_address = Bytes::from([0u8; 20]);
         let needs_native = wrapped_native_token.as_ref() == Some(token);
         let needs_wrapped = *token == native_address;
 
-        let index = self.token_index.read().await;
         let mut ids = index.get(token).cloned().unwrap_or_default();
 
         if needs_native {
@@ -549,16 +552,18 @@ impl StateStore {
         token_in: &Bytes,
         token_out: &Bytes,
     ) -> Vec<(String, PoolEntry)> {
-        let (token_in_ids, token_out_ids) =
+        // Keep both token ID lookups on the same index snapshot under concurrent updates.
+        let (token_in_ids, token_out_ids) = {
+            let index = self.token_index.read().await;
             if self.is_opposite_native_wrapped_pair(token_in, token_out) {
-                let index = self.token_index.read().await;
                 (index.get(token_in).cloned(), index.get(token_out).cloned())
             } else {
                 (
-                    self.ids_for_token(token_in).await,
-                    self.ids_for_token(token_out).await,
+                    self.ids_for_token_from_index(&index, token_in),
+                    self.ids_for_token_from_index(&index, token_out),
                 )
-            };
+            }
+        };
 
         let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
             return Vec::new();
@@ -1435,6 +1440,88 @@ mod tests {
 
         assert_eq!(weth_to_native_ids.len(), 1);
         assert!(weth_to_native_ids.contains("pool-native-weth"));
+    }
+
+    #[tokio::test]
+    async fn matching_pools_reads_token_ids_from_single_snapshot() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = Arc::new(StateStore::new(token_store));
+
+        let token_a = mk_token(70, "TKNA");
+        let token_b = mk_token(71, "TKNB");
+
+        let component_v1 = mk_component(
+            40,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let component_v2 = mk_component(
+            41,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+
+        store
+            .apply_update(mk_update(vec![
+                ("pool-v1".to_string(), component_v1, Box::new(DummySim)),
+                ("pool-v2".to_string(), component_v2, Box::new(DummySim)),
+            ]))
+            .await;
+
+        let token_a_address = token_a.address.clone();
+        let token_b_address = token_b.address.clone();
+        let mut index_guard = store.token_index.write().await;
+        *index_guard = HashMap::from([
+            (
+                token_a_address.clone(),
+                HashSet::from(["pool-v1".to_string()]),
+            ),
+            (
+                token_b_address.clone(),
+                HashSet::from(["pool-v1".to_string()]),
+            ),
+        ]);
+
+        let query_store = Arc::clone(&store);
+        let query_token_a = token_a_address.clone();
+        let query_token_b = token_b_address.clone();
+        let query_task = tokio::spawn(async move {
+            query_store
+                .matching_pools_by_addresses(&query_token_a, &query_token_b)
+                .await
+        });
+
+        // Queue the reader before the writer while an external write lock is held.
+        // The previous two-read implementation could then observe v1 for token_a and v2
+        // for token_b, causing a transient empty intersection.
+        tokio::task::yield_now().await;
+
+        let writer_store = Arc::clone(&store);
+        let writer_token_a = token_a_address;
+        let writer_token_b = token_b_address;
+        let writer_task = tokio::spawn(async move {
+            let mut index = writer_store.token_index.write().await;
+            *index = HashMap::from([
+                (writer_token_a, HashSet::from(["pool-v2".to_string()])),
+                (writer_token_b, HashSet::from(["pool-v2".to_string()])),
+            ]);
+        });
+
+        drop(index_guard);
+
+        writer_task.await.expect("writer task should succeed");
+        let matches = query_task.await.expect("query task should succeed");
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(ids, HashSet::from(["pool-v1".to_string()]));
     }
 
     #[tokio::test]
