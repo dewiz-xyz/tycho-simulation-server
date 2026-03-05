@@ -542,28 +542,11 @@ impl StateStore {
         (!ids.is_empty()).then_some(ids)
     }
 
-    pub(crate) async fn matching_pools_by_addresses(
-        &self,
-        token_in: &Bytes,
-        token_out: &Bytes,
-    ) -> Vec<(String, PoolEntry)> {
-        // Keep both token ID lookups on the same index snapshot under concurrent updates.
-        let (token_in_ids, token_out_ids) = {
-            let index = self.token_index.read().await;
-            (
-                self.ids_for_token_from_index(&index, token_in),
-                self.ids_for_token_from_index(&index, token_out),
-            )
-        };
-
-        let (Some(token_in_ids), Some(token_out_ids)) = (token_in_ids, token_out_ids) else {
-            return Vec::new();
-        };
-
-        let (smaller, larger) = if token_in_ids.len() <= token_out_ids.len() {
-            (token_in_ids, token_out_ids)
+    fn intersect_pool_ids(left: HashSet<String>, right: HashSet<String>) -> Vec<String> {
+        let (smaller, larger) = if left.len() <= right.len() {
+            (left, right)
         } else {
-            (token_out_ids, token_in_ids)
+            (right, left)
         };
 
         let mut candidate_ids = Vec::with_capacity(smaller.len());
@@ -573,6 +556,13 @@ impl StateStore {
             }
         }
 
+        candidate_ids
+    }
+
+    async fn pool_entries_for_candidate_ids(
+        &self,
+        candidate_ids: &[String],
+    ) -> Vec<(String, PoolEntry)> {
         if candidate_ids.is_empty() {
             return Vec::new();
         }
@@ -585,12 +575,16 @@ impl StateStore {
                 .collect()
         };
 
+        if id_kinds.is_empty() {
+            return Vec::new();
+        }
+
         let mut by_kind: HashMap<ProtocolKind, Vec<String>> = HashMap::new();
         for (id, kind) in id_kinds {
             by_kind.entry(kind).or_default().push(id);
         }
 
-        let mut result = Vec::with_capacity(candidate_ids.len());
+        let mut result = Vec::new();
         for (kind, ids) in by_kind {
             if let Some(shard) = self.shards.get(&kind) {
                 let guard = shard.states.read().await;
@@ -603,6 +597,51 @@ impl StateStore {
         }
 
         result
+    }
+
+    pub(crate) async fn matching_pools_by_addresses(
+        &self,
+        token_in: &Bytes,
+        token_out: &Bytes,
+    ) -> Vec<(String, PoolEntry)> {
+        // Keep both token ID lookups on the same index snapshot under concurrent updates.
+        let (token_in_exact_ids, token_out_exact_ids, token_in_ids, token_out_ids) = {
+            let index = self.token_index.read().await;
+            (
+                index.get(token_in).cloned(),
+                index.get(token_out).cloned(),
+                self.ids_for_token_from_index(&index, token_in),
+                self.ids_for_token_from_index(&index, token_out),
+            )
+        };
+
+        let exact_candidate_ids = match (token_in_exact_ids, token_out_exact_ids) {
+            (Some(token_in_exact_ids), Some(token_out_exact_ids)) => {
+                Self::intersect_pool_ids(token_in_exact_ids, token_out_exact_ids)
+            }
+            _ => Vec::new(),
+        };
+
+        // Prefer exact token matches first, but if those IDs are stale by the time we
+        // resolve active pools, fall back to alias-expanded candidates.
+        if !exact_candidate_ids.is_empty() {
+            let exact_entries = self
+                .pool_entries_for_candidate_ids(exact_candidate_ids.as_slice())
+                .await;
+            if !exact_entries.is_empty() {
+                return exact_entries;
+            }
+        }
+
+        let alias_candidate_ids = match (token_in_ids, token_out_ids) {
+            (Some(token_in_ids), Some(token_out_ids)) => {
+                Self::intersect_pool_ids(token_in_ids, token_out_ids)
+            }
+            _ => Vec::new(),
+        };
+
+        self.pool_entries_for_candidate_ids(alias_candidate_ids.as_slice())
+            .await
     }
 
     pub(crate) async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
@@ -1157,28 +1196,28 @@ mod tests {
 
         let cases = [
             Case {
-                name: "wrapped request includes wrapped and native pools",
+                name: "wrapped request prefers exact wrapped pools",
                 request_token_in: RequestTokenIn::Wrapped,
                 include_wrapped_pool: true,
                 include_native_pool: true,
-                expected_pool_ids: &["pool-weth", "pool-native"],
+                expected_pool_ids: &["pool-weth"],
             },
             Case {
-                name: "wrapped request includes native-only pool",
+                name: "wrapped request falls back to native-only pool",
                 request_token_in: RequestTokenIn::Wrapped,
                 include_wrapped_pool: false,
                 include_native_pool: true,
                 expected_pool_ids: &["pool-native"],
             },
             Case {
-                name: "native request includes wrapped and native pools",
+                name: "native request prefers exact native pools",
                 request_token_in: RequestTokenIn::Native,
                 include_wrapped_pool: true,
                 include_native_pool: true,
-                expected_pool_ids: &["pool-weth", "pool-native"],
+                expected_pool_ids: &["pool-native"],
             },
             Case {
-                name: "native request includes wrapped-only pool",
+                name: "native request falls back to wrapped-only pool",
                 request_token_in: RequestTokenIn::Native,
                 include_wrapped_pool: true,
                 include_native_pool: false,
@@ -1249,6 +1288,63 @@ mod tests {
 
             assert_eq!(ids, expected, "case {}", case.name);
         }
+    }
+
+    #[tokio::test]
+    async fn matching_pools_falls_back_to_alias_when_exact_ids_are_stale() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+
+        let wrapped_address =
+            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let native_address = native_token_address();
+        let token_x = mk_token(12, "TKNX");
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+
+        // Keep one live native-only pool so alias fallback has a valid target.
+        store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                mk_component(
+                    22,
+                    "rocketpool",
+                    "rocketpool",
+                    vec![native_token, token_x.clone()],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        // Inject stale exact IDs that no longer exist in id_to_kind.
+        let mut index_guard = store.token_index.write().await;
+        *index_guard = HashMap::from([
+            (
+                wrapped_address.clone(),
+                HashSet::from(["pool-stale".to_string()]),
+            ),
+            (
+                native_address.clone(),
+                HashSet::from(["pool-native".to_string()]),
+            ),
+            (
+                token_x.address.clone(),
+                HashSet::from(["pool-stale".to_string(), "pool-native".to_string()]),
+            ),
+        ]);
+        drop(index_guard);
+
+        let matches = store
+            .matching_pools_by_addresses(&wrapped_address, &token_x.address)
+            .await;
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
     }
 
     #[tokio::test]
