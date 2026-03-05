@@ -48,19 +48,24 @@ def is_int_string(value) -> bool:
     return value.isdigit()
 
 
-def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
+def validate_pool_entry(entry, expected_len: int, allow_partial_output: bool) -> tuple[bool, str]:
     if not isinstance(entry, dict):
         return False, "pool entry is not an object"
 
     amounts_out = entry.get("amounts_out")
-    if not isinstance(amounts_out, list) or len(amounts_out) != expected_len:
+    if not isinstance(amounts_out, list) or not amounts_out:
+        return False, "amounts_out must be a non-empty list"
+    if allow_partial_output:
+        if len(amounts_out) > expected_len:
+            return False, f"amounts_out length mismatch (expected <= {expected_len})"
+    elif len(amounts_out) != expected_len:
         return False, f"amounts_out length mismatch (expected {expected_len})"
     if not all(is_int_string(v) for v in amounts_out):
         return False, "amounts_out contains non-integer strings"
 
     gas_used = entry.get("gas_used")
-    if not isinstance(gas_used, list) or len(gas_used) != expected_len:
-        return False, f"gas_used length mismatch (expected {expected_len})"
+    if not isinstance(gas_used, list) or len(gas_used) != len(amounts_out):
+        return False, "gas_used length mismatch with amounts_out"
     if not all(isinstance(v, int) and v >= 0 for v in gas_used):
         return False, "gas_used contains non-integers"
 
@@ -97,7 +102,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Validate response pool entries (amounts_out/gas_used lengths, gas_in_sell integer-string, "
-            "block_number, monotonicity)"
+            "block_number, monotonicity; with --allow-failures, partial ladders are allowed)"
         ),
     )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
@@ -212,7 +217,11 @@ def main() -> int:
 
         if args.validate_data and isinstance(data, list):
             for entry in data:
-                ok, error = validate_pool_entry(entry, expected_len=len(amounts))
+                ok, error = validate_pool_entry(
+                    entry,
+                    expected_len=len(amounts),
+                    allow_partial_output=args.allow_failures,
+                )
                 if not ok:
                     print(f"[FAIL] {pair_label} invalid pool entry: {error}")
                     failures += 1
