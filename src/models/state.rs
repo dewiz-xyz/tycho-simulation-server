@@ -689,7 +689,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::models::messages::AmountOutRequest;
+    use crate::models::stream_health::StreamHealth;
+    use crate::services::quotes::get_amounts_out;
     use num_bigint::BigUint;
+    use num_traits::Zero;
+    use tokio::sync::RwLock;
     use tycho_simulation::{
         protocol::models::ProtocolComponent,
         tycho_common::{
@@ -760,6 +765,66 @@ mod tests {
 
         fn eq(&self, other: &dyn ProtocolSim) -> bool {
             other.as_any().is::<DummySim>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+    struct QuoteableSim;
+
+    #[typetag::serde]
+    impl ProtocolSim for QuoteableSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Err(SimulationError::FatalError("spot unavailable".to_string()))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::from(21_000u64),
+                Box::new(self.clone()),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<QuoteableSim>()
         }
     }
 
@@ -1345,6 +1410,99 @@ mod tests {
         let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
 
         assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_uses_alias_fallback_when_exact_ids_are_stale() {
+        let wrapped_address =
+            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let native_address = native_token_address();
+        let token_x = mk_token(12, "TKNX");
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let wrapped_token = Token::new(&wrapped_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
+
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::from([
+                (wrapped_address.clone(), wrapped_token.clone()),
+                (native_address.clone(), native_token.clone()),
+                (token_x.address.clone(), token_x.clone()),
+            ]),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        native_state_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                mk_component(
+                    23,
+                    "rocketpool",
+                    "rocketpool",
+                    vec![native_token, token_x.clone()],
+                ),
+                Box::new(QuoteableSim),
+            )]))
+            .await;
+
+        let mut index_guard = native_state_store.token_index.write().await;
+        *index_guard = HashMap::from([
+            (
+                wrapped_address.clone(),
+                HashSet::from(["pool-stale".to_string()]),
+            ),
+            (
+                native_address.clone(),
+                HashSet::from(["pool-native".to_string()]),
+            ),
+            (
+                token_x.address.clone(),
+                HashSet::from(["pool-stale".to_string(), "pool-native".to_string()]),
+            ),
+        ]);
+        drop(index_guard);
+
+        let app_state = AppState {
+            tokens: Arc::clone(&token_store),
+            native_state_store,
+            vm_state_store,
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
+            native_gas_price_reporting_enabled: Arc::new(RwLock::new(false)),
+            enable_vm_pools: false,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_secs(1),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(2),
+            native_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency: 1,
+            vm_sim_concurrency: 1,
+        };
+
+        let computation = get_amounts_out(
+            app_state,
+            AmountOutRequest {
+                request_id: "req-stale-alias-quote".to_string(),
+                auction_id: None,
+                token_in: wrapped_address.to_string(),
+                token_out: token_x.address.to_string(),
+                amounts: vec!["2".to_string()],
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "pool-native");
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
     }
 
     #[tokio::test]

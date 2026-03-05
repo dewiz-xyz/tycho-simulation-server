@@ -156,7 +156,7 @@ pub async fn simulate(
         };
     }
 
-    if timed_out {
+    if timed_out && computation.responses.is_empty() {
         log_completion!(
             tracing::Level::WARN,
             "handler_timeout",
