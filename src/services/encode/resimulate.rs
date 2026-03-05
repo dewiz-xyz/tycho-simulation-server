@@ -14,7 +14,7 @@ use tycho_simulation::{
 
 use crate::models::state::AppState;
 use crate::services::native_wrapped::normalize_native_to_wrapped;
-use crate::services::pool_runtime::{run_blocking_pool_job, PermitAcquire, PoolJobError};
+use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
 use super::allocation::allocate_swaps_by_bps;
 use super::model::{
@@ -110,49 +110,60 @@ pub(super) async fn resimulate_route(
 
                 let pool_state = Arc::clone(&pool_entry.0);
                 let amount_in_for_sim = allocated.amount_in.clone();
-                let pool_timeout = if pool_entry.1.protocol_system.starts_with("vm:") {
+                let is_vm_pool = pool_entry.1.protocol_system.starts_with("vm:");
+                let pool_timeout = if is_vm_pool {
                     state.pool_timeout_vm()
                 } else {
                     state.pool_timeout_native()
                 };
+                let permit = if is_vm_pool {
+                    state
+                        .vm_sim_semaphore()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            EncodeError::internal(format!(
+                                "Pool {} semaphore closed",
+                                allocated.pool.component_id
+                            ))
+                        })?
+                } else {
+                    state
+                        .native_sim_semaphore()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            EncodeError::internal(format!(
+                                "Pool {} semaphore closed",
+                                allocated.pool.component_id
+                            ))
+                        })?
+                };
 
                 let component_id = allocated.pool.component_id.clone();
-                let (pre_state, result) = run_blocking_pool_job(
-                    state,
-                    &pool_entry.1.protocol_system,
-                    pool_timeout,
-                    PermitAcquire::Acquire,
-                    None,
-                    move |_| {
+                let (pre_state, result) =
+                    run_blocking_pool_job(permit, pool_timeout, None, move |_| {
                         let pre_state = pool_state;
                         let result =
                             pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
                         (pre_state, result)
-                    },
-                )
-                .await
-                .map_err(|error| match error {
-                    PoolJobError::TimedOut => EncodeError::simulation(format!(
-                        "Pool {} simulation timed out after {}ms",
-                        component_id,
-                        pool_timeout.as_millis()
-                    )),
-                    PoolJobError::Cancelled => EncodeError::simulation(format!(
-                        "Pool {} simulation cancelled",
-                        component_id
-                    )),
-                    PoolJobError::SemaphoreClosed => {
-                        EncodeError::internal(format!("Pool {} semaphore closed", component_id))
-                    }
-                    PoolJobError::JoinFailed(join_err) => EncodeError::internal(format!(
-                        "Pool {} simulation task failed: {}",
-                        component_id, join_err
-                    )),
-                    PoolJobError::NoPermit => EncodeError::internal(format!(
-                        "Pool {} unexpectedly skipped permit acquisition",
-                        component_id
-                    )),
-                })?;
+                    })
+                    .await
+                    .map_err(|error| match error {
+                        PoolJobError::TimedOut => EncodeError::simulation(format!(
+                            "Pool {} simulation timed out after {}ms",
+                            component_id,
+                            pool_timeout.as_millis()
+                        )),
+                        PoolJobError::Cancelled => EncodeError::simulation(format!(
+                            "Pool {} simulation cancelled",
+                            component_id
+                        )),
+                        PoolJobError::JoinFailed(join_err) => EncodeError::internal(format!(
+                            "Pool {} simulation task failed: {}",
+                            component_id, join_err
+                        )),
+                    })?;
                 let result = result.map_err(|err| {
                     EncodeError::simulation(format!(
                         "Pool {} simulation failed: {}",
