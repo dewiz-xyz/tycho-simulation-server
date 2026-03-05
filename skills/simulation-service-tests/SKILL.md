@@ -30,7 +30,7 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
-`run_suite.sh` smoke checks now require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
+`run_suite.sh` smoke checks require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount: ETH/WETH sell tokens use direct `1.0` conversion from gas-in-ETH, other sell tokens currently return `"0"`, and `"0"` is also valid when gas reporting inputs are unavailable.
 
 VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
 ```bash
@@ -41,6 +41,7 @@ If you need to tolerate partial failures or empty-liquidity responses while stil
 ```bash
 scripts/run_suite.sh --repo . --suite core --allow-partial --allow-no-liquidity --stop
 ```
+With `--allow-partial`, smoke validation now accepts partial-ladder pool entries as long as `amounts_out` and `gas_used` stay aligned, monotonic, and non-empty.
 
 ## Smoke test /simulate
 
@@ -63,6 +64,8 @@ Allow partial responses explicitly:
 ```bash
 python3 scripts/simulate_smoke.py --suite smoke --allow-status ready,partial_success --allow-failures
 ```
+Quote handler logs now keep request-guard and zero-result timeout completions at `WARN` (`scope="handler_timeout"`), while partial-success responses that still return usable quotes log at `INFO` (`scope="handler_complete"`).
+When `--allow-failures` is set together with `--validate-data`, partial ladders are accepted.
 
 ## Smoke test /encode
 
