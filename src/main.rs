@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
@@ -21,13 +22,22 @@ use tycho_simulation_server::services::stream_builder::{build_native_stream, bui
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+fn main() -> anyhow::Result<()> {
     init_logging();
-
-    // Load configuration
     let config = load_config();
+    let max_blocking_threads = std::cmp::max(
+        512,
+        config.global_native_sim_concurrency + config.global_vm_sim_concurrency + 32,
+    );
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking_threads)
+        .build()?;
+
+    runtime.block_on(async_main(config))
+}
+
+async fn async_main(config: tycho_simulation_server::config::AppConfig) -> anyhow::Result<()> {
     info!("Initializing price service...");
 
     info!(
