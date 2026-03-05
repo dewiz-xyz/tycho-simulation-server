@@ -1,10 +1,15 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    future::FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
+use tokio::sync::TryAcquireError;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -26,7 +31,7 @@ use crate::models::tokens::TokenStoreError;
 use crate::services::native_wrapped::{
     is_direct_native_wrapped_pair, is_native_or_wrapped_token, simulation_tokens_for_pool,
 };
-use crate::services::pool_runtime::{run_blocking_pool_job, PermitAcquire, PoolJobError};
+use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -473,6 +478,12 @@ pub async fn get_amounts_out(
         .unwrap_or_default();
     let mut tasks = FuturesUnordered::new();
     let mut vm_first_gases = Vec::new();
+    let native_semaphore = state.native_sim_semaphore();
+    let vm_semaphore = state.vm_sim_semaphore();
+    // Count pools that actually acquired a permit so timeout metrics stay accurate
+    // without reserving capacity during the enqueue pass.
+    let scheduled_native_pools = Arc::new(AtomicUsize::new(0));
+    let scheduled_vm_pools = Arc::new(AtomicUsize::new(0));
 
     // Native first
     for (id, pool_state, component) in native_candidates.into_iter() {
@@ -510,7 +521,6 @@ pub async fn get_amounts_out(
         );
 
         tasks.push(simulate_pool(
-            state.clone(),
             id,
             pool_state,
             pool_address,
@@ -524,6 +534,8 @@ pub async fn get_amounts_out(
             quote_deadline,
             pool_timeout,
             pool_cancel,
+            native_semaphore.clone(),
+            Arc::clone(&scheduled_native_pools),
         ));
     }
 
@@ -563,7 +575,6 @@ pub async fn get_amounts_out(
         );
 
         tasks.push(simulate_pool(
-            state.clone(),
             id,
             pool_state,
             pool_address,
@@ -577,6 +588,8 @@ pub async fn get_amounts_out(
             quote_deadline,
             pool_timeout,
             pool_cancel,
+            vm_semaphore.clone(),
+            Arc::clone(&scheduled_vm_pools),
         ));
     }
 
@@ -597,163 +610,57 @@ pub async fn get_amounts_out(
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
                     meta.status = QuoteStatus::PartialSuccess;
+                    drain_ready_pool_outcomes(
+                        &mut tasks,
+                        &mut responses,
+                        &mut failures,
+                        &mut pool_results,
+                        &mut metrics,
+                        &mut meta,
+                        &mut vm_first_gases,
+                        expected_len,
+                        gas_price_wei,
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
+                        current_block,
+                    );
                     break;
                 }
                 _ = cancel_token.cancelled() => {
                     meta.status = QuoteStatus::PartialSuccess;
+                    drain_ready_pool_outcomes(
+                        &mut tasks,
+                        &mut responses,
+                        &mut failures,
+                        &mut pool_results,
+                        &mut metrics,
+                        &mut meta,
+                        &mut vm_first_gases,
+                        expected_len,
+                        gas_price_wei,
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
+                        current_block,
+                    );
                     break;
                 }
                 maybe_outcome = tasks.next() => {
                     match maybe_outcome {
                         Some(outcome) => {
-                            if outcome.scheduled() {
-                                record_scheduled_pool_metrics(&mut metrics, outcome.protocol());
-                            }
-                            match outcome {
-                                PoolTaskResult::Completed(outcome) => match outcome {
-                                    PoolSimOutcome::Simulated(result) => {
-                                        let had_timeout = is_timeout_like_outcome(&result);
-                                        let is_partial = result.amounts_out.len() < expected_len;
-                                        record_vm_first_gas_metrics(
-                                            &mut metrics,
-                                            &mut vm_first_gases,
-                                            result.protocol.as_str(),
-                                            result.pool.as_str(),
-                                            result.gas_used.first().copied(),
-                                        );
-
-                                        if let Some((outcome_kind, reason)) =
-                                            classify_pool_outcome(&result, expected_len)
-                                        {
-                                            pool_results.push(make_pool_outcome(
-                                                result.pool.clone(),
-                                                result.pool_name.clone(),
-                                                result.pool_address.clone(),
-                                                result.protocol.clone(),
-                                                outcome_kind,
-                                                result.amounts_out.len(),
-                                                expected_len,
-                                                reason,
-                                            ));
-                                        }
-
-                                        if !result.errors.is_empty() || is_partial {
-                                            let context = FailureContext {
-                                                pool_id: &result.pool,
-                                                pool_name: Some(&result.pool_name),
-                                                pool_address: Some(&result.pool_address),
-                                                protocol: Some(&result.protocol),
-                                            };
-                                            let descriptor = format_pool_descriptor(&context);
-                                            let message = if had_timeout {
-                                                format!(
-                                                    "{}: Quote computation timed out (partial ladder {} of {} steps)",
-                                                    descriptor,
-                                                    result.amounts_out.len(),
-                                                    expected_len
-                                                )
-                                            } else if result.amounts_out.is_empty() {
-                                                let base_error = result
-                                                    .errors
-                                                    .first()
-                                                    .cloned()
-                                                    .unwrap_or_else(|| "Pool returned no quotes".to_string());
-                                                format!("{}: {}", descriptor, base_error)
-                                            } else {
-                                                format!(
-                                                    "{} produced partial ladder ({} of {} steps)",
-                                                    descriptor,
-                                                    result.amounts_out.len(),
-                                                    expected_len
-                                                )
-                                            };
-                                            let kind = if had_timeout {
-                                                QuoteFailureKind::Timeout
-                                            } else if result.amounts_out.is_empty() {
-                                                classify_failure(&message, true)
-                                            } else {
-                                                QuoteFailureKind::InconsistentResult
-                                            };
-                                            failures.push(make_failure(kind, message, Some(context)));
-                                        }
-
-                                        if !result.amounts_out.is_empty() {
-                                            let gas_in_sell = compute_gas_in_sell_base_units(
-                                                gas_price_wei,
-                                                result.gas_used.last().copied(),
-                                                eth_to_sell_spot_price,
-                                                sell_token_decimals,
-                                            );
-                                            responses.push(AmountOutResponse {
-                                                pool: result.pool,
-                                                pool_name: result.pool_name,
-                                                pool_address: result.pool_address,
-                                                amounts_out: result.amounts_out,
-                                                gas_used: result.gas_used,
-                                                gas_in_sell,
-                                                block_number: current_block,
-                                            });
-                                        }
-                                    }
-                                    PoolSimOutcome::SkippedDueToLimits {
-                                        pool,
-                                        pool_name,
-                                        pool_address,
-                                        protocol,
-                                        reason,
-                                    } => {
-                                        if protocol.starts_with("vm:") {
-                                            metrics.skipped_vm_limits += 1;
-                                        } else {
-                                            metrics.skipped_native_limits += 1;
-                                        }
-                                        pool_results.push(make_pool_outcome(
-                                            pool,
-                                            pool_name,
-                                            pool_address,
-                                            protocol,
-                                            PoolOutcomeKind::SkippedPrecheck,
-                                            0,
-                                            expected_len,
-                                            reason,
-                                        ));
-                                    }
-                                },
-                                PoolTaskResult::SkippedDueToConcurrency {
-                                    pool,
-                                    pool_name,
-                                    pool_address,
-                                    protocol,
-                                    reason,
-                                } => {
-                                    if protocol.starts_with("vm:") {
-                                        metrics.skipped_vm_concurrency += 1;
-                                    } else {
-                                        metrics.skipped_native_concurrency += 1;
-                                    }
-                                    pool_results.push(make_pool_outcome(
-                                        pool,
-                                        pool_name,
-                                        pool_address,
-                                        protocol,
-                                        PoolOutcomeKind::SkippedConcurrency,
-                                        0,
-                                        expected_len,
-                                        reason,
-                                    ));
-                                }
-                                PoolTaskResult::Failed { failure, .. } => {
-                                    if let Some(pool_outcome) =
-                                        pool_outcome_from_failure(&failure, expected_len)
-                                    {
-                                        pool_results.push(pool_outcome);
-                                    }
-                                    if matches!(failure.kind, QuoteFailureKind::Internal) {
-                                        meta.status = QuoteStatus::InternalError;
-                                    }
-                                    failures.push(failure);
-                                }
-                            }
+                            handle_pool_task_result(
+                                outcome,
+                                &mut responses,
+                                &mut failures,
+                                &mut pool_results,
+                                &mut metrics,
+                                &mut meta,
+                                &mut vm_first_gases,
+                                expected_len,
+                                gas_price_wei,
+                                eth_to_sell_spot_price,
+                                sell_token_decimals,
+                                current_block,
+                            );
                         }
                         None => break,
                     }
@@ -763,6 +670,8 @@ pub async fn get_amounts_out(
     }
 
     drop(tasks);
+    metrics.scheduled_native_pools = scheduled_native_pools.load(Ordering::Relaxed);
+    metrics.scheduled_vm_pools = scheduled_vm_pools.load(Ordering::Relaxed);
     finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
 
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
@@ -937,44 +846,11 @@ enum PoolTaskResult {
     },
     Failed {
         failure: QuoteFailure,
-        scheduled: bool,
     },
-}
-
-impl PoolTaskResult {
-    fn protocol(&self) -> Option<&str> {
-        match self {
-            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
-                Some(result.protocol.as_str())
-            }
-            PoolTaskResult::Completed(PoolSimOutcome::SkippedDueToLimits { protocol, .. }) => {
-                Some(protocol.as_str())
-            }
-            PoolTaskResult::SkippedDueToConcurrency { protocol, .. } => Some(protocol.as_str()),
-            PoolTaskResult::Failed { failure, .. } => failure.protocol.as_deref(),
-        }
-    }
-
-    fn scheduled(&self) -> bool {
-        match self {
-            PoolTaskResult::Completed(_) => true,
-            PoolTaskResult::SkippedDueToConcurrency { .. } => false,
-            PoolTaskResult::Failed { scheduled, .. } => *scheduled,
-        }
-    }
-}
-
-fn record_scheduled_pool_metrics(metrics: &mut QuoteMetrics, protocol: Option<&str>) {
-    match protocol {
-        Some(protocol) if protocol.starts_with("vm:") => metrics.scheduled_vm_pools += 1,
-        Some(_) => metrics.scheduled_native_pools += 1,
-        None => {}
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn simulate_pool(
-    state: AppState,
     pool_id: String,
     pool_state: Arc<dyn ProtocolSim>,
     pool_address: String,
@@ -988,6 +864,8 @@ async fn simulate_pool(
     quote_deadline: Instant,
     pool_timeout: Duration,
     cancel_token: CancellationToken,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    scheduled_pool_count: Arc<AtomicUsize>,
 ) -> PoolTaskResult {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
@@ -997,12 +875,43 @@ async fn simulate_pool(
     let token_out_clone = Arc::clone(&token_out);
     let amounts_clone = Arc::clone(&amounts);
     let cancel_token_clone = cancel_token.clone();
-    let pool_protocol_for_runtime = pool_protocol.clone();
+    let permit = match semaphore.try_acquire_owned() {
+        Ok(permit) => {
+            scheduled_pool_count.fetch_add(1, Ordering::Relaxed);
+            permit
+        }
+        Err(TryAcquireError::NoPermits) => {
+            return PoolTaskResult::SkippedDueToConcurrency {
+                pool: pool_id_for_failure,
+                pool_name: pool_name_for_failure,
+                pool_address: pool_addr_for_failure,
+                protocol: pool_protocol_for_failure,
+                reason: Some(
+                    "Pool scheduling skipped because concurrency permits were exhausted"
+                        .to_string(),
+                ),
+            };
+        }
+        Err(TryAcquireError::Closed) => {
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            return PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Internal,
+                    format!("{}: Pool semaphore closed", descriptor),
+                    Some(context),
+                ),
+            };
+        }
+    };
     let result = run_blocking_pool_job(
-        &state,
-        &pool_protocol_for_runtime,
+        permit,
         pool_timeout,
-        PermitAcquire::TryAcquire,
         Some(cancel_token.clone()),
         move |started_at| {
             let deadline = std::cmp::min(started_at + pool_timeout, quote_deadline);
@@ -1290,32 +1199,6 @@ async fn simulate_pool(
 
     match result {
         Ok(outcome) => PoolTaskResult::Completed(outcome),
-        Err(PoolJobError::NoPermit) => PoolTaskResult::SkippedDueToConcurrency {
-            pool: pool_id_for_failure,
-            pool_name: pool_name_for_failure,
-            pool_address: pool_addr_for_failure,
-            protocol: pool_protocol_for_failure,
-            reason: Some(
-                "Pool scheduling skipped because concurrency permits were exhausted".to_string(),
-            ),
-        },
-        Err(PoolJobError::SemaphoreClosed) => {
-            let context = FailureContext {
-                pool_id: &pool_id_for_failure,
-                pool_name: Some(pool_name_for_failure.as_str()),
-                pool_address: Some(pool_addr_for_failure.as_str()),
-                protocol: Some(pool_protocol_for_failure.as_str()),
-            };
-            let descriptor = format_pool_descriptor(&context);
-            PoolTaskResult::Failed {
-                failure: make_failure(
-                    QuoteFailureKind::Internal,
-                    format!("{}: Pool semaphore closed", descriptor),
-                    Some(context),
-                ),
-                scheduled: false,
-            }
-        }
         Err(PoolJobError::TimedOut) => {
             let context = FailureContext {
                 pool_id: &pool_id_for_failure,
@@ -1330,7 +1213,6 @@ async fn simulate_pool(
                     format!("{}: Quote computation timed out", descriptor),
                     Some(context),
                 ),
-                scheduled: true,
             }
         }
         Err(PoolJobError::Cancelled) => {
@@ -1347,7 +1229,6 @@ async fn simulate_pool(
                     format!("{}: Quote computation cancelled", descriptor),
                     Some(context),
                 ),
-                scheduled: true,
             }
         }
         Err(PoolJobError::JoinFailed(join_err)) => {
@@ -1364,9 +1245,201 @@ async fn simulate_pool(
                     format!("{}: Quote computation panicked: {}", descriptor, join_err),
                     Some(context),
                 ),
-                scheduled: true,
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_pool_task_result(
+    outcome: PoolTaskResult,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) {
+    match outcome {
+        PoolTaskResult::Completed(outcome) => match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                let had_timeout = is_timeout_like_outcome(&result);
+                let is_partial = result.amounts_out.len() < expected_len;
+                record_vm_first_gas_metrics(
+                    metrics,
+                    vm_first_gases,
+                    result.protocol.as_str(),
+                    result.pool.as_str(),
+                    result.gas_used.first().copied(),
+                );
+
+                if let Some((outcome_kind, reason)) = classify_pool_outcome(&result, expected_len) {
+                    pool_results.push(make_pool_outcome(
+                        result.pool.clone(),
+                        result.pool_name.clone(),
+                        result.pool_address.clone(),
+                        result.protocol.clone(),
+                        outcome_kind,
+                        result.amounts_out.len(),
+                        expected_len,
+                        reason,
+                    ));
+                }
+
+                if !result.errors.is_empty() || is_partial {
+                    let context = FailureContext {
+                        pool_id: &result.pool,
+                        pool_name: Some(&result.pool_name),
+                        pool_address: Some(&result.pool_address),
+                        protocol: Some(&result.protocol),
+                    };
+                    let descriptor = format_pool_descriptor(&context);
+                    let message = if had_timeout {
+                        format!(
+                            "{}: Quote computation timed out (partial ladder {} of {} steps)",
+                            descriptor,
+                            result.amounts_out.len(),
+                            expected_len
+                        )
+                    } else if result.amounts_out.is_empty() {
+                        let base_error = result
+                            .errors
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "Pool returned no quotes".to_string());
+                        format!("{}: {}", descriptor, base_error)
+                    } else {
+                        format!(
+                            "{} produced partial ladder ({} of {} steps)",
+                            descriptor,
+                            result.amounts_out.len(),
+                            expected_len
+                        )
+                    };
+                    let kind = if had_timeout {
+                        QuoteFailureKind::Timeout
+                    } else if result.amounts_out.is_empty() {
+                        classify_failure(&message, true)
+                    } else {
+                        QuoteFailureKind::InconsistentResult
+                    };
+                    failures.push(make_failure(kind, message, Some(context)));
+                }
+
+                if !result.amounts_out.is_empty() {
+                    let gas_in_sell = compute_gas_in_sell_base_units(
+                        gas_price_wei,
+                        result.gas_used.last().copied(),
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
+                    );
+                    responses.push(AmountOutResponse {
+                        pool: result.pool,
+                        pool_name: result.pool_name,
+                        pool_address: result.pool_address,
+                        amounts_out: result.amounts_out,
+                        gas_used: result.gas_used,
+                        gas_in_sell,
+                        block_number: current_block,
+                    });
+                }
+            }
+            PoolSimOutcome::SkippedDueToLimits {
+                pool,
+                pool_name,
+                pool_address,
+                protocol,
+                reason,
+            } => {
+                if protocol.starts_with("vm:") {
+                    metrics.skipped_vm_limits += 1;
+                } else {
+                    metrics.skipped_native_limits += 1;
+                }
+                pool_results.push(make_pool_outcome(
+                    pool,
+                    pool_name,
+                    pool_address,
+                    protocol,
+                    PoolOutcomeKind::SkippedPrecheck,
+                    0,
+                    expected_len,
+                    reason,
+                ));
+            }
+        },
+        PoolTaskResult::SkippedDueToConcurrency {
+            pool,
+            pool_name,
+            pool_address,
+            protocol,
+            reason,
+        } => {
+            if protocol.starts_with("vm:") {
+                metrics.skipped_vm_concurrency += 1;
+            } else {
+                metrics.skipped_native_concurrency += 1;
+            }
+            pool_results.push(make_pool_outcome(
+                pool,
+                pool_name,
+                pool_address,
+                protocol,
+                PoolOutcomeKind::SkippedConcurrency,
+                0,
+                expected_len,
+                reason,
+            ));
+        }
+        PoolTaskResult::Failed { failure } => {
+            if let Some(pool_outcome) = pool_outcome_from_failure(&failure, expected_len) {
+                pool_results.push(pool_outcome);
+            }
+            if matches!(failure.kind, QuoteFailureKind::Internal) {
+                meta.status = QuoteStatus::InternalError;
+            }
+            failures.push(failure);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_pool_outcomes<F>(
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    while let Some(Some(outcome)) = tasks.next().now_or_never() {
+        handle_pool_task_result(
+            outcome,
+            responses,
+            failures,
+            pool_results,
+            metrics,
+            meta,
+            vm_first_gases,
+            expected_len,
+            gas_price_wei,
+            eth_to_sell_spot_price,
+            sell_token_decimals,
+            current_block,
+        );
     }
 }
 
@@ -1753,6 +1826,14 @@ mod tests {
     use crate::models::tokens::TokenStore;
 
     fn default_calls() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    fn test_semaphore() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(1))
+    }
+
+    fn test_scheduled_counter() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
     }
 
@@ -2215,25 +2296,6 @@ mod tests {
         }
     }
 
-    fn make_runtime_only_app_state(
-        native_sim_concurrency: usize,
-        vm_sim_concurrency: usize,
-    ) -> AppState {
-        let token_store = make_token_store(Vec::new());
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        make_test_app_state(
-            token_store,
-            native_state_store,
-            vm_state_store,
-            TestAppStateConfig {
-                native_sim_concurrency,
-                vm_sim_concurrency,
-                ..TestAppStateConfig::default()
-            },
-        )
-    }
-
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct SpotPriceCountingSim {
         spot_price_value: Option<f64>,
@@ -2273,6 +2335,69 @@ mod tests {
             _buy_token: Bytes,
         ) -> Result<(BigUint, BigUint), SimulationError> {
             Ok((BigUint::from(self.max_in), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct SlowQuoteSim {
+        delay_ms: u64,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for SlowQuoteSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Err(SimulationError::FatalError("spot unavailable".to_string()))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            std::thread::sleep(Duration::from_millis(self.delay_ms));
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::from(21_000u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
         }
 
         fn delta_transition(
@@ -3539,7 +3664,6 @@ mod tests {
         };
 
         let outcome = simulate_pool(
-            make_runtime_only_app_state(1, 1),
             "pool-1".to_string(),
             Arc::new(sim),
             "0x0000000000000000000000000000000000000009".to_string(),
@@ -3553,6 +3677,8 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(50),
             CancellationToken::new(),
+            test_semaphore(),
+            test_scheduled_counter(),
         )
         .await;
 
@@ -3586,7 +3712,6 @@ mod tests {
         };
 
         let outcome = simulate_pool(
-            make_runtime_only_app_state(1, 1),
             "pool-1".to_string(),
             Arc::new(sim),
             "0x0000000000000000000000000000000000000009".to_string(),
@@ -3600,6 +3725,8 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(50),
             CancellationToken::new(),
+            test_semaphore(),
+            test_scheduled_counter(),
         )
         .await;
 
@@ -4044,7 +4171,6 @@ mod tests {
         };
 
         let outcome = simulate_pool(
-            make_runtime_only_app_state(1, 1),
             "pool-1".to_string(),
             Arc::new(sim),
             "0x0000000000000000000000000000000000000009".to_string(),
@@ -4058,6 +4184,8 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(50),
             CancellationToken::new(),
+            test_semaphore(),
+            test_scheduled_counter(),
         )
         .await;
 
@@ -4099,7 +4227,6 @@ mod tests {
             occupier_started_rx.await.expect("occupier should start");
 
             let outcome = simulate_pool(
-                make_runtime_only_app_state(1, 1),
                 "pool-delayed".to_string(),
                 Arc::new(SpotPriceCountingSim {
                     spot_price_value: Some(1.0),
@@ -4117,6 +4244,8 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_millis(20),
                 CancellationToken::new(),
+                test_semaphore(),
+                test_scheduled_counter(),
             )
             .await;
 
@@ -4131,6 +4260,56 @@ mod tests {
                 _ => panic!("expected queued pool to complete after blocking thread became free"),
             }
         });
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_does_not_reserve_permit_before_poll() {
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address");
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+        let semaphore = test_semaphore();
+        let scheduled = test_scheduled_counter();
+
+        let future = simulate_pool(
+            "pool-queued".to_string(),
+            Arc::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8)]),
+            BigUint::from(1u8),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
+            CancellationToken::new(),
+            semaphore.clone(),
+            Arc::clone(&scheduled),
+        );
+
+        let extra_permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("queued future should not reserve the only permit");
+        assert_eq!(scheduled.load(Ordering::SeqCst), 0);
+        drop(extra_permit);
+
+        let outcome = future.await;
+
+        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        match outcome {
+            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
+                assert_eq!(result.amounts_out, vec!["1".to_string()]);
+                assert_eq!(result.gas_used, vec![1]);
+            }
+            _ => panic!("expected queued pool to acquire permit once polled"),
+        }
     }
 
     #[tokio::test]
@@ -4452,6 +4631,96 @@ mod tests {
             .pool_results
             .iter()
             .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::ConcurrencyLimit)));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_keeps_scheduling_metrics_and_skip_outcomes() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let token_in_meta = make_token(&token_in, "TK1");
+        let token_out_meta = make_token(&token_out, "TK2");
+
+        let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        for (pool_id, address) in [
+            ("pool-1", "0x0000000000000000000000000000000000000031"),
+            ("pool-2", "0x0000000000000000000000000000000000000032"),
+            ("pool-3", "0x0000000000000000000000000000000000000033"),
+        ] {
+            states.insert(
+                pool_id.to_string(),
+                Box::new(SlowQuoteSim { delay_ms: 50 }) as Box<dyn ProtocolSim>,
+            );
+            new_pairs.insert(
+                pool_id.to_string(),
+                make_pair_component(
+                    address,
+                    "uniswap_v2",
+                    "uniswap_v2",
+                    vec![token_in_meta.clone(), token_out_meta.clone()],
+                ),
+            );
+        }
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let mut app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 1,
+                ..TestAppStateConfig::default()
+            },
+        );
+        app_state.quote_timeout = Duration::from_millis(10);
+        app_state.pool_timeout_native = Duration::from_millis(100);
+
+        let request = AmountOutRequest {
+            request_id: "req-timeout-accounting".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(computation.responses.is_empty());
+        assert_eq!(computation.metrics.scheduled_native_pools, 1);
+        assert_eq!(computation.metrics.skipped_native_concurrency, 2);
+        assert_eq!(
+            computation
+                .meta
+                .pool_results
+                .iter()
+                .filter(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency)
+                .count(),
+            2
+        );
+        assert!(matches!(
+            computation.meta.status,
+            QuoteStatus::PartialSuccess
+        ));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout)));
         assert!(computation
             .meta
             .failures
