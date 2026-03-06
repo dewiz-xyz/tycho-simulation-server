@@ -805,6 +805,17 @@ pub async fn get_amounts_out(
                                                 eth_to_sell_spot_price,
                                                 sell_token_decimals,
                                             );
+                                            let slippage_bps = compute_slippage_bps(
+                                                &amounts_in,
+                                                &result.amounts_out,
+                                                result.spot_price,
+                                                token_in.decimals,
+                                                token_out.decimals,
+                                            );
+                                            let pool_utilization_bps = compute_pool_utilization_bps(
+                                                &requested_max_in,
+                                                result.max_in.as_ref(),
+                                            );
                                             responses.push(AmountOutResponse {
                                                 pool: result.pool,
                                                 pool_name: result.pool_name,
@@ -813,6 +824,8 @@ pub async fn get_amounts_out(
                                                 gas_used: result.gas_used,
                                                 gas_in_sell,
                                                 block_number: current_block,
+                                                slippage_bps,
+                                                pool_utilization_bps,
                                             });
                                         }
                                     }
@@ -1057,6 +1070,10 @@ struct PoolQuoteResult {
     gas_used: Vec<u64>,
     errors: Vec<String>,
     timed_out: bool,
+    /// Marginal spot price: token_out per token_in, human-readable (decimal-adjusted) units.
+    spot_price: Option<f64>,
+    /// Maximum token_in the pool can absorb, from get_limits().
+    max_in: Option<BigUint>,
 }
 
 enum PoolSimOutcome {
@@ -1128,6 +1145,8 @@ async fn simulate_pool(
                 gas_used: Vec::new(),
                 errors: vec!["Cancelled".to_string()],
                 timed_out: false,
+                spot_price: None,
+                max_in: None,
             });
         }
         if Instant::now() >= deadline {
@@ -1148,6 +1167,8 @@ async fn simulate_pool(
                 gas_used: Vec::new(),
                 errors: vec!["Timed out".to_string()],
                 timed_out: true,
+                spot_price: None,
+                max_in: None,
             });
         }
 
@@ -1162,12 +1183,14 @@ async fn simulate_pool(
         let mut probed_amount_in: Option<BigUint> = None;
         let mut probed_amount: Option<(String, u64)> = None;
         let mut probed_amount_error: Option<String> = None;
+        let mut pool_max_in: Option<BigUint> = None;
         if !requested_max_in.is_zero() {
             match pool_state.get_limits(
                 token_in_clone.address.clone(),
                 token_out_clone.address.clone(),
             ) {
                 Ok((max_in, _max_out)) => {
+                    pool_max_in = Some(max_in.clone());
                     if requested_max_in > max_in {
                         let all_amounts_exceed_limit =
                             amounts_clone.iter().all(|amount| amount > &max_in);
@@ -1204,6 +1227,8 @@ async fn simulate_pool(
                                             probe_amount_in, max_in,
                                         )],
                                         timed_out: false,
+                                        spot_price: None,
+                                        max_in: pool_max_in,
                                     });
                                 }
                             }
@@ -1281,6 +1306,8 @@ async fn simulate_pool(
                                         probe_amount_in, max_in, other,
                                     )],
                                     timed_out: false,
+                                    spot_price: None,
+                                    max_in: pool_max_in,
                                 });
                             }
                         }
@@ -1393,6 +1420,11 @@ async fn simulate_pool(
             }
         }
 
+        let spot_price = pool_state
+            .spot_price(&token_in_clone, &token_out_clone)
+            .ok()
+            .filter(|p| p.is_finite() && *p > 0.0);
+
         PoolSimOutcome::Simulated(PoolQuoteResult {
             pool: pool_id,
             pool_name,
@@ -1402,6 +1434,8 @@ async fn simulate_pool(
             gas_used,
             errors,
             timed_out,
+            spot_price,
+            max_in: pool_max_in,
         })
     });
     tokio::pin!(handle);
@@ -1670,6 +1704,74 @@ fn compute_gas_in_sell_base_units(
         * BigUint::from(gas_used_last);
     let denominator = BigUint::from(SPOT_PRICE_SCALE) * BigUint::from(WEI_PER_ETH);
     (numerator / denominator).to_string()
+}
+
+/// Compute per-ladder-step slippage in basis points.
+///
+/// `spot_price_human` is the marginal rate returned by `pool_state.spot_price()`:
+/// token_out per token_in expressed in **human-readable** (decimal-adjusted) units.
+/// We convert it to a base-unit ratio, then compare against `amount_out / amount_in`
+/// for each ladder step.
+///
+/// Returns one entry per successfully simulated step.  Steps where the spot price
+/// is unavailable or the arithmetic overflows yield `None`.
+fn compute_slippage_bps(
+    amounts_in: &[BigUint],
+    amounts_out: &[String],
+    spot_price_human: Option<f64>,
+    decimals_in: u32,
+    decimals_out: u32,
+) -> Vec<Option<i32>> {
+    let Some(spot_human) = spot_price_human else {
+        return amounts_out.iter().map(|_| None).collect();
+    };
+
+    // Convert human-readable spot price to base-unit ratio:
+    //   spot_base = spot_human * 10^decimals_out / 10^decimals_in
+    // We work in f64 throughout; precision is fine for bps (integers).
+    let decimal_scale = 10f64.powi(decimals_out as i32 - decimals_in as i32);
+    let spot_base = spot_human * decimal_scale;
+
+    if !spot_base.is_finite() || spot_base <= 0.0 {
+        return amounts_out.iter().map(|_| None).collect();
+    }
+
+    amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        .map(|(amount_in, amount_out_str)| {
+            let amount_out = BigUint::from_str(amount_out_str).ok()?;
+            if amount_in.is_zero() {
+                return None;
+            }
+            // effective_price = amount_out / amount_in  (both in base units)
+            // Use f64 ratio; for bps precision this is sufficient.
+            let effective = amount_out.to_f64()? / amount_in.to_f64()?;
+            if !effective.is_finite() || effective < 0.0 {
+                return None;
+            }
+            let slippage = 1.0 - (effective / spot_base);
+            // Clamp to [-10_000, 10_000] bps before truncating to i32.
+            let bps = (slippage * 10_000.0).round().clamp(-10_000.0, 10_000.0) as i32;
+            Some(bps)
+        })
+        .collect()
+}
+
+/// Compute what fraction of the pool's reported `max_in` the largest requested
+/// amount consumes, in basis points (10_000 = 100 %).
+fn compute_pool_utilization_bps(
+    requested_max_in: &BigUint,
+    pool_max_in: Option<&BigUint>,
+) -> Option<u32> {
+    let max_in = pool_max_in?;
+    if max_in.is_zero() || requested_max_in.is_zero() {
+        return None;
+    }
+    // utilization = requested_max_in / max_in * 10_000
+    // Scale up before integer division to avoid losing precision.
+    let utilization = (requested_max_in * 10_000u32) / max_in;
+    utilization.to_u32().or(Some(u32::MAX))
 }
 
 fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
@@ -3220,7 +3322,8 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(pair_spot_price_calls.load(Ordering::SeqCst), 0);
+        // Each pair pool is now queried for spot_price inside simulate_pool() for slippage.
+        assert_eq!(pair_spot_price_calls.load(Ordering::SeqCst), 2);
         assert_eq!(spot_source_calls.load(Ordering::SeqCst), 1);
         assert_eq!(computation.responses.len(), 2);
         let unique_gas_in_sell: HashSet<&str> = computation
@@ -3937,7 +4040,8 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
+        // Pool is queried once for spot_price inside simulate_pool() for slippage calculation.
+        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 1);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].gas_used, vec![2, 5]);
         assert_eq!(computation.responses[0].gas_in_sell, "0");
