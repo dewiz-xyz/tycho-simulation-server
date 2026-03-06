@@ -1,13 +1,16 @@
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    future::FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
-use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
-use tokio::task::spawn_blocking;
+use tokio::sync::TryAcquireError;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -26,6 +29,8 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
+use crate::services::native_wrapped::{is_direct_native_wrapped_pair, simulation_tokens_for_pool};
+use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -33,11 +38,6 @@ const SPOT_PRICE_SCALE: u128 = 1_000_000_000;
 const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
 const MIN_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e-12;
 const MAX_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e12;
-const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
-
-fn native_token_address() -> Bytes {
-    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpotProbeMode {
@@ -523,6 +523,10 @@ pub async fn get_amounts_out(
     let mut vm_first_gases = Vec::new();
     let native_semaphore = state.native_sim_semaphore();
     let vm_semaphore = state.vm_sim_semaphore();
+    // Count pools that actually acquired a permit so timeout metrics stay accurate
+    // without reserving capacity during the enqueue pass.
+    let scheduled_native_pools = Arc::new(AtomicUsize::new(0));
+    let scheduled_vm_pools = Arc::new(AtomicUsize::new(0));
 
     // Native first
     for (id, pool_state, component) in native_candidates.into_iter() {
@@ -533,16 +537,9 @@ pub async fn get_amounts_out(
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
+        let pool_timeout = state.pool_timeout_native();
 
-        let now = Instant::now();
-        let proposed_deadline = now + state.pool_timeout_native();
-        let pool_deadline = if proposed_deadline <= quote_deadline {
-            proposed_deadline
-        } else {
-            quote_deadline
-        };
-
-        if pool_deadline <= now {
+        if Instant::now() >= quote_deadline {
             metrics.skipped_native_deadline += 1;
             pool_results.push(make_pool_outcome(
                 id.clone(),
@@ -557,38 +554,7 @@ pub async fn get_amounts_out(
             continue;
         }
 
-        let permit = match native_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_native_concurrency += 1;
-                pool_results.push(make_pool_outcome(
-                    id.clone(),
-                    pool_name.clone(),
-                    pool_address.clone(),
-                    pool_protocol.clone(),
-                    PoolOutcomeKind::SkippedConcurrency,
-                    0,
-                    expected_len,
-                    Some(
-                        "Pool scheduling skipped because native concurrency permits were exhausted"
-                            .to_string(),
-                    ),
-                ));
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "Native pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
-                break;
-            }
-        };
-
         let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_native_pools += 1;
         let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
             token_in.as_ref(),
             token_out.as_ref(),
@@ -608,9 +574,11 @@ pub async fn get_amounts_out(
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
-            pool_deadline,
+            quote_deadline,
+            pool_timeout,
             pool_cancel,
-            permit,
+            native_semaphore.clone(),
+            Arc::clone(&scheduled_native_pools),
         ));
     }
 
@@ -623,16 +591,9 @@ pub async fn get_amounts_out(
         let pool_address = component.id.to_string();
         let pool_protocol = component.protocol_system.clone();
         let pool_name = derive_pool_name(&component);
+        let pool_timeout = state.pool_timeout_vm();
 
-        let now = Instant::now();
-        let proposed_deadline = now + state.pool_timeout_vm();
-        let pool_deadline = if proposed_deadline <= quote_deadline {
-            proposed_deadline
-        } else {
-            quote_deadline
-        };
-
-        if pool_deadline <= now {
+        if Instant::now() >= quote_deadline {
             metrics.skipped_vm_deadline += 1;
             pool_results.push(make_pool_outcome(
                 id.clone(),
@@ -647,38 +608,7 @@ pub async fn get_amounts_out(
             continue;
         }
 
-        let permit = match vm_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_vm_concurrency += 1;
-                pool_results.push(make_pool_outcome(
-                    id.clone(),
-                    pool_name.clone(),
-                    pool_address.clone(),
-                    pool_protocol.clone(),
-                    PoolOutcomeKind::SkippedConcurrency,
-                    0,
-                    expected_len,
-                    Some(
-                        "Pool scheduling skipped because VM concurrency permits were exhausted"
-                            .to_string(),
-                    ),
-                ));
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "VM pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
-                break;
-            }
-        };
-
         let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_vm_pools += 1;
         let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
             token_in.as_ref(),
             token_out.as_ref(),
@@ -698,9 +628,11 @@ pub async fn get_amounts_out(
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
-            pool_deadline,
+            quote_deadline,
+            pool_timeout,
             pool_cancel,
-            permit,
+            vm_semaphore.clone(),
+            Arc::clone(&scheduled_vm_pools),
         ));
     }
 
@@ -714,144 +646,65 @@ pub async fn get_amounts_out(
         while !tasks.is_empty() {
             tokio::select! {
                 _ = &mut quote_timeout_sleep => {
-                    cancel_token.cancel();
                     let message = format!(
                         "Quote computation timed out after {}ms",
                         quote_timeout.as_millis()
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
                     meta.status = QuoteStatus::PartialSuccess;
+                    cancel_and_flush_pool_outcomes(
+                        &cancel_token,
+                        &mut tasks,
+                        &mut responses,
+                        &mut failures,
+                        &mut pool_results,
+                        &mut metrics,
+                        &mut meta,
+                        &mut vm_first_gases,
+                        expected_len,
+                        gas_price_wei,
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
+                        current_block,
+                    );
                     break;
                 }
                 _ = cancel_token.cancelled() => {
                     meta.status = QuoteStatus::PartialSuccess;
+                    cancel_and_flush_pool_outcomes(
+                        &cancel_token,
+                        &mut tasks,
+                        &mut responses,
+                        &mut failures,
+                        &mut pool_results,
+                        &mut metrics,
+                        &mut meta,
+                        &mut vm_first_gases,
+                        expected_len,
+                        gas_price_wei,
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
+                        current_block,
+                    );
                     break;
                 }
                 maybe_outcome = tasks.next() => {
                     match maybe_outcome {
                         Some(outcome) => {
-                            match outcome {
-                                Ok(outcome) => match outcome {
-                                    PoolSimOutcome::Simulated(result) => {
-                                        let had_timeout = is_timeout_like_outcome(&result);
-                                        let is_partial = result.amounts_out.len() < expected_len;
-                                        record_vm_first_gas_metrics(
-                                            &mut metrics,
-                                            &mut vm_first_gases,
-                                            result.protocol.as_str(),
-                                            result.pool.as_str(),
-                                            result.gas_used.first().copied(),
-                                        );
-
-                                        if let Some((outcome_kind, reason)) =
-                                            classify_pool_outcome(&result, expected_len)
-                                        {
-                                            pool_results.push(make_pool_outcome(
-                                                result.pool.clone(),
-                                                result.pool_name.clone(),
-                                                result.pool_address.clone(),
-                                                result.protocol.clone(),
-                                                outcome_kind,
-                                                result.amounts_out.len(),
-                                                expected_len,
-                                                reason,
-                                            ));
-                                        }
-
-                                        if !result.errors.is_empty() || is_partial {
-                                            let context = FailureContext {
-                                                pool_id: &result.pool,
-                                                pool_name: Some(&result.pool_name),
-                                                pool_address: Some(&result.pool_address),
-                                                protocol: Some(&result.protocol),
-                                            };
-                                            let descriptor = format_pool_descriptor(&context);
-                                            let message = if had_timeout {
-                                                format!(
-                                                    "{}: Quote computation timed out (partial ladder {} of {} steps)",
-                                                    descriptor,
-                                                    result.amounts_out.len(),
-                                                    expected_len
-                                                )
-                                            } else if result.amounts_out.is_empty() {
-                                                let base_error = result
-                                                    .errors
-                                                    .first()
-                                                    .cloned()
-                                                    .unwrap_or_else(|| "Pool returned no quotes".to_string());
-                                                format!("{}: {}", descriptor, base_error)
-                                            } else {
-                                                format!(
-                                                    "{} produced partial ladder ({} of {} steps)",
-                                                    descriptor,
-                                                    result.amounts_out.len(),
-                                                    expected_len
-                                                )
-                                            };
-                                            let kind = if had_timeout {
-                                                QuoteFailureKind::Timeout
-                                            } else if result.amounts_out.is_empty() {
-                                                classify_failure(&message, true)
-                                            } else {
-                                                QuoteFailureKind::InconsistentResult
-                                            };
-                                            failures.push(make_failure(kind, message, Some(context)));
-                                        }
-
-                                        if !result.amounts_out.is_empty() {
-                                            let gas_in_sell = compute_gas_in_sell_base_units(
-                                                gas_price_wei,
-                                                result.gas_used.last().copied(),
-                                                eth_to_sell_spot_price,
-                                                sell_token_decimals,
-                                            );
-                                            responses.push(AmountOutResponse {
-                                                pool: result.pool,
-                                                pool_name: result.pool_name,
-                                                pool_address: result.pool_address,
-                                                amounts_out: result.amounts_out,
-                                                gas_used: result.gas_used,
-                                                gas_in_sell,
-                                                block_number: current_block,
-                                            });
-                                        }
-                                    }
-                                    PoolSimOutcome::SkippedDueToLimits {
-                                        pool,
-                                        pool_name,
-                                        pool_address,
-                                        protocol,
-                                        reason,
-                                    } => {
-                                        if protocol.starts_with("vm:") {
-                                            metrics.skipped_vm_limits += 1;
-                                        } else {
-                                            metrics.skipped_native_limits += 1;
-                                        }
-                                        pool_results.push(make_pool_outcome(
-                                            pool,
-                                            pool_name,
-                                            pool_address,
-                                            protocol,
-                                            PoolOutcomeKind::SkippedPrecheck,
-                                            0,
-                                            expected_len,
-                                            reason,
-                                        ));
-                                    }
-                                },
-                                Err(failure) => {
-                                    if let Some(pool_outcome) =
-                                        pool_outcome_from_failure(&failure, expected_len)
-                                    {
-                                        pool_results.push(pool_outcome);
-                                    }
-                                    if matches!(failure.kind, QuoteFailureKind::Internal) {
-                                        meta.status = QuoteStatus::InternalError;
-                                    }
-                                    failures.push(failure);
-                                }
-                            }
+                            handle_pool_task_result(
+                                outcome,
+                                &mut responses,
+                                &mut failures,
+                                &mut pool_results,
+                                &mut metrics,
+                                &mut meta,
+                                &mut vm_first_gases,
+                                expected_len,
+                                gas_price_wei,
+                                eth_to_sell_spot_price,
+                                sell_token_decimals,
+                                current_block,
+                            );
                         }
                         None => break,
                     }
@@ -861,6 +714,8 @@ pub async fn get_amounts_out(
     }
 
     drop(tasks);
+    metrics.scheduled_native_pools = scheduled_native_pools.load(Ordering::Relaxed);
+    metrics.scheduled_vm_pools = scheduled_vm_pools.load(Ordering::Relaxed);
     finalize_vm_first_gas_metrics(&mut metrics, &mut vm_first_gases);
 
     // Record scheduling skips as a single aggregated failure to avoid bloating responses
@@ -968,17 +823,6 @@ pub async fn get_amounts_out(
     }
 }
 
-fn simulation_tokens_for_pool(
-    request_token_in: &Token,
-    request_token_out: &Token,
-    component: &ProtocolComponent,
-) -> (Token, Token) {
-    (
-        remap_request_token_for_pool(request_token_in, component),
-        remap_request_token_for_pool(request_token_out, component),
-    )
-}
-
 fn simulation_tokens_for_pool_with_remap_log(
     request_token_in: &Token,
     request_token_out: &Token,
@@ -1004,48 +848,6 @@ fn simulation_tokens_for_pool_with_remap_log(
     }
 
     (Arc::new(sim_token_in), Arc::new(sim_token_out))
-}
-
-fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolComponent) -> Token {
-    let native = request_token.chain.native_token();
-    let wrapped_native = request_token.chain.wrapped_native_token();
-
-    if native.address == wrapped_native.address {
-        return request_token.clone();
-    }
-
-    let pool_has_native = component
-        .tokens
-        .iter()
-        .any(|token| token.address == native.address);
-    let pool_has_wrapped = component
-        .tokens
-        .iter()
-        .any(|token| token.address == wrapped_native.address);
-
-    if request_token.address == wrapped_native.address && pool_has_native && !pool_has_wrapped {
-        return native;
-    }
-
-    if request_token.address == native.address && pool_has_wrapped && !pool_has_native {
-        return wrapped_native;
-    }
-
-    request_token.clone()
-}
-
-fn is_direct_native_wrapped_pair(
-    token_in: &Bytes,
-    token_out: &Bytes,
-    wrapped_native: Option<&Bytes>,
-) -> bool {
-    let native_address = native_token_address();
-    let Some(wrapped_native) = wrapped_native else {
-        return false;
-    };
-
-    (token_in == &native_address && token_out == wrapped_native)
-        || (token_in == wrapped_native && token_out == &native_address)
 }
 
 struct PoolQuoteResult {
@@ -1077,6 +879,20 @@ struct FailureContext<'a> {
     protocol: Option<&'a str>,
 }
 
+enum PoolTaskResult {
+    Completed(PoolSimOutcome),
+    SkippedDueToConcurrency {
+        pool: String,
+        pool_name: String,
+        pool_address: String,
+        protocol: String,
+        reason: Option<String>,
+    },
+    Failed {
+        failure: QuoteFailure,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn simulate_pool(
     pool_id: String,
@@ -1089,10 +905,12 @@ async fn simulate_pool(
     amounts: Arc<Vec<BigUint>>,
     requested_max_in: BigUint,
     expected_len: usize,
-    deadline: Instant,
+    quote_deadline: Instant,
+    pool_timeout: Duration,
     cancel_token: CancellationToken,
-    permit: OwnedSemaphorePermit,
-) -> Result<PoolSimOutcome, QuoteFailure> {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    scheduled_pool_count: Arc<AtomicUsize>,
+) -> PoolTaskResult {
     let pool_id_for_failure = pool_id.clone();
     let pool_addr_for_failure = pool_address.clone();
     let pool_name_for_failure = pool_name.clone();
@@ -1100,80 +918,118 @@ async fn simulate_pool(
     let token_in_clone = Arc::clone(&token_in);
     let token_out_clone = Arc::clone(&token_out);
     let amounts_clone = Arc::clone(&amounts);
-
     let cancel_token_clone = cancel_token.clone();
-    let sleep_duration = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(Duration::from_millis(0));
-    let handle = spawn_blocking(move || {
-        // Hold the permit until the blocking work exits.
-        let _permit = permit;
 
-        // Abort quickly if this task starts after cancellation/deadline.
-        if cancel_token_clone.is_cancelled() {
-            debug!(
-                scope = "pool_timeout",
-                pool_id = %pool_id,
-                protocol = %pool_protocol,
-                pool_name = %pool_name,
-                pool_address = %pool_address,
-                "Pool quote cancelled before completion"
-            );
-            return PoolSimOutcome::Simulated(PoolQuoteResult {
-                pool: pool_id,
-                pool_name,
-                pool_address,
-                protocol: pool_protocol,
-                amounts_out: Vec::new(),
-                gas_used: Vec::new(),
-                errors: vec!["Cancelled".to_string()],
-                timed_out: false,
-            });
+    let permit = match semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            return PoolTaskResult::SkippedDueToConcurrency {
+                pool: pool_id_for_failure,
+                pool_name: pool_name_for_failure,
+                pool_address: pool_addr_for_failure,
+                protocol: pool_protocol_for_failure,
+                reason: Some(
+                    "Pool scheduling skipped because concurrency permits were exhausted"
+                        .to_string(),
+                ),
+            };
         }
-        if Instant::now() >= deadline {
-            debug!(
-                scope = "pool_timeout",
-                pool_id = %pool_id,
-                protocol = %pool_protocol,
-                pool_name = %pool_name,
-                pool_address = %pool_address,
-                "Pool quote exceeded deadline before completion"
-            );
-            return PoolSimOutcome::Simulated(PoolQuoteResult {
-                pool: pool_id,
-                pool_name,
-                pool_address,
-                protocol: pool_protocol,
-                amounts_out: Vec::new(),
-                gas_used: Vec::new(),
-                errors: vec!["Timed out".to_string()],
-                timed_out: true,
-            });
+        Err(TryAcquireError::Closed) => {
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            return PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Internal,
+                    format!("{}: Pool semaphore closed", descriptor),
+                    Some(context),
+                ),
+            };
         }
+    };
 
-        // Short-circuit when the request exceeds pool limits to avoid wasted compute.
-        //
-        // Note: `get_limits` can be a "soft" limit (advisory). When the request exceeds the
-        // reported limit, we do a single probe before quoting the whole ladder:
-        // - If some requested amounts are within the reported max, probe the max requested amount
-        //   to avoid wasted compute for the largest step.
-        // - If every requested amount exceeds the reported max, probe the smallest requested
-        //   amount and only skip the whole pool if that also fails with a clear limits signal.
-        let mut probed_amount_in: Option<BigUint> = None;
-        let mut probed_amount: Option<(String, u64)> = None;
-        let mut probed_amount_error: Option<String> = None;
-        if !requested_max_in.is_zero() {
-            match pool_state.get_limits(
-                token_in_clone.address.clone(),
-                token_out_clone.address.clone(),
-            ) {
-                Ok((max_in, _max_out)) => {
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        let context = FailureContext {
+            pool_id: &pool_id_for_failure,
+            pool_name: Some(pool_name_for_failure.as_str()),
+            pool_address: Some(pool_addr_for_failure.as_str()),
+            protocol: Some(pool_protocol_for_failure.as_str()),
+        };
+        let descriptor = format_pool_descriptor(&context);
+        return PoolTaskResult::Failed {
+            failure: make_failure(
+                QuoteFailureKind::Timeout,
+                format!("{}: Quote computation cancelled", descriptor),
+                Some(context),
+            ),
+        };
+    }
+    scheduled_pool_count.fetch_add(1, Ordering::Relaxed);
+    let result = run_blocking_pool_job(
+        permit,
+        pool_timeout,
+        Some(cancel_token.clone()),
+        move |started_at| {
+            let deadline = std::cmp::min(started_at + pool_timeout, quote_deadline);
+
+            if cancel_token_clone.is_cancelled() {
+                debug!(
+                    scope = "pool_timeout",
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    "Pool quote cancelled before completion"
+                );
+                return PoolSimOutcome::Simulated(PoolQuoteResult {
+                    pool: pool_id,
+                    pool_name,
+                    pool_address,
+                    protocol: pool_protocol,
+                    amounts_out: Vec::new(),
+                    gas_used: Vec::new(),
+                    errors: vec!["Cancelled".to_string()],
+                    timed_out: false,
+                });
+            }
+            if Instant::now() >= deadline {
+                debug!(
+                    scope = "pool_timeout",
+                    pool_id = %pool_id,
+                    protocol = %pool_protocol,
+                    pool_name = %pool_name,
+                    pool_address = %pool_address,
+                    "Pool quote exceeded deadline before completion"
+                );
+                return PoolSimOutcome::Simulated(PoolQuoteResult {
+                    pool: pool_id,
+                    pool_name,
+                    pool_address,
+                    protocol: pool_protocol,
+                    amounts_out: Vec::new(),
+                    gas_used: Vec::new(),
+                    errors: vec!["Timed out".to_string()],
+                    timed_out: true,
+                });
+            }
+
+            let mut probed_amount_in: Option<BigUint> = None;
+            let mut probed_amount: Option<(String, u64)> = None;
+            let mut probed_amount_error: Option<String> = None;
+            if !requested_max_in.is_zero() {
+                if let Ok((max_in, _max_out)) = pool_state.get_limits(
+                    token_in_clone.address.clone(),
+                    token_out_clone.address.clone(),
+                ) {
                     if requested_max_in > max_in {
                         let all_amounts_exceed_limit =
                             amounts_clone.iter().all(|amount| amount > &max_in);
                         let probe_amount_in = if all_amounts_exceed_limit {
-                            // Prefer probing the smallest requested amount when every request is
-                            // above the reported limit: `max_in` can be conservative.
                             amounts_clone
                                 .iter()
                                 .min()
@@ -1182,6 +1038,7 @@ async fn simulate_pool(
                         } else {
                             requested_max_in.clone()
                         };
+
                         match pool_state.get_amount_out(
                             probe_amount_in.clone(),
                             &token_in_clone,
@@ -1212,10 +1069,8 @@ async fn simulate_pool(
                                     "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
                                     probe_amount_in, max_in, message,
                                 );
-                                if is_limits_exhaustion_probe_error(
-                                    &message,
-                                    maybe_result.is_some(),
-                                ) {
+                                if is_limits_exhaustion_probe_error(&message, maybe_result.is_some())
+                                {
                                     if all_amounts_exceed_limit {
                                         debug!(
                                             scope = "limits_precheck",
@@ -1286,65 +1141,79 @@ async fn simulate_pool(
                         }
                     }
                 }
-                Err(_) => {
-                    // Best-effort: if limits are unavailable, proceed with the normal ladder.
+            }
+
+            let mut amounts_out = Vec::with_capacity(expected_len);
+            let mut gas_used = Vec::with_capacity(expected_len);
+            let mut errors = Vec::new();
+            let mut timed_out = false;
+
+            for amount_in in amounts_clone.iter() {
+                if cancel_token_clone.is_cancelled() {
+                    debug!(
+                        scope = "pool_timeout",
+                        pool_id = %pool_id,
+                        protocol = %pool_protocol,
+                        pool_name = %pool_name,
+                        pool_address = %pool_address,
+                        "Pool quote cancelled before completion"
+                    );
+                    errors.push("Cancelled".to_string());
+                    break;
                 }
-            }
-        }
+                if Instant::now() >= deadline {
+                    debug!(
+                        scope = "pool_timeout",
+                        pool_id = %pool_id,
+                        protocol = %pool_protocol,
+                        pool_name = %pool_name,
+                        pool_address = %pool_address,
+                        "Pool quote exceeded deadline before completion"
+                    );
+                    errors.push("Timed out".to_string());
+                    timed_out = true;
+                    break;
+                }
 
-        let mut amounts_out = Vec::with_capacity(expected_len);
-        let mut gas_used = Vec::with_capacity(expected_len);
-        let mut errors = Vec::new();
-        let mut timed_out = false;
-
-        for amount_in in amounts_clone.iter() {
-            if cancel_token_clone.is_cancelled() {
-                debug!(
-                    scope = "pool_timeout",
-                    pool_id = %pool_id,
-                    protocol = %pool_protocol,
-                    pool_name = %pool_name,
-                    pool_address = %pool_address,
-                    "Pool quote cancelled before completion"
-                );
-                errors.push("Cancelled".to_string());
-                break;
-            }
-            if Instant::now() >= deadline {
-                debug!(
-                    scope = "pool_timeout",
-                    pool_id = %pool_id,
-                    protocol = %pool_protocol,
-                    pool_name = %pool_name,
-                    pool_address = %pool_address,
-                    "Pool quote exceeded deadline before completion"
-                );
-                errors.push("Timed out".to_string());
-                timed_out = true;
-                break;
-            }
-
-            if let Some(probed_amount_in_value) = probed_amount_in.as_ref() {
-                if amount_in == probed_amount_in_value {
-                    if let Some((amount_out, gas_u64)) = &probed_amount {
-                        amounts_out.push(amount_out.clone());
-                        gas_used.push(*gas_u64);
-                        continue;
-                    }
-                    if let Some(probe_error) = &probed_amount_error {
-                        errors.push(probe_error.clone());
-                        continue;
+                if let Some(probed_amount_in_value) = probed_amount_in.as_ref() {
+                    if amount_in == probed_amount_in_value {
+                        if let Some((amount_out, gas_u64)) = &probed_amount {
+                            amounts_out.push(amount_out.clone());
+                            gas_used.push(*gas_u64);
+                            continue;
+                        }
+                        if let Some(probe_error) = &probed_amount_error {
+                            errors.push(probe_error.clone());
+                            continue;
+                        }
                     }
                 }
-            }
 
-            match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone) {
-                Ok(result) => {
-                    if let Some(gas_u64) = result.gas.to_u64() {
-                        amounts_out.push(result.amount.to_string());
-                        gas_used.push(gas_u64);
-                    } else {
-                        let msg = "no gas reported".to_string();
+                match pool_state.get_amount_out(amount_in.clone(), &token_in_clone, &token_out_clone)
+                {
+                    Ok(result) => {
+                        if let Some(gas_u64) = result.gas.to_u64() {
+                            amounts_out.push(result.amount.to_string());
+                            gas_used.push(gas_u64);
+                        } else {
+                            let msg = "no gas reported".to_string();
+                            debug!(
+                                scope = "pool_timeout",
+                                pool_id = %pool_id,
+                                protocol = %pool_protocol,
+                                pool_name = %pool_name,
+                                pool_address = %pool_address,
+                                "Pool quote error: {}",
+                                msg
+                            );
+                            errors.push(msg);
+                            amounts_out.clear();
+                            gas_used.clear();
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let msg = error.to_string();
                         debug!(
                             scope = "pool_timeout",
                             pool_id = %pool_id,
@@ -1354,104 +1223,376 @@ async fn simulate_pool(
                             "Pool quote error: {}",
                             msg
                         );
-                        // Do not return results with no gas: mark as error and discard
                         errors.push(msg);
-                        amounts_out.clear();
-                        gas_used.clear();
-                        break;
                     }
                 }
-                Err(e) => {
-                    let msg = e.to_string();
+
+                if Instant::now() >= deadline {
                     debug!(
                         scope = "pool_timeout",
                         pool_id = %pool_id,
                         protocol = %pool_protocol,
                         pool_name = %pool_name,
                         pool_address = %pool_address,
-                        "Pool quote error: {}",
-                        msg
+                        "Pool quote deadline reached after ladder step"
                     );
-                    errors.push(msg);
+                    if errors.is_empty() {
+                        errors.push("Timed out".to_string());
+                    }
+                    timed_out = true;
+                    break;
                 }
             }
 
-            if Instant::now() >= deadline {
-                debug!(
-                    scope = "pool_timeout",
-                    pool_id = %pool_id,
-                    protocol = %pool_protocol,
-                    pool_name = %pool_name,
-                    pool_address = %pool_address,
-                    "Pool quote deadline reached after ladder step"
-                );
-                if errors.is_empty() {
-                    errors.push("Timed out".to_string());
-                }
-                timed_out = true;
-                break;
+            PoolSimOutcome::Simulated(PoolQuoteResult {
+                pool: pool_id,
+                pool_name,
+                pool_address,
+                protocol: pool_protocol,
+                amounts_out,
+                gas_used,
+                errors,
+                timed_out,
+            })
+        },
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => PoolTaskResult::Completed(outcome),
+        Err(PoolJobError::TimedOut) => {
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Timeout,
+                    format!("{}: Quote computation timed out", descriptor),
+                    Some(context),
+                ),
             }
         }
+        Err(PoolJobError::Cancelled) => {
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Timeout,
+                    format!("{}: Quote computation cancelled", descriptor),
+                    Some(context),
+                ),
+            }
+        }
+        Err(PoolJobError::JoinFailed(join_err)) => {
+            let context = FailureContext {
+                pool_id: &pool_id_for_failure,
+                pool_name: Some(pool_name_for_failure.as_str()),
+                pool_address: Some(pool_addr_for_failure.as_str()),
+                protocol: Some(pool_protocol_for_failure.as_str()),
+            };
+            let descriptor = format_pool_descriptor(&context);
+            PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Internal,
+                    format!("{}: Quote computation panicked: {}", descriptor, join_err),
+                    Some(context),
+                ),
+            }
+        }
+    }
+}
 
-        PoolSimOutcome::Simulated(PoolQuoteResult {
-            pool: pool_id,
-            pool_name,
-            pool_address,
-            protocol: pool_protocol,
-            amounts_out,
-            gas_used,
-            errors,
-            timed_out,
-        })
-    });
-    tokio::pin!(handle);
+#[allow(clippy::too_many_arguments)]
+fn handle_pool_task_result(
+    outcome: PoolTaskResult,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) {
+    match outcome {
+        PoolTaskResult::Completed(outcome) => match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                let had_timeout = is_timeout_like_outcome(&result);
+                let is_partial = result.amounts_out.len() < expected_len;
+                record_vm_first_gas_metrics(
+                    metrics,
+                    vm_first_gases,
+                    result.protocol.as_str(),
+                    result.pool.as_str(),
+                    result.gas_used.first().copied(),
+                );
 
-    tokio::select! {
-        res = handle.as_mut() => {
-            match res {
-                Ok(result) => Ok(result),
-                Err(join_err) => {
+                if let Some((outcome_kind, reason)) = classify_pool_outcome(&result, expected_len) {
+                    pool_results.push(make_pool_outcome(
+                        result.pool.clone(),
+                        result.pool_name.clone(),
+                        result.pool_address.clone(),
+                        result.protocol.clone(),
+                        outcome_kind,
+                        result.amounts_out.len(),
+                        expected_len,
+                        reason,
+                    ));
+                }
+
+                if !result.errors.is_empty() || is_partial {
                     let context = FailureContext {
-                        pool_id: &pool_id_for_failure,
-                        pool_name: Some(pool_name_for_failure.as_str()),
-                        pool_address: Some(pool_addr_for_failure.as_str()),
-                        protocol: Some(pool_protocol_for_failure.as_str()),
+                        pool_id: &result.pool,
+                        pool_name: Some(&result.pool_name),
+                        pool_address: Some(&result.pool_address),
+                        protocol: Some(&result.protocol),
                     };
                     let descriptor = format_pool_descriptor(&context);
-                    let message = format!(
-                        "{}: Quote computation panicked: {}",
-                        descriptor, join_err
+                    let message = if had_timeout {
+                        format!(
+                            "{}: Quote computation timed out (partial ladder {} of {} steps)",
+                            descriptor,
+                            result.amounts_out.len(),
+                            expected_len
+                        )
+                    } else if result.amounts_out.is_empty() {
+                        let base_error = result
+                            .errors
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "Pool returned no quotes".to_string());
+                        format!("{}: {}", descriptor, base_error)
+                    } else {
+                        format!(
+                            "{} produced partial ladder ({} of {} steps)",
+                            descriptor,
+                            result.amounts_out.len(),
+                            expected_len
+                        )
+                    };
+                    let kind = if had_timeout {
+                        QuoteFailureKind::Timeout
+                    } else if result.amounts_out.is_empty() {
+                        classify_failure(&message, true)
+                    } else {
+                        QuoteFailureKind::InconsistentResult
+                    };
+                    failures.push(make_failure(kind, message, Some(context)));
+                }
+
+                if !result.amounts_out.is_empty() {
+                    let gas_in_sell = compute_gas_in_sell_base_units(
+                        gas_price_wei,
+                        result.gas_used.last().copied(),
+                        eth_to_sell_spot_price,
+                        sell_token_decimals,
                     );
-                    Err(make_failure(QuoteFailureKind::Internal, message, Some(context)))
+                    responses.push(AmountOutResponse {
+                        pool: result.pool,
+                        pool_name: result.pool_name,
+                        pool_address: result.pool_address,
+                        amounts_out: result.amounts_out,
+                        gas_used: result.gas_used,
+                        gas_in_sell,
+                        block_number: current_block,
+                    });
                 }
             }
+            PoolSimOutcome::SkippedDueToLimits {
+                pool,
+                pool_name,
+                pool_address,
+                protocol,
+                reason,
+            } => {
+                if protocol.starts_with("vm:") {
+                    metrics.skipped_vm_limits += 1;
+                } else {
+                    metrics.skipped_native_limits += 1;
+                }
+                pool_results.push(make_pool_outcome(
+                    pool,
+                    pool_name,
+                    pool_address,
+                    protocol,
+                    PoolOutcomeKind::SkippedPrecheck,
+                    0,
+                    expected_len,
+                    reason,
+                ));
+            }
+        },
+        PoolTaskResult::SkippedDueToConcurrency {
+            pool,
+            pool_name,
+            pool_address,
+            protocol,
+            reason,
+        } => {
+            if protocol.starts_with("vm:") {
+                metrics.skipped_vm_concurrency += 1;
+            } else {
+                metrics.skipped_native_concurrency += 1;
+            }
+            pool_results.push(make_pool_outcome(
+                pool,
+                pool_name,
+                pool_address,
+                protocol,
+                PoolOutcomeKind::SkippedConcurrency,
+                0,
+                expected_len,
+                reason,
+            ));
         }
-        _ = cancel_token.cancelled() => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
-            let context = FailureContext {
-                pool_id: &pool_id_for_failure,
-                pool_name: Some(pool_name_for_failure.as_str()),
-                pool_address: Some(pool_addr_for_failure.as_str()),
-                protocol: Some(pool_protocol_for_failure.as_str()),
-            };
-            let descriptor = format_pool_descriptor(&context);
-            let message = format!("{}: Quote computation cancelled", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+        PoolTaskResult::Failed { failure } => {
+            if let Some(pool_outcome) = pool_outcome_from_failure(&failure, expected_len) {
+                pool_results.push(pool_outcome);
+            }
+            if matches!(failure.kind, QuoteFailureKind::Internal) {
+                meta.status = QuoteStatus::InternalError;
+            }
+            failures.push(failure);
         }
-        _ = sleep(sleep_duration) => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
-            let context = FailureContext {
-                pool_id: &pool_id_for_failure,
-                pool_name: Some(pool_name_for_failure.as_str()),
-                pool_address: Some(pool_addr_for_failure.as_str()),
-                protocol: Some(pool_protocol_for_failure.as_str()),
-            };
-            let descriptor = format_pool_descriptor(&context);
-            let message = format!("{}: Quote computation timed out", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cancel_and_flush_pool_outcomes<F>(
+    cancel_token: &CancellationToken,
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    cancel_token.cancel();
+    poll_queued_pool_tasks_once(
+        tasks,
+        responses,
+        failures,
+        pool_results,
+        metrics,
+        meta,
+        vm_first_gases,
+        expected_len,
+        gas_price_wei,
+        eth_to_sell_spot_price,
+        sell_token_decimals,
+        current_block,
+    );
+    drain_ready_pool_outcomes(
+        tasks,
+        responses,
+        failures,
+        pool_results,
+        metrics,
+        meta,
+        vm_first_gases,
+        expected_len,
+        gas_price_wei,
+        eth_to_sell_spot_price,
+        sell_token_decimals,
+        current_block,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_queued_pool_tasks_once<F>(
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    // Newly queued FuturesUnordered entries are never polled until the stream gets polled.
+    // Give each currently queued task one chance to run its pre-await path after cancellation
+    // so immediate skipped/cancelled outcomes are surfaced before we stop waiting.
+    let queued_tasks = tasks.len();
+    for _ in 0..queued_tasks {
+        match tasks.next().now_or_never() {
+            Some(Some(outcome)) => handle_pool_task_result(
+                outcome,
+                responses,
+                failures,
+                pool_results,
+                metrics,
+                meta,
+                vm_first_gases,
+                expected_len,
+                gas_price_wei,
+                eth_to_sell_spot_price,
+                sell_token_decimals,
+                current_block,
+            ),
+            Some(None) => break,
+            None => {}
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_pool_outcomes<F>(
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    while let Some(Some(outcome)) = tasks.next().now_or_never() {
+        handle_pool_task_result(
+            outcome,
+            responses,
+            failures,
+            pool_results,
+            metrics,
+            meta,
+            vm_first_gases,
+            expected_len,
+            gas_price_wei,
+            eth_to_sell_spot_price,
+            sell_token_decimals,
+            current_block,
+        );
     }
 }
 
@@ -1998,12 +2139,16 @@ fn make_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::native_wrapped::remap_request_token_for_pool;
 
     use std::any::Any;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
 
     use chrono::NaiveDateTime;
     use num_traits::Zero;
@@ -2023,6 +2168,32 @@ mod tests {
 
     fn default_calls() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    fn test_semaphore() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(1))
+    }
+
+    fn test_scheduled_counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    struct PendingThenReadyTask {
+        polls: Arc<AtomicUsize>,
+        result: Option<PoolTaskResult>,
+    }
+
+    impl Future for PendingThenReadyTask {
+        type Output = PoolTaskResult;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            Poll::Ready(self.result.take().expect("task should only resolve once"))
+        }
     }
 
     #[test]
@@ -2552,30 +2723,18 @@ mod tests {
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PairAwareSpotPriceSim {
-        sell_token: Bytes,
-        wrapped_native: Bytes,
-        native_token: Bytes,
-        wrapped_price: f64,
-        native_price: f64,
+    struct SlowQuoteSim {
+        delay_ms: u64,
     }
 
     #[typetag::serde]
-    impl ProtocolSim for PairAwareSpotPriceSim {
+    impl ProtocolSim for SlowQuoteSim {
         fn fee(&self) -> f64 {
             0.0
         }
 
-        fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-            if quote.address == self.sell_token && base.address == self.wrapped_native {
-                return Ok(self.wrapped_price);
-            }
-            if quote.address == self.sell_token && base.address == self.native_token {
-                return Ok(self.native_price);
-            }
-            Err(SimulationError::FatalError(
-                "pair not supported".to_string(),
-            ))
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Err(SimulationError::FatalError("spot unavailable".to_string()))
         }
 
         fn get_amount_out(
@@ -2584,105 +2743,10 @@ mod tests {
             _token_in: &Token,
             _token_out: &Token,
         ) -> Result<GetAmountOutResult, SimulationError> {
+            std::thread::sleep(Duration::from_millis(self.delay_ms));
             Ok(GetAmountOutResult::new(
                 amount_in.clone(),
-                amount_in,
-                self.clone_box(),
-            ))
-        }
-
-        fn get_limits(
-            &self,
-            _sell_token: Bytes,
-            _buy_token: Bytes,
-        ) -> Result<(BigUint, BigUint), SimulationError> {
-            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
-        }
-
-        fn delta_transition(
-            &mut self,
-            _delta: ProtocolStateDelta,
-            _tokens: &HashMap<Bytes, Token>,
-            _balances: &Balances,
-        ) -> Result<(), TransitionError<String>> {
-            Ok(())
-        }
-
-        fn clone_box(&self) -> Box<dyn ProtocolSim> {
-            Box::new(self.clone())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        fn eq(&self, other: &dyn ProtocolSim) -> bool {
-            other.as_any().is::<Self>()
-        }
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct ProbeModeGuardSpotPriceSim {
-        sell_token: Bytes,
-        wrapped_native: Bytes,
-        native_token: Bytes,
-        native_price: f64,
-        wrapped_price: f64,
-        #[serde(skip, default = "default_calls")]
-        native_calls: Arc<AtomicUsize>,
-        #[serde(skip, default = "default_calls")]
-        wrapped_calls: Arc<AtomicUsize>,
-    }
-
-    #[typetag::serde]
-    impl ProtocolSim for ProbeModeGuardSpotPriceSim {
-        fn fee(&self) -> f64 {
-            0.0
-        }
-
-        fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-            let is_native_pair = (base.address == self.native_token
-                && quote.address == self.sell_token)
-                || (base.address == self.sell_token && quote.address == self.native_token);
-            if is_native_pair {
-                self.native_calls.fetch_add(1, Ordering::SeqCst);
-                return if base.address == self.sell_token {
-                    Ok(1.0 / self.native_price)
-                } else {
-                    Ok(self.native_price)
-                };
-            }
-
-            let is_wrapped_pair = (base.address == self.wrapped_native
-                && quote.address == self.sell_token)
-                || (base.address == self.sell_token && quote.address == self.wrapped_native);
-            if is_wrapped_pair {
-                self.wrapped_calls.fetch_add(1, Ordering::SeqCst);
-                return if base.address == self.sell_token {
-                    Ok(1.0 / self.wrapped_price)
-                } else {
-                    Ok(self.wrapped_price)
-                };
-            }
-
-            Err(SimulationError::FatalError(
-                "pair not supported".to_string(),
-            ))
-        }
-
-        fn get_amount_out(
-            &self,
-            amount_in: BigUint,
-            _token_in: &Token,
-            _token_out: &Token,
-        ) -> Result<GetAmountOutResult, SimulationError> {
-            Ok(GetAmountOutResult::new(
-                amount_in.clone(),
-                amount_in,
+                BigUint::from(21_000u64),
                 self.clone_box(),
             ))
         }
@@ -2810,313 +2874,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_returns_one_for_wrapped_native_sell() {
-        let sell_token = Chain::Ethereum.wrapped_native_token();
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            Vec::new();
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates);
-
-        assert_eq!(price, Some(1.0));
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_prefers_wrapped_native_source() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b1")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = PairAwareSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            wrapped_price: 2_500.0,
-            native_price: 552_709_307.0,
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_native_only_pool_ignores_wrapped_path() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-        let native_calls = Arc::new(AtomicUsize::new(0));
-        let wrapped_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b1")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![native_token.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = ProbeModeGuardSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            native_price: 2_500.0,
-            wrapped_price: 552_709_307.0,
-            native_calls: Arc::clone(&native_calls),
-            wrapped_calls: Arc::clone(&wrapped_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_wrapped_only_pool_ignores_native_path() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-        let native_calls = Arc::new(AtomicUsize::new(0));
-        let wrapped_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b2")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = ProbeModeGuardSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            native_price: 552_709_307.0,
-            wrapped_price: 2_500.0,
-            native_calls: Arc::clone(&native_calls),
-            wrapped_calls: Arc::clone(&wrapped_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_returns_none_when_probe_mode_is_none() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let unrelated_a = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000d1").expect("valid address"),
-            "AAA",
-            18,
-        );
-        let unrelated_b = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000d2").expect("valid address"),
-            "BBB",
-            18,
-        );
-        let spot_price_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b3")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![unrelated_a, unrelated_b],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = SpotPriceCountingSim {
-            spot_price_value: Some(2_500.0),
-            max_in: 1_000_000,
-            spot_price_calls: Arc::clone(&spot_price_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let spot_price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates);
-        assert_eq!(spot_price, None);
-        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            compute_gas_in_sell_base_units(
-                Some(1_000_000_000_000_000_000),
-                Some(21_000),
-                spot_price,
-                sell_token.decimals,
-            ),
-            "0"
-        );
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_uses_most_liquid_pool() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000b2").expect("valid address"),
-            "WBTC",
-            8,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let low_liquidity_calls = Arc::new(AtomicUsize::new(0));
-        let high_liquidity_calls = Arc::new(AtomicUsize::new(0));
-
-        let component_a = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000c1")
-                .expect("valid pool address"),
-            "uniswap_v4".to_string(),
-            "uniswap_v4".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let component_b = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000c2")
-                .expect("valid pool address"),
-            "uniswap_v3".to_string(),
-            "uniswap_v3".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-
-        let outlier = SpotPriceCountingSim {
-            spot_price_value: Some(1.0e18),
-            max_in: 10,
-            spot_price_calls: Arc::clone(&low_liquidity_calls),
-        };
-        let consensus = SpotPriceCountingSim {
-            spot_price_value: Some(0.03125),
-            max_in: 1_000_000_000,
-            spot_price_calls: Arc::clone(&high_liquidity_calls),
-        };
-
-        // Keep ids ordered so the low-liquidity outlier candidate is visited first.
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = vec![
-            (
-                "a-outlier".to_string(),
-                Arc::new(outlier) as Arc<dyn ProtocolSim>,
-                Arc::new(component_a),
-            ),
-            (
-                "b-liquid".to_string(),
-                Arc::new(consensus) as Arc<dyn ProtocolSim>,
-                Arc::new(component_b),
-            ),
-        ];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 0.03125).abs() < f64::EPSILON);
-        assert_eq!(low_liquidity_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(high_liquidity_calls.load(Ordering::SeqCst), 1);
-    }
-
     #[tokio::test]
-    async fn get_amounts_out_uses_request_scoped_gas_snapshot_across_all_pools() {
-        let token_in_hex = "0x0000000000000000000000000000000000000001";
+    async fn get_amounts_out_uses_direct_gas_conversion_for_wrapped_native_sell_token() {
+        let token_in = Chain::Ethereum.wrapped_native_token().address;
         let token_out_hex = "0x0000000000000000000000000000000000000002";
-        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
         let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let token_in_hex = token_in.to_string();
 
-        let token_in_meta = make_token_with_decimals(&token_in, "TK1", 2);
+        let token_in_meta = make_token_with_decimals(&token_in, "WETH", 18);
         let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
 
         let mut initial_tokens = HashMap::new();
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
-        initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
 
         let token_store = Arc::new(TokenStore::new(
             initial_tokens,
@@ -3129,52 +2899,26 @@ mod tests {
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
-        let pair_spot_price_calls = Arc::new(AtomicUsize::new(0));
-        let spot_source_calls = Arc::new(AtomicUsize::new(0));
+        let spot_price_calls = Arc::new(AtomicUsize::new(0));
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
-        for (pool_id, pool_address_hex) in [
-            ("pool-a", "0x0000000000000000000000000000000000000011"),
-            ("pool-b", "0x0000000000000000000000000000000000000012"),
-        ] {
-            let component = ProtocolComponent::new(
-                Bytes::from_str(pool_address_hex).expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), token_out_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            );
-            states.insert(
-                pool_id.to_string(),
-                Box::new(SpotPriceCountingSim {
-                    spot_price_value: Some(1.5),
-                    max_in: 1_000_000,
-                    spot_price_calls: Arc::clone(&pair_spot_price_calls),
-                }) as Box<dyn ProtocolSim>,
-            );
-            new_pairs.insert(pool_id.to_string(), component);
-        }
         states.insert(
-            "pool-spot".to_string(),
+            "pool-a".to_string(),
             Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.5),
-                max_in: 10_000_000,
-                spot_price_calls: Arc::clone(&spot_source_calls),
+                spot_price_value: Some(1234.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::clone(&spot_price_calls),
             }) as Box<dyn ProtocolSim>,
         );
         new_pairs.insert(
-            "pool-spot".to_string(),
+            "pool-a".to_string(),
             ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000013")
+                Bytes::from_str("0x0000000000000000000000000000000000000011")
                     .expect("valid pool address"),
                 "uniswap_v2".to_string(),
                 "uniswap_v2".to_string(),
                 Chain::Ethereum,
-                vec![token_in_meta.clone(), wrapped_native_meta.clone()],
+                vec![token_in_meta.clone(), token_out_meta.clone()],
                 Vec::new(),
                 HashMap::new(),
                 Bytes::default(),
@@ -3193,9 +2937,7 @@ mod tests {
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
-                5_000_000_000_000_000_000,
-            ))),
+            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(1))),
             native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
             enable_vm_pools: false,
             readiness_stale: Duration::from_secs(120),
@@ -3211,28 +2953,92 @@ mod tests {
         };
 
         let request = AmountOutRequest {
-            request_id: "req-spot-reuse".to_string(),
+            request_id: "req-direct-weth-gas".to_string(),
             auction_id: None,
-            token_in: token_in_hex.to_string(),
+            token_in: token_in_hex,
             token_out: token_out_hex.to_string(),
             amounts: vec!["2".to_string(), "5".to_string()],
         };
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(pair_spot_price_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(spot_source_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(computation.responses.len(), 2);
-        let unique_gas_in_sell: HashSet<&str> = computation
-            .responses
-            .iter()
-            .map(|response| response.gas_in_sell.as_str())
-            .collect();
-        assert_eq!(unique_gas_in_sell.len(), 1);
-        for response in &computation.responses {
-            assert_eq!(response.gas_used, vec![2, 5]);
-            assert_eq!(response.gas_in_sell, "3750");
-        }
+        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].gas_used, vec![2, 5]);
+        assert_eq!(computation.responses[0].gas_in_sell, "5");
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_uses_direct_gas_conversion_for_native_sell_token() {
+        let native = Chain::Ethereum.native_token().address;
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000003").expect("valid address");
+
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let wrapped_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK3", 6);
+        let token_store = make_token_store(vec![
+            native_meta.clone(),
+            wrapped_meta.clone(),
+            token_out_meta.clone(),
+        ]);
+
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        states.insert(
+            "pool-wrapped".to_string(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: wrapped_native.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }) as Box<dyn ProtocolSim>,
+        );
+        new_pairs.insert(
+            "pool-wrapped".to_string(),
+            make_pair_component(
+                "0x0000000000000000000000000000000000000012",
+                "uniswap_v2",
+                "uniswap_v2",
+                vec![wrapped_meta, token_out_meta],
+            ),
+        );
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig {
+                gas_price_wei: Some(1),
+                gas_reporting_enabled: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let request = AmountOutRequest {
+            request_id: "req-direct-eth-gas".to_string(),
+            auction_id: None,
+            token_in: native.to_string(),
+            token_out: token_out.to_string(),
+            amounts: vec!["2".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].gas_in_sell, "21000");
     }
 
     #[tokio::test]
@@ -3733,16 +3539,13 @@ mod tests {
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
         let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
 
         let token_in_meta = make_token_with_decimals(&token_in, "TK1", 6);
         let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
 
         let mut initial_tokens = HashMap::new();
         initial_tokens.insert(token_in.clone(), token_in_meta.clone());
         initial_tokens.insert(token_out.clone(), token_out_meta.clone());
-        initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
 
         let token_store = Arc::new(TokenStore::new(
             initial_tokens,
@@ -3774,29 +3577,6 @@ mod tests {
                 "uniswap_v2".to_string(),
                 Chain::Ethereum,
                 vec![token_in_meta.clone(), token_out_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            ),
-        );
-        states.insert(
-            "pool-spot".to_string(),
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.5),
-                max_in: 10_000_000,
-                spot_price_calls: Arc::new(AtomicUsize::new(0)),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-spot".to_string(),
-            ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000013")
-                    .expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), wrapped_native_meta.clone()],
                 Vec::new(),
                 HashMap::new(),
                 Bytes::default(),
@@ -3848,7 +3628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_amounts_out_sets_gas_in_sell_to_zero_when_spot_price_fails() {
+    async fn get_amounts_out_sets_gas_in_sell_to_zero_for_non_native_sell_without_probe() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -4242,11 +4022,6 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("permit");
-
         let outcome = simulate_pool(
             "pool-1".to_string(),
             Arc::new(sim),
@@ -4259,23 +4034,25 @@ mod tests {
             BigUint::from(11u8),
             2,
             Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
             CancellationToken::new(),
-            permit,
+            test_semaphore(),
+            test_scheduled_counter(),
         )
-        .await
-        .expect("simulate_pool should return outcome");
+        .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
         match outcome {
-            PoolSimOutcome::Simulated(result) => {
+            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
                 assert_eq!(result.amounts_out.len(), 1);
                 assert_eq!(result.gas_used.len(), 1);
                 assert_eq!(result.errors.len(), 1);
                 assert!(result.errors[0].contains("Probe quote failed"));
             }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
+            PoolTaskResult::Completed(PoolSimOutcome::SkippedDueToLimits { .. }) => {
                 panic!("mixed ladder should still quote lower amounts")
             }
+            _ => panic!("expected simulated pool outcome"),
         }
     }
 
@@ -4293,11 +4070,6 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("permit");
-
         let outcome = simulate_pool(
             "pool-1".to_string(),
             Arc::new(sim),
@@ -4310,15 +4082,16 @@ mod tests {
             BigUint::from(20u8),
             2,
             Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
             CancellationToken::new(),
-            permit,
+            test_semaphore(),
+            test_scheduled_counter(),
         )
-        .await
-        .expect("simulate_pool should return outcome");
+        .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + remaining amount");
         match outcome {
-            PoolSimOutcome::Simulated(result) => {
+            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
                 assert_eq!(result.amounts_out.len(), 1);
                 assert_eq!(result.gas_used.len(), 1);
                 assert_eq!(result.errors.len(), 1);
@@ -4326,9 +4099,10 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("sell amount exceeds limit"));
             }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
+            PoolTaskResult::Completed(PoolSimOutcome::SkippedDueToLimits { .. }) => {
                 panic!("min-amount probe should prevent conservative get_limits skip")
             }
+            _ => panic!("expected simulated pool outcome"),
         }
     }
 
@@ -4755,11 +4529,6 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("permit");
-
         let outcome = simulate_pool(
             "pool-1".to_string(),
             Arc::new(sim),
@@ -4772,15 +4541,16 @@ mod tests {
             BigUint::from(11u8),
             2,
             Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
             CancellationToken::new(),
-            permit,
+            test_semaphore(),
+            test_scheduled_counter(),
         )
-        .await
-        .expect("simulate_pool should return outcome");
+        .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
         match outcome {
-            PoolSimOutcome::Simulated(result) => {
+            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
                 assert_eq!(result.amounts_out.len(), 1);
                 assert_eq!(result.gas_used.len(), 1);
                 assert!(!result.timed_out);
@@ -4788,9 +4558,164 @@ mod tests {
                 assert!(result.errors[0].contains("Probe quote failed"));
                 assert!(result.errors[0].contains("Invalid input"));
             }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
+            PoolTaskResult::Completed(PoolSimOutcome::SkippedDueToLimits { .. }) => {
                 panic!("non-limit invalid input should not be treated as limits skip")
             }
+            _ => panic!("expected simulated pool outcome"),
+        }
+    }
+
+    #[test]
+    fn simulate_pool_starts_timeout_when_blocking_work_actually_begins() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001")
+                .expect("valid address");
+            let token_out = Bytes::from_str("0x0000000000000000000000000000000000000002")
+                .expect("valid address");
+            let (occupier_started_tx, occupier_started_rx) = tokio::sync::oneshot::channel();
+            let occupier = tokio::task::spawn_blocking(move || {
+                let _ = occupier_started_tx.send(());
+                std::thread::sleep(Duration::from_millis(60));
+            });
+            occupier_started_rx.await.expect("occupier should start");
+
+            let outcome = simulate_pool(
+                "pool-delayed".to_string(),
+                Arc::new(SpotPriceCountingSim {
+                    spot_price_value: Some(1.0),
+                    max_in: 1_000_000,
+                    spot_price_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                "0x0000000000000000000000000000000000000009".to_string(),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Arc::new(make_token(&token_in, "TK1")),
+                Arc::new(make_token(&token_out, "TK2")),
+                Arc::new(vec![BigUint::from(1u8)]),
+                BigUint::from(1u8),
+                1,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(20),
+                CancellationToken::new(),
+                test_semaphore(),
+                test_scheduled_counter(),
+            )
+            .await;
+
+            occupier.await.expect("occupier should finish");
+
+            match outcome {
+                PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
+                    assert_eq!(result.amounts_out, vec!["1".to_string()]);
+                    assert_eq!(result.gas_used, vec![1]);
+                    assert!(!result.timed_out);
+                }
+                _ => panic!("expected queued pool to complete after blocking thread became free"),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_does_not_reserve_permit_before_poll() {
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address");
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+        let semaphore = test_semaphore();
+        let scheduled = test_scheduled_counter();
+
+        let future = simulate_pool(
+            "pool-queued".to_string(),
+            Arc::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8)]),
+            BigUint::from(1u8),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
+            CancellationToken::new(),
+            semaphore.clone(),
+            Arc::clone(&scheduled),
+        );
+
+        let extra_permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("queued future should not reserve the only permit");
+        assert_eq!(scheduled.load(Ordering::SeqCst), 0);
+        drop(extra_permit);
+
+        let outcome = future.await;
+
+        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        match outcome {
+            PoolTaskResult::Completed(PoolSimOutcome::Simulated(result)) => {
+                assert_eq!(result.amounts_out, vec!["1".to_string()]);
+                assert_eq!(result.gas_used, vec![1]);
+            }
+            _ => panic!("expected queued pool to acquire permit once polled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_does_not_count_or_keep_a_permit_after_cancellation() {
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address");
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+        let semaphore = test_semaphore();
+        let scheduled = test_scheduled_counter();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = simulate_pool(
+            "pool-cancelled".to_string(),
+            Arc::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8)]),
+            BigUint::from(1u8),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
+            cancel,
+            semaphore.clone(),
+            Arc::clone(&scheduled),
+        )
+        .await;
+
+        assert_eq!(scheduled.load(Ordering::SeqCst), 0);
+        let _ = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("cancelled task should not consume the permit");
+        match outcome {
+            PoolTaskResult::Failed { failure } => {
+                assert!(matches!(failure.kind, QuoteFailureKind::Timeout));
+                assert!(failure.message.contains("cancelled"));
+            }
+            _ => panic!("expected cancelled pool to return a timeout-style failure"),
         }
     }
 
@@ -5118,6 +5043,180 @@ mod tests {
             .failures
             .iter()
             .any(|failure| matches!(failure.kind, QuoteFailureKind::ConcurrencyLimit)));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_keeps_scheduling_metrics_and_skip_outcomes() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let token_in_meta = make_token(&token_in, "TK1");
+        let token_out_meta = make_token(&token_out, "TK2");
+
+        let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        for (pool_id, address) in [
+            ("pool-1", "0x0000000000000000000000000000000000000031"),
+            ("pool-2", "0x0000000000000000000000000000000000000032"),
+            ("pool-3", "0x0000000000000000000000000000000000000033"),
+        ] {
+            states.insert(
+                pool_id.to_string(),
+                Box::new(SlowQuoteSim { delay_ms: 50 }) as Box<dyn ProtocolSim>,
+            );
+            new_pairs.insert(
+                pool_id.to_string(),
+                make_pair_component(
+                    address,
+                    "uniswap_v2",
+                    "uniswap_v2",
+                    vec![token_in_meta.clone(), token_out_meta.clone()],
+                ),
+            );
+        }
+
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let mut app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 1,
+                ..TestAppStateConfig::default()
+            },
+        );
+        app_state.quote_timeout = Duration::from_millis(10);
+        app_state.pool_timeout_native = Duration::from_millis(100);
+
+        let request = AmountOutRequest {
+            request_id: "req-timeout-accounting".to_string(),
+            auction_id: None,
+            token_in: token_in_hex.to_string(),
+            token_out: token_out_hex.to_string(),
+            amounts: vec!["1".to_string()],
+        };
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(computation.responses.is_empty());
+        assert_eq!(computation.metrics.scheduled_native_pools, 1);
+        assert_eq!(computation.metrics.skipped_native_concurrency, 2);
+        assert_eq!(
+            computation
+                .meta
+                .pool_results
+                .iter()
+                .filter(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency)
+                .count(),
+            2
+        );
+        assert!(matches!(
+            computation.meta.status,
+            QuoteStatus::PartialSuccess
+        ));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout)));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::ConcurrencyLimit)));
+    }
+
+    #[test]
+    fn cancel_and_flush_pool_outcomes_surfaces_never_polled_tasks() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let mut tasks = FuturesUnordered::new();
+        tasks.push(PendingThenReadyTask {
+            polls: Arc::clone(&poll_count),
+            result: Some(PoolTaskResult::SkippedDueToConcurrency {
+                pool: "pool-skipped".to_string(),
+                pool_name: "uniswap_v2::TK1/TK2".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                protocol: "uniswap_v2".to_string(),
+                reason: Some(
+                    "Pool scheduling skipped because concurrency permits were exhausted"
+                        .to_string(),
+                ),
+            }),
+        });
+        tasks.push(PendingThenReadyTask {
+            polls: Arc::clone(&poll_count),
+            result: Some(PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Timeout,
+                    "pool-timeout: Quote computation cancelled".to_string(),
+                    Some(FailureContext {
+                        pool_id: "pool-timeout",
+                        pool_name: Some("uniswap_v2::TK1/TK2"),
+                        pool_address: Some("0x0000000000000000000000000000000000000002"),
+                        protocol: Some("uniswap_v2"),
+                    }),
+                ),
+            }),
+        });
+
+        let cancel_token = CancellationToken::new();
+        let mut responses = Vec::new();
+        let mut failures = Vec::new();
+        let mut pool_results = Vec::new();
+        let mut metrics = QuoteMetrics::default();
+        let mut meta = QuoteMeta {
+            status: QuoteStatus::Ready,
+            result_quality: QuoteResultQuality::RequestLevelFailure,
+            block_number: 42,
+            vm_block_number: None,
+            matching_pools: 0,
+            candidate_pools: 0,
+            total_pools: None,
+            auction_id: None,
+            pool_results: Vec::new(),
+            vm_unavailable: false,
+            failures: Vec::new(),
+        };
+        let mut vm_first_gases = Vec::new();
+
+        cancel_and_flush_pool_outcomes(
+            &cancel_token,
+            &mut tasks,
+            &mut responses,
+            &mut failures,
+            &mut pool_results,
+            &mut metrics,
+            &mut meta,
+            &mut vm_first_gases,
+            1,
+            None,
+            None,
+            18,
+            42,
+        );
+
+        assert!(cancel_token.is_cancelled());
+        assert!(poll_count.load(Ordering::SeqCst) >= 2);
+        assert!(responses.is_empty());
+        assert_eq!(metrics.skipped_native_concurrency, 1);
+        assert!(failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout)));
+        assert!(pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
+        assert!(pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::TimedOut));
     }
 
     #[tokio::test]

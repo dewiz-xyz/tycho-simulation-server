@@ -25,7 +25,7 @@ Options:
   --stop             Stop server when done (only if started by this script)
   -h, --help         Show this help
 
-Tip: For mainnet variability, use --allow-partial --allow-no-liquidity for local runs.
+Tip: For mainnet variability, use --allow-partial --allow-no-liquidity for local runs; the smoke validator will then accept non-empty partial ladders in `data`.
 USAGE
 }
 

@@ -30,7 +30,7 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
-`run_suite.sh` smoke checks now require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
+`run_suite.sh` smoke checks require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount: ETH/WETH sell tokens use direct `1.0` conversion from gas-in-ETH, non-native sell tokens may return a non-zero value when a sell-token/native or sell-token/wrapped-native spot source is available, and `"0"` remains valid when gas reporting inputs are unavailable or no usable spot source exists.
 
 VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
 ```bash
@@ -41,6 +41,7 @@ If you need to tolerate partial failures or empty-liquidity responses while stil
 ```bash
 scripts/run_suite.sh --repo . --suite core --allow-partial --allow-no-liquidity --stop
 ```
+With `--allow-partial`, smoke validation now accepts partial-ladder pool entries as long as `amounts_out` and `gas_used` stay aligned, monotonic, and non-empty.
 
 ## Smoke test /simulate
 
@@ -54,7 +55,7 @@ python3 scripts/simulate_smoke.py --pair DAI:USDC --pair WETH:USDC
 python3 scripts/simulate_smoke.py --list-tokens
 ```
 
-For stricter checks (fail on empty data and validate pool entries, including `gas_in_sell`; `"0"` is valid):
+For stricter checks (fail on empty data and validate pool entries, including `gas_in_sell`; `"0"` is still valid when reporting inputs or spot conversion data are unavailable):
 ```bash
 python3 scripts/simulate_smoke.py --suite smoke --require-data --validate-data
 ```
@@ -63,6 +64,8 @@ Allow partial responses explicitly:
 ```bash
 python3 scripts/simulate_smoke.py --suite smoke --allow-status ready,partial_success --allow-failures
 ```
+Quote handler logs now keep request-guard and zero-result timeout completions at `WARN` (`scope="handler_timeout"`), while partial-success responses that still return usable quotes log at `INFO` (`scope="handler_complete"`).
+When `--allow-failures` is set together with `--validate-data`, partial ladders are accepted.
 
 ## Smoke test /encode
 
@@ -135,7 +138,7 @@ zsh skills/simulation-service-tests/scripts/run_checks.zsh --repo /path/to/tycho
 
 1. Bump `tycho-simulation` tag/version (or other deps).
 2. Run: `cargo fmt`, `cargo clippy ...`, `cargo test`, `cargo build --release`.
-3. Run the end-to-end suite (`run_suite.zsh`) with and without VM pools.
+3. Run the end-to-end suite (`scripts/run_suite.sh`) with and without VM pools.
 4. If infra changes are involved: `npm ci`, `npx cdk synth`, `npx cdk diff`.
 
 ## Deploy workflow (CDK + Docker)
@@ -144,7 +147,8 @@ See `references/deploy.md`.
 
 ## Included scripts
 
-- Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
+- Repo scripts are the canonical entrypoints: `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
+- Skill-local wrappers and helper utilities are not kept in lockstep with every repo-script change in this pass. Use repo `scripts/` for start/stop/wait/suite flows.
 - Skill utilities: `scripts/run_checks.zsh` (CI-like `cargo fmt/clippy/test/build` + optional `cdk synth`/`docker build`).
 
 ## References

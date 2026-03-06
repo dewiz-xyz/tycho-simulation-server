@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
-use tokio::task::spawn_blocking;
-use tokio::time::sleep;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
@@ -15,6 +15,8 @@ use tycho_simulation::{
 };
 
 use crate::models::state::AppState;
+use crate::services::native_wrapped::normalize_native_to_wrapped;
+use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
 use super::allocation::allocate_swaps_by_bps;
 use super::model::{
@@ -30,6 +32,7 @@ pub(super) async fn resimulate_route(
     chain: Chain,
     request_token_in: &Bytes,
     request_token_out: &Bytes,
+    request_cancel: Option<&CancellationToken>,
 ) -> Result<ResimulatedRouteInternal, EncodeError> {
     let mut token_cache = TokenCache::new(state);
     let mut pool_cache: HashMap<String, (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
@@ -108,72 +111,50 @@ pub(super) async fn resimulate_route(
                 let token_in = token_cache.get(&sim_token_in).await?;
                 let token_out = token_cache.get(&sim_token_out).await?;
 
-                // Offload pool simulation to the blocking pool (VM pools can be CPU-heavy).
-                //
-                // Mirror `/simulate` guardrails: hold a semaphore permit inside the blocking task
-                // so timeouts/cancellation don't accidentally uncap concurrent CPU-bound work.
-                let is_vm = pool_entry.1.protocol_system.starts_with("vm:");
-                let permit = if is_vm {
-                    state
-                        .vm_sim_semaphore()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| EncodeError::internal("VM pool semaphore closed"))?
-                } else {
-                    state
-                        .native_sim_semaphore()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| EncodeError::internal("Native pool semaphore closed"))?
-                };
                 let pool_state = Arc::clone(&pool_entry.0);
                 let amount_in_for_sim = allocated.amount_in.clone();
-                let pool_timeout = if is_vm {
+                let is_vm_pool = pool_entry.1.protocol_system.starts_with("vm:");
+                let pool_timeout = if is_vm_pool {
                     state.pool_timeout_vm()
                 } else {
                     state.pool_timeout_native()
                 };
+                let permit = acquire_pool_permit(
+                    state,
+                    is_vm_pool,
+                    allocated.pool.component_id.as_str(),
+                    request_cancel,
+                )
+                .await?;
 
-                let handle = spawn_blocking(move || {
-                    // Hold the permit until the blocking work exits.
-                    let _permit = permit;
-                    // Move the pool state into the blocking task and return it so the caller can
-                    // attach it to the response without an extra clone.
-                    let pre_state = pool_state;
-                    let result = pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
-                    (pre_state, result)
-                });
-                tokio::pin!(handle);
-
-                let (pre_state, result) = tokio::select! {
-                    res = handle.as_mut() => {
-                        res.map_err(|join_err| {
-                            let reason = if join_err.is_panic() {
-                                "panicked"
-                            } else if join_err.is_cancelled() {
-                                "was cancelled"
-                            } else {
-                                "failed"
-                            };
-                            EncodeError::internal(format!(
-                                "Pool {} simulation task {}: {}",
-                                allocated.pool.component_id, reason, join_err
-                            ))
-                        })?
-                    }
-                    _ = sleep(pool_timeout) => {
-                        // Best-effort attempt to stop waiting on the blocking task after a pool-level
-                        // timeout; this doesn't reliably prevent `spawn_blocking` work from running
-                        // once scheduled. The semaphore permit is held inside the closure to cap
-                        // concurrent CPU usage even if the task keeps running.
-                        handle.as_mut().abort();
-                        return Err(EncodeError::simulation(format!(
-                            "Pool {} simulation timed out after {}ms",
-                            allocated.pool.component_id,
-                            pool_timeout.as_millis()
-                        )));
-                    }
-                };
+                let component_id = allocated.pool.component_id.clone();
+                let (pre_state, result) = run_blocking_pool_job(
+                    permit,
+                    pool_timeout,
+                    request_cancel.map(CancellationToken::child_token),
+                    move |_| {
+                        let pre_state = pool_state;
+                        let result =
+                            pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
+                        (pre_state, result)
+                    },
+                )
+                .await
+                .map_err(|error| match error {
+                    PoolJobError::TimedOut => EncodeError::simulation(format!(
+                        "Pool {} simulation timed out after {}ms",
+                        component_id,
+                        pool_timeout.as_millis()
+                    )),
+                    PoolJobError::Cancelled => EncodeError::simulation(format!(
+                        "Pool {} simulation cancelled",
+                        component_id
+                    )),
+                    PoolJobError::JoinFailed(join_err) => EncodeError::internal(format!(
+                        "Pool {} simulation task failed: {}",
+                        component_id, join_err
+                    )),
+                })?;
                 let result = result.map_err(|err| {
                     EncodeError::simulation(format!(
                         "Pool {} simulation failed: {}",
@@ -291,11 +272,37 @@ fn ensure_native_swap_supported(
 }
 
 fn map_swap_token(address: &Bytes, chain: Chain, keep_native_unwrapped: bool) -> Bytes {
-    if !keep_native_unwrapped && *address == chain.native_token().address {
-        chain.wrapped_native_token().address
+    normalize_native_to_wrapped(address, chain, keep_native_unwrapped)
+}
+
+async fn acquire_pool_permit(
+    state: &AppState,
+    is_vm_pool: bool,
+    component_id: &str,
+    request_cancel: Option<&CancellationToken>,
+) -> Result<OwnedSemaphorePermit, EncodeError> {
+    let semaphore = if is_vm_pool {
+        state.vm_sim_semaphore()
     } else {
-        address.clone()
-    }
+        state.native_sim_semaphore()
+    };
+
+    let acquire_result = if let Some(request_cancel) = request_cancel {
+        tokio::select! {
+            permit = semaphore.acquire_owned() => permit,
+            _ = request_cancel.cancelled() => {
+                return Err(EncodeError::simulation(format!(
+                    "Pool {} simulation cancelled",
+                    component_id
+                )));
+            }
+        }
+    } else {
+        semaphore.acquire_owned().await
+    };
+
+    acquire_result
+        .map_err(|_| EncodeError::internal(format!("Pool {} semaphore closed", component_id)))
 }
 
 struct TokenCache<'a> {
@@ -539,6 +546,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            None,
         )
         .await
         .unwrap();
@@ -667,6 +675,7 @@ mod tests {
             Chain::Ethereum,
             &token_a.address,
             &token_c.address,
+            None,
         )
         .await
         .unwrap();
@@ -767,6 +776,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            None,
         )
         .await
         {
@@ -873,6 +883,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            None,
         )
         .await
         {
@@ -889,5 +900,249 @@ mod tests {
             "unexpected error: {}",
             err.message()
         );
+    }
+
+    #[test]
+    fn resimulate_route_cancels_while_waiting_for_blocking_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+            let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+            let mut tokens = HashMap::new();
+            tokens.insert(token_in.address.clone(), token_in.clone());
+            tokens.insert(token_out.address.clone(), token_out.clone());
+
+            let tokens_store = Arc::new(TokenStore::new(
+                tokens,
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            ));
+            let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+            let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+            let component = ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![token_in.clone(), token_out.clone()],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            );
+            let mut states = HashMap::new();
+            states.insert(
+                "pool-fast".to_string(),
+                Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+            );
+            let mut new_pairs = HashMap::new();
+            new_pairs.insert("pool-fast".to_string(), component);
+            native_state_store
+                .apply_update(Update::new(1, states, new_pairs))
+                .await;
+
+            let app_state = AppState {
+                tokens: Arc::clone(&tokens_store),
+                native_state_store: Arc::clone(&native_state_store),
+                vm_state_store: Arc::clone(&vm_state_store),
+                native_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+                latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+                native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+                enable_vm_pools: false,
+                readiness_stale: Duration::from_secs(120),
+                quote_timeout: Duration::from_millis(1000),
+                pool_timeout_native: Duration::from_millis(200),
+                pool_timeout_vm: Duration::from_millis(1000),
+                request_timeout: Duration::from_millis(1000),
+                native_sim_semaphore: Arc::new(Semaphore::new(1)),
+                vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+                reset_allowance_tokens: Arc::new(HashMap::new()),
+                native_sim_concurrency: 1,
+                vm_sim_concurrency: 1,
+            };
+
+            let normalized = NormalizedRouteInternal {
+                segments: vec![NormalizedSegmentInternal {
+                    share_bps: 10_000,
+                    amount_in: BigUint::from(10u32),
+                    hops: vec![NormalizedHopInternal {
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        swaps: vec![NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-fast"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 0,
+                        }],
+                    }],
+                }],
+            };
+
+            let (occupier_started_tx, occupier_started_rx) = tokio::sync::oneshot::channel();
+            let occupier = tokio::task::spawn_blocking(move || {
+                let _ = occupier_started_tx.send(());
+                std::thread::sleep(Duration::from_millis(80));
+            });
+            occupier_started_rx.await.expect("occupier should start");
+
+            let cancel = CancellationToken::new();
+            let cancel_for_task = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancel_for_task.cancel();
+            });
+
+            let started_at = std::time::Instant::now();
+            let err = match resimulate_route(
+                &app_state,
+                &normalized,
+                Chain::Ethereum,
+                &token_in.address,
+                &token_out.address,
+                Some(&cancel),
+            )
+            .await
+            {
+                Ok(_) => panic!("queued route should be cancelled"),
+                Err(err) => err,
+            };
+            let elapsed = started_at.elapsed();
+
+            occupier.await.expect("occupier should finish");
+
+            assert!(elapsed < Duration::from_millis(50));
+            assert_eq!(
+                err.kind(),
+                crate::services::encode::EncodeErrorKind::Simulation
+            );
+            assert!(
+                err.message().contains("pool-fast") && err.message().contains("cancelled"),
+                "unexpected error: {}",
+                err.message()
+            );
+        });
+    }
+
+    #[test]
+    fn resimulate_route_waits_for_blocking_thread_before_starting_timeout() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+            let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+            let mut tokens = HashMap::new();
+            tokens.insert(token_in.address.clone(), token_in.clone());
+            tokens.insert(token_out.address.clone(), token_out.clone());
+
+            let tokens_store = Arc::new(TokenStore::new(
+                tokens,
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            ));
+            let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+            let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+
+            let component = ProtocolComponent::new(
+                Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
+                "uniswap_v2".to_string(),
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                vec![token_in.clone(), token_out.clone()],
+                Vec::new(),
+                HashMap::new(),
+                Bytes::default(),
+                NaiveDateTime::default(),
+            );
+            let mut states = HashMap::new();
+            states.insert(
+                "pool-fast".to_string(),
+                Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+            );
+            let mut new_pairs = HashMap::new();
+            new_pairs.insert("pool-fast".to_string(), component);
+            native_state_store
+                .apply_update(Update::new(1, states, new_pairs))
+                .await;
+
+            let app_state = AppState {
+                tokens: Arc::clone(&tokens_store),
+                native_state_store: Arc::clone(&native_state_store),
+                vm_state_store: Arc::clone(&vm_state_store),
+                native_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+                latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+                native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+                enable_vm_pools: false,
+                readiness_stale: Duration::from_secs(120),
+                quote_timeout: Duration::from_millis(1000),
+                pool_timeout_native: Duration::from_millis(20),
+                pool_timeout_vm: Duration::from_millis(1000),
+                request_timeout: Duration::from_millis(1000),
+                native_sim_semaphore: Arc::new(Semaphore::new(1)),
+                vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+                reset_allowance_tokens: Arc::new(HashMap::new()),
+                native_sim_concurrency: 1,
+                vm_sim_concurrency: 1,
+            };
+
+            let normalized = NormalizedRouteInternal {
+                segments: vec![NormalizedSegmentInternal {
+                    share_bps: 10_000,
+                    amount_in: BigUint::from(10u32),
+                    hops: vec![NormalizedHopInternal {
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        swaps: vec![NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-fast"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 0,
+                        }],
+                    }],
+                }],
+            };
+
+            let (occupier_started_tx, occupier_started_rx) = tokio::sync::oneshot::channel();
+            let occupier = tokio::task::spawn_blocking(move || {
+                let _ = occupier_started_tx.send(());
+                std::thread::sleep(Duration::from_millis(60));
+            });
+            occupier_started_rx.await.expect("occupier should start");
+
+            let resimulated = resimulate_route(
+                &app_state,
+                &normalized,
+                Chain::Ethereum,
+                &token_in.address,
+                &token_out.address,
+                None,
+            )
+            .await
+            .expect("queued route should still resimulate");
+
+            occupier.await.expect("occupier should finish");
+
+            assert_eq!(
+                resimulated.segments[0].hops[0].swaps[0].expected_amount_out,
+                BigUint::from(10u32)
+            );
+        });
     }
 }
