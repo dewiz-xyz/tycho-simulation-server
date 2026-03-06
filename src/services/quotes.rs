@@ -919,11 +919,9 @@ async fn simulate_pool(
     let token_out_clone = Arc::clone(&token_out);
     let amounts_clone = Arc::clone(&amounts);
     let cancel_token_clone = cancel_token.clone();
+
     let permit = match semaphore.try_acquire_owned() {
-        Ok(permit) => {
-            scheduled_pool_count.fetch_add(1, Ordering::Relaxed);
-            permit
-        }
+        Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => {
             return PoolTaskResult::SkippedDueToConcurrency {
                 pool: pool_id_for_failure,
@@ -953,6 +951,25 @@ async fn simulate_pool(
             };
         }
     };
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        let context = FailureContext {
+            pool_id: &pool_id_for_failure,
+            pool_name: Some(pool_name_for_failure.as_str()),
+            pool_address: Some(pool_addr_for_failure.as_str()),
+            protocol: Some(pool_protocol_for_failure.as_str()),
+        };
+        let descriptor = format_pool_descriptor(&context);
+        return PoolTaskResult::Failed {
+            failure: make_failure(
+                QuoteFailureKind::Timeout,
+                format!("{}: Quote computation cancelled", descriptor),
+                Some(context),
+            ),
+        };
+    }
+    scheduled_pool_count.fetch_add(1, Ordering::Relaxed);
     let result = run_blocking_pool_job(
         permit,
         pool_timeout,
@@ -4651,6 +4668,54 @@ mod tests {
                 assert_eq!(result.gas_used, vec![1]);
             }
             _ => panic!("expected queued pool to acquire permit once polled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_does_not_count_or_keep_a_permit_after_cancellation() {
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address");
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
+        let semaphore = test_semaphore();
+        let scheduled = test_scheduled_counter();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = simulate_pool(
+            "pool-cancelled".to_string(),
+            Arc::new(SpotPriceCountingSim {
+                spot_price_value: Some(1.0),
+                max_in: 1_000_000,
+                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "0x0000000000000000000000000000000000000009".to_string(),
+            "uniswap_v2".to_string(),
+            "uniswap_v2".to_string(),
+            Arc::new(make_token(&token_in, "TK1")),
+            Arc::new(make_token(&token_out, "TK2")),
+            Arc::new(vec![BigUint::from(1u8)]),
+            BigUint::from(1u8),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(50),
+            cancel,
+            semaphore.clone(),
+            Arc::clone(&scheduled),
+        )
+        .await;
+
+        assert_eq!(scheduled.load(Ordering::SeqCst), 0);
+        let _ = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("cancelled task should not consume the permit");
+        match outcome {
+            PoolTaskResult::Failed { failure } => {
+                assert!(matches!(failure.kind, QuoteFailureKind::Timeout));
+                assert!(failure.message.contains("cancelled"));
+            }
+            _ => panic!("expected cancelled pool to return a timeout-style failure"),
         }
     }
 

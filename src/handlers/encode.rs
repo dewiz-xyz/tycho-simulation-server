@@ -20,6 +20,29 @@ enum EncodeComputation {
     TimedOut,
 }
 
+struct CancelOnDrop {
+    token: CancellationToken,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(token: CancellationToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
+}
+
 pub async fn encode(
     State(state): State<AppState>,
     Json(request): Json<RouteEncodeRequest>,
@@ -49,11 +72,16 @@ pub async fn encode(
             .await
         }
     });
+    let mut cancel_guard = CancelOnDrop::new(request_cancel.clone());
 
     let computation =
         match await_encode_computation(computation_task, request_timeout, request_cancel).await {
-            EncodeComputation::Completed(result) => result,
+            EncodeComputation::Completed(result) => {
+                cancel_guard.disarm();
+                result
+            }
             EncodeComputation::JoinFailed(join_err) => {
+                cancel_guard.disarm();
                 warn!(
                     scope = "handler_internal",
                     request_id,
@@ -140,17 +168,20 @@ async fn await_encode_computation(
 ) -> EncodeComputation {
     let timeout = tokio::time::sleep(request_timeout);
     tokio::pin!(timeout);
-    tokio::pin!(computation_task);
+    let mut computation_task = computation_task;
 
     tokio::select! {
-        result = computation_task.as_mut() => match result {
+        result = &mut computation_task => match result {
             Ok(result) => EncodeComputation::Completed(result),
             Err(join_err) => EncodeComputation::JoinFailed(join_err),
         },
         _ = &mut timeout => {
-            // `tokio::time::timeout` would drop the JoinHandle here, which detaches the task.
             request_cancel.cancel();
-            computation_task.as_mut().abort();
+            // Keep awaiting the spawned task in the background so it can propagate cancellation
+            // into any in-flight pool jobs instead of getting detached here.
+            tokio::spawn(async move {
+                let _ = computation_task.await;
+            });
             EncodeComputation::TimedOut
         }
     }
@@ -162,19 +193,26 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
 
-    use super::{await_encode_computation, EncodeComputation};
+    use super::{await_encode_computation, CancelOnDrop, EncodeComputation};
     use crate::models::messages::RouteEncodeResponse;
     use crate::services::encode::EncodeError;
+    use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
     #[tokio::test]
-    async fn await_encode_computation_aborts_timed_out_task() {
+    async fn await_encode_computation_cancels_timed_out_task_without_aborting_it() {
         let task_finished = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::new(AtomicBool::new(false));
         let task_finished_flag = Arc::clone(&task_finished);
+        let task_cancelled_flag = Arc::clone(&task_cancelled);
         let request_cancel = CancellationToken::new();
+        let request_cancel_for_task = request_cancel.clone();
         let computation_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            request_cancel_for_task.cancelled().await;
+            task_cancelled_flag.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
             task_finished_flag.store(true, Ordering::SeqCst);
             Ok::<_, EncodeError>(RouteEncodeResponse {
                 interactions: Vec::new(),
@@ -192,7 +230,100 @@ mod tests {
         assert!(matches!(result, EncodeComputation::TimedOut));
         assert!(request_cancel.is_cancelled());
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(!task_finished.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(task_cancelled.load(Ordering::SeqCst));
+        assert!(task_finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancel_on_drop_cancels_work_when_handler_exits_early() {
+        let task_finished = Arc::new(AtomicBool::new(false));
+        let task_finished_flag = Arc::clone(&task_finished);
+        let request_cancel = CancellationToken::new();
+        let request_cancel_for_task = request_cancel.clone();
+        let computation_task = tokio::spawn(async move {
+            request_cancel_for_task.cancelled().await;
+            task_finished_flag.store(true, Ordering::SeqCst);
+            Ok::<_, EncodeError>(RouteEncodeResponse {
+                interactions: Vec::new(),
+                debug: None,
+            })
+        });
+        let guard = CancelOnDrop::new(request_cancel.clone());
+
+        drop(guard);
+        drop(computation_task);
+
+        assert!(request_cancel.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(task_finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn await_encode_computation_lets_cancellation_reach_blocking_pool_job() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let request_cancel = CancellationToken::new();
+            let blocking_permit = Arc::new(Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .expect("permit");
+            let job_started = Arc::new(AtomicBool::new(false));
+            let job_started_flag = Arc::clone(&job_started);
+
+            let (occupier_started_tx, occupier_started_rx) = tokio::sync::oneshot::channel();
+            let occupier = tokio::task::spawn_blocking(move || {
+                let _ = occupier_started_tx.send(());
+                std::thread::sleep(Duration::from_millis(80));
+            });
+            occupier_started_rx.await.expect("occupier should start");
+
+            let computation_task = tokio::spawn({
+                let request_cancel = request_cancel.clone();
+                async move {
+                    match run_blocking_pool_job(
+                        blocking_permit,
+                        Duration::from_millis(200),
+                        Some(request_cancel),
+                        move |_| {
+                            job_started_flag.store(true, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(20));
+                            Ok::<_, EncodeError>(RouteEncodeResponse {
+                                interactions: Vec::new(),
+                                debug: None,
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(PoolJobError::Cancelled) => Err(EncodeError::simulation("cancelled")),
+                        Err(PoolJobError::TimedOut) => Err(EncodeError::simulation("timed out")),
+                        Err(PoolJobError::JoinFailed(join_err)) => {
+                            Err(EncodeError::internal(format!("join failed: {join_err}")))
+                        }
+                    }
+                }
+            });
+
+            let result = await_encode_computation(
+                computation_task,
+                Duration::from_millis(10),
+                request_cancel.clone(),
+            )
+            .await;
+
+            assert!(matches!(result, EncodeComputation::TimedOut));
+            assert!(request_cancel.is_cancelled());
+
+            occupier.await.expect("occupier should finish");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(!job_started.load(Ordering::SeqCst));
+        });
     }
 }
