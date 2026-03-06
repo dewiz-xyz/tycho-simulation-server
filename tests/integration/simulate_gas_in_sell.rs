@@ -9,7 +9,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::NaiveDateTime;
 use num_bigint::BigUint;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use tokio::sync::{RwLock, Semaphore};
 use tower::ServiceExt;
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
@@ -25,9 +25,14 @@ use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatu
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
 
+const GAS_PRICE_WEI: u128 = 50_000_000_000; // 50 gwei
+const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+const SPOT_PRICE_SCALE: u128 = 1_000_000_000;
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct SimPool {
     gas_ladder: Vec<u64>,
+    spot_quotes: Vec<(Bytes, Bytes, f64)>,
     #[serde(skip, default = "default_calls")]
     calls: Arc<AtomicUsize>,
 }
@@ -42,7 +47,12 @@ impl ProtocolSim for SimPool {
         0.0
     }
 
-    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+    fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
+        for (base_address, quote_address, price) in &self.spot_quotes {
+            if *base_address == base.address && *quote_address == quote.address {
+                return Ok(*price);
+            }
+        }
         Err(SimulationError::FatalError(
             "spot price not available".to_string(),
         ))
@@ -101,6 +111,22 @@ impl ProtocolSim for SimPool {
     fn eq(&self, other: &dyn ProtocolSim) -> bool {
         other.as_any().is::<SimPool>()
     }
+}
+
+fn expected_gas_in_sell_base_units(
+    gas_used: u64,
+    sell_decimals: u32,
+    eth_to_sell_spot: f64,
+) -> u128 {
+    let spot_scaled = (eth_to_sell_spot * SPOT_PRICE_SCALE as f64).floor() as u128;
+    let numerator = BigUint::from(gas_used)
+        * BigUint::from(GAS_PRICE_WEI)
+        * BigUint::from(spot_scaled)
+        * BigUint::from(10u32).pow(sell_decimals);
+    let denominator = BigUint::from(SPOT_PRICE_SCALE) * BigUint::from(WEI_PER_ETH);
+    (numerator / denominator)
+        .to_u128()
+        .expect("expected gas_in_sell to fit into u128")
 }
 
 fn make_token(address: &Bytes, symbol: &str, decimals: u32) -> Token {
@@ -202,6 +228,7 @@ async fn simulate_gas_in_sell_uses_direct_conversion_for_wrapped_native_sell_tok
         "pool-weth-usdc".to_string(),
         Box::new(SimPool {
             gas_ladder: vec![120_000, 150_000],
+            spot_quotes: Vec::new(),
             calls: default_calls(),
         }) as Box<dyn ProtocolSim>,
     );
@@ -245,6 +272,105 @@ async fn simulate_gas_in_sell_uses_direct_conversion_for_wrapped_native_sell_tok
 }
 
 #[tokio::test]
+async fn simulate_gas_in_sell_uses_sell_token_spot_pool_for_non_native_sell_token() {
+    let usdt = Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap();
+    let usdc = Bytes::from_str("0xA0b86991c6218b36c1d19d4a2e9Eb0cE3606eB48").unwrap();
+    let weth = Chain::Ethereum.wrapped_native_token().address;
+
+    let usdt_token = make_token(&usdt, "USDT", 6);
+    let usdc_token = make_token(&usdc, "USDC", 6);
+    let weth_token = make_token(&weth, "WETH", 18);
+
+    let token_store = Arc::new(TokenStore::new(
+        HashMap::from([
+            (usdt.clone(), usdt_token.clone()),
+            (usdc.clone(), usdc_token.clone()),
+            (weth.clone(), weth_token.clone()),
+        ]),
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+    let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
+    let mut new_pairs = HashMap::new();
+    states.insert(
+        "pool-usdt-usdc".to_string(),
+        Box::new(SimPool {
+            gas_ladder: vec![120_000, 150_000],
+            spot_quotes: Vec::new(),
+            calls: default_calls(),
+        }) as Box<dyn ProtocolSim>,
+    );
+    new_pairs.insert(
+        "pool-usdt-usdc".to_string(),
+        make_component(
+            "0x0000000000000000000000000000000000000102",
+            usdt_token.clone(),
+            usdc_token,
+            "uniswap_v2",
+            "uniswap_v2",
+        ),
+    );
+    states.insert(
+        "pool-spot-usdt-weth".to_string(),
+        Box::new(SimPool {
+            gas_ladder: vec![0],
+            spot_quotes: vec![(weth.clone(), usdt.clone(), 2_000.0)],
+            calls: default_calls(),
+        }) as Box<dyn ProtocolSim>,
+    );
+    new_pairs.insert(
+        "pool-spot-usdt-weth".to_string(),
+        make_component(
+            "0x0000000000000000000000000000000000000201",
+            usdt_token.clone(),
+            weth_token,
+            "uniswap_v2",
+            "uniswap_v2",
+        ),
+    );
+
+    native_state_store
+        .apply_update(Update::new(1, states, new_pairs))
+        .await;
+
+    let app_state = make_app_state(
+        Arc::clone(&token_store),
+        native_state_store,
+        vm_state_store,
+        Some(GAS_PRICE_WEI),
+        true,
+    );
+
+    let response = post_simulate(
+        create_router(app_state),
+        serde_json::json!({
+            "request_id": "req-usdt-gas",
+            "token_in": usdt.to_string(),
+            "token_out": usdc.to_string(),
+            "amounts": ["2", "5"]
+        }),
+    )
+    .await;
+
+    let entry = &response["data"][0];
+    let gas_in_sell = entry["gas_in_sell"]
+        .as_str()
+        .and_then(|value| value.parse::<u128>().ok())
+        .expect("gas_in_sell must be a u128 string");
+
+    assert_eq!(entry["gas_used"], serde_json::json!([120000, 150000]));
+    assert_eq!(
+        gas_in_sell,
+        expected_gas_in_sell_base_units(150_000, usdt_token.decimals, 2_000.0)
+    );
+}
+
+#[tokio::test]
 async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() {
     let usdt = Bytes::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap();
     let usdc = Bytes::from_str("0xA0b86991c6218b36c1d19d4a2e9Eb0cE3606eB48").unwrap();
@@ -271,6 +397,7 @@ async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() {
         "pool-usdt-usdc".to_string(),
         Box::new(SimPool {
             gas_ladder: vec![120_000, 150_000],
+            spot_quotes: Vec::new(),
             calls: default_calls(),
         }) as Box<dyn ProtocolSim>,
     );

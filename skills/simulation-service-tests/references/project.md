@@ -36,7 +36,7 @@
   - `scripts/run_suite.sh --repo . --suite core --stop`
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
-  - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string; ETH/WETH sell tokens use direct gas-in-ETH conversion, other sell tokens currently return `"0"`, and `"0"` is also valid when reporting inputs are unavailable).
+  - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string; ETH/WETH sell tokens use direct gas-in-ETH conversion, non-native sell tokens may return a non-zero value when a sell-token/native or sell-token/wrapped-native spot source is available, and `"0"` remains valid when reporting inputs are unavailable or no usable spot source exists).
   - With `--allow-partial`, smoke validation accepts partial-ladder pool entries as long as `amounts_out` and `gas_used` stay aligned, monotonic, and non-empty.
   - Core coverage now includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH`.
 - Individual runners:
