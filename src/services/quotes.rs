@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,15 +29,23 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
-use crate::services::native_wrapped::{
-    is_direct_native_wrapped_pair, is_native_or_wrapped_token, simulation_tokens_for_pool,
-};
+use crate::services::native_wrapped::{is_direct_native_wrapped_pair, simulation_tokens_for_pool};
 use crate::services::pool_runtime::{run_blocking_pool_job, PoolJobError};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
 const SPOT_PRICE_SCALE: u128 = 1_000_000_000;
 const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+const MIN_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e-12;
+const MAX_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpotProbeMode {
+    NativeOnly,
+    WrappedOnly,
+    Both,
+    None,
+}
 
 // Per-request scheduling metrics (logged once by the handler).
 #[derive(Debug, Default, Clone)]
@@ -461,12 +470,46 @@ pub async fn get_amounts_out(
     );
 
     let sell_token_decimals = token_in_ref.decimals;
-    let eth_to_sell_spot_price = is_native_or_wrapped_token(&token_in_ref).then_some(1.0);
-    let gas_price_wei = state.effective_native_gas_price_wei_for_quotes().await;
-
-    // Stable ordering keeps scheduling deterministic under contention.
+    // Stable ordering ensures deterministic spot source and scheduling under contention.
     native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
     vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let native = token_in_ref.chain.native_token();
+    let wrapped_native = token_in_ref.chain.wrapped_native_token();
+
+    let mut spot_native_candidates_raw = if token_in_ref.address == native.address
+        || token_in_ref.address == wrapped_native.address
+    {
+        Vec::new()
+    } else {
+        let mut candidates = state
+            .native_state_store
+            .matching_pools_by_addresses(&token_in_bytes, &wrapped_native.address)
+            .await;
+        if native.address != wrapped_native.address {
+            candidates.extend(
+                state
+                    .native_state_store
+                    .matching_pools_by_addresses(&token_in_bytes, &native.address)
+                    .await,
+            );
+        }
+        candidates
+    };
+
+    let mut seen_spot_ids = HashSet::new();
+    let mut spot_native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
+        Vec::new();
+    for (id, (pool_state, component)) in spot_native_candidates_raw.drain(..) {
+        if seen_spot_ids.insert(id.clone()) {
+            spot_native_candidates.push((id, pool_state, component));
+        }
+    }
+    spot_native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let eth_to_sell_spot_price =
+        resolve_request_eth_to_sell_spot_price(&token_in_ref, &spot_native_candidates, &[]);
+    let gas_price_wei = state.effective_native_gas_price_wei_for_quotes().await;
 
     let token_in = Arc::new(token_in_ref);
     let token_out = Arc::new(token_out_ref);
@@ -603,14 +646,14 @@ pub async fn get_amounts_out(
         while !tasks.is_empty() {
             tokio::select! {
                 _ = &mut quote_timeout_sleep => {
-                    cancel_token.cancel();
                     let message = format!(
                         "Quote computation timed out after {}ms",
                         quote_timeout.as_millis()
                     );
                     failures.push(make_failure(QuoteFailureKind::Timeout, message, None));
                     meta.status = QuoteStatus::PartialSuccess;
-                    drain_ready_pool_outcomes(
+                    cancel_and_flush_pool_outcomes(
+                        &cancel_token,
                         &mut tasks,
                         &mut responses,
                         &mut failures,
@@ -628,7 +671,8 @@ pub async fn get_amounts_out(
                 }
                 _ = cancel_token.cancelled() => {
                     meta.status = QuoteStatus::PartialSuccess;
-                    drain_ready_pool_outcomes(
+                    cancel_and_flush_pool_outcomes(
+                        &cancel_token,
                         &mut tasks,
                         &mut responses,
                         &mut failures,
@@ -1409,6 +1453,98 @@ fn handle_pool_task_result(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn cancel_and_flush_pool_outcomes<F>(
+    cancel_token: &CancellationToken,
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    cancel_token.cancel();
+    poll_queued_pool_tasks_once(
+        tasks,
+        responses,
+        failures,
+        pool_results,
+        metrics,
+        meta,
+        vm_first_gases,
+        expected_len,
+        gas_price_wei,
+        eth_to_sell_spot_price,
+        sell_token_decimals,
+        current_block,
+    );
+    drain_ready_pool_outcomes(
+        tasks,
+        responses,
+        failures,
+        pool_results,
+        metrics,
+        meta,
+        vm_first_gases,
+        expected_len,
+        gas_price_wei,
+        eth_to_sell_spot_price,
+        sell_token_decimals,
+        current_block,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_queued_pool_tasks_once<F>(
+    tasks: &mut FuturesUnordered<F>,
+    responses: &mut Vec<AmountOutResponse>,
+    failures: &mut Vec<QuoteFailure>,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    metrics: &mut QuoteMetrics,
+    meta: &mut QuoteMeta,
+    vm_first_gases: &mut Vec<u64>,
+    expected_len: usize,
+    gas_price_wei: Option<u128>,
+    eth_to_sell_spot_price: Option<f64>,
+    sell_token_decimals: u32,
+    current_block: u64,
+) where
+    F: std::future::Future<Output = PoolTaskResult>,
+{
+    // Newly queued FuturesUnordered entries are never polled until the stream gets polled.
+    // Give each currently queued task one chance to run its pre-await path after cancellation
+    // so immediate skipped/cancelled outcomes are surfaced before we stop waiting.
+    let queued_tasks = tasks.len();
+    for _ in 0..queued_tasks {
+        match tasks.next().now_or_never() {
+            Some(Some(outcome)) => handle_pool_task_result(
+                outcome,
+                responses,
+                failures,
+                pool_results,
+                metrics,
+                meta,
+                vm_first_gases,
+                expected_len,
+                gas_price_wei,
+                eth_to_sell_spot_price,
+                sell_token_decimals,
+                current_block,
+            ),
+            Some(None) => break,
+            None => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn drain_ready_pool_outcomes<F>(
     tasks: &mut FuturesUnordered<F>,
     responses: &mut Vec<AmountOutResponse>,
@@ -1441,6 +1577,191 @@ fn drain_ready_pool_outcomes<F>(
             current_block,
         );
     }
+}
+
+fn resolve_request_eth_to_sell_spot_price(
+    sell_token: &Token,
+    native_candidates: &[(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)],
+    vm_candidates: &[(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)],
+) -> Option<f64> {
+    let native = sell_token.chain.native_token();
+    let wrapped_native = sell_token.chain.wrapped_native_token();
+
+    // Gas price is denominated in native token units (wei for ETH family).
+    // Wrapped/native are interchangeable for conversion purposes.
+    if sell_token.address == native.address || sell_token.address == wrapped_native.address {
+        return Some(1.0);
+    }
+
+    let mut fallback_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
+    let mut selected_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
+    let mut best_liquidity_score: Option<BigUint> = None;
+
+    for (_, pool_state, component) in native_candidates.iter().chain(vm_candidates.iter()) {
+        if fallback_pool.is_none() {
+            fallback_pool = Some((pool_state, component));
+        }
+
+        let Some(liquidity_score) = spot_liquidity_score_in_sell_token(
+            pool_state.as_ref(),
+            sell_token,
+            &wrapped_native,
+            &native,
+        ) else {
+            continue;
+        };
+
+        let should_replace = best_liquidity_score
+            .as_ref()
+            .map(|current| liquidity_score > *current)
+            .unwrap_or(true);
+
+        if should_replace {
+            best_liquidity_score = Some(liquidity_score);
+            selected_pool = Some((pool_state, component));
+        }
+    }
+
+    let (pool_state, component) = selected_pool.or(fallback_pool)?;
+    let probe_mode = spot_probe_mode(component.as_ref(), sell_token, &wrapped_native, &native);
+    spot_price_eth_to_sell_from_pool(
+        pool_state.as_ref(),
+        sell_token,
+        &wrapped_native,
+        &native,
+        probe_mode,
+    )
+}
+
+fn spot_liquidity_score_in_sell_token(
+    pool_state: &dyn ProtocolSim,
+    sell_token: &Token,
+    wrapped_native: &Token,
+    native: &Token,
+) -> Option<BigUint> {
+    let mut best_score: Option<BigUint> = None;
+
+    let mut consider = |candidate: BigUint| {
+        if candidate.is_zero() {
+            return;
+        }
+        let should_replace = best_score
+            .as_ref()
+            .map(|current| candidate > *current)
+            .unwrap_or(true);
+        if should_replace {
+            best_score = Some(candidate);
+        }
+    };
+
+    if let Ok((max_in, _)) =
+        pool_state.get_limits(sell_token.address.clone(), wrapped_native.address.clone())
+    {
+        consider(max_in);
+    }
+    if native.address != wrapped_native.address {
+        if let Ok((max_in, _)) =
+            pool_state.get_limits(sell_token.address.clone(), native.address.clone())
+        {
+            consider(max_in);
+        }
+    }
+
+    if let Ok((_, max_out)) =
+        pool_state.get_limits(wrapped_native.address.clone(), sell_token.address.clone())
+    {
+        consider(max_out);
+    }
+    if native.address != wrapped_native.address {
+        if let Ok((_, max_out)) =
+            pool_state.get_limits(native.address.clone(), sell_token.address.clone())
+        {
+            consider(max_out);
+        }
+    }
+
+    best_score
+}
+
+fn spot_price_eth_to_sell_from_pool(
+    pool_state: &dyn ProtocolSim,
+    sell_token: &Token,
+    wrapped_native: &Token,
+    native: &Token,
+    probe_mode: SpotProbeMode,
+) -> Option<f64> {
+    match probe_mode {
+        SpotProbeMode::NativeOnly => {
+            spot_price_candidate(pool_state.spot_price(native, sell_token).ok(), false).or_else(
+                || spot_price_candidate(pool_state.spot_price(sell_token, native).ok(), true),
+            )
+        }
+        SpotProbeMode::WrappedOnly => spot_price_candidate(
+            pool_state.spot_price(wrapped_native, sell_token).ok(),
+            false,
+        )
+        .or_else(|| {
+            spot_price_candidate(pool_state.spot_price(sell_token, wrapped_native).ok(), true)
+        }),
+        SpotProbeMode::Both => spot_price_candidate(
+            pool_state.spot_price(wrapped_native, sell_token).ok(),
+            false,
+        )
+        .or_else(|| spot_price_candidate(pool_state.spot_price(native, sell_token).ok(), false))
+        .or_else(|| {
+            spot_price_candidate(pool_state.spot_price(sell_token, wrapped_native).ok(), true)
+        })
+        .or_else(|| spot_price_candidate(pool_state.spot_price(sell_token, native).ok(), true)),
+        SpotProbeMode::None => None,
+    }
+}
+
+fn spot_probe_mode(
+    component: &ProtocolComponent,
+    sell_token: &Token,
+    wrapped_native: &Token,
+    native: &Token,
+) -> SpotProbeMode {
+    let has_sell = component
+        .tokens
+        .iter()
+        .any(|token| token.address == sell_token.address);
+    if !has_sell {
+        return SpotProbeMode::None;
+    }
+
+    let has_wrapped = component
+        .tokens
+        .iter()
+        .any(|token| token.address == wrapped_native.address);
+    let has_native = component
+        .tokens
+        .iter()
+        .any(|token| token.address == native.address);
+    match (has_native, has_wrapped) {
+        (true, true) => SpotProbeMode::Both,
+        (true, false) => SpotProbeMode::NativeOnly,
+        (false, true) => SpotProbeMode::WrappedOnly,
+        (false, false) => SpotProbeMode::None,
+    }
+}
+
+fn spot_price_candidate(raw_price: Option<f64>, inverted: bool) -> Option<f64> {
+    let raw_spot_price = raw_price.filter(|price| price.is_finite() && *price > 0.0)?;
+    let eth_to_sell_spot_price = if inverted {
+        1.0 / raw_spot_price
+    } else {
+        raw_spot_price
+    };
+    if !eth_to_sell_spot_price.is_finite()
+        || eth_to_sell_spot_price <= 0.0
+        || !(MIN_REASONABLE_ETH_TO_SELL_SPOT..=MAX_REASONABLE_ETH_TO_SELL_SPOT)
+            .contains(&eth_to_sell_spot_price)
+    {
+        return None;
+    }
+
+    Some(eth_to_sell_spot_price)
 }
 
 fn compute_gas_in_sell_base_units(
@@ -1805,9 +2126,12 @@ mod tests {
 
     use std::any::Any;
     use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
 
     use chrono::NaiveDateTime;
     use num_traits::Zero;
@@ -1835,6 +2159,24 @@ mod tests {
 
     fn test_scheduled_counter() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    struct PendingThenReadyTask {
+        polls: Arc<AtomicUsize>,
+        result: Option<PoolTaskResult>,
+    }
+
+    impl Future for PendingThenReadyTask {
+        type Output = PoolTaskResult;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            Poll::Ready(self.result.take().expect("task should only resolve once"))
+        }
     }
 
     #[test]
@@ -4726,6 +5068,90 @@ mod tests {
             .failures
             .iter()
             .any(|failure| matches!(failure.kind, QuoteFailureKind::ConcurrencyLimit)));
+    }
+
+    #[test]
+    fn cancel_and_flush_pool_outcomes_surfaces_never_polled_tasks() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let mut tasks = FuturesUnordered::new();
+        tasks.push(PendingThenReadyTask {
+            polls: Arc::clone(&poll_count),
+            result: Some(PoolTaskResult::SkippedDueToConcurrency {
+                pool: "pool-skipped".to_string(),
+                pool_name: "uniswap_v2::TK1/TK2".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                protocol: "uniswap_v2".to_string(),
+                reason: Some(
+                    "Pool scheduling skipped because concurrency permits were exhausted"
+                        .to_string(),
+                ),
+            }),
+        });
+        tasks.push(PendingThenReadyTask {
+            polls: Arc::clone(&poll_count),
+            result: Some(PoolTaskResult::Failed {
+                failure: make_failure(
+                    QuoteFailureKind::Timeout,
+                    "pool-timeout: Quote computation cancelled".to_string(),
+                    Some(FailureContext {
+                        pool_id: "pool-timeout",
+                        pool_name: Some("uniswap_v2::TK1/TK2"),
+                        pool_address: Some("0x0000000000000000000000000000000000000002"),
+                        protocol: Some("uniswap_v2"),
+                    }),
+                ),
+            }),
+        });
+
+        let cancel_token = CancellationToken::new();
+        let mut responses = Vec::new();
+        let mut failures = Vec::new();
+        let mut pool_results = Vec::new();
+        let mut metrics = QuoteMetrics::default();
+        let mut meta = QuoteMeta {
+            status: QuoteStatus::Ready,
+            result_quality: QuoteResultQuality::RequestLevelFailure,
+            block_number: 42,
+            vm_block_number: None,
+            matching_pools: 0,
+            candidate_pools: 0,
+            total_pools: None,
+            auction_id: None,
+            pool_results: Vec::new(),
+            vm_unavailable: false,
+            failures: Vec::new(),
+        };
+        let mut vm_first_gases = Vec::new();
+
+        cancel_and_flush_pool_outcomes(
+            &cancel_token,
+            &mut tasks,
+            &mut responses,
+            &mut failures,
+            &mut pool_results,
+            &mut metrics,
+            &mut meta,
+            &mut vm_first_gases,
+            1,
+            None,
+            None,
+            18,
+            42,
+        );
+
+        assert!(cancel_token.is_cancelled());
+        assert!(poll_count.load(Ordering::SeqCst) >= 2);
+        assert!(responses.is_empty());
+        assert_eq!(metrics.skipped_native_concurrency, 1);
+        assert!(failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout)));
+        assert!(pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
+        assert!(pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::TimedOut));
     }
 
     #[tokio::test]

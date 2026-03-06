@@ -12,12 +12,6 @@ pub(crate) fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
 }
 
-pub(crate) fn is_native_or_wrapped_token(token: &Token) -> bool {
-    let native = token.chain.native_token();
-    let wrapped_native = token.chain.wrapped_native_token();
-    token.address == native.address || token.address == wrapped_native.address
-}
-
 pub(crate) fn is_direct_native_wrapped_pair(
     token_in: &Bytes,
     token_out: &Bytes,

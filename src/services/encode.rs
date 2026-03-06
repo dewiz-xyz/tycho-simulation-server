@@ -14,12 +14,15 @@ mod test_support;
 
 pub use error::{EncodeError, EncodeErrorKind};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;
 
 pub async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
+    request_cancel: Option<CancellationToken>,
 ) -> Result<RouteEncodeResponse, EncodeError> {
     let chain = request::validate_chain(request.chain_id)?;
     request::validate_swap_kinds(&request)?;
@@ -37,8 +40,15 @@ pub async fn encode_route(
     let is_native_input = token_in == native_address;
     let normalized =
         normalize::normalize_route(&request, &token_in, &token_out, &amount_in, &native_address)?;
-    let resimulated =
-        resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
+    let resimulated = resimulate::resimulate_route(
+        &state,
+        &normalized,
+        chain,
+        &token_in,
+        &token_out,
+        request_cancel.as_ref(),
+    )
+    .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
     let encoder = calldata::build_encoder(chain, router_address.clone())?;
     let expected_total = response::compute_expected_total(&resimulated);
