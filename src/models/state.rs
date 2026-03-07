@@ -7,7 +7,9 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
-    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
+    tycho_common::{
+        models::token::Token, models::Chain, simulation::protocol_sim::ProtocolSim, Bytes,
+    },
 };
 
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
@@ -21,6 +23,8 @@ fn native_token_address() -> Bytes {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub chain: Chain,
+    pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
@@ -1146,6 +1150,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_store),
             vm_state_store: Arc::clone(&vm_store),
@@ -1432,6 +1438,8 @@ mod tests {
     #[tokio::test]
     async fn app_state_native_gas_price_defaults_to_none() {
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),
@@ -1477,6 +1485,8 @@ mod tests {
     #[tokio::test]
     async fn app_state_native_gas_price_updates() {
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),
@@ -1523,6 +1533,8 @@ mod tests {
     #[tokio::test]
     async fn app_state_effective_native_gas_price_for_quotes_serializes_with_disable_transition() {
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::new(TokenStore::new(
                 HashMap::new(),
                 "http://localhost".to_string(),

@@ -485,6 +485,8 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
     vm_state_store.apply_update(vm_update).await;
 
     let app_state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&token_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),

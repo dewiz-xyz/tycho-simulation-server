@@ -6,6 +6,7 @@
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
+- Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to scripts.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the server:
   ```bash
@@ -15,9 +16,10 @@
 
 ## Readiness
 - `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "block": <u64>, "pools": <usize> }`
+  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }`
   - `503 Service Unavailable` with `{ "status": "warming_up", ... }`
 - Cold starts can take several minutes (3–5+ mins; longer with VM pools); wait before concluding readiness is stuck.
+- `scripts/wait_ready.sh --expect-chain-id <id>` should be used to guard against hitting the wrong deployment.
 
 ## Quote simulation
 - `POST /simulate` request body:
@@ -33,16 +35,16 @@
 
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
-  - `scripts/run_suite.sh --repo . --suite core --stop`
-  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
+  - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --stop`
+  - `scripts/run_suite.sh --repo . --chain-id 8453 --suite core --stop`
+  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds.
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
-  - Core coverage now includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH`.
 - Individual runners:
-  - `python3 scripts/simulate_smoke.py --suite smoke`
-  - `python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`
-  - `python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json`
-  - `python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50`
+  - `python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke`
+  - `python3 scripts/encode_smoke.py --chain-id 1 --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json`
+  - `python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50`
 - See `STRESS_TEST_README.md` for suites, defaults, and latency knobs.
 
 ## Useful commands

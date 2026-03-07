@@ -1,8 +1,10 @@
 # Protocol feeds (what this server subscribes to)
 
-The service subscribes to specific Tycho exchanges at startup (see `src/services/stream_builder.rs`).
+The service subscribes to chain-specific Tycho exchanges at startup (see `src/config/mod.rs` and `src/services/stream_builder.rs`).
 
-## Always enabled (native feeds)
+## Native feeds by chain
+
+### Ethereum (`CHAIN_ID=1`)
 - `uniswap_v2`
 - `sushiswap_v2`
 - `pancakeswap_v2`
@@ -10,27 +12,40 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - `pancakeswap_v3`
 - `uniswap_v4`
 - `ekubo_v2`
-- `ekubo_v3`
 - `fluid_v1`
-- `rocketpool`
+- `ekubo_v3`
 
-## Optional (VM feeds)
-- `vm:curve` (enabled when `ENABLE_VM_POOLS=true`, default)
-- `vm:balancer_v2` (enabled when `ENABLE_VM_POOLS=true`, default)
-- `vm:maverick_v2` (enabled when `ENABLE_VM_POOLS=true`, default)
+### Base (`CHAIN_ID=8453`)
+- `uniswap_v2`
+- `uniswap_v3`
+- `uniswap_v4`
+- `pancakeswap_v3`
+
+## VM feeds by chain
+
+### Ethereum (`CHAIN_ID=1`)
+- `vm:curve`
+- `vm:balancer_v2`
+- `vm:maverick_v2`
+
+### Base (`CHAIN_ID=8453`)
+- No VM protocols configured in this iteration.
+
+## Effective VM enablement
+
+- Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
+- This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
+- `scripts/run_suite.sh` and `wait_ready.sh` now key VM assertions off runtime `/status.vm_enabled`.
 
 ## Notes that affect test coverage
 
-- **VM pools are on by default**. Disable them if you want to validate native-only behavior:
-  - `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
-  - Or start the server with `ENABLE_VM_POOLS=false`:
-    - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --env ENABLE_VM_POOLS=false`
-- **Core suite coverage** includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH` to exercise Maverick/Rocketpool/native paths in normal runs.
-- **TVL filtering matters**: pools are included/removed based on `TVL_THRESHOLD` + `TVL_KEEP_RATIO`.
-  - If your tests miss protocols/pools, try lowering `TVL_THRESHOLD` (at the cost of ingesting more pools).
-- **Uniswap v4 pairs**: some v4 pools may use native ETH (often represented as `0x000...000`).
-  - The `v4_candidates` suite includes `ETH:USDC` alongside `WETH:USDC`.
-- **Protocol names in reports**: `coverage_sweep.py` derives “protocol” from `pool_name` (the prefix before `::`).
-  - Treat it as best-effort labeling; if upstream changes formatting, update `protocol_from_pool_name`.
-  - When using `--expect-protocols`, use the lowercased `pool_name` prefixes from the sweep output, not request protocol IDs like `uniswap_v3`.
-  - For hard CI/local gates, prefer stable expectations for your probe pairs (for example: `maverick_v2`).
+- Always pass chain context to scripts (`--chain-id` or env `CHAIN_ID`).
+- To test native-only behavior on Ethereum:
+  - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop`
+- Or start with VM disabled:
+  - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --chain-id 1 --env ENABLE_VM_POOLS=false`
+- TVL filtering matters: pools are included/removed based on `TVL_THRESHOLD` + `TVL_KEEP_RATIO`.
+- Protocol labels in `coverage_sweep.py` are derived from `pool_name` prefixes (best effort).
+- Chain-aware protocol assertions are recommended:
+  - Ethereum VM gate example: `--expect-protocols maverick_v2`
+  - Base currently has no default VM protocol gate.

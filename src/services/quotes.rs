@@ -3187,6 +3187,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -3809,6 +3811,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -3904,6 +3908,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -4000,6 +4006,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store,
             vm_state_store,
@@ -4178,6 +4186,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -4451,6 +4461,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -4616,6 +4628,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -4848,6 +4862,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -4972,6 +4988,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -5068,6 +5086,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -5173,6 +5193,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),

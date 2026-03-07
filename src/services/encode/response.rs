@@ -109,6 +109,8 @@ mod tests {
             .await;
 
         let state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: std::sync::Arc::clone(&tokens_store),
             native_state_store: std::sync::Arc::clone(&native_state_store),
             vm_state_store: std::sync::Arc::clone(&vm_state_store),
@@ -165,6 +167,8 @@ mod tests {
             .await;
 
         let state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: std::sync::Arc::clone(&tokens_store),
             native_state_store: std::sync::Arc::clone(&native_state_store),
             vm_state_store: std::sync::Arc::clone(&vm_state_store),

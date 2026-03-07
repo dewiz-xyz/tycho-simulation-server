@@ -16,47 +16,47 @@ The suite (`scripts/run_suite.sh`) performs:
 1. **Python 3** (stdlib only)
 2. **Rust toolchain** for `cargo run --release`
 3. **Tycho API key** in `.env` (`TYCHO_API_KEY=...`)
+4. **Chain context** via `--chain-id` or `CHAIN_ID` (`1` Ethereum, `8453` Base)
 
 ## Quick Start
 
-Run the full suite (start → wait → smoke → coverage → latency):
+Run the full suite on Ethereum (start → wait → smoke → coverage → latency):
 
 ```bash
-scripts/run_suite.sh --repo . --stop
+scripts/run_suite.sh --repo . --chain-id 1 --stop
 ```
 
-Run with VM pools enabled:
+Run the full suite on Base:
 
 ```bash
-scripts/run_suite.sh --repo . --enable-vm-pools --stop
+scripts/run_suite.sh --repo . --chain-id 8453 --stop
 ```
 
 ## Suite Configuration
 
-- **Suites** (see `scripts/presets.py`):
+- **Suites** (see `scripts/presets.py`, chain-aware):
   - `smoke`, `core`, `extended`, `stables`, `lst`, `governance`, `v4_candidates`
-  - `extended` includes lower-liquidity pairs removed from `core`.
 - **Latency defaults** (override via env):
   - `LATENCY_REQUESTS` (default: 200)
   - `LATENCY_CONCURRENCY` (default: 8)
   - `LATENCY_CONCURRENCY_VM` (default: 4)
-- **Amounts**: per-token default ladders (e.g., 6-decimal stables, capped WBTC/WETH). Override with `--amounts` on each script.
+- **Amounts**: per-token default ladders. Override with `--amounts` on each script.
 
 ## Running Individual Steps
 
 Smoke test:
 ```bash
-python3 scripts/simulate_smoke.py --suite smoke
+python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke
 ```
 
 Coverage sweep (writes JSON report):
 ```bash
-python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json
+python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json
 ```
 
 Latency percentiles:
 ```bash
-python3 scripts/latency_percentiles.py --suite core --requests 200 --concurrency 8
+python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 200 --concurrency 8
 ```
 
 ## Output
@@ -67,12 +67,13 @@ python3 scripts/latency_percentiles.py --suite core --requests 200 --concurrency
 ## Troubleshooting
 
 - **Server not running**: `scripts/run_suite.sh` starts it for you. For manual control:
-  - `scripts/start_server.sh --repo .`
+  - `scripts/start_server.sh --repo . --chain-id 1`
   - `scripts/stop_server.sh --repo .`
 - **Readiness timeouts**: check `logs/tycho-sim-server.log` for startup errors.
+- **Wrong chain target**: use `scripts/wait_ready.sh --expect-chain-id <id>` to assert the running deployment.
 - **Partial successes**: `/simulate` returns `200 OK` even when `meta.status=partial_success`. The suite requires `ready` by default.
 
 ## Customization Notes
 
-- Use `--allow-status ready,partial_success` and `--allow-failures` on the Python scripts if you want to tolerate partial successes.
-- Change suites or token lists in `scripts/presets.py` to match your coverage needs.
+- Use `--allow-status ready,partial_success` and `--allow-failures` on Python scripts if you want to tolerate partial successes.
+- Change suites or token lists in `scripts/presets.py` per chain.

@@ -21,7 +21,7 @@ use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
 };
-use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
+use super::request::{format_native_protocol_allowlist, is_native_protocol_allowlisted};
 use super::EncodeError;
 
 pub(super) async fn resimulate_route(
@@ -30,6 +30,7 @@ pub(super) async fn resimulate_route(
     chain: Chain,
     request_token_in: &Bytes,
     request_token_out: &Bytes,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<ResimulatedRouteInternal, EncodeError> {
     let mut token_cache = TokenCache::new(state);
     let mut pool_cache: HashMap<String, (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
@@ -100,6 +101,7 @@ pub(super) async fn resimulate_route(
                     &allocated.token_out,
                     &pool_entry.1,
                     &allocated.pool.component_id,
+                    native_token_protocol_allowlist,
                 )?;
                 let sim_token_in =
                     map_swap_token(&allocated.token_in, chain, keep_native_unwrapped);
@@ -274,13 +276,15 @@ fn ensure_native_swap_supported(
     token_out: &Bytes,
     component: &ProtocolComponent,
     component_id: &str,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<bool, EncodeError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
-    let protocol_supports_native = is_native_protocol_allowlisted(&component.protocol_system);
+    let protocol_supports_native =
+        is_native_protocol_allowlisted(&component.protocol_system, native_token_protocol_allowlist);
 
     if swap_uses_native && !protocol_supports_native {
-        let supported = native_protocol_allowlist().join(", ");
+        let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
         return Err(EncodeError::invalid(format!(
             "native tokenIn/tokenOut is only supported for protocols [{}]; pool {} uses {}",
             supported, component_id, component.protocol_system
@@ -487,6 +491,8 @@ mod tests {
         native_state_store.apply_update(update).await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -539,6 +545,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &["rocketpool".to_string()],
         )
         .await
         .unwrap();
@@ -595,6 +602,8 @@ mod tests {
         native_state_store.apply_update(update).await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -667,6 +676,7 @@ mod tests {
             Chain::Ethereum,
             &token_a.address,
             &token_c.address,
+            &["rocketpool".to_string()],
         )
         .await
         .unwrap();
@@ -723,6 +733,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -767,6 +779,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &["rocketpool".to_string()],
         )
         .await
         {
@@ -829,6 +842,8 @@ mod tests {
             .await;
 
         let app_state = AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&tokens_store),
             native_state_store: Arc::clone(&native_state_store),
             vm_state_store: Arc::clone(&vm_state_store),
@@ -873,6 +888,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &["rocketpool".to_string()],
         )
         .await
         {

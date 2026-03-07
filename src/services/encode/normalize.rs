@@ -9,7 +9,7 @@ use super::model::{
     NormalizedHopInternal, NormalizedRouteInternal, NormalizedSegmentInternal,
     NormalizedSwapDraftInternal,
 };
-use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
+use super::request::{format_native_protocol_allowlist, is_native_protocol_allowlisted};
 use super::wire::parse_address;
 use super::EncodeError;
 
@@ -19,6 +19,7 @@ pub(super) fn normalize_route(
     request_token_out: &Bytes,
     total_amount_in: &BigUint,
     native_address: &Bytes,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
@@ -44,7 +45,7 @@ pub(super) fn normalize_route(
         let hops = segment
             .hops
             .iter()
-            .map(|hop| normalize_hop(hop, native_address))
+            .map(|hop| normalize_hop(hop, native_address, native_token_protocol_allowlist))
             .collect::<Result<Vec<_>, _>>()?;
 
         let segment_amount_in = segment_amounts
@@ -123,6 +124,7 @@ fn validate_hop_continuity(
 fn normalize_hop(
     hop: &HopDraft,
     native_address: &Bytes,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
@@ -132,8 +134,9 @@ fn normalize_hop(
     let token_out = parse_address(&hop.token_out)?;
     if token_in == *native_address || token_out == *native_address {
         for swap in &hop.swaps {
-            if !is_native_protocol_allowlisted(&swap.pool.protocol) {
-                let supported = native_protocol_allowlist().join(", ");
+            if !is_native_protocol_allowlisted(&swap.pool.protocol, native_token_protocol_allowlist)
+            {
+                let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
                 return Err(EncodeError::invalid(format!(
                     "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
                     supported, swap.pool.protocol
@@ -244,8 +247,15 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
         let native_address = Chain::Ethereum.native_token().address;
-        let normalized =
-            normalize_route(&request, &token_in, &token_out, &amount_in, &native_address).unwrap();
+        let normalized = normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native_address,
+            &["rocketpool".to_string()],
+        )
+        .unwrap();
         assert_eq!(normalized.segments.len(), 2);
         assert_eq!(normalized.segments[0].share_bps, 2000);
         assert_eq!(normalized.segments[1].share_bps, 0);
@@ -302,7 +312,14 @@ mod tests {
         let amount_in = BigUint::from(1u32);
         let native = Chain::Ethereum.native_token().address;
 
-        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native) {
+        let err = match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            &["rocketpool".to_string()],
+        ) {
             Ok(_) => panic!("Expected segment share rounding to zero to be rejected"),
             Err(err) => err,
         };
@@ -366,7 +383,14 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
         let native_address = Chain::Ethereum.native_token().address;
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native_address) {
+        match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native_address,
+            &["rocketpool".to_string()],
+        ) {
             Err(err) => assert_eq!(
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -420,7 +444,14 @@ mod tests {
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native) {
+        match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native,
+            &["rocketpool".to_string()],
+        ) {
             Err(err) => assert_eq!(
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -467,9 +498,15 @@ mod tests {
         let request_token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        let normalized =
-            normalize_route(&request, &token_in, &request_token_out, &amount_in, &native)
-                .expect("rocketpool native route should normalize");
+        let normalized = normalize_route(
+            &request,
+            &token_in,
+            &request_token_out,
+            &amount_in,
+            &native,
+            &["rocketpool".to_string()],
+        )
+        .expect("rocketpool native route should normalize");
         assert_eq!(normalized.segments.len(), 1);
         assert_eq!(normalized.segments[0].hops.len(), 1);
         assert_eq!(normalized.segments[0].hops[0].token_in, native);
