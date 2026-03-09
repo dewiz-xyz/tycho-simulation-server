@@ -334,19 +334,15 @@ mod tests {
     use std::time::Duration;
 
     use chrono::NaiveDateTime;
-    use tokio::sync::Semaphore;
     use tycho_simulation::protocol::models::{ProtocolComponent, Update};
-    use tycho_simulation::tycho_common::models::Chain;
 
     use super::*;
-    use crate::models::state::{StateStore, VmStreamStatus};
-    use crate::models::stream_health::StreamHealth;
-    use crate::models::tokens::TokenStore;
     use crate::services::encode::model::{
         NormalizedHopInternal, NormalizedSegmentInternal, NormalizedSwapDraftInternal,
     };
     use crate::services::encode::test_support::{
-        component_with_tokens, dummy_token, pool_ref, step_multiplier, StepProtocolSim,
+        component_with_tokens, dummy_token, pool_ref, step_multiplier, test_app_state,
+        test_state_stores, token_store_with_tokens, StepProtocolSim, TestAppStateConfig,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -451,30 +447,12 @@ mod tests {
     async fn resimulate_route_advances_pool_state_for_repeated_swaps() {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
-        let mut tokens = HashMap::new();
-        tokens.insert(token_in.address.clone(), token_in.clone());
-        tokens.insert(token_out.address.clone(), token_out.clone());
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
-        let tokens_store = Arc::new(TokenStore::new(
-            tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
+        let component = component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
             vec![token_in.clone(), token_out.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
         );
         let mut states = HashMap::new();
         states.insert(
@@ -486,27 +464,12 @@ mod tests {
         let update = Update::new(1, states, new_pairs);
         native_state_store.apply_update(update).await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&tokens_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
 
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
@@ -555,20 +518,9 @@ mod tests {
         let token_a = dummy_token("0x0000000000000000000000000000000000000001");
         let token_b = dummy_token("0x0000000000000000000000000000000000000002");
         let token_c = dummy_token("0x0000000000000000000000000000000000000003");
-        let mut tokens = HashMap::new();
-        tokens.insert(token_a.address.clone(), token_a.clone());
-        tokens.insert(token_b.address.clone(), token_b.clone());
-        tokens.insert(token_c.address.clone(), token_c.clone());
-
-        let tokens_store = Arc::new(TokenStore::new(
-            tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let tokens_store =
+            token_store_with_tokens(vec![token_a.clone(), token_b.clone(), token_c.clone()]);
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
         let component_a = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -594,27 +546,12 @@ mod tests {
         let update = Update::new(1, states, new_pairs);
         native_state_store.apply_update(update).await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&tokens_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
 
         let normalized = NormalizedRouteInternal {
             segments: vec![
@@ -684,30 +621,12 @@ mod tests {
     async fn resimulate_route_times_out_native_pool_simulation() {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
-        let mut tokens = HashMap::new();
-        tokens.insert(token_in.address.clone(), token_in.clone());
-        tokens.insert(token_out.address.clone(), token_out.clone());
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
-        let tokens_store = Arc::new(TokenStore::new(
-            tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
+        let component = component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
             vec![token_in.clone(), token_out.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
         );
         let mut states = HashMap::new();
         states.insert(
@@ -722,27 +641,18 @@ mod tests {
             .apply_update(Update::new(1, states, new_pairs))
             .await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&tokens_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(1000),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(1000),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig {
+                quote_timeout: Duration::from_millis(1000),
+                pool_timeout_native: Duration::from_millis(10),
+                pool_timeout_vm: Duration::from_millis(1000),
+                request_timeout: Duration::from_millis(1000),
+                ..TestAppStateConfig::default()
+            },
+        );
 
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
@@ -789,19 +699,8 @@ mod tests {
     async fn resimulate_route_times_out_vm_pool_simulation() {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
-        let mut tokens = HashMap::new();
-        tokens.insert(token_in.address.clone(), token_in.clone());
-        tokens.insert(token_out.address.clone(), token_out.clone());
-
-        let tokens_store = Arc::new(TokenStore::new(
-            tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens_store)));
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
         let component = ProtocolComponent::new(
             Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
@@ -828,27 +727,18 @@ mod tests {
             .apply_update(Update::new(1, states, new_pairs))
             .await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&tokens_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: true,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(1000),
-            pool_timeout_native: Duration::from_millis(1000),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                quote_timeout: Duration::from_millis(1000),
+                pool_timeout_native: Duration::from_millis(1000),
+                pool_timeout_vm: Duration::from_millis(10),
+                request_timeout: Duration::from_millis(1000),
+            },
+        );
 
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
