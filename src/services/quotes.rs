@@ -72,6 +72,182 @@ pub struct QuoteComputation {
     pub metrics: QuoteMetrics,
 }
 
+type CandidatePool = (String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
+
+fn build_request_exit(
+    responses: Vec<AmountOutResponse>,
+    mut meta: QuoteMeta,
+    metrics: QuoteMetrics,
+    pool_results: Vec<PoolSimulationOutcome>,
+    failures: Vec<QuoteFailure>,
+    status: QuoteStatus,
+    result_quality: QuoteResultQuality,
+) -> QuoteComputation {
+    meta.status = status;
+    meta.result_quality = result_quality;
+    meta.pool_results = pool_results;
+    meta.vm_unavailable = metrics.skipped_vm_unavailable;
+    meta.failures = failures;
+    QuoteComputation {
+        responses,
+        meta,
+        metrics,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScheduledPoolKind {
+    Native,
+    Vm,
+}
+
+impl ScheduledPoolKind {
+    fn concurrency_exhausted_message(self) -> &'static str {
+        match self {
+            Self::Native => {
+                "Pool scheduling skipped because native concurrency permits were exhausted"
+            }
+            Self::Vm => "Pool scheduling skipped because VM concurrency permits were exhausted",
+        }
+    }
+
+    fn semaphore_closed_message(self) -> &'static str {
+        match self {
+            Self::Native => "Native pool semaphore closed",
+            Self::Vm => "VM pool semaphore closed",
+        }
+    }
+
+    fn mark_deadline_skip(self, metrics: &mut QuoteMetrics) {
+        match self {
+            Self::Native => metrics.skipped_native_deadline += 1,
+            Self::Vm => metrics.skipped_vm_deadline += 1,
+        }
+    }
+
+    fn mark_concurrency_skip(self, metrics: &mut QuoteMetrics) {
+        match self {
+            Self::Native => metrics.skipped_native_concurrency += 1,
+            Self::Vm => metrics.skipped_vm_concurrency += 1,
+        }
+    }
+
+    fn mark_scheduled(self, metrics: &mut QuoteMetrics) {
+        match self {
+            Self::Native => metrics.scheduled_native_pools += 1,
+            Self::Vm => metrics.scheduled_vm_pools += 1,
+        }
+    }
+}
+
+struct PreparedPoolSimulation {
+    id: String,
+    pool_state: Arc<dyn ProtocolSim>,
+    pool_address: String,
+    pool_name: String,
+    pool_protocol: String,
+    sim_token_in: Arc<Token>,
+    sim_token_out: Arc<Token>,
+    pool_deadline: Instant,
+    pool_cancel: CancellationToken,
+    permit: OwnedSemaphorePermit,
+}
+
+enum PoolScheduleOutcome {
+    Scheduled(PreparedPoolSimulation),
+    Skip,
+    Abort,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_pool_simulation(
+    kind: ScheduledPoolKind,
+    id: String,
+    pool_state: Arc<dyn ProtocolSim>,
+    component: Arc<ProtocolComponent>,
+    quote_deadline: Instant,
+    pool_timeout: Duration,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    cancel_token: &CancellationToken,
+    token_in: &Token,
+    token_out: &Token,
+    expected_len: usize,
+    metrics: &mut QuoteMetrics,
+    pool_results: &mut Vec<PoolSimulationOutcome>,
+    failures: &mut Vec<QuoteFailure>,
+    meta: &mut QuoteMeta,
+) -> PoolScheduleOutcome {
+    let pool_address = component.id.to_string();
+    let pool_protocol = component.protocol_system.clone();
+    let pool_name = derive_pool_name(&component);
+
+    let now = Instant::now();
+    let pool_deadline = (now + pool_timeout).min(quote_deadline);
+    if pool_deadline <= now {
+        kind.mark_deadline_skip(metrics);
+        pool_results.push(make_pool_outcome(
+            id,
+            pool_name,
+            pool_address,
+            pool_protocol,
+            PoolOutcomeKind::SkippedDeadline,
+            0,
+            expected_len,
+            Some("Pool scheduling skipped because request deadline was reached".to_string()),
+        ));
+        return PoolScheduleOutcome::Skip;
+    }
+
+    let permit = match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            kind.mark_concurrency_skip(metrics);
+            pool_results.push(make_pool_outcome(
+                id,
+                pool_name,
+                pool_address,
+                pool_protocol,
+                PoolOutcomeKind::SkippedConcurrency,
+                0,
+                expected_len,
+                Some(kind.concurrency_exhausted_message().to_string()),
+            ));
+            return PoolScheduleOutcome::Skip;
+        }
+        Err(TryAcquireError::Closed) => {
+            failures.push(make_failure(
+                QuoteFailureKind::Internal,
+                kind.semaphore_closed_message().to_string(),
+                None,
+            ));
+            meta.status = QuoteStatus::InternalError;
+            return PoolScheduleOutcome::Abort;
+        }
+    };
+
+    kind.mark_scheduled(metrics);
+    let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
+        token_in,
+        token_out,
+        component.as_ref(),
+        &id,
+        &pool_protocol,
+    );
+
+    PoolScheduleOutcome::Scheduled(PreparedPoolSimulation {
+        id,
+        pool_state,
+        pool_address,
+        pool_name,
+        pool_protocol,
+        sim_token_in,
+        sim_token_out,
+        pool_deadline,
+        pool_cancel: cancel_token.child_token(),
+        permit,
+    })
+}
+
 pub async fn get_amounts_out(
     state: AppState,
     request: AmountOutRequest,
@@ -108,15 +284,15 @@ pub async fn get_amounts_out(
         .map(|token| token.is_cancelled())
         .unwrap_or(false)
     {
-        meta.status = QuoteStatus::PartialSuccess;
-        meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-        meta.pool_results = pool_results;
-        meta.vm_unavailable = metrics.skipped_vm_unavailable;
-        return QuoteComputation {
+        return build_request_exit(
             responses,
             meta,
             metrics,
-        };
+            pool_results,
+            failures,
+            QuoteStatus::PartialSuccess,
+            QuoteResultQuality::RequestLevelFailure,
+        );
     }
 
     let token_in_address = request.token_in.trim_start_matches("0x").to_lowercase();
@@ -130,16 +306,15 @@ pub async fn get_amounts_out(
                 format!("Invalid token_in address: {}", e),
                 None,
             ));
-            meta.status = QuoteStatus::InvalidRequest;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::InvalidRequest,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
     };
 
@@ -151,16 +326,15 @@ pub async fn get_amounts_out(
                 format!("Invalid token_out address: {}", e),
                 None,
             ));
-            meta.status = QuoteStatus::InvalidRequest;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::InvalidRequest,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
     };
 
@@ -168,20 +342,18 @@ pub async fn get_amounts_out(
     if is_direct_native_wrapped_pair(&token_in_bytes, &token_out_bytes, wrapped_native.as_ref()) {
         failures.push(make_failure(
             QuoteFailureKind::InvalidRequest,
-            "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
-                .to_string(),
+            "Direct native/wrapped quotes are unsupported".to_string(),
             None,
         ));
-        meta.status = QuoteStatus::InvalidRequest;
-        meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-        meta.pool_results = pool_results;
-        meta.vm_unavailable = metrics.skipped_vm_unavailable;
-        meta.failures = failures;
-        return QuoteComputation {
+        return build_request_exit(
             responses,
             meta,
             metrics,
-        };
+            pool_results,
+            failures,
+            QuoteStatus::InvalidRequest,
+            QuoteResultQuality::RequestLevelFailure,
+        );
     }
 
     if !state.is_ready() {
@@ -195,16 +367,15 @@ pub async fn get_amounts_out(
                 ),
                 None,
             ));
-            meta.status = QuoteStatus::WarmingUp;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::WarmingUp,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
         current_block = state.current_block().await;
         current_vm_block = state.current_vm_block().await;
@@ -228,16 +399,15 @@ pub async fn get_amounts_out(
                 format!("Token not found: {}", token_in_address),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
         Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
@@ -256,16 +426,15 @@ pub async fn get_amounts_out(
                 ),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
         Err(TokenStoreError::RequestFailed(message)) => {
             warn!(
@@ -280,16 +449,15 @@ pub async fn get_amounts_out(
                 format!("Token metadata fetch failed: {}", message),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
     };
 
@@ -301,16 +469,15 @@ pub async fn get_amounts_out(
                 format!("Token not found: {}", token_out_address),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
         Err(TokenStoreError::FetchTimeout(duration)) => {
             let timeout_ms = duration.as_millis() as u64;
@@ -329,16 +496,15 @@ pub async fn get_amounts_out(
                 ),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
         Err(TokenStoreError::RequestFailed(message)) => {
             warn!(
@@ -353,16 +519,15 @@ pub async fn get_amounts_out(
                 format!("Token metadata fetch failed: {}", message),
                 None,
             ));
-            meta.status = QuoteStatus::TokenMissing;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::TokenMissing,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
     };
 
@@ -384,16 +549,15 @@ pub async fn get_amounts_out(
                 format!("Invalid amount: {}", e),
                 None,
             ));
-            meta.status = QuoteStatus::InvalidRequest;
-            meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            meta.pool_results = pool_results;
-            meta.vm_unavailable = metrics.skipped_vm_unavailable;
-            meta.failures = failures;
-            return QuoteComputation {
+            return build_request_exit(
                 responses,
                 meta,
                 metrics,
-            };
+                pool_results,
+                failures,
+                QuoteStatus::InvalidRequest,
+                QuoteResultQuality::RequestLevelFailure,
+            );
         }
     };
 
@@ -419,17 +583,15 @@ pub async fn get_amounts_out(
         Vec::new()
     };
 
-    let mut native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-        native_candidates_raw
-            .into_iter()
-            .map(|(id, (pool_state, component))| (id, pool_state, component))
-            .collect();
+    let mut native_candidates: Vec<CandidatePool> = native_candidates_raw
+        .into_iter()
+        .map(|(id, (pool_state, component))| (id, pool_state, component))
+        .collect();
 
-    let mut vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-        vm_candidates_raw
-            .into_iter()
-            .map(|(id, (pool_state, component))| (id, pool_state, component))
-            .collect();
+    let mut vm_candidates: Vec<CandidatePool> = vm_candidates_raw
+        .into_iter()
+        .map(|(id, (pool_state, component))| (id, pool_state, component))
+        .collect();
 
     let total_candidates = native_candidates.len() + vm_candidates.len();
     meta.matching_pools = total_candidates;
@@ -447,16 +609,15 @@ pub async fn get_amounts_out(
             ),
             None,
         ));
-        meta.status = QuoteStatus::NoLiquidity;
-        meta.result_quality = QuoteResultQuality::NoResults;
-        meta.pool_results = pool_results;
-        meta.vm_unavailable = metrics.skipped_vm_unavailable;
-        meta.failures = failures;
-        return QuoteComputation {
+        return build_request_exit(
             responses,
             meta,
             metrics,
-        };
+            pool_results,
+            failures,
+            QuoteStatus::NoLiquidity,
+            QuoteResultQuality::NoResults,
+        );
     }
 
     debug!(
@@ -498,8 +659,7 @@ pub async fn get_amounts_out(
     };
 
     let mut seen_spot_ids = HashSet::new();
-    let mut spot_native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-        Vec::new();
+    let mut spot_native_candidates: Vec<CandidatePool> = Vec::new();
     for (id, (pool_state, component)) in spot_native_candidates_raw.drain(..) {
         if seen_spot_ids.insert(id.clone()) {
             spot_native_candidates.push((id, pool_state, component));
@@ -530,87 +690,44 @@ pub async fn get_amounts_out(
             break;
         }
 
-        let pool_address = component.id.to_string();
-        let pool_protocol = component.protocol_system.clone();
-        let pool_name = derive_pool_name(&component);
-
-        let now = Instant::now();
-        let proposed_deadline = now + state.pool_timeout_native();
-        let pool_deadline = if proposed_deadline <= quote_deadline {
-            proposed_deadline
-        } else {
-            quote_deadline
-        };
-
-        if pool_deadline <= now {
-            metrics.skipped_native_deadline += 1;
-            pool_results.push(make_pool_outcome(
-                id.clone(),
-                pool_name.clone(),
-                pool_address.clone(),
-                pool_protocol.clone(),
-                PoolOutcomeKind::SkippedDeadline,
-                0,
-                expected_len,
-                Some("Pool scheduling skipped because request deadline was reached".to_string()),
-            ));
-            continue;
-        }
-
-        let permit = match native_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_native_concurrency += 1;
-                pool_results.push(make_pool_outcome(
-                    id.clone(),
-                    pool_name.clone(),
-                    pool_address.clone(),
-                    pool_protocol.clone(),
-                    PoolOutcomeKind::SkippedConcurrency,
-                    0,
-                    expected_len,
-                    Some(
-                        "Pool scheduling skipped because native concurrency permits were exhausted"
-                            .to_string(),
-                    ),
-                ));
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "Native pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
+        let scheduled = match prepare_pool_simulation(
+            ScheduledPoolKind::Native,
+            id,
+            pool_state,
+            component,
+            quote_deadline,
+            state.pool_timeout_native(),
+            &native_semaphore,
+            &cancel_token,
+            token_in.as_ref(),
+            token_out.as_ref(),
+            expected_len,
+            &mut metrics,
+            &mut pool_results,
+            &mut failures,
+            &mut meta,
+        ) {
+            PoolScheduleOutcome::Scheduled(scheduled) => scheduled,
+            PoolScheduleOutcome::Skip => continue,
+            PoolScheduleOutcome::Abort => {
                 break;
             }
         };
 
-        let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_native_pools += 1;
-        let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
-            token_in.as_ref(),
-            token_out.as_ref(),
-            component.as_ref(),
-            &id,
-            &pool_protocol,
-        );
-
         tasks.push(simulate_pool(
-            id,
-            pool_state,
-            pool_address,
-            pool_name,
-            pool_protocol,
-            sim_token_in,
-            sim_token_out,
+            scheduled.id,
+            scheduled.pool_state,
+            scheduled.pool_address,
+            scheduled.pool_name,
+            scheduled.pool_protocol,
+            scheduled.sim_token_in,
+            scheduled.sim_token_out,
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
-            pool_deadline,
-            pool_cancel,
-            permit,
+            scheduled.pool_deadline,
+            scheduled.pool_cancel,
+            scheduled.permit,
         ));
     }
 
@@ -620,87 +737,44 @@ pub async fn get_amounts_out(
             break;
         }
 
-        let pool_address = component.id.to_string();
-        let pool_protocol = component.protocol_system.clone();
-        let pool_name = derive_pool_name(&component);
-
-        let now = Instant::now();
-        let proposed_deadline = now + state.pool_timeout_vm();
-        let pool_deadline = if proposed_deadline <= quote_deadline {
-            proposed_deadline
-        } else {
-            quote_deadline
-        };
-
-        if pool_deadline <= now {
-            metrics.skipped_vm_deadline += 1;
-            pool_results.push(make_pool_outcome(
-                id.clone(),
-                pool_name.clone(),
-                pool_address.clone(),
-                pool_protocol.clone(),
-                PoolOutcomeKind::SkippedDeadline,
-                0,
-                expected_len,
-                Some("Pool scheduling skipped because request deadline was reached".to_string()),
-            ));
-            continue;
-        }
-
-        let permit = match vm_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                metrics.skipped_vm_concurrency += 1;
-                pool_results.push(make_pool_outcome(
-                    id.clone(),
-                    pool_name.clone(),
-                    pool_address.clone(),
-                    pool_protocol.clone(),
-                    PoolOutcomeKind::SkippedConcurrency,
-                    0,
-                    expected_len,
-                    Some(
-                        "Pool scheduling skipped because VM concurrency permits were exhausted"
-                            .to_string(),
-                    ),
-                ));
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                failures.push(make_failure(
-                    QuoteFailureKind::Internal,
-                    "VM pool semaphore closed".to_string(),
-                    None,
-                ));
-                meta.status = QuoteStatus::InternalError;
+        let scheduled = match prepare_pool_simulation(
+            ScheduledPoolKind::Vm,
+            id,
+            pool_state,
+            component,
+            quote_deadline,
+            state.pool_timeout_vm(),
+            &vm_semaphore,
+            &cancel_token,
+            token_in.as_ref(),
+            token_out.as_ref(),
+            expected_len,
+            &mut metrics,
+            &mut pool_results,
+            &mut failures,
+            &mut meta,
+        ) {
+            PoolScheduleOutcome::Scheduled(scheduled) => scheduled,
+            PoolScheduleOutcome::Skip => continue,
+            PoolScheduleOutcome::Abort => {
                 break;
             }
         };
 
-        let pool_cancel = cancel_token.child_token();
-        metrics.scheduled_vm_pools += 1;
-        let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
-            token_in.as_ref(),
-            token_out.as_ref(),
-            component.as_ref(),
-            &id,
-            &pool_protocol,
-        );
-
         tasks.push(simulate_pool(
-            id,
-            pool_state,
-            pool_address,
-            pool_name,
-            pool_protocol,
-            sim_token_in,
-            sim_token_out,
+            scheduled.id,
+            scheduled.pool_state,
+            scheduled.pool_address,
+            scheduled.pool_name,
+            scheduled.pool_protocol,
+            scheduled.sim_token_in,
+            scheduled.sim_token_out,
             Arc::clone(&amounts_in),
             requested_max_in.clone(),
             expected_len,
-            pool_deadline,
-            pool_cancel,
-            permit,
+            scheduled.pool_deadline,
+            scheduled.pool_cancel,
+            scheduled.permit,
         ));
     }
 
@@ -2484,6 +2558,121 @@ mod tests {
         }
     }
 
+    fn make_test_state_stores(token_store: &Arc<TokenStore>) -> (Arc<StateStore>, Arc<StateStore>) {
+        (
+            Arc::new(StateStore::new(Arc::clone(token_store))),
+            Arc::new(StateStore::new(Arc::clone(token_store))),
+        )
+    }
+
+    fn make_amount_out_request(
+        request_id: &str,
+        token_in: &str,
+        token_out: &str,
+        amounts: &[&str],
+    ) -> AmountOutRequest {
+        AmountOutRequest {
+            request_id: request_id.to_string(),
+            auction_id: None,
+            token_in: token_in.to_string(),
+            token_out: token_out.to_string(),
+            amounts: amounts.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Test helper keeps repetitive fixture setup readable.
+    fn insert_pool_state(
+        states: &mut HashMap<String, Box<dyn ProtocolSim>>,
+        new_pairs: &mut HashMap<String, ProtocolComponent>,
+        pool_id: &str,
+        pool_address: &str,
+        protocol_system: &str,
+        protocol_type_name: &str,
+        tokens: Vec<Token>,
+        sim: Box<dyn ProtocolSim>,
+    ) {
+        states.insert(pool_id.to_string(), sim);
+        new_pairs.insert(
+            pool_id.to_string(),
+            make_pair_component(pool_address, protocol_system, protocol_type_name, tokens),
+        );
+    }
+
+    async fn make_gas_in_sell_zero_fixture(
+        request_id: &str,
+        token_in_decimals: u32,
+        gas_reporting_enabled: bool,
+        pair_spot_price: Option<f64>,
+        include_spot_source: bool,
+    ) -> (AppState, AmountOutRequest, Arc<AtomicUsize>) {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+
+        let token_in_meta = make_token_with_decimals(&token_in, "TK1", token_in_decimals);
+        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
+        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
+        let mut tokens = vec![token_in_meta.clone(), token_out_meta.clone()];
+        if include_spot_source {
+            tokens.push(wrapped_native_meta.clone());
+        }
+        let token_store = make_token_store(tokens);
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+
+        let spot_price_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-a",
+            "0x0000000000000000000000000000000000000011",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![token_in_meta.clone(), token_out_meta.clone()],
+            Box::new(SpotPriceCountingSim {
+                spot_price_value: pair_spot_price,
+                max_in: 1_000_000,
+                spot_price_calls: Arc::clone(&spot_price_calls),
+            }),
+        );
+        if include_spot_source {
+            insert_pool_state(
+                &mut states,
+                &mut new_pairs,
+                "pool-spot",
+                "0x0000000000000000000000000000000000000013",
+                "uniswap_v2",
+                "uniswap_v2",
+                vec![token_in_meta.clone(), wrapped_native_meta],
+                Box::new(SpotPriceCountingSim {
+                    spot_price_value: Some(1.5),
+                    max_in: 10_000_000,
+                    spot_price_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            );
+        }
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig {
+                gas_price_wei: Some(5_000_000_000_000_000_000),
+                gas_reporting_enabled,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = make_amount_out_request(request_id, token_in_hex, token_out_hex, &["2", "5"]);
+
+        (app_state, request, spot_price_calls)
+    }
+
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct SpotPriceCountingSim {
         spot_price_value: Option<f64>,
@@ -3112,22 +3301,12 @@ mod tests {
         let token_in_meta = make_token_with_decimals(&token_in, "TK1", 2);
         let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
         let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
-
-        let mut initial_tokens = HashMap::new();
-        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
-        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
-        initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
-
-        let token_store = Arc::new(TokenStore::new(
-            initial_tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(60),
-        ));
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let token_store = make_token_store(vec![
+            token_in_meta.clone(),
+            token_out_meta.clone(),
+            wrapped_native_meta.clone(),
+        ]);
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         let pair_spot_price_calls = Arc::new(AtomicUsize::new(0));
         let spot_source_calls = Arc::new(AtomicUsize::new(0));
@@ -3137,86 +3316,53 @@ mod tests {
             ("pool-a", "0x0000000000000000000000000000000000000011"),
             ("pool-b", "0x0000000000000000000000000000000000000012"),
         ] {
-            let component = ProtocolComponent::new(
-                Bytes::from_str(pool_address_hex).expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
+            insert_pool_state(
+                &mut states,
+                &mut new_pairs,
+                pool_id,
+                pool_address_hex,
+                "uniswap_v2",
+                "uniswap_v2",
                 vec![token_in_meta.clone(), token_out_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            );
-            states.insert(
-                pool_id.to_string(),
                 Box::new(SpotPriceCountingSim {
                     spot_price_value: Some(1.5),
                     max_in: 1_000_000,
                     spot_price_calls: Arc::clone(&pair_spot_price_calls),
-                }) as Box<dyn ProtocolSim>,
+                }),
             );
-            new_pairs.insert(pool_id.to_string(), component);
         }
-        states.insert(
-            "pool-spot".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-spot",
+            "0x0000000000000000000000000000000000000013",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![token_in_meta.clone(), wrapped_native_meta.clone()],
             Box::new(SpotPriceCountingSim {
                 spot_price_value: Some(1.5),
                 max_in: 10_000_000,
                 spot_price_calls: Arc::clone(&spot_source_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-spot".to_string(),
-            ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000013")
-                    .expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), wrapped_native_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            ),
+            }),
         );
 
         native_state_store
             .apply_update(Update::new(1, states, new_pairs))
             .await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&token_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
-                5_000_000_000_000_000_000,
-            ))),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_secs(1),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(2),
-            native_sim_semaphore: Arc::new(Semaphore::new(2)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 2,
-            vm_sim_concurrency: 1,
-        };
-
-        let request = AmountOutRequest {
-            request_id: "req-spot-reuse".to_string(),
-            auction_id: None,
-            token_in: token_in_hex.to_string(),
-            token_out: token_out_hex.to_string(),
-            amounts: vec!["2".to_string(), "5".to_string()],
-        };
+        let app_state = make_test_app_state(
+            Arc::clone(&token_store),
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig {
+                gas_price_wei: Some(5_000_000_000_000_000_000),
+                gas_reporting_enabled: true,
+                native_sim_concurrency: 2,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request =
+            make_amount_out_request("req-spot-reuse", token_in_hex, token_out_hex, &["2", "5"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3238,8 +3384,7 @@ mod tests {
     #[tokio::test]
     async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
         let token_store = make_token_store(Vec::new());
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
         let app_state = make_test_app_state(
             token_store,
             native_state_store,
@@ -3253,13 +3398,7 @@ mod tests {
             ("req-native-to-wrapped", native.clone(), wrapped.clone()),
             ("req-wrapped-to-native", wrapped.clone(), native.clone()),
         ] {
-            let request = AmountOutRequest {
-                request_id: request_id.to_string(),
-                auction_id: None,
-                token_in,
-                token_out,
-                amounts: vec!["1".to_string()],
-            };
+            let request = make_amount_out_request(request_id, &token_in, &token_out, &["1"]);
 
             let computation = get_amounts_out(app_state.clone(), request, None).await;
 
@@ -3282,7 +3421,7 @@ mod tests {
             assert_eq!(computation.meta.failures.len(), 1);
             assert_eq!(
                 computation.meta.failures[0].message,
-                "Direct native/wrapped quotes are unsupported; use wrap or unwrap flow instead"
+                "Direct native/wrapped quotes are unsupported"
             );
         }
     }
@@ -3302,31 +3441,26 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
-        states.insert(
-            "pool-native".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-native",
+            "0x0000000000000000000000000000000000000011",
+            "rocketpool",
+            "rocketpool",
+            vec![native_meta, token_out_meta],
             Box::new(StrictPairTokenSim {
                 expected_sell: native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&limit_calls),
                 quote_calls: Arc::clone(&quote_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-native".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000011",
-                "rocketpool",
-                "rocketpool",
-                vec![native_meta, token_out_meta],
-            ),
+            }),
         );
 
         native_state_store
@@ -3340,13 +3474,12 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = AmountOutRequest {
-            request_id: "req-remap-native-only".to_string(),
-            auction_id: None,
-            token_in: wrapped_native.to_string(),
-            token_out: token_out.to_string(),
-            amounts: vec!["2".to_string()],
-        };
+        let request = make_amount_out_request(
+            "req-remap-native-only",
+            &wrapped_native.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3373,9 +3506,7 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3384,42 +3515,35 @@ mod tests {
 
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
-        states.insert(
-            "pool-weth".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-weth",
+            "0x0000000000000000000000000000000000000015",
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![wrapped_meta, token_out_meta.clone()],
             Box::new(StrictPairTokenSim {
                 expected_sell: wrapped_native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&wrapped_limit_calls),
                 quote_calls: Arc::clone(&wrapped_quote_calls),
-            }) as Box<dyn ProtocolSim>,
+            }),
         );
-        new_pairs.insert(
-            "pool-weth".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000015",
-                "uniswap_v2",
-                "uniswap_v2_pool",
-                vec![wrapped_meta, token_out_meta.clone()],
-            ),
-        );
-
-        states.insert(
-            "pool-native".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-native",
+            "0x0000000000000000000000000000000000000016",
+            "rocketpool",
+            "rocketpool",
+            vec![native_meta, token_out_meta],
             Box::new(StrictPairTokenSim {
                 expected_sell: native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&native_limit_calls),
                 quote_calls: Arc::clone(&native_quote_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-native".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000016",
-                "rocketpool",
-                "rocketpool",
-                vec![native_meta, token_out_meta],
-            ),
+            }),
         );
 
         native_state_store
@@ -3433,13 +3557,12 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = AmountOutRequest {
-            request_id: "req-prefer-exact-wrapped".to_string(),
-            auction_id: None,
-            token_in: wrapped_native.to_string(),
-            token_out: token_out.to_string(),
-            amounts: vec!["2".to_string()],
-        };
+        let request = make_amount_out_request(
+            "req-prefer-exact-wrapped",
+            &wrapped_native.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3470,9 +3593,7 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3481,42 +3602,35 @@ mod tests {
 
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
-        states.insert(
-            "pool-weth".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-weth",
+            "0x0000000000000000000000000000000000000017",
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![wrapped_meta, token_out_meta.clone()],
             Box::new(StrictPairTokenSim {
                 expected_sell: wrapped_native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&wrapped_limit_calls),
                 quote_calls: Arc::clone(&wrapped_quote_calls),
-            }) as Box<dyn ProtocolSim>,
+            }),
         );
-        new_pairs.insert(
-            "pool-weth".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000017",
-                "uniswap_v2",
-                "uniswap_v2_pool",
-                vec![wrapped_meta, token_out_meta.clone()],
-            ),
-        );
-
-        states.insert(
-            "pool-native".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-native",
+            "0x0000000000000000000000000000000000000018",
+            "rocketpool",
+            "rocketpool",
+            vec![native_meta, token_out_meta],
             Box::new(StrictPairTokenSim {
                 expected_sell: native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&native_limit_calls),
                 quote_calls: Arc::clone(&native_quote_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-native".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000018",
-                "rocketpool",
-                "rocketpool",
-                vec![native_meta, token_out_meta],
-            ),
+            }),
         );
 
         native_state_store
@@ -3530,13 +3644,12 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = AmountOutRequest {
-            request_id: "req-prefer-exact-native".to_string(),
-            auction_id: None,
-            token_in: native.to_string(),
-            token_out: token_out.to_string(),
-            amounts: vec!["2".to_string()],
-        };
+        let request = make_amount_out_request(
+            "req-prefer-exact-native",
+            &native.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3567,31 +3680,26 @@ mod tests {
             native_meta.clone(),
             token_in_meta.clone(),
         ]);
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
         let mut states = HashMap::new();
         let mut new_pairs = HashMap::new();
-        states.insert(
-            "pool-native-buy".to_string(),
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-native-buy",
+            "0x0000000000000000000000000000000000000019",
+            "rocketpool",
+            "rocketpool",
+            vec![token_in_meta, native_meta],
             Box::new(StrictPairTokenSim {
                 expected_sell: token_in.clone(),
                 expected_buy: native.clone(),
                 limit_calls: Arc::clone(&limit_calls),
                 quote_calls: Arc::clone(&quote_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-native-buy".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000019",
-                "rocketpool",
-                "rocketpool",
-                vec![token_in_meta, native_meta],
-            ),
+            }),
         );
 
         native_state_store
@@ -3605,13 +3713,12 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = AmountOutRequest {
-            request_id: "req-remap-native-buy".to_string(),
-            auction_id: None,
-            token_in: token_in.to_string(),
-            token_out: wrapped_native.to_string(),
-            amounts: vec!["2".to_string()],
-        };
+        let request = make_amount_out_request(
+            "req-remap-native-buy",
+            &token_in.to_string(),
+            &wrapped_native.to_string(),
+            &["2"],
+        );
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3638,9 +3745,7 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
         // Keep native store ready without creating any matching pools for the request pair.
         let native_dummy_token_a =
@@ -3651,22 +3756,19 @@ mod tests {
         let native_dummy_meta_b = make_token_with_decimals(&native_dummy_token_b, "NTB", 18);
         let mut native_states = HashMap::new();
         let mut native_pairs = HashMap::new();
-        native_states.insert(
-            "native-dummy".to_string(),
+        insert_pool_state(
+            &mut native_states,
+            &mut native_pairs,
+            "native-dummy",
+            "0x0000000000000000000000000000000000000013",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![native_dummy_meta_a, native_dummy_meta_b],
             Box::new(SpotPriceCountingSim {
                 spot_price_value: Some(1.0),
                 max_in: 1_000_000,
                 spot_price_calls: Arc::new(AtomicUsize::new(0)),
-            }) as Box<dyn ProtocolSim>,
-        );
-        native_pairs.insert(
-            "native-dummy".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000013",
-                "uniswap_v2",
-                "uniswap_v2",
-                vec![native_dummy_meta_a, native_dummy_meta_b],
-            ),
+            }),
         );
         native_state_store
             .apply_update(Update::new(1, native_states, native_pairs))
@@ -3676,23 +3778,20 @@ mod tests {
         let vm_quote_calls = Arc::new(AtomicUsize::new(0));
         let mut vm_states = HashMap::new();
         let mut vm_pairs = HashMap::new();
-        vm_states.insert(
-            "vm-native".to_string(),
+        insert_pool_state(
+            &mut vm_states,
+            &mut vm_pairs,
+            "vm-native",
+            "0x0000000000000000000000000000000000000014",
+            "vm:curve",
+            "curve_pool",
+            vec![native_meta, token_out_meta],
             Box::new(StrictPairTokenSim {
                 expected_sell: native.clone(),
                 expected_buy: token_out.clone(),
                 limit_calls: Arc::clone(&vm_limit_calls),
                 quote_calls: Arc::clone(&vm_quote_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        vm_pairs.insert(
-            "vm-native".to_string(),
-            make_pair_component(
-                "0x0000000000000000000000000000000000000014",
-                "vm:curve",
-                "curve_pool",
-                vec![native_meta, token_out_meta],
-            ),
+            }),
         );
         vm_state_store
             .apply_update(Update::new(2, vm_states, vm_pairs))
@@ -3708,13 +3807,12 @@ mod tests {
             },
         );
 
-        let request = AmountOutRequest {
-            request_id: "req-remap-vm-native-only".to_string(),
-            auction_id: None,
-            token_in: wrapped_native.to_string(),
-            token_out: token_out.to_string(),
-            amounts: vec!["2".to_string()],
-        };
+        let request = make_amount_out_request(
+            "req-remap-vm-native-only",
+            &wrapped_native.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -3729,117 +3827,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_sets_gas_in_sell_to_zero_when_reporting_disabled() {
-        let token_in_hex = "0x0000000000000000000000000000000000000001";
-        let token_out_hex = "0x0000000000000000000000000000000000000002";
-        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
-        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
-
-        let token_in_meta = make_token_with_decimals(&token_in, "TK1", 6);
-        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
-
-        let mut initial_tokens = HashMap::new();
-        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
-        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
-        initial_tokens.insert(wrapped_native.clone(), wrapped_native_meta.clone());
-
-        let token_store = Arc::new(TokenStore::new(
-            initial_tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(60),
-        ));
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-
-        let mut states = HashMap::new();
-        let mut new_pairs = HashMap::new();
-        states.insert(
-            "pool-a".to_string(),
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.5),
-                max_in: 1_000_000,
-                spot_price_calls: Arc::new(AtomicUsize::new(0)),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-a".to_string(),
-            ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000011")
-                    .expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), token_out_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            ),
-        );
-        states.insert(
-            "pool-spot".to_string(),
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.5),
-                max_in: 10_000_000,
-                spot_price_calls: Arc::new(AtomicUsize::new(0)),
-            }) as Box<dyn ProtocolSim>,
-        );
-        new_pairs.insert(
-            "pool-spot".to_string(),
-            ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000013")
-                    .expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), wrapped_native_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            ),
-        );
-
-        native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
-            .await;
-
-        let app_state = AppState {
-            tokens: Arc::clone(&token_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
-                5_000_000_000_000_000_000,
-            ))),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_secs(1),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(2),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
-
-        let request = AmountOutRequest {
-            request_id: "req-reporting-disabled".to_string(),
-            auction_id: None,
-            token_in: token_in_hex.to_string(),
-            token_out: token_out_hex.to_string(),
-            amounts: vec!["2".to_string(), "5".to_string()],
-        };
-
+        let (app_state, request, _) =
+            make_gas_in_sell_zero_fixture("req-reporting-disabled", 6, false, Some(1.5), true)
+                .await;
         let computation = get_amounts_out(app_state, request, None).await;
 
         assert_eq!(computation.responses.len(), 1);
@@ -3849,92 +3839,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_sets_gas_in_sell_to_zero_when_spot_price_fails() {
-        let token_in_hex = "0x0000000000000000000000000000000000000001";
-        let token_out_hex = "0x0000000000000000000000000000000000000002";
-        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
-        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-
-        let token_in_meta = make_token_with_decimals(&token_in, "TK1", 2);
-        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-
-        let mut initial_tokens = HashMap::new();
-        initial_tokens.insert(token_in.clone(), token_in_meta.clone());
-        initial_tokens.insert(token_out.clone(), token_out_meta.clone());
-
-        let token_store = Arc::new(TokenStore::new(
-            initial_tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(60),
-        ));
-
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-
-        let spot_price_calls = Arc::new(AtomicUsize::new(0));
-        let mut states = HashMap::new();
-        states.insert(
-            "pool-a".to_string(),
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: None,
-                max_in: 1_000_000,
-                spot_price_calls: Arc::clone(&spot_price_calls),
-            }) as Box<dyn ProtocolSim>,
-        );
-        let mut new_pairs = HashMap::new();
-        new_pairs.insert(
-            "pool-a".to_string(),
-            ProtocolComponent::new(
-                Bytes::from_str("0x0000000000000000000000000000000000000011")
-                    .expect("valid pool address"),
-                "uniswap_v2".to_string(),
-                "uniswap_v2".to_string(),
-                Chain::Ethereum,
-                vec![token_in_meta.clone(), token_out_meta.clone()],
-                Vec::new(),
-                HashMap::new(),
-                Bytes::default(),
-                NaiveDateTime::default(),
-            ),
-        );
-
-        native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
-            .await;
-
-        let app_state = AppState {
-            tokens: Arc::clone(&token_store),
-            native_state_store: Arc::clone(&native_state_store),
-            vm_state_store: Arc::clone(&vm_state_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(Some(
-                5_000_000_000_000_000_000,
-            ))),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_secs(1),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(2),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
-
-        let request = AmountOutRequest {
-            request_id: "req-spot-failure".to_string(),
-            auction_id: None,
-            token_in: token_in_hex.to_string(),
-            token_out: token_out_hex.to_string(),
-            amounts: vec!["2".to_string(), "5".to_string()],
-        };
-
+        let (app_state, request, spot_price_calls) =
+            make_gas_in_sell_zero_fixture("req-spot-failure", 2, true, None, false).await;
         let computation = get_amounts_out(app_state, request, None).await;
 
         assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
