@@ -26,12 +26,6 @@ use tycho_simulation::{
 
 use crate::models::tokens::TokenStore;
 
-#[derive(Clone, Copy)]
-enum StreamDecodePolicy {
-    Native,
-    Vm,
-}
-
 pub async fn build_native_stream(
     tycho_url: &str,
     api_key: &str,
@@ -52,7 +46,7 @@ pub async fn build_native_stream(
         api_key,
         tvl_add_threshold,
         tvl_keep_threshold,
-        decode_skip_state_failures(StreamDecodePolicy::Native),
+        true,
     );
 
     builder = builder.exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None);
@@ -98,7 +92,7 @@ pub async fn build_vm_stream(
         api_key,
         tvl_add_threshold,
         tvl_keep_threshold,
-        decode_skip_state_failures(StreamDecodePolicy::Vm),
+        true,
     );
 
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
@@ -143,26 +137,4 @@ fn base_builder(
         .skip_state_decode_failures(skip_state_decode_failures);
 
     (builder, tvl_filter)
-}
-
-fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    match policy {
-        StreamDecodePolicy::Native => true,
-        StreamDecodePolicy::Vm => true,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{decode_skip_state_failures, StreamDecodePolicy};
-
-    #[test]
-    fn native_stream_keeps_decode_skip_enabled() {
-        assert!(decode_skip_state_failures(StreamDecodePolicy::Native));
-    }
-
-    #[test]
-    fn vm_stream_keeps_decode_skip_enabled() {
-        assert!(decode_skip_state_failures(StreamDecodePolicy::Vm));
-    }
 }

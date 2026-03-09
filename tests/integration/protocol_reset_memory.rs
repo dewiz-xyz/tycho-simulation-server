@@ -102,6 +102,10 @@ fn address_hex(seed: u8) -> String {
     format!("{:02x}", seed).repeat(20)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Deterministic fixture ids always decode as addresses."
+)]
 fn address(seed: u8) -> Bytes {
     Bytes::from_str(&address_hex(seed)).expect("valid address")
 }
@@ -120,6 +124,10 @@ fn address_hex_from_seed(seed: u64) -> String {
     hex
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Deterministic fixture ids always decode as addresses."
+)]
 fn address_from_seed(seed: u64) -> Bytes {
     Bytes::from_str(&address_hex_from_seed(seed)).expect("valid address")
 }
@@ -136,6 +144,10 @@ fn make_token_seed(seed: u64, symbol: &str) -> Token {
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "The Unix epoch timestamp is always valid."
+)]
 fn make_component(
     id_seed: u8,
     protocol_system: &str,
@@ -157,6 +169,10 @@ fn make_component(
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "The Unix epoch timestamp is always valid."
+)]
 fn make_component_seed(
     id_seed: u64,
     protocol_system: &str,
@@ -222,6 +238,10 @@ fn missing_block_error() -> Result<Update, Box<dyn std::error::Error + Send + Sy
     Err(Box::new(TestError("Missing block!")))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "The seeded test range is bounded to avoid overflow."
+)]
 fn build_pairs(
     protocol_system: &str,
     protocol_type_name: &str,
@@ -321,6 +341,10 @@ fn build_account_updates(
     updates
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "The jemalloc control API is required for these allocator harnesses."
+)]
 fn jemalloc_allocated_bytes() -> usize {
     jemalloc::epoch::advance().expect("jemalloc epoch advance");
     jemalloc::stats::allocated::read().expect("jemalloc allocated bytes")
@@ -404,6 +428,10 @@ async fn missing_block_burst_restarts_at_threshold() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::expect_used,
+    reason = "The spawned stream task should always join in this test."
+)]
 async fn native_stream_restarts_on_stale() {
     let token_store = Arc::new(TokenStore::new(
         HashMap::new(),
@@ -588,6 +616,10 @@ async fn jemalloc_memory_plateau_after_reset() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::expect_used,
+    reason = "This harness intentionally treats TychoDB operations as hard invariants."
+)]
 async fn memory_spike_breakdown_harness() {
     const POOL_COUNT: usize = 512;
     const DB_ACCOUNT_COUNT: usize = 4000;
@@ -657,6 +689,10 @@ async fn memory_spike_breakdown_harness() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::expect_used,
+    reason = "This harness intentionally treats TychoDB operations as hard invariants."
+)]
 async fn shared_db_rebuild_stress_harness() {
     const DB_ACCOUNT_COUNT: usize = 4000;
     const DB_SLOTS_PER_ACCOUNT: usize = 64;
