@@ -9,7 +9,7 @@ Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or
 ## Local correctness checks
 1. `cargo fmt`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
-3. `cargo test`
+3. `cargo nextest run`
 
 ## End-to-end API verification
 1. Start and wait for readiness:

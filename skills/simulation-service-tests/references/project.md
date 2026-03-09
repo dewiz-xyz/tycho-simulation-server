@@ -48,4 +48,4 @@
 ## Useful commands
 - Format: `cargo fmt`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Test: `cargo test`
+- Test: `cargo nextest run`

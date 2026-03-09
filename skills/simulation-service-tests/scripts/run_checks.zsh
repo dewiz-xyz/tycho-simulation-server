@@ -10,7 +10,7 @@ Run a CI-like verification pass for this repo.
 Rust (always):
   - cargo fmt (or --check)
   - cargo clippy --all-targets --all-features -- -D warnings
-  - cargo test
+  - cargo nextest run
   - cargo build --release
 
 Optional:
@@ -77,7 +77,7 @@ else
 fi
 
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo nextest run
 cargo build --release
 
 if [[ "$run_docker" == "true" ]]; then
@@ -105,4 +105,3 @@ if [[ "$run_cdk" == "true" ]]; then
 fi
 
 echo "Checks complete."
-
