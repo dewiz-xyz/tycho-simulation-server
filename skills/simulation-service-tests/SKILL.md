@@ -1,6 +1,6 @@
 ---
 name: simulation-service-tests
-description: Run, test, benchmark, upgrade, and deploy the Tycho simulation server in this repo (tycho-simulation-server). Use when starting/stopping the service, waiting for /status readiness, validating /simulate across many token pairs/pools/protocols (including VM pools like curve/balancer/maverick), computing p50/p90/p99 latencies, running load/stress tests, or verifying upgrades and deployments (cargo fmt/clippy/test, docker build, CDK synth/diff/deploy).
+description: Run, test, benchmark, upgrade, and deploy the Tycho simulation server in this repo (tycho-simulation-server). Use when starting/stopping the service, waiting for /status readiness, validating /simulate across many token pairs/pools/protocols (including VM pools like curve/balancer/maverick), computing p50/p90/p99 latencies, running load/stress tests, or verifying upgrades and deployments (cargo fmt/clippy/nextest/build, docker build, CDK synth/diff/deploy).
 metadata:
   short-description: Tycho simulation service tests
 ---
@@ -134,7 +134,7 @@ zsh skills/simulation-service-tests/scripts/run_checks.zsh --repo /path/to/tycho
 ## Upgrade workflow (typical)
 
 1. Bump `tycho-simulation` tag/version (or other deps).
-2. Run: `cargo fmt`, `cargo clippy ...`, `cargo test`, `cargo build --release`.
+2. Run: `cargo fmt`, `cargo clippy ...`, `cargo nextest run`, `cargo build --release`.
 3. Run the end-to-end suite (`run_suite.zsh`) with and without VM pools.
 4. If infra changes are involved: `npm ci`, `npx cdk synth`, `npx cdk diff`.
 
@@ -145,7 +145,7 @@ See `references/deploy.md`.
 ## Included scripts
 
 - Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
-- Skill utilities: `scripts/run_checks.zsh` (CI-like `cargo fmt/clippy/test/build` + optional `cdk synth`/`docker build`).
+- Skill utilities: `scripts/run_checks.zsh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`).
 
 ## References
 
