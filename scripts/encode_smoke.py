@@ -67,18 +67,30 @@ def apply_slippage(amount: str | int, bps: int) -> str:
     return str((value * safe_bps) // 10_000)
 
 
-def select_pool(response: dict, label: str) -> dict:
+def select_pool(response: dict, label: str, expected_len: int) -> dict:
     data = response.get("data")
     if not isinstance(data, list) or not data:
         raise AssertionError(f"{label}: no pool data")
-    pool = data[0]
     required = ["pool", "amounts_out", "gas_used", "gas_in_sell", "block_number", "pool_name", "pool_address"]
-    for key in required:
-        if key not in pool:
-            raise AssertionError(f"{label}: missing {key}")
-    if not is_int_string(pool.get("gas_in_sell")):
-        raise AssertionError(f'{label}: gas_in_sell must be an integer string ("0" is valid)')
-    return pool
+    last_error = f"{label}: no pool data"
+    for pool in data:
+        missing = [key for key in required if key not in pool]
+        if missing:
+            last_error = f"{label}: missing {', '.join(missing)}"
+            continue
+        if not is_int_string(pool.get("gas_in_sell")):
+            last_error = f'{label}: gas_in_sell must be an integer string ("0" is valid)'
+            continue
+        amounts_out = pool.get("amounts_out")
+        gas_used = pool.get("gas_used")
+        if not isinstance(amounts_out, list) or len(amounts_out) != expected_len:
+            last_error = f"{label}: amounts_out length mismatch (expected {expected_len})"
+            continue
+        if not isinstance(gas_used, list) or len(gas_used) != expected_len:
+            last_error = f"{label}: gas_used length mismatch (expected {expected_len})"
+            continue
+        return pool
+    raise AssertionError(last_error)
 
 
 def protocol_from_pool_name(pool_name: str) -> str:
@@ -186,7 +198,7 @@ def main() -> int:
         print(f"[FAIL] simulate dai->usdc had {len(failures_list)} failures")
         return 1
 
-    pool_first = select_pool(response, "simulate dai->usdc")
+    pool_first = select_pool(response, "simulate dai->usdc", len(amounts))
 
     hop_amounts_out = pool_first["amounts_out"]
     hop_amounts_in = [apply_slippage(value, DEFAULT_SLIPPAGE_BPS) for value in hop_amounts_out]
@@ -219,7 +231,7 @@ def main() -> int:
         print(f"[FAIL] simulate usdc->usdt had {len(failures_list)} failures")
         return 1
 
-    pool_second = select_pool(response_second, "simulate usdc->usdt")
+    pool_second = select_pool(response_second, "simulate usdc->usdt", len(hop_amounts_in))
 
     protocol_first = protocol_from_pool_name(pool_first.get("pool_name", ""))
     protocol_second = protocol_from_pool_name(pool_second.get("pool_name", ""))

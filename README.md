@@ -77,7 +77,7 @@ The following environment variables are read at startup:
 - `STREAM_MEM_LOG_MIN_NEW_PAIRS` – Only snapshot on stream updates with at least this many new pairs (default: `1000`)
 - `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
-Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. `meta.status` remains an operational/reliability signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
+Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. The runtime's blocking-thread budget is aligned to the resolved native + VM concurrency caps, so those semaphore caps remain the real limiter. `meta.status` remains an operational/reliability signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
 
 ## Docs
 
@@ -136,7 +136,7 @@ Response body:
 
 `meta.pool_results` contains anomaly-only per-pool outcomes (`partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `skipped_precheck`, `timed_out`, `simulator_error`, `internal_error`). `meta.vm_unavailable=true` indicates VM pools were skipped because VM state was not ready.
 
-`gas_in_sell` is computed per pool from the latest background-refreshed cached `eth_gasPrice` (from `RPC_URL`), the request-scoped `spot_price(ETH, sellToken)`, and the pool's last `gas_used` ladder entry; it is returned in sell-token base units. When spot price, gas reporting is disabled due to consecutive RPC failures, cached gas price, or gas usage is unavailable, it is `"0"`.
+`gas_in_sell` is computed per pool from the latest background-refreshed cached `eth_gasPrice` (from `RPC_URL`) and the pool's last `gas_used` ladder entry. For ETH/WETH sell tokens it uses a direct `1.0` conversion into sell-token base units; for every other sell token in the current implementation it is `"0"`. It is also `"0"` when gas reporting is disabled due to consecutive RPC failures, cached gas price is unavailable, or gas usage is unavailable.
 
 `block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
 
