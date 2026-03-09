@@ -1,8 +1,7 @@
 # Slippage Calculation Strategy
 
 This document explains how the tycho-simulation-server calculates slippage for each pool
-and each trade amount. It is written for developers who are still learning how
-liquidity pools and automated market makers (AMMs) work.
+and each trade amount.
 
 ---
 
