@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -24,6 +25,33 @@ use super::model::{
 use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
 use super::EncodeError;
 
+type CachedPoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
+
+struct SegmentSimState {
+    next_amount_in: BigUint,
+    hops: Vec<Option<ResimulatedHopInternal>>,
+}
+
+struct RouteResimulator<'a> {
+    state: &'a AppState,
+    normalized: &'a NormalizedRouteInternal,
+    chain: Chain,
+    segment_states: Vec<SegmentSimState>,
+    token_cache: TokenCache<'a>,
+    pool_cache: HashMap<String, CachedPoolEntry>,
+}
+
+struct BlockingSwapRequest<'a> {
+    state: &'a AppState,
+    pool_state: Arc<dyn ProtocolSim>,
+    amount_in_for_sim: BigUint,
+    token_in: Token,
+    token_out: Token,
+    pool_timeout: Duration,
+    pool_id: &'a str,
+    component: &'a ProtocolComponent,
+}
+
 pub(super) async fn resimulate_route(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
@@ -31,220 +59,319 @@ pub(super) async fn resimulate_route(
     request_token_in: &Bytes,
     request_token_out: &Bytes,
 ) -> Result<ResimulatedRouteInternal, EncodeError> {
-    let mut token_cache = TokenCache::new(state);
-    let mut pool_cache: HashMap<String, (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-        HashMap::new();
+    let mut resimulator = RouteResimulator::new(state, normalized, chain);
 
-    struct SegmentSimState {
-        next_amount_in: BigUint,
-        hops: Vec<Option<ResimulatedHopInternal>>,
+    // Resimulate in hop-depth order to match build_route_swaps execution order.
+    for hop_index in 0..resimulator.max_hop_depth() {
+        for segment_index in 0..normalized.segments.len() {
+            resimulator
+                .resimulate_segment_hop(segment_index, hop_index)
+                .await?;
+        }
     }
 
-    let mut segment_states = normalized
+    validate_request_tokens(request_token_in, request_token_out)?;
+    let segments = resimulator.build_resimulated_segments()?;
+    Ok(ResimulatedRouteInternal { segments })
+}
+
+impl<'a> RouteResimulator<'a> {
+    fn new(state: &'a AppState, normalized: &'a NormalizedRouteInternal, chain: Chain) -> Self {
+        Self {
+            state,
+            normalized,
+            chain,
+            segment_states: initialize_segment_states(normalized),
+            token_cache: TokenCache::new(state),
+            pool_cache: HashMap::new(),
+        }
+    }
+
+    fn max_hop_depth(&self) -> usize {
+        self.normalized
+            .segments
+            .iter()
+            .map(|segment| segment.hops.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    async fn resimulate_segment_hop(
+        &mut self,
+        segment_index: usize,
+        hop_index: usize,
+    ) -> Result<(), EncodeError> {
+        let Some(hop) = self
+            .normalized
+            .segments
+            .get(segment_index)
+            .and_then(|segment| segment.hops.get(hop_index))
+        else {
+            return Ok(());
+        };
+        let hop_amount_in = {
+            let segment_state = self
+                .segment_states
+                .get_mut(segment_index)
+                .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+            require_hop_amount_in(segment_state, segment_index, hop_index)?
+        };
+        let allocated_swaps =
+            allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)?;
+        let (swap_results, hop_expected) = self
+            .simulate_allocated_swaps(allocated_swaps, &hop_amount_in)
+            .await?;
+        // We come back for the segment state here because the pool work above awaits.
+        let segment_state = self
+            .segment_states
+            .get_mut(segment_index)
+            .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+        segment_state.hops[hop_index] = Some(ResimulatedHopInternal {
+            token_in: hop.token_in.clone(),
+            token_out: hop.token_out.clone(),
+            amount_in: hop_amount_in,
+            expected_amount_out: hop_expected.clone(),
+            swaps: swap_results,
+        });
+        segment_state.next_amount_in = hop_expected;
+        Ok(())
+    }
+
+    async fn simulate_allocated_swaps(
+        &mut self,
+        allocated_swaps: Vec<super::allocation::AllocatedSwap>,
+        hop_amount_in: &BigUint,
+    ) -> Result<(Vec<ResimulatedSwapInternal>, BigUint), EncodeError> {
+        let mut swap_results = Vec::with_capacity(allocated_swaps.len());
+        let mut hop_expected = BigUint::zero();
+
+        for allocated in allocated_swaps {
+            let swap = self.simulate_allocated_swap(allocated).await?;
+            hop_expected += swap.expected_amount_out.clone();
+            swap_results.push(swap);
+        }
+
+        if hop_expected.is_zero() {
+            return Err(EncodeError::simulation(format!(
+                "hop amountIn {} produced zero amountOut",
+                hop_amount_in
+            )));
+        }
+
+        Ok((swap_results, hop_expected))
+    }
+
+    async fn simulate_allocated_swap(
+        &mut self,
+        allocated: super::allocation::AllocatedSwap,
+    ) -> Result<ResimulatedSwapInternal, EncodeError> {
+        let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
+        let keep_native_unwrapped = ensure_native_swap_supported(
+            self.chain,
+            &allocated.token_in,
+            &allocated.token_out,
+            &pool_entry.1,
+            &allocated.pool.component_id,
+        )?;
+        let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
+        let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
+        let token_in = self.token_cache.get(&sim_token_in).await?;
+        let token_out = self.token_cache.get(&sim_token_out).await?;
+        let pool_timeout = pool_timeout_for_component(self.state, pool_entry.1.as_ref());
+        let (pre_state, result) = simulate_swap_blocking(BlockingSwapRequest {
+            state: self.state,
+            pool_state: Arc::clone(&pool_entry.0),
+            amount_in_for_sim: allocated.amount_in.clone(),
+            token_in,
+            token_out,
+            pool_timeout,
+            pool_id: &allocated.pool.component_id,
+            component: pool_entry.1.as_ref(),
+        })
+        .await?;
+        let expected_out =
+            require_non_zero_amount_out(&allocated.pool.component_id, result.amount)?;
+        // Reusing the same pool in one route should see the updated state from the prior swap.
+        self.pool_cache.insert(
+            allocated.pool.component_id.clone(),
+            (Arc::from(result.new_state), Arc::clone(&pool_entry.1)),
+        );
+        Ok(ResimulatedSwapInternal {
+            pool: allocated.pool,
+            token_in: allocated.token_in,
+            token_out: allocated.token_out,
+            split_bps: allocated.split_bps,
+            amount_in: allocated.amount_in,
+            expected_amount_out: expected_out,
+            pool_state: pre_state,
+            component: pool_entry.1,
+        })
+    }
+
+    async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, EncodeError> {
+        if let Some(entry) = self.pool_cache.get(pool_id) {
+            return Ok((Arc::clone(&entry.0), Arc::clone(&entry.1)));
+        }
+
+        let entry = self
+            .state
+            .pool_by_id(pool_id)
+            .await
+            .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
+        self.pool_cache.insert(pool_id.to_string(), entry.clone());
+        Ok(entry)
+    }
+
+    fn build_resimulated_segments(
+        &mut self,
+    ) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
+        build_resimulated_segments(self.normalized, &mut self.segment_states)
+    }
+}
+
+fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<SegmentSimState> {
+    normalized
         .segments
         .iter()
         .map(|segment| SegmentSimState {
             next_amount_in: segment.amount_in.clone(),
             hops: (0..segment.hops.len()).map(|_| None).collect(),
         })
-        .collect::<Vec<_>>();
-    let max_hops = normalized
-        .segments
-        .iter()
-        .map(|segment| segment.hops.len())
-        .max()
-        .unwrap_or(0);
+        .collect()
+}
 
-    // Resimulate in hop-depth order to match build_route_swaps execution order.
-    for hop_index in 0..max_hops {
-        for (segment_index, segment) in normalized.segments.iter().enumerate() {
-            let Some(hop) = segment.hops.get(hop_index) else {
-                continue;
-            };
-            let segment_state = segment_states
-                .get_mut(segment_index)
-                .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
-            let hop_amount_in = segment_state.next_amount_in.clone();
-            if hop_amount_in.is_zero() {
-                return Err(EncodeError::invalid(format!(
-                    "segment[{}].hop[{}] amountIn is zero",
-                    segment_index, hop_index
-                )));
-            }
-
-            let allocated_swaps =
-                allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)?;
-            let mut swap_results = Vec::with_capacity(allocated_swaps.len());
-            let mut hop_expected = BigUint::zero();
-
-            for allocated in allocated_swaps {
-                let pool_entry = if let Some(entry) = pool_cache.get(&allocated.pool.component_id) {
-                    (Arc::clone(&entry.0), Arc::clone(&entry.1))
-                } else {
-                    let entry = state
-                        .pool_by_id(&allocated.pool.component_id)
-                        .await
-                        .ok_or_else(|| {
-                            EncodeError::not_found(format!(
-                                "Pool {} not found",
-                                allocated.pool.component_id
-                            ))
-                        })?;
-                    pool_cache.insert(allocated.pool.component_id.clone(), entry.clone());
-                    entry
-                };
-
-                let keep_native_unwrapped = ensure_native_swap_supported(
-                    chain,
-                    &allocated.token_in,
-                    &allocated.token_out,
-                    &pool_entry.1,
-                    &allocated.pool.component_id,
-                )?;
-                let sim_token_in =
-                    map_swap_token(&allocated.token_in, chain, keep_native_unwrapped);
-                let sim_token_out =
-                    map_swap_token(&allocated.token_out, chain, keep_native_unwrapped);
-                let token_in = token_cache.get(&sim_token_in).await?;
-                let token_out = token_cache.get(&sim_token_out).await?;
-
-                // Offload pool simulation to the blocking pool (VM pools can be CPU-heavy).
-                //
-                // Mirror `/simulate` guardrails: hold a semaphore permit inside the blocking task
-                // so timeouts/cancellation don't accidentally uncap concurrent CPU-bound work.
-                let is_vm = pool_entry.1.protocol_system.starts_with("vm:");
-                let permit = if is_vm {
-                    state
-                        .vm_sim_semaphore()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| EncodeError::internal("VM pool semaphore closed"))?
-                } else {
-                    state
-                        .native_sim_semaphore()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| EncodeError::internal("Native pool semaphore closed"))?
-                };
-                let pool_state = Arc::clone(&pool_entry.0);
-                let amount_in_for_sim = allocated.amount_in.clone();
-                let pool_timeout = if is_vm {
-                    state.pool_timeout_vm()
-                } else {
-                    state.pool_timeout_native()
-                };
-
-                let handle = spawn_blocking(move || {
-                    // Hold the permit until the blocking work exits.
-                    let _permit = permit;
-                    // Move the pool state into the blocking task and return it so the caller can
-                    // attach it to the response without an extra clone.
-                    let pre_state = pool_state;
-                    let result = pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
-                    (pre_state, result)
-                });
-                tokio::pin!(handle);
-
-                let (pre_state, result) = tokio::select! {
-                    res = handle.as_mut() => {
-                        res.map_err(|join_err| {
-                            let reason = if join_err.is_panic() {
-                                "panicked"
-                            } else if join_err.is_cancelled() {
-                                "was cancelled"
-                            } else {
-                                "failed"
-                            };
-                            EncodeError::internal(format!(
-                                "Pool {} simulation task {}: {}",
-                                allocated.pool.component_id, reason, join_err
-                            ))
-                        })?
-                    }
-                    _ = sleep(pool_timeout) => {
-                        // Best-effort attempt to stop waiting on the blocking task after a pool-level
-                        // timeout; this doesn't reliably prevent `spawn_blocking` work from running
-                        // once scheduled. The semaphore permit is held inside the closure to cap
-                        // concurrent CPU usage even if the task keeps running.
-                        handle.as_mut().abort();
-                        return Err(EncodeError::simulation(format!(
-                            "Pool {} simulation timed out after {}ms",
-                            allocated.pool.component_id,
-                            pool_timeout.as_millis()
-                        )));
-                    }
-                };
-                let result = result.map_err(|err| {
-                    EncodeError::simulation(format!(
-                        "Pool {} simulation failed: {}",
-                        allocated.pool.component_id, err
-                    ))
-                })?;
-                let expected_out = result.amount;
-                if expected_out.is_zero() {
-                    return Err(EncodeError::simulation(format!(
-                        "Pool {} returned zero amountOut",
-                        allocated.pool.component_id
-                    )));
-                }
-
-                // Advance cached pool state so repeated-pool swaps simulate sequentially.
-                pool_cache.insert(
-                    allocated.pool.component_id.clone(),
-                    (Arc::from(result.new_state), Arc::clone(&pool_entry.1)),
-                );
-
-                hop_expected += expected_out.clone();
-
-                swap_results.push(ResimulatedSwapInternal {
-                    pool: allocated.pool,
-                    token_in: allocated.token_in,
-                    token_out: allocated.token_out,
-                    split_bps: allocated.split_bps,
-                    amount_in: allocated.amount_in,
-                    expected_amount_out: expected_out,
-                    pool_state: pre_state,
-                    component: Arc::clone(&pool_entry.1),
-                });
-            }
-
-            if hop_expected.is_zero() {
-                return Err(EncodeError::simulation(format!(
-                    "segment[{}].hop[{}] produced zero amountOut",
-                    segment_index, hop_index
-                )));
-            }
-
-            let resim_hop = ResimulatedHopInternal {
-                token_in: hop.token_in.clone(),
-                token_out: hop.token_out.clone(),
-                amount_in: hop_amount_in.clone(),
-                expected_amount_out: hop_expected.clone(),
-                swaps: swap_results,
-            };
-
-            segment_state.hops[hop_index] = Some(resim_hop);
-            segment_state.next_amount_in = hop_expected;
-        }
+fn require_hop_amount_in(
+    segment_state: &SegmentSimState,
+    segment_index: usize,
+    hop_index: usize,
+) -> Result<BigUint, EncodeError> {
+    let hop_amount_in = segment_state.next_amount_in.clone();
+    if hop_amount_in.is_zero() {
+        return Err(EncodeError::invalid(format!(
+            "segment[{}].hop[{}] amountIn is zero",
+            segment_index, hop_index
+        )));
     }
 
+    Ok(hop_amount_in)
+}
+
+fn pool_timeout_for_component(state: &AppState, component: &ProtocolComponent) -> Duration {
+    if component.protocol_system.starts_with("vm:") {
+        state.pool_timeout_vm()
+    } else {
+        state.pool_timeout_native()
+    }
+}
+
+async fn simulate_swap_blocking(
+    request: BlockingSwapRequest<'_>,
+) -> Result<
+    (
+        Arc<dyn ProtocolSim>,
+        tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
+    ),
+    EncodeError,
+> {
+    let BlockingSwapRequest {
+        state,
+        pool_state,
+        amount_in_for_sim,
+        token_in,
+        token_out,
+        pool_timeout,
+        pool_id,
+        component,
+    } = request;
+    let permit = acquire_pool_permit(state, component).await?;
+    let handle = spawn_blocking(move || {
+        let _permit = permit;
+        let pre_state = pool_state;
+        let result = pre_state.get_amount_out(amount_in_for_sim, &token_in, &token_out);
+        (pre_state, result)
+    });
+    tokio::pin!(handle);
+
+    let (pre_state, result) = tokio::select! {
+        res = handle.as_mut() => {
+            res.map_err(|join_err| join_error(pool_id, join_err))?
+        }
+        _ = sleep(pool_timeout) => {
+            handle.as_mut().abort();
+            return Err(timeout_error(pool_id, pool_timeout));
+        }
+    };
+    let result = result.map_err(|err| {
+        EncodeError::simulation(format!("Pool {} simulation failed: {}", pool_id, err))
+    })?;
+    Ok((pre_state, result))
+}
+
+async fn acquire_pool_permit(
+    state: &AppState,
+    component: &ProtocolComponent,
+) -> Result<tokio::sync::OwnedSemaphorePermit, EncodeError> {
+    if component.protocol_system.starts_with("vm:") {
+        state
+            .vm_sim_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| EncodeError::internal("VM pool semaphore closed"))
+    } else {
+        state
+            .native_sim_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| EncodeError::internal("Native pool semaphore closed"))
+    }
+}
+
+fn join_error(pool_id: &str, join_err: tokio::task::JoinError) -> EncodeError {
+    let reason = if join_err.is_panic() {
+        "panicked"
+    } else if join_err.is_cancelled() {
+        "was cancelled"
+    } else {
+        "failed"
+    };
+    EncodeError::internal(format!(
+        "Pool {} simulation task {}: {}",
+        pool_id, reason, join_err
+    ))
+}
+
+fn timeout_error(pool_id: &str, pool_timeout: Duration) -> EncodeError {
+    EncodeError::simulation(format!(
+        "Pool {} simulation timed out after {}ms",
+        pool_id,
+        pool_timeout.as_millis()
+    ))
+}
+
+fn require_non_zero_amount_out(
+    pool_id: &str,
+    expected_out: BigUint,
+) -> Result<BigUint, EncodeError> {
+    if expected_out.is_zero() {
+        return Err(EncodeError::simulation(format!(
+            "Pool {} returned zero amountOut",
+            pool_id
+        )));
+    }
+
+    Ok(expected_out)
+}
+
+fn build_resimulated_segments(
+    normalized: &NormalizedRouteInternal,
+    segment_states: &mut [SegmentSimState],
+) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
     let mut resim_segments = Vec::with_capacity(normalized.segments.len());
     for (segment_index, segment) in normalized.segments.iter().enumerate() {
-        let mut resim_hops = Vec::with_capacity(segment.hops.len());
-        let segment_state = segment_states
-            .get_mut(segment_index)
-            .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
-        for hop_index in 0..segment.hops.len() {
-            let resim_hop = segment_state.hops[hop_index]
-                .take()
-                .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
-            resim_hops.push(resim_hop);
-        }
-
+        let resim_hops = take_segment_hops(segment_states, segment_index, segment.hops.len())?;
         let last_hop = resim_hops
             .last()
             .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
-
         resim_segments.push(ResimulatedSegmentInternal {
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.clone(),
@@ -252,16 +379,38 @@ pub(super) async fn resimulate_route(
             hops: resim_hops,
         });
     }
+    Ok(resim_segments)
+}
 
+fn take_segment_hops(
+    segment_states: &mut [SegmentSimState],
+    segment_index: usize,
+    hop_len: usize,
+) -> Result<Vec<ResimulatedHopInternal>, EncodeError> {
+    let segment_state = segment_states
+        .get_mut(segment_index)
+        .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+    let mut resim_hops = Vec::with_capacity(hop_len);
+    for hop_index in 0..hop_len {
+        let resim_hop = segment_state.hops[hop_index]
+            .take()
+            .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
+        resim_hops.push(resim_hop);
+    }
+    Ok(resim_hops)
+}
+
+fn validate_request_tokens(
+    request_token_in: &Bytes,
+    request_token_out: &Bytes,
+) -> Result<(), EncodeError> {
     if request_token_in.is_empty() || request_token_out.is_empty() {
         return Err(EncodeError::internal(
             "Request tokens missing after resimulation",
         ));
     }
 
-    Ok(ResimulatedRouteInternal {
-        segments: resim_segments,
-    })
+    Ok(())
 }
 
 fn ensure_native_swap_supported(
@@ -324,6 +473,18 @@ impl<'a> TokenCache<'a> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "resimulation fixtures use deterministic addresses and test doubles"
+)]
+#[expect(
+    clippy::panic,
+    reason = "negative test branches are expressed as explicit test invariants"
+)]
+#[expect(
+    clippy::manual_let_else,
+    reason = "negative test assertions read more clearly in match form here"
+)]
 mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
@@ -331,13 +492,13 @@ mod tests {
     use tycho_simulation::protocol::models::Update;
 
     use super::*;
+    use crate::services::encode::fixtures::{
+        component_with_protocol, component_with_tokens, dummy_token, pool_ref, test_app_state,
+        test_state_stores, token_store_with_tokens, TestAppStateConfig,
+    };
+    use crate::services::encode::mocks::{step_multiplier, StepProtocolSim};
     use crate::services::encode::model::{
         NormalizedHopInternal, NormalizedSegmentInternal, NormalizedSwapDraftInternal,
-    };
-    use crate::services::encode::test_support::{
-        component_with_protocol, component_with_tokens, dummy_token, pool_ref, step_multiplier,
-        test_app_state, test_state_stores, token_store_with_tokens, StepProtocolSim,
-        TestAppStateConfig,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
