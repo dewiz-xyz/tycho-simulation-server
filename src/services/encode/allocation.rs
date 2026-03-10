@@ -137,115 +137,80 @@ pub(super) fn allocate_swaps_by_bps(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use super::*;
-    use crate::services::encode::test_support::pool_ref;
+    use crate::services::encode::fixtures::{fixture_bytes, pool_ref};
+
+    type TestResult = std::result::Result<(), EncodeError>;
+
+    fn swap_draft(pool: &str, split_bps: u32) -> NormalizedSwapDraftInternal {
+        NormalizedSwapDraftInternal {
+            pool: pool_ref(pool),
+            token_in: fixture_bytes("0x0000000000000000000000000000000000000001"),
+            token_out: fixture_bytes("0x0000000000000000000000000000000000000002"),
+            split_bps,
+        }
+    }
 
     #[test]
-    fn allocate_swaps_by_bps_applies_remainder() {
+    fn allocate_swaps_by_bps_applies_remainder() -> TestResult {
         let hop_amount = BigUint::from(100u32);
-        let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 3000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 0,
-            },
-        ];
+        let swaps = vec![swap_draft("p1", 3000), swap_draft("p2", 0)];
 
-        let allocated = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0).expect("allocates");
+        let allocated = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0)?;
         assert_eq!(allocated.len(), 2);
         assert_eq!(allocated[0].amount_in, BigUint::from(30u32));
         assert_eq!(allocated[1].amount_in, BigUint::from(70u32));
         assert_eq!(allocated[0].split_bps, 3000);
         assert_eq!(allocated[1].split_bps, 0);
+        Ok(())
     }
 
     #[test]
-    fn allocate_swaps_by_bps_rejects_non_last_remainder() {
+    fn allocate_swaps_by_bps_rejects_non_last_remainder() -> TestResult {
         let hop_amount = BigUint::from(100u32);
-        let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 0,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 5000,
-            },
-        ];
+        let swaps = vec![swap_draft("p1", 0), swap_draft("p2", 5000)];
 
-        let err =
-            allocate_swaps_by_bps(hop_amount, &swaps, 0, 0).expect_err("remainder must be last");
+        let Err(err) = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0) else {
+            return Err(EncodeError::internal("remainder must be last"));
+        };
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
         );
+        Ok(())
     }
 
     #[test]
-    fn allocate_swaps_by_bps_rejects_non_zero_last_share() {
+    fn allocate_swaps_by_bps_rejects_non_zero_last_share() -> TestResult {
         let hop_amount = BigUint::from(100u32);
-        let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 6000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 4000,
-            },
-        ];
+        let swaps = vec![swap_draft("p1", 6000), swap_draft("p2", 4000)];
 
-        let err = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0)
-            .expect_err("last share must be zero to take remainder");
+        let Err(err) = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0) else {
+            return Err(EncodeError::internal(
+                "last share must be zero to take remainder",
+            ));
+        };
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
         );
+        Ok(())
     }
 
     #[test]
-    fn allocate_swaps_by_bps_rejects_zero_remainder_amount() {
+    fn allocate_swaps_by_bps_rejects_zero_remainder_amount() -> TestResult {
         let hop_amount = BigUint::from(100u32);
         let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 5000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 5000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p3"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 0,
-            },
+            swap_draft("p1", 5000),
+            swap_draft("p2", 5000),
+            swap_draft("p3", 0),
         ];
 
-        let err = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0)
-            .expect_err("remainder must be positive for multi-swap splits");
+        let Err(err) = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0) else {
+            return Err(EncodeError::internal(
+                "remainder must be positive for multi-swap splits",
+            ));
+        };
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -255,59 +220,34 @@ mod tests {
             "unexpected error: {}",
             err.message()
         );
+        Ok(())
     }
 
     #[test]
-    fn allocate_swaps_by_bps_allows_sum_10000_with_positive_remainder() {
+    fn allocate_swaps_by_bps_allows_sum_10000_with_positive_remainder() -> TestResult {
         let hop_amount = BigUint::from(101u32);
         let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 5000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 5000,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p3"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 0,
-            },
+            swap_draft("p1", 5000),
+            swap_draft("p2", 5000),
+            swap_draft("p3", 0),
         ];
 
-        let allocated = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0).expect("allocates");
+        let allocated = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0)?;
         assert_eq!(allocated.len(), 3);
         assert_eq!(allocated[0].amount_in, BigUint::from(50u32));
         assert_eq!(allocated[1].amount_in, BigUint::from(50u32));
         assert_eq!(allocated[2].amount_in, BigUint::from(1u32));
+        Ok(())
     }
 
     #[test]
-    fn allocate_swaps_by_bps_rejects_non_remainder_rounding_to_zero() {
+    fn allocate_swaps_by_bps_rejects_non_remainder_rounding_to_zero() -> TestResult {
         let hop_amount = BigUint::from(1u32);
-        let swaps = vec![
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p1"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 1,
-            },
-            NormalizedSwapDraftInternal {
-                pool: pool_ref("p2"),
-                token_in: Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                token_out: Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap(),
-                split_bps: 0,
-            },
-        ];
+        let swaps = vec![swap_draft("p1", 1), swap_draft("p2", 0)];
 
-        let err =
-            allocate_swaps_by_bps(hop_amount, &swaps, 0, 0).expect_err("rounding to zero invalid");
+        let Err(err) = allocate_swaps_by_bps(hop_amount, &swaps, 0, 0) else {
+            return Err(EncodeError::internal("rounding to zero invalid"));
+        };
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -317,5 +257,6 @@ mod tests {
             "unexpected error: {}",
             err.message()
         );
+        Ok(())
     }
 }

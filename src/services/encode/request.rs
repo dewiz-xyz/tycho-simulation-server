@@ -98,6 +98,10 @@ pub(super) fn validate_swap_kinds(request: &RouteEncodeRequest) -> Result<(), En
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "negative request tests use explicit invariant assertions"
+)]
 mod tests {
     use super::*;
 
@@ -120,7 +124,7 @@ mod tests {
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![crate::models::messages::PoolSwapDraft {
-                            pool: crate::services::encode::test_support::pool_ref("p1"),
+                            pool: crate::services::encode::fixtures::pool_ref("p1"),
                             token_in: "0x0000000000000000000000000000000000000001".to_string(),
                             token_out: "0x0000000000000000000000000000000000000002".to_string(),
                             split_bps: 0,
@@ -134,7 +138,7 @@ mod tests {
                         token_in: "0x0000000000000000000000000000000000000001".to_string(),
                         token_out: "0x0000000000000000000000000000000000000002".to_string(),
                         swaps: vec![crate::models::messages::PoolSwapDraft {
-                            pool: crate::services::encode::test_support::pool_ref("p2"),
+                            pool: crate::services::encode::fixtures::pool_ref("p2"),
                             token_in: "0x0000000000000000000000000000000000000001".to_string(),
                             token_out: "0x0000000000000000000000000000000000000002".to_string(),
                             split_bps: 0,
