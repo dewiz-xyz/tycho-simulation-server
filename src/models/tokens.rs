@@ -145,8 +145,10 @@ impl TokenStore {
         let start = Instant::now();
 
         let body = build_tokens_request_body(address, self.chain);
-        let response = self.send_fetch_request(address, &body, start).await?;
-        let result = self.parse_token_response(address, response, start).await;
+        let result = match self.send_fetch_request(address, &body, start).await {
+            Ok(response) => self.parse_token_response(address, response, start).await,
+            Err(err) => Err(err),
+        };
 
         let _ = tx.send(Some(result.clone()));
         result
@@ -301,5 +303,107 @@ fn build_http_client() -> Client {
             eprintln!("Failed to build token-store HTTP client: {err}");
             std::process::abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use anyhow::Result;
+    use tokio::{
+        net::TcpListener,
+        sync::{Barrier, Notify},
+        task::JoinHandle,
+        time::sleep,
+    };
+
+    fn test_address() -> Bytes {
+        Bytes::from([0x11_u8; 20])
+    }
+
+    async fn spawn_hanging_token_server(
+        hold_duration: Duration,
+        request_count: Arc<AtomicUsize>,
+    ) -> Result<(String, Arc<Notify>, JoinHandle<Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal.notified() => break,
+                    accept_result = listener.accept() => {
+                        let (socket, _) = accept_result?;
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            // Keep the socket open long enough for reqwest to time out
+                            // before any response bytes arrive.
+                            let _socket = socket;
+                            sleep(hold_duration).await;
+                        });
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok((address, shutdown, task))
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_timeout_error_without_duplicate_fetches() -> Result<()> {
+        const CONCURRENT_CALLS: usize = 6;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let fetch_timeout = Duration::from_millis(50);
+        let hold_duration = Duration::from_millis(150);
+        let (tycho_url, shutdown, server_task) =
+            spawn_hanging_token_server(hold_duration, Arc::clone(&request_count)).await?;
+        let store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            tycho_url,
+            "test".to_string(),
+            Chain::Ethereum,
+            fetch_timeout,
+        ));
+        let address = test_address();
+        let barrier = Arc::new(Barrier::new(CONCURRENT_CALLS + 1));
+
+        let handles: Vec<_> = (0..CONCURRENT_CALLS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let address = address.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store.ensure(&address).await
+                })
+            })
+            .collect();
+
+        barrier.wait().await;
+
+        for handle in handles {
+            let result = handle.await?;
+            assert!(
+                matches!(result, Err(TokenStoreError::FetchTimeout(duration)) if duration == fetch_timeout),
+                "expected shared timeout error, got {result:?}"
+            );
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "concurrent cache misses should share one upstream timeout"
+        );
+
+        shutdown.notify_waiters();
+        server_task.await??;
+        Ok(())
     }
 }
