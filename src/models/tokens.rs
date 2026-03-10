@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use reqwest::{header, Client, ClientBuilder};
+use reqwest::{header, Client, ClientBuilder, Response};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 use tycho_simulation::tycho_common::{
@@ -40,13 +40,7 @@ impl TokenStore {
         chain: Chain,
         fetch_timeout: Duration,
     ) -> Self {
-        let client = ClientBuilder::new()
-            .connect_timeout(Duration::from_millis(750))
-            .pool_idle_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .tcp_nodelay(true)
-            .build()
-            .expect("failed to build HTTP client");
+        let client = build_http_client();
 
         TokenStore {
             tokens: RwLock::new(initial),
@@ -132,7 +126,9 @@ impl TokenStore {
         address: &Bytes,
         tx: watch::Sender<Option<Result<Option<Token>, TokenStoreError>>>,
     ) -> Result<Option<Token>, TokenStoreError> {
-        let _permit = self.fetch_semaphore.acquire().await.unwrap();
+        let _permit = self.fetch_semaphore.acquire().await.map_err(|_| {
+            TokenStoreError::RequestFailed("token fetch semaphore unexpectedly closed".to_string())
+        })?;
 
         // Another task may have populated the cache while we were waiting.
         if let Some(token) = self.tokens.read().await.get(address).cloned() {
@@ -148,109 +144,113 @@ impl TokenStore {
 
         let start = Instant::now();
 
-        let body = TokensRequestBody {
-            token_addresses: Some(vec![address.clone()]),
-            chain: self.chain.into(),
-            ..Default::default()
-        };
+        let body = build_tokens_request_body(address, self.chain);
+        let response = self.send_fetch_request(address, &body, start).await?;
+        let result = self.parse_token_response(address, response, start).await;
 
+        let _ = tx.send(Some(result.clone()));
+        result
+    }
+
+    async fn send_fetch_request(
+        &self,
+        address: &Bytes,
+        body: &TokensRequestBody,
+        start: Instant,
+    ) -> Result<Response, TokenStoreError> {
         let url = format!("{}/v1/tokens", self.rpc_base_url());
-
-        let result: Result<Option<Token>, TokenStoreError> = async {
-            let response = self
-                .client
-                .post(url)
-                .header(header::AUTHORIZATION, self.api_key.clone())
-                .json(&body)
-                .timeout(self.fetch_timeout)
-                .send()
-                .await
-                .map_err(|err| {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    warn!(
-                        scope = "token_single_fetch",
-                        token_address = %address,
-                        elapsed_ms,
-                        is_timeout = err.is_timeout(),
-                        is_connect = err.is_connect(),
-                        error = %err,
-                        "Token fetch request failed before response"
-                    );
-                    if err.is_timeout() {
-                        TokenStoreError::FetchTimeout(self.fetch_timeout)
-                    } else {
-                        TokenStoreError::RequestFailed(err.to_string())
-                    }
-                })?;
-
-            if !response.status().is_success() {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                info!(
-                    scope = "token_single_fetch",
-                    token_address = %address,
-                    status = %response.status(),
-                    elapsed_ms,
-                    "Token fetch returned non-success status"
-                );
-                return Err(TokenStoreError::RequestFailed(format!(
-                    "Tycho RPC returned status {} when fetching token {}",
-                    response.status(),
-                    address
-                )));
-            }
-
-            let TokensRequestResponse { tokens, .. } = response
-                .json::<TokensRequestResponse>()
-                .await
-                .map_err(|err| {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    warn!(
-                        scope = "token_single_fetch",
-                        token_address = %address,
-                        elapsed_ms,
-                        error = %err,
-                        "Failed to decode token response"
-                    );
-                    TokenStoreError::RequestFailed(format!(
-                        "Failed to parse token response: {}",
-                        err
-                    ))
-                })?;
-
-            let maybe_token = tokens
-                .into_iter()
-                .find(|token| token.address == *address)
-                .and_then(|token| Token::try_from(token).ok());
-
-            if let Some(token) = maybe_token {
-                self.tokens
-                    .write()
-                    .await
-                    .entry(token.address.clone())
-                    .or_insert_with(|| token.clone());
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                debug!(
-                    scope = "token_single_fetch",
-                    token_address = %address,
-                    elapsed_ms,
-                    "Token fetch succeeded"
-                );
-                Ok(Some(token))
-            } else {
+        self.client
+            .post(url)
+            .header(header::AUTHORIZATION, self.api_key.clone())
+            .json(body)
+            .timeout(self.fetch_timeout)
+            .send()
+            .await
+            .map_err(|err| {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 warn!(
                     scope = "token_single_fetch",
                     token_address = %address,
                     elapsed_ms,
-                    "Token response contained no matching token"
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    error = %err,
+                    "Token fetch request failed before response"
                 );
-                Ok(None)
-            }
-        }
-        .await;
+                if err.is_timeout() {
+                    TokenStoreError::FetchTimeout(self.fetch_timeout)
+                } else {
+                    TokenStoreError::RequestFailed(err.to_string())
+                }
+            })
+    }
 
-        let _ = tx.send(Some(result.clone()));
-        result
+    async fn parse_token_response(
+        &self,
+        address: &Bytes,
+        response: Response,
+        start: Instant,
+    ) -> Result<Option<Token>, TokenStoreError> {
+        if !response.status().is_success() {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            info!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                status = %response.status(),
+                elapsed_ms,
+                "Token fetch returned non-success status"
+            );
+            return Err(TokenStoreError::RequestFailed(format!(
+                "Tycho RPC returned status {} when fetching token {}",
+                response.status(),
+                address
+            )));
+        }
+
+        let TokensRequestResponse { tokens, .. } = response
+            .json::<TokensRequestResponse>()
+            .await
+            .map_err(|err| {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            warn!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                error = %err,
+                "Failed to decode token response"
+            );
+            TokenStoreError::RequestFailed(format!("Failed to parse token response: {err}"))
+        })?;
+
+        let maybe_token = tokens
+            .into_iter()
+            .find(|token| token.address == *address)
+            .and_then(|token| Token::try_from(token).ok());
+
+        if let Some(token) = maybe_token {
+            self.tokens
+                .write()
+                .await
+                .entry(token.address.clone())
+                .or_insert_with(|| token.clone());
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            debug!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                "Token fetch succeeded"
+            );
+            Ok(Some(token))
+        } else {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            warn!(
+                scope = "token_single_fetch",
+                token_address = %address,
+                elapsed_ms,
+                "Token response contained no matching token"
+            );
+            Ok(None)
+        }
     }
 
     fn rpc_base_url(&self) -> String {
@@ -280,3 +280,26 @@ impl fmt::Display for TokenStoreError {
 }
 
 impl std::error::Error for TokenStoreError {}
+
+fn build_tokens_request_body(address: &Bytes, chain: Chain) -> TokensRequestBody {
+    TokensRequestBody {
+        token_addresses: Some(vec![address.clone()]),
+        chain: chain.into(),
+        ..Default::default()
+    }
+}
+
+fn build_http_client() -> Client {
+    let builder = ClientBuilder::new()
+        .connect_timeout(Duration::from_millis(750))
+        .pool_idle_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(1)
+        .tcp_nodelay(true);
+    match builder.build() {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("Failed to build token-store HTTP client: {err}");
+            std::process::abort();
+        }
+    }
+}
