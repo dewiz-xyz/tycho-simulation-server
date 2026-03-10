@@ -39,11 +39,16 @@ pub(super) fn dummy_component() -> ProtocolComponent {
     )
 }
 
-pub(super) fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolComponent {
+pub(super) fn component_with_protocol(
+    id: &str,
+    protocol_system: &str,
+    protocol_type_name: &str,
+    tokens: Vec<Token>,
+) -> ProtocolComponent {
     ProtocolComponent::new(
         Bytes::from_str(id).unwrap(),
-        "uniswap_v2".to_string(),
-        "uniswap_v2".to_string(),
+        protocol_system.to_string(),
+        protocol_type_name.to_string(),
         Chain::Ethereum,
         tokens,
         Vec::new(),
@@ -51,6 +56,10 @@ pub(super) fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolCom
         Bytes::default(),
         NaiveDateTime::default(),
     )
+}
+
+pub(super) fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolComponent {
+    component_with_protocol(id, "uniswap_v2", "uniswap_v2", tokens)
 }
 
 pub(super) fn dummy_token(address: &str) -> Token {

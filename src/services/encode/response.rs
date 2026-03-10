@@ -85,6 +85,21 @@ mod tests {
         test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
 
+    fn test_request(request_id: Option<&str>) -> RouteEncodeRequest {
+        RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "10".to_string(),
+            min_amount_out: "8".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: Vec::new(),
+            request_id: request_id.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn build_debug_omits_when_request_id_missing() {
         let tokens_store = token_store_with_tokens(Vec::new());
@@ -101,18 +116,7 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            min_amount_out: "8".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            request_id: None,
-        };
+        let request = test_request(None);
 
         assert!(build_debug(&state, &request).await.is_none());
     }
@@ -133,18 +137,7 @@ mod tests {
             TestAppStateConfig::default(),
         );
 
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            min_amount_out: "8".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            request_id: Some("req-1".to_string()),
-        };
+        let request = test_request(Some("req-1"));
 
         let debug = build_debug(&state, &request).await.expect("debug present");
         assert_eq!(debug.request_id.as_deref(), Some("req-1"));

@@ -77,7 +77,7 @@ pub(super) async fn resimulate_route(
             let mut swap_results = Vec::with_capacity(allocated_swaps.len());
             let mut hop_expected = BigUint::zero();
 
-            for (swap_index, allocated) in allocated_swaps.into_iter().enumerate() {
+            for allocated in allocated_swaps {
                 let pool_entry = if let Some(entry) = pool_cache.get(&allocated.pool.component_id) {
                     (Arc::clone(&entry.0), Arc::clone(&entry.1))
                 } else {
@@ -206,10 +206,6 @@ pub(super) async fn resimulate_route(
                     pool_state: pre_state,
                     component: Arc::clone(&pool_entry.1),
                 });
-
-                if swap_results.len() - 1 != swap_index {
-                    return Err(EncodeError::internal("Swap allocation ordering mismatch"));
-                }
             }
 
             if hop_expected.is_zero() {
@@ -330,19 +326,18 @@ impl<'a> TokenCache<'a> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::str::FromStr;
     use std::time::Duration;
 
-    use chrono::NaiveDateTime;
-    use tycho_simulation::protocol::models::{ProtocolComponent, Update};
+    use tycho_simulation::protocol::models::Update;
 
     use super::*;
     use crate::services::encode::model::{
         NormalizedHopInternal, NormalizedSegmentInternal, NormalizedSwapDraftInternal,
     };
     use crate::services::encode::test_support::{
-        component_with_tokens, dummy_token, pool_ref, step_multiplier, test_app_state,
-        test_state_stores, token_store_with_tokens, StepProtocolSim, TestAppStateConfig,
+        component_with_protocol, component_with_tokens, dummy_token, pool_ref, step_multiplier,
+        test_app_state, test_state_stores, token_store_with_tokens, StepProtocolSim,
+        TestAppStateConfig,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -441,6 +436,32 @@ mod tests {
                 .downcast_ref::<SlowProtocolSim>()
                 .is_some_and(|rhs| rhs.sleep_for == self.sleep_for)
         }
+    }
+
+    fn timeout_test_config(
+        enable_vm_pools: bool,
+        pool_timeout_native: Duration,
+        pool_timeout_vm: Duration,
+    ) -> TestAppStateConfig {
+        TestAppStateConfig {
+            enable_vm_pools,
+            quote_timeout: Duration::from_millis(1000),
+            pool_timeout_native,
+            pool_timeout_vm,
+            request_timeout: Duration::from_millis(1000),
+        }
+    }
+
+    fn assert_timeout_error(err: EncodeError, pool_id: &str) {
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::Simulation
+        );
+        assert!(
+            err.message().contains(pool_id) && err.message().contains("timed out"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -645,13 +666,11 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
-            TestAppStateConfig {
-                quote_timeout: Duration::from_millis(1000),
-                pool_timeout_native: Duration::from_millis(10),
-                pool_timeout_vm: Duration::from_millis(1000),
-                request_timeout: Duration::from_millis(1000),
-                ..TestAppStateConfig::default()
-            },
+            timeout_test_config(
+                false,
+                Duration::from_millis(10),
+                Duration::from_millis(1000),
+            ),
         );
 
         let normalized = NormalizedRouteInternal {
@@ -684,15 +703,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(
-            err.kind(),
-            crate::services::encode::EncodeErrorKind::Simulation
-        );
-        assert!(
-            err.message().contains("pool-slow") && err.message().contains("timed out"),
-            "unexpected error: {}",
-            err.message()
-        );
+        assert_timeout_error(err, "pool-slow");
     }
 
     #[tokio::test]
@@ -702,16 +713,11 @@ mod tests {
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x0000000000000000000000000000000000000009").unwrap(),
-            "vm:curve".to_string(),
-            "curve_pool".to_string(),
-            Chain::Ethereum,
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "vm:curve",
+            "curve_pool",
             vec![token_in.clone(), token_out.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
         );
 
         let mut states = HashMap::new();
@@ -731,13 +737,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
-            TestAppStateConfig {
-                enable_vm_pools: true,
-                quote_timeout: Duration::from_millis(1000),
-                pool_timeout_native: Duration::from_millis(1000),
-                pool_timeout_vm: Duration::from_millis(10),
-                request_timeout: Duration::from_millis(1000),
-            },
+            timeout_test_config(true, Duration::from_millis(1000), Duration::from_millis(10)),
         );
 
         let normalized = NormalizedRouteInternal {
@@ -770,14 +770,6 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(
-            err.kind(),
-            crate::services::encode::EncodeErrorKind::Simulation
-        );
-        assert!(
-            err.message().contains("pool-vm-slow") && err.message().contains("timed out"),
-            "unexpected error: {}",
-            err.message()
-        );
+        assert_timeout_error(err, "pool-vm-slow");
     }
 }
