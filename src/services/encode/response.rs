@@ -77,60 +77,16 @@ pub(super) async fn build_debug(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use tokio::sync::Semaphore;
     use tycho_simulation::protocol::models::Update;
-    use tycho_simulation::tycho_common::models::Chain;
 
     use super::*;
     use crate::models::messages::SwapKind;
-    use crate::models::state::{StateStore, VmStreamStatus};
-    use crate::models::stream_health::StreamHealth;
-    use crate::models::tokens::TokenStore;
+    use crate::services::encode::test_support::{
+        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
+    };
 
-    #[tokio::test]
-    async fn build_debug_omits_when_request_id_missing() {
-        let tokens_store = std::sync::Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let vm_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-
-        native_state_store
-            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
-            .await;
-
-        let state = AppState {
-            tokens: std::sync::Arc::clone(&tokens_store),
-            native_state_store: std::sync::Arc::clone(&native_state_store),
-            vm_state_store: std::sync::Arc::clone(&vm_state_store),
-            native_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
-
-        let request = RouteEncodeRequest {
+    fn test_request(request_id: Option<&str>) -> RouteEncodeRequest {
+        RouteEncodeRequest {
             chain_id: 1,
             token_in: "0x0000000000000000000000000000000000000001".to_string(),
             token_out: "0x0000000000000000000000000000000000000002".to_string(),
@@ -140,64 +96,48 @@ mod tests {
             tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
             swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
-            request_id: None,
-        };
+            request_id: request_id.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_debug_omits_when_request_id_missing() {
+        let tokens_store = token_store_with_tokens(Vec::new());
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+
+        native_state_store
+            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
+            .await;
+
+        let state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
+
+        let request = test_request(None);
 
         assert!(build_debug(&state, &request).await.is_none());
     }
 
     #[tokio::test]
     async fn build_debug_includes_block_when_request_id_present() {
-        let tokens_store = std::sync::Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
-        let vm_state_store =
-            std::sync::Arc::new(StateStore::new(std::sync::Arc::clone(&tokens_store)));
+        let tokens_store = token_store_with_tokens(Vec::new());
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
             .await;
 
-        let state = AppState {
-            tokens: std::sync::Arc::clone(&tokens_store),
-            native_state_store: std::sync::Arc::clone(&native_state_store),
-            vm_state_store: std::sync::Arc::clone(&vm_state_store),
-            native_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream_health: std::sync::Arc::new(StreamHealth::new()),
-            vm_stream: std::sync::Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: false,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(10),
-            native_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: std::sync::Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: std::sync::Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
 
-        let request = RouteEncodeRequest {
-            chain_id: 1,
-            token_in: "0x0000000000000000000000000000000000000001".to_string(),
-            token_out: "0x0000000000000000000000000000000000000002".to_string(),
-            amount_in: "10".to_string(),
-            min_amount_out: "8".to_string(),
-            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-            swap_kind: SwapKind::SimpleSwap,
-            segments: Vec::new(),
-            request_id: Some("req-1".to_string()),
-        };
+        let request = test_request(Some("req-1"));
 
         let debug = build_debug(&state, &request).await.expect("debug present");
         assert_eq!(debug.request_id.as_deref(), Some("req-1"));
