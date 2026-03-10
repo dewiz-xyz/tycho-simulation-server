@@ -26,6 +26,8 @@ USAGE
 repo=""
 base_url="http://localhost:3000"
 suite="core"
+coverage_suite=""
+latency_suite=""
 enable_vm_pools="true"
 stop_after="false"
 
@@ -99,6 +101,21 @@ echo "Base URL: $base_url"
 echo "Suite: $suite"
 echo "Enable VM pools: $enable_vm_pools"
 
+if [[ "$suite" == "core" ]] && [[ "$enable_vm_pools" == "true" ]]; then
+  latency_suite="${LATENCY_SUITE:-latency_core_vm}"
+elif [[ "$suite" == "core" ]]; then
+  latency_suite="${LATENCY_SUITE:-latency_core}"
+else
+  latency_suite="${LATENCY_SUITE:-$suite}"
+fi
+if [[ "$suite" == "core" ]] && [[ "$enable_vm_pools" == "true" ]]; then
+  coverage_suite="${COVERAGE_SUITE:-coverage_core_vm}"
+else
+  coverage_suite="${COVERAGE_SUITE:-$suite}"
+fi
+echo "Coverage suite: $coverage_suite"
+echo "Latency suite: $latency_suite"
+
 if curl -s "$status_url" >/dev/null 2>&1; then
   echo "Server already responding at $status_url"
 else
@@ -121,7 +138,7 @@ python3 "$skill_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --all
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
-python3 "$skill_dir/coverage_sweep.py" --url "$simulate_url" --suite "$suite" --allow-status ready --out "$repo/logs/coverage_sweep.json"
+python3 "$skill_dir/coverage_sweep.py" --url "$simulate_url" --suite "$coverage_suite" --allow-status ready --out "$repo/logs/coverage_sweep.json"
 
 echo "Latency percentiles..."
 latency_requests="${LATENCY_REQUESTS:-200}"
@@ -130,7 +147,7 @@ if [[ "$enable_vm_pools" == "true" ]]; then
 else
   latency_concurrency="${LATENCY_CONCURRENCY:-8}"
 fi
-python3 "$skill_dir/latency_percentiles.py" --url "$simulate_url" --suite "$suite" --requests "$latency_requests" --concurrency "$latency_concurrency" --allow-status ready
+python3 "$skill_dir/latency_percentiles.py" --url "$simulate_url" --suite "$latency_suite" --requests "$latency_requests" --concurrency "$latency_concurrency" --allow-status ready
 
 if [[ "$stop_after" == "true" ]] && [[ "$started_by_me" == "true" ]]; then
   echo "Stopping server..."

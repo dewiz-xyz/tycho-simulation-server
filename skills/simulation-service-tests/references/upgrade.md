@@ -26,7 +26,7 @@ Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or
 VM pools are enabled by default; keep a run with them disabled for comparison:
 - `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
 
-Core coverage should exercise representative native/VM pairs in normal runs (`GHO:USDC`, `ETH:RETH`, `RETH:ETH`).
+Core coverage should exercise representative native paths with `ETH:RETH` and `RETH:ETH`. Maverick coverage is checked separately by the protocol presence probe in `scripts/run_suite.sh`.
 
 ## Load testing / regressions
 - Prefer `scripts/run_suite.sh` and/or `scripts/latency_percentiles.py` with higher `--requests`/`--concurrency`.

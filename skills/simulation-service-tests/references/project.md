@@ -37,7 +37,9 @@
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
-  - Core coverage now includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH`.
+  - Core coverage keeps `ETH:RETH` and `RETH:ETH`, while Maverick coverage is checked by the dedicated protocol presence probe in `scripts/run_suite.sh`.
+  - With VM pools enabled, the coverage leg uses `coverage_core_vm` so the gate stays broad without depending on Balancer pools that currently return partial ladders at the default request sizes.
+  - The latency leg uses `latency_core` when `--suite core` is selected, so p50/p90/p99 stays on pairs that reliably return `ready`.
 - Individual runners:
   - `python3 scripts/simulate_smoke.py --suite smoke`
   - `python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`

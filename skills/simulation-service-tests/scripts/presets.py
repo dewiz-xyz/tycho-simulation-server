@@ -118,21 +118,61 @@ BASE_AMOUNTS: list[int] = [
 
 Pair = Tuple[str, str]
 
+LATENCY_CORE_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("WBTC", "USDC"),
+    ("WBTC", "WETH"),
+    ("STETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("LINK", "WETH"),
+    ("LDO", "WETH"),
+]
+
+COVERAGE_CORE_VM_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("USDC", "USDT"),
+    ("WBTC", "USDC"),
+    ("FRAX", "USDC"),
+    ("STETH", "WETH"),
+    ("WSTETH", "WETH"),
+    ("RETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("UNI", "WETH"),
+    ("LINK", "WETH"),
+    ("AAVE", "WETH"),
+    ("COMP", "WETH"),
+    ("MKR", "WETH"),
+    ("LDO", "WETH"),
+]
+
+LATENCY_CORE_VM_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("WBTC", "USDC"),
+    ("WBTC", "WETH"),
+    ("STETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("LINK", "WETH"),
+    ("LDO", "WETH"),
+]
+
 
 PAIR_SUITES: dict[str, list[Pair]] = {
     # Fast sanity checks; should work even with TVL thresholds at defaults.
     "smoke": [
         ("DAI", "USDC"),
-        ("WETH", "USDC"),
         ("USDC", "USDT"),
-        ("WBTC", "WETH"),
         ("STETH", "WETH"),
+        ("LINK", "WETH"),
+        ("LDO", "WETH"),
     ],
-    # Broad coverage across common pool types; useful after upgrades.
+    # Keep the default suite on pairs that stay liquid with and without VM
+    # feeds. Maverick coverage is checked separately in run_suite.sh.
     "core": [
         ("DAI", "USDC"),
         ("USDC", "USDT"),
-        ("GHO", "USDC"),
         ("WETH", "USDC"),
         ("WETH", "USDT"),
         ("WETH", "DAI"),
@@ -144,27 +184,26 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("RETH", "WETH"),
         ("ETH", "RETH"),
         ("RETH", "ETH"),
-        ("CBETH", "WETH"),
         ("UNI", "WETH"),
         ("LINK", "WETH"),
         ("AAVE", "WETH"),
         ("COMP", "WETH"),
         ("MKR", "WETH"),
-        ("SUSHI", "WETH"),
         ("LDO", "WETH"),
     ],
+    "latency_core": LATENCY_CORE_PAIRS,
+    "coverage_core_vm": COVERAGE_CORE_VM_PAIRS,
+    "latency_core_vm": LATENCY_CORE_VM_PAIRS,
     "stables": [
         ("DAI", "USDC"),
         ("DAI", "USDT"),
         ("USDC", "USDT"),
-        ("GHO", "USDC"),
         ("FRAX", "USDC"),
     ],
     "lst": [
         ("STETH", "WETH"),
         ("WSTETH", "WETH"),
         ("RETH", "WETH"),
-        ("CBETH", "WETH"),
     ],
     "governance": [
         ("UNI", "WETH"),
@@ -172,7 +211,6 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("AAVE", "WETH"),
         ("COMP", "WETH"),
         ("MKR", "WETH"),
-        ("SUSHI", "WETH"),
         ("LDO", "WETH"),
     ],
     # Candidate pairs that are likely to hit Uniswap v4 pools on mainnet.

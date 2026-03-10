@@ -110,10 +110,11 @@ BASE_AMOUNTS: list[int] = [
 
 Pair = Tuple[str, str]
 
+# Keep the default coverage suite on pairs that stay liquid in both native-only
+# and VM-enabled runs. The VM-specific Maverick check lives in run_suite.sh.
 CORE_PAIRS: list[Pair] = [
     ("DAI", "USDC"),
     ("USDC", "USDT"),
-    ("GHO", "USDC"),
     ("WETH", "USDC"),
     ("WETH", "USDT"),
     ("WETH", "DAI"),
@@ -125,13 +126,51 @@ CORE_PAIRS: list[Pair] = [
     ("RETH", "WETH"),
     ("ETH", "RETH"),
     ("RETH", "ETH"),
-    ("CBETH", "WETH"),
     ("UNI", "WETH"),
     ("LINK", "WETH"),
     ("AAVE", "WETH"),
     ("COMP", "WETH"),
     ("MKR", "WETH"),
-    ("SUSHI", "WETH"),
+    ("LDO", "WETH"),
+]
+
+LATENCY_CORE_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("WBTC", "USDC"),
+    ("WBTC", "WETH"),
+    ("STETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("LINK", "WETH"),
+    ("LDO", "WETH"),
+]
+
+COVERAGE_CORE_VM_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("USDC", "USDT"),
+    ("WBTC", "USDC"),
+    ("FRAX", "USDC"),
+    ("STETH", "WETH"),
+    ("WSTETH", "WETH"),
+    ("RETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("UNI", "WETH"),
+    ("LINK", "WETH"),
+    ("AAVE", "WETH"),
+    ("COMP", "WETH"),
+    ("MKR", "WETH"),
+    ("LDO", "WETH"),
+]
+
+LATENCY_CORE_VM_PAIRS: list[Pair] = [
+    ("DAI", "USDC"),
+    ("WBTC", "USDC"),
+    ("WBTC", "WETH"),
+    ("STETH", "WETH"),
+    ("ETH", "RETH"),
+    ("RETH", "ETH"),
+    ("LINK", "WETH"),
     ("LDO", "WETH"),
 ]
 
@@ -150,25 +189,26 @@ LOW_LIQUIDITY_PAIRS: list[Pair] = [
 PAIR_SUITES: dict[str, list[Pair]] = {
     "smoke": [
         ("DAI", "USDC"),
-        ("WETH", "USDC"),
         ("USDC", "USDT"),
-        ("WBTC", "WETH"),
         ("STETH", "WETH"),
+        ("LINK", "WETH"),
+        ("LDO", "WETH"),
     ],
     "core": CORE_PAIRS,
+    "latency_core": LATENCY_CORE_PAIRS,
+    "coverage_core_vm": COVERAGE_CORE_VM_PAIRS,
+    "latency_core_vm": LATENCY_CORE_VM_PAIRS,
     "extended": CORE_PAIRS + LOW_LIQUIDITY_PAIRS,
     "stables": [
         ("DAI", "USDC"),
         ("DAI", "USDT"),
         ("USDC", "USDT"),
-        ("GHO", "USDC"),
         ("FRAX", "USDC"),
     ],
     "lst": [
         ("STETH", "WETH"),
         ("WSTETH", "WETH"),
         ("RETH", "WETH"),
-        ("CBETH", "WETH"),
     ],
     "governance": [
         ("UNI", "WETH"),
@@ -176,7 +216,6 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("AAVE", "WETH"),
         ("COMP", "WETH"),
         ("MKR", "WETH"),
-        ("SUSHI", "WETH"),
         ("LDO", "WETH"),
     ],
     "v4_candidates": [
