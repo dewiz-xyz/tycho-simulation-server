@@ -35,6 +35,8 @@
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
   - `scripts/run_suite.sh --repo . --suite core --stop`
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
+  - With VM pools enabled, the suite waits for `vm_status=ready` and `vm_pools>=1` before running the VM-specific coverage checks, so cold starts are slower but the default gate is stable.
+  - There is no repo-runner mode that leaves VM pools enabled while skipping that wait; use `--disable-vm-pools` for the native-only fast path.
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
   - Core coverage keeps `ETH:RETH` and `RETH:ETH`, while Maverick coverage is checked by the dedicated protocol presence probe in `scripts/run_suite.sh`.

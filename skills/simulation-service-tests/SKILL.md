@@ -30,12 +30,16 @@ cd /path/to/tycho-simulation-server
 scripts/run_suite.sh --repo . --suite core --stop
 ```
 
+`run_suite.sh` is the stable, VM-aware repo verification path. With VM pools enabled (the default), it waits for `vm_status=ready` and at least one VM pool before running VM protocol presence checks, so cold starts can take longer than native-only runs.
+
 `run_suite.sh` smoke checks now require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
 
-VM pools (Curve/Balancer/Maverick feeds) are enabled by default. To exclude them:
+VM pools (Curve/Balancer/Maverick feeds) are enabled by default. The supported fast path is to exclude them entirely:
 ```bash
 scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop
 ```
+
+There is no repo-runner mode that keeps VM pools enabled while skipping VM readiness waiting.
 
 If you need to tolerate partial failures or empty-liquidity responses while still running the suite:
 ```bash
@@ -84,11 +88,14 @@ python3 scripts/encode_smoke.py --allow-status ready,partial_success --allow-fai
 ```bash
 python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json
 python3 scripts/coverage_sweep.py --suite v4_candidates
+python3 scripts/coverage_sweep.py --suite exploratory_protocols --allow-failures --allow-no-pools
 ```
 
 VM pool feeds (Curve/Balancer/Maverick) are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
 
-To assert specific protocol presence (derived from `pool_name` prefixes), use:
+`coverage_sweep.py` now reports both winner-path protocols (from successful `data` entries) and candidate-path protocols (from `data` plus `meta.pool_results`). `--expect-protocols` validates against candidate-path presence so prechecked/skipped pools still count toward coverage expectations.
+
+To assert specific protocol presence, use:
 ```bash
 python3 scripts/coverage_sweep.py --suite core --expect-protocols uniswap_v3,uniswap_v4,maverick_v2
 ```
