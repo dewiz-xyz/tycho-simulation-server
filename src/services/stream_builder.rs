@@ -9,10 +9,11 @@ use tycho_simulation::{
         protocol::{
             ekubo::state::EkuboState,
             ekubo_v3::state::EkuboV3State,
-            filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
+            erc4626::state::ERC4626State,
+            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
-            // rocketpool::state::RocketpoolState,
+            rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
@@ -61,8 +62,9 @@ pub async fn build_native_stream(
         tvl_filter.clone(),
         Some(fluid_v1_paused_pools_filter),
     );
-    // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
+    builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
     builder = builder.exchange::<EkuboV3State>("ekubo_v3", tvl_filter.clone(), None);
+    builder = builder.exchange::<ERC4626State>("erc4626", tvl_filter.clone(), Some(erc4626_filter));
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
@@ -98,7 +100,7 @@ pub async fn build_vm_stream(
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
         "vm:curve",
         tvl_filter.clone(),
-        Some(curve_pool_filter),
+        None,
     );
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
         "vm:balancer_v2",
