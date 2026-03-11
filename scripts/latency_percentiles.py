@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 
 from presets import (
     TOKENS,
-    default_amounts_for_token,
+    amounts_for_pair,
     list_suites,
     list_tokens,
     parse_amounts,
@@ -142,8 +142,8 @@ def main() -> int:
             return pair.token_in, pair.token_out
         return tuple(random.sample(tokens, 2))
 
-    def amounts_for_token(token_in: str) -> list[str]:
-        return amounts_override or default_amounts_for_token(token_in)
+    def amounts_for_request(token_in: str, token_out: str) -> list[str]:
+        return amounts_override or amounts_for_pair(token_in, token_out)
 
     if args.dry_run:
         sample_pair = pick_pair()
@@ -151,7 +151,7 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-sample",
             "token_in": sample_pair[0],
             "token_out": sample_pair[1],
-            "amounts": amounts_for_token(sample_pair[0]),
+            "amounts": amounts_for_request(sample_pair[0], sample_pair[1]),
         }
         print("Dry run configuration:")
         print(
@@ -181,7 +181,7 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-{index}-{uuid.uuid4().hex[:8]}",
             "token_in": token_in,
             "token_out": token_out,
-            "amounts": amounts_for_token(token_in),
+            "amounts": amounts_for_request(token_in, token_out),
         }
         try:
             status_code, body, elapsed = request_simulate(args.url, payload, args.timeout)

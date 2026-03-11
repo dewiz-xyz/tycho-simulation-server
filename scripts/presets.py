@@ -51,6 +51,10 @@ ADDRESS_DECIMALS: dict[str, int] = {
     TOKENS[symbol].lower(): decimals for symbol, decimals in TOKEN_DECIMALS.items()
 }
 
+ADDRESS_TO_SYMBOL: dict[str, str] = {
+    address.lower(): symbol for symbol, address in TOKENS.items()
+}
+
 TOKEN_BASE_UNITS: dict[str, list[int]] = {
     # 0.001 .. 2 WBTC (8 decimals) to avoid pathological ladders at huge sizes.
     "WBTC": [
@@ -95,6 +99,76 @@ ADDRESS_BASE_UNITS: dict[str, list[int]] = {
     TOKENS[symbol].lower(): units for symbol, units in TOKEN_BASE_UNITS.items()
 }
 
+Pair = Tuple[str, str]
+
+# Some pairs need tighter ladders than token-wide defaults to keep coverage
+# deterministic across live mainnet liquidity and VM pool limits.
+PAIR_BASE_UNITS: dict[Pair, list[int]] = {
+    ("WETH", "USDC"): [
+        100_000_000_000_000_000,
+        500_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        2_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ],
+    ("ETH", "USDC"): [
+        100_000_000_000_000_000,
+        500_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        2_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ],
+    ("WETH", "DAI"): [
+        100_000_000_000_000_000,
+        500_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        2_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ],
+    ("CBETH", "WETH"): [
+        10_000_000_000_000_000,
+        50_000_000_000_000_000,
+        100_000_000_000_000_000,
+        500_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+    ],
+    ("ETH", "CBETH"): [
+        10_000_000_000_000_000,
+        50_000_000_000_000_000,
+        100_000_000_000_000_000,
+        500_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+    ],
+    ("GHO", "USDC"): [
+        1_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+        50_000_000_000_000_000_000,
+        100_000_000_000_000_000_000,
+        500_000_000_000_000_000_000,
+    ],
+    ("USDC", "GHO"): [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        50_000_000,
+        100_000_000,
+        500_000_000,
+    ],
+    ("SUSHI", "WETH"): [
+        10_000_000_000_000_000_000,
+        50_000_000_000_000_000_000,
+        100_000_000_000_000_000_000,
+        500_000_000_000_000_000_000,
+        1_000_000_000_000_000_000_000,
+        5_000_000_000_000_000_000_000,
+        10_000_000_000_000_000_000_000,
+    ],
+}
+
 BASE_AMOUNTS: list[int] = [
     1,
     5,
@@ -107,8 +181,6 @@ BASE_AMOUNTS: list[int] = [
     10_000,
     50_000,
 ]
-
-Pair = Tuple[str, str]
 
 # Keep the default coverage suite on pairs that stay liquid in both native-only
 # and VM-enabled runs. The VM-specific Maverick check lives in run_suite.sh.
@@ -223,6 +295,13 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("WBTC", "USDC"),
         ("ETH", "USDC"),
     ],
+    "exploratory_protocols": [
+        ("GHO", "USDC"),
+        ("USDC", "GHO"),
+        ("CBETH", "WETH"),
+        ("ETH", "CBETH"),
+        ("SUSHI", "WETH"),
+    ],
 }
 
 
@@ -266,6 +345,22 @@ def default_amounts_for_token(token_or_symbol: str) -> list[str]:
     if base_units is not None:
         return [str(value) for value in base_units]
     return default_amounts(token_decimals(token_or_symbol))
+
+
+def amounts_for_pair(token_in: str, token_out: str) -> list[str]:
+    def normalize_pair_token(token: str) -> str:
+        normalized = token.strip()
+        if normalized.lower().startswith("0x"):
+            return ADDRESS_TO_SYMBOL.get(normalized.lower(), normalized.lower())
+        return normalized.upper()
+
+    left = normalize_pair_token(token_in)
+    right = normalize_pair_token(token_out)
+
+    pair_units = PAIR_BASE_UNITS.get((left, right))
+    if pair_units is not None:
+        return [str(value) for value in pair_units]
+    return default_amounts_for_token(token_in)
 
 
 def parse_amounts(amounts_csv: str | None) -> list[str]:

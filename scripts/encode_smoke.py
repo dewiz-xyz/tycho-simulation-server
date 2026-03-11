@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib import request
 from urllib.error import HTTPError, URLError
 
-from presets import TOKENS, default_amounts_for_token
+from presets import TOKENS, amounts_for_pair
 
 DEFAULT_SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
 DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
@@ -157,7 +157,7 @@ def main() -> int:
         print("Error: DAI/USDC/USDT must be present in presets", file=sys.stderr)
         return 2
 
-    amounts = default_amounts_for_token(dai)
+    amounts = amounts_for_pair(dai, usdc)
 
     simulate_payload = {
         "request_id": f"encode-smoke-{uuid.uuid4().hex[:8]}",
