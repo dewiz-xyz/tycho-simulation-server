@@ -21,6 +21,27 @@ The raw completion logs now emit `quote_status` and `quote_result_quality`; the 
 3. Filter: `zsh skills/tycho-cloudwatch-logs/scripts/cw_filter.zsh --since 2h --filter-pattern "Block update:"`
 4. Query: `zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --preset resync --since 24h`
 
+## ERC4626 rollout checks
+For ERC4626 `/simulate` rollout triage, use the existing presets instead of adding a new one:
+`simulate-requests`, `simulate-completions`, `simulate-successes`, and `simulate-runs`.
+
+Supported ERC4626 directions on this server today:
+- `USDS -> sUSDS`
+- `sUSDS -> USDS`
+- `USDC -> sUSDC`
+- `sUSDC -> USDC`
+- `PYUSD -> spPYUSD`
+- `spPYUSD -> PYUSD`
+
+Negative probe to keep handy:
+- `sUSDe -> USDe`
+
+Current observability limits:
+- ERC4626 candidate drops and unsupported ERC4626 encode rejections are logged at `debug`, so they will not appear in CloudWatch under the default `info` log level.
+- `/encode` logs do not currently include enough pair or protocol detail to isolate ERC4626 traffic reliably in CloudWatch.
+
+Start with `references/queries.md` for copyable ERC4626 pair filters built on top of the existing presets.
+
 ## Preset catalog
 | Preset | Purpose |
 | --- | --- |

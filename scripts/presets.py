@@ -18,12 +18,20 @@ TOKENS: dict[str, str] = {
     "GHO": "0x40d16fc0246ad3160ccc09b8d0d3a2cd28ae6c2f",
     "FRAX": "0x853d955acef822db058eb8505911ed77f175b99e",
     "LUSD": "0x5f98805a4e8be255a32880fdec7f6728c6568ba0",
+    "PYUSD": "0x6c3ea9036406852006290770bedfcaba0e23a0e8",
+    "USDS": "0xdc035d45d973e3ec169d2276ddab16f1e407384f",
+    "USDE": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3",
     # LSTs
     "STETH": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
     "WSTETH": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
     "RETH": "0xae78736cd615f374d3085123a210448e74fc6393",
     "CBETH": "0xbe9895146f7af43049ca1c1ae358b0541ea49704",
     "FRXETH": "0x5e8422345238f34275888049021821e8e08caa1f",
+    # ERC4626 vault shares
+    "SPPYUSD": "0x80128dbb9f07b93dde62a6daeadb69ed14a7d354",
+    "SUSDC": "0xbc65ad17c5c0a2a4d159fa5a503f4992c7b545fe",
+    "SUSDS": "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+    "SUSDE": "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
     # Bluechips / governance
     "UNI": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
     "LINK": "0x514910771af9ca656af840dff83e8264ecf986ca",
@@ -45,6 +53,9 @@ TOKEN_DECIMALS: dict[str, int] = {
     "USDC": 6,
     "USDT": 6,
     "WBTC": 8,
+    "PYUSD": 6,
+    "SPPYUSD": 6,
+    "SUSDC": 6,
 }
 
 ADDRESS_DECIMALS: dict[str, int] = {
@@ -101,6 +112,27 @@ ADDRESS_BASE_UNITS: dict[str, list[int]] = {
 
 Pair = Tuple[str, str]
 
+
+# Keep Rocket Pool coverage sized in ETH notionals, then convert into rETH
+# inputs with a slightly rich fixed rate so the ladder stays conservative
+# without adding a live RPC dependency to the harness.
+RETH_ETH_TARGET_BASE_UNITS: list[int] = [
+    100_000_000_000_000_000,
+    500_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+    2_000_000_000_000_000_000,
+    5_000_000_000_000_000_000,
+    10_000_000_000_000_000_000,
+    20_000_000_000_000_000_000,
+    50_000_000_000_000_000_000,
+]
+RETH_ETH_CONSERVATIVE_RATE_BPS = 11_200
+
+
+def reth_base_units_for_eth_targets(eth_targets: list[int]) -> list[int]:
+    return [(target * 10_000) // RETH_ETH_CONSERVATIVE_RATE_BPS for target in eth_targets]
+
+
 # Some pairs need tighter ladders than token-wide defaults to keep coverage
 # deterministic across live mainnet liquidity and VM pool limits.
 PAIR_BASE_UNITS: dict[Pair, list[int]] = {
@@ -142,6 +174,9 @@ PAIR_BASE_UNITS: dict[Pair, list[int]] = {
         500_000_000_000_000_000,
         1_000_000_000_000_000_000,
     ],
+    # Rocket Pool withdrawals have a much tighter live liquidity ceiling than
+    # token-wide 18-decimal defaults; keep coverage/latency on deterministic sizes.
+    ("RETH", "ETH"): reth_base_units_for_eth_targets(RETH_ETH_TARGET_BASE_UNITS),
     ("GHO", "USDC"): [
         1_000_000_000_000_000_000,
         5_000_000_000_000_000_000,
@@ -151,6 +186,54 @@ PAIR_BASE_UNITS: dict[Pair, list[int]] = {
         500_000_000_000_000_000_000,
     ],
     ("USDC", "GHO"): [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        50_000_000,
+        100_000_000,
+        500_000_000,
+    ],
+    ("USDS", "SUSDS"): [
+        1_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+        50_000_000_000_000_000_000,
+        100_000_000_000_000_000_000,
+        500_000_000_000_000_000_000,
+    ],
+    ("SUSDS", "USDS"): [
+        1_000_000_000_000_000_000,
+        5_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+        50_000_000_000_000_000_000,
+        100_000_000_000_000_000_000,
+        500_000_000_000_000_000_000,
+    ],
+    ("USDC", "SUSDC"): [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        50_000_000,
+        100_000_000,
+        500_000_000,
+    ],
+    ("SUSDC", "USDC"): [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        50_000_000,
+        100_000_000,
+        500_000_000,
+    ],
+    ("PYUSD", "SPPYUSD"): [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        50_000_000,
+        100_000_000,
+        500_000_000,
+    ],
+    ("SPPYUSD", "PYUSD"): [
         1_000_000,
         5_000_000,
         10_000_000,
@@ -301,6 +384,17 @@ PAIR_SUITES: dict[str, list[Pair]] = {
         ("CBETH", "WETH"),
         ("ETH", "CBETH"),
         ("SUSHI", "WETH"),
+    ],
+    "erc4626_allowlisted": [
+        ("USDS", "SUSDS"),
+        ("SUSDS", "USDS"),
+        ("USDC", "SUSDC"),
+        ("SUSDC", "USDC"),
+        ("PYUSD", "SPPYUSD"),
+        ("SPPYUSD", "PYUSD"),
+    ],
+    "erc4626_negative": [
+        ("SUSDE", "USDE"),
     ],
 }
 

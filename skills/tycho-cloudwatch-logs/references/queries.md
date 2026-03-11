@@ -81,6 +81,250 @@ Use `cw_metrics.zsh` for ECS ContainerInsights memory/CPU checks.
 - Pivot spike check:
   `zsh skills/tycho-cloudwatch-logs/scripts/cw_metrics.zsh --since 2h --pivot 2026-02-04T11:38:00Z --window 10m`
 
+## ERC4626 rollout triage
+Use the existing `/simulate` presets for ERC4626 rollout checks. They already expose:
+- `token_in`
+- `token_out`
+- `top_pool_name`
+- `top_pool_address`
+
+Most useful presets:
+- `simulate-requests`: confirm request traffic for an allowlisted pair
+- `simulate-completions`: inspect readiness, failures, and skipped counts for a pair
+- `simulate-successes`: inspect successful quotes and top pool selection for a pair
+- `simulate-runs`: inspect per-request scheduled pool counts for a pair
+
+Supported ERC4626 directions on this server:
+- `USDS -> sUSDS`
+- `sUSDS -> USDS`
+- `USDC -> sUSDC`
+- `sUSDC -> USDC`
+- `PYUSD -> spPYUSD`
+- `spPYUSD -> PYUSD`
+
+Negative probe:
+- `sUSDe -> USDe`
+
+Current blind spots:
+- Unsupported ERC4626 directions filtered by the server will usually be invisible here because the ERC4626 gate logs are `debug`, not `info`.
+- `/encode` requests cannot be isolated reliably by ERC4626 pair from current CloudWatch logs.
+
+### Copyable ERC4626 commands
+Use `--query` when you want a one-off pair filter without adding a new preset. Start from the matching preset query below and append a `token_in`/`token_out` filter.
+
+#### simulate-successes for allowlisted directions
+`USDS -> sUSDS`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "USDS" and token_out = "sUSDS"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+`sUSDS -> USDS`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "sUSDS" and token_out = "USDS"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+`USDC -> sUSDC`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "USDC" and token_out = "sUSDC"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+`sUSDC -> USDC`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "sUSDC" and token_out = "USDC"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+`PYUSD -> spPYUSD`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "PYUSD" and token_out = "spPYUSD"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+`spPYUSD -> PYUSD`
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed" and status = "Ready"
+| filter token_in = "spPYUSD" and token_out = "PYUSD"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+#### Negative probe for `sUSDe -> USDe`
+Use `simulate-requests` to confirm traffic and `simulate-completions` to confirm that the server is not advertising it as supported liquidity.
+
+Request visibility:
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"amounts":(?<amounts>[0-9]+)/
+| filter msg like /Received simulate request/
+| filter token_in = "sUSDe" and token_out = "USDe"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, token_in, token_out, amounts, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+Completion visibility:
+```bash
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --since 6h --query "$(cat <<'QUERY'
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"request_id":"(?<request_id>[^"]+)"/
+| parse @message /"auction_id":"(?<auction_id>[^"]+)"/
+| parse @message /"token_in":"(?<token_in>[^"]+)"/
+| parse @message /"token_out":"(?<token_out>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"responses":(?<responses>[0-9]+)/
+| parse @message /"failures":(?<failures>[0-9]+)/
+| parse @message /"pool_results":(?<pool_results>[0-9]+)/
+| parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
+| parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
+| parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
+| filter msg = "Simulate computation completed"
+| filter token_in = "sUSDe" and token_out = "USDe"
+| sort @timestamp desc
+| display @timestamp, request_id, auction_id, status, result_quality, responses, failures, pool_results, latency_ms, token_in, token_out, top_pool_name, top_pool_address, msg, @logStream
+| limit 100
+QUERY
+)"```
+
+Interpretation note:
+- If you see request traffic but no successful completions with an ERC4626 top pool, that is expected today.
+- You will not see the ERC4626 gate-drop reason directly in CloudWatch unless production is running with `RUST_LOG=debug`.
+
 ## Logs Insights queries
 ### block-updates
 ```

@@ -70,7 +70,7 @@ pub async fn build_native_stream(
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
     }))
 }
 
@@ -110,7 +110,7 @@ pub async fn build_vm_stream(
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
     }))
 }
 

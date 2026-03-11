@@ -37,8 +37,14 @@ pub async fn encode_route(
 
     let native_address = chain.native_token().address;
     let is_native_input = token_in == native_address;
-    let normalized =
-        normalize::normalize_route(&request, &token_in, &token_out, &amount_in, &native_address)?;
+    let normalized = normalize::normalize_route(
+        &request,
+        &token_in,
+        &token_out,
+        &amount_in,
+        &native_address,
+        state.erc4626_deposits_enabled,
+    )?;
     let resimulated =
         resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);

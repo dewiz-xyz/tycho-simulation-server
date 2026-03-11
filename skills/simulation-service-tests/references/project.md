@@ -46,6 +46,8 @@
   - `python3 scripts/simulate_smoke.py --suite smoke`
   - `python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`
   - `python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json`
+  - `python3 scripts/coverage_sweep.py --suite erc4626_allowlisted --expect-protocols erc4626`
+  - `python3 scripts/coverage_sweep.py --suite erc4626_negative --allow-no-pools`
   - `python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50`
 - See `STRESS_TEST_README.md` for suites, defaults, and latency knobs.
 
@@ -53,3 +55,6 @@
 - Format: `cargo fmt`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
 - Test: `cargo nextest run`
+- ERC4626 rollout checks:
+  - `python3 scripts/coverage_sweep.py --suite erc4626_allowlisted --expect-protocols erc4626`
+  - `python3 scripts/coverage_sweep.py --suite erc4626_negative --allow-no-pools`

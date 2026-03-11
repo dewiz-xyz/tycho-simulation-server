@@ -22,6 +22,7 @@ use tycho_simulation::{
     },
 };
 
+use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
     QuoteFailureKind, QuoteMeta, QuoteResultQuality, QuoteStatus,
@@ -703,6 +704,12 @@ impl QuoteRequestRunner {
             .into_iter()
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
+        let native_candidates = filter_unsupported_erc4626_candidates(
+            native_candidates,
+            &pair.token_in_bytes,
+            &pair.token_out_bytes,
+            self.state.erc4626_deposits_enabled,
+        );
         let vm_ready = self.state.vm_ready().await;
         if self.state.enable_vm_pools && !vm_ready {
             self.run.metrics.skipped_vm_unavailable = true;
@@ -1204,6 +1211,37 @@ impl QuoteRequestRunner {
                 .then(outcome_kind_label(a.outcome).cmp(outcome_kind_label(b.outcome)))
         });
     }
+}
+
+fn filter_unsupported_erc4626_candidates(
+    candidates: Vec<CandidatePool>,
+    token_in: &Bytes,
+    token_out: &Bytes,
+    erc4626_deposits_enabled: bool,
+) -> Vec<CandidatePool> {
+    candidates
+        .into_iter()
+        .filter(|(candidate_id, _, component)| {
+            let supported = component_direction_supported(
+                component.as_ref(),
+                token_in,
+                token_out,
+                erc4626_deposits_enabled,
+            );
+            if !supported {
+                debug!(
+                    scope = "erc4626_gate",
+                    candidate_id,
+                    component_id = %component.id,
+                    protocol = component.protocol_system.as_str(),
+                    token_in = %token_in,
+                    token_out = %token_out,
+                    "Skipping unsupported ERC4626 candidate"
+                );
+            }
+            supported
+        })
+        .collect()
 }
 
 fn dedupe_candidate_pools(candidates: Vec<RawCandidatePool>) -> Vec<CandidatePool> {
@@ -2189,6 +2227,7 @@ fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> 
         || lowered.contains("get_limits")
         || lowered.contains("sell amount exceeds limit")
         || lowered.contains("exceeds limit")
+        || lowered.contains("exceeds available liquidity")
         || lowered.contains("borrowable limit")
         || lowered.contains("insufficient reserve")
         || lowered.contains("ticks exceeded")
@@ -2806,6 +2845,7 @@ mod tests {
 
     struct TestAppStateConfig {
         enable_vm_pools: bool,
+        erc4626_deposits_enabled: bool,
         native_sim_concurrency: usize,
         vm_sim_concurrency: usize,
         gas_price_wei: Option<u128>,
@@ -2820,6 +2860,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 enable_vm_pools: false,
+                erc4626_deposits_enabled: false,
                 native_sim_concurrency: 1,
                 vm_sim_concurrency: 1,
                 gas_price_wei: None,
@@ -2857,6 +2898,7 @@ mod tests {
             request_timeout: config.request_timeout,
             native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
+            erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: config.native_sim_concurrency,
             vm_sim_concurrency: config.vm_sim_concurrency,
@@ -2903,6 +2945,54 @@ mod tests {
             let token_out = Bytes::from_str(token_out_hex).expect("valid address");
             let token_in_meta = make_token(&token_in, "TK1");
             let token_out_meta = make_token(&token_out, "TK2");
+            let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+            let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+
+            Self {
+                token_in_hex,
+                token_out_hex,
+                token_in_meta,
+                token_out_meta,
+                token_store,
+                native_state_store,
+                vm_state_store,
+            }
+        }
+
+        fn pair_tokens(&self) -> Vec<Token> {
+            vec![self.token_in_meta.clone(), self.token_out_meta.clone()]
+        }
+
+        fn request(&self, request_id: &str, amounts: &[&str]) -> AmountOutRequest {
+            make_amount_out_request(request_id, self.token_in_hex, self.token_out_hex, amounts)
+        }
+    }
+
+    struct Erc4626QuoteFixture {
+        token_in_hex: &'static str,
+        token_out_hex: &'static str,
+        token_in_meta: Token,
+        token_out_meta: Token,
+        token_store: Arc<TokenStore>,
+        native_state_store: Arc<StateStore>,
+        vm_state_store: Arc<StateStore>,
+    }
+
+    impl Erc4626QuoteFixture {
+        fn new(
+            token_in_hex: &'static str,
+            token_in_symbol: &str,
+            token_in_decimals: u32,
+            token_out_hex: &'static str,
+            token_out_symbol: &str,
+            token_out_decimals: u32,
+        ) -> Self {
+            let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+            let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+            let token_in_meta =
+                make_token_with_decimals(&token_in, token_in_symbol, token_in_decimals);
+            let token_out_meta =
+                make_token_with_decimals(&token_out, token_out_symbol, token_out_decimals);
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
             let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
 
@@ -3828,6 +3918,289 @@ mod tests {
                 "Direct native/wrapped quotes are unsupported"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_quotes_allowlisted_erc4626_direction() {
+        let fixture = Erc4626QuoteFixture::new(
+            "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
+            "USDS",
+            18,
+            "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+            "sUSDS",
+            18,
+        );
+        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-erc4626",
+            fixture.token_out_hex,
+            "erc4626",
+            "erc4626_pool",
+            fixture.pair_tokens(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                erc4626_deposits_enabled: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-erc4626-allowlisted", &["2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(computation.meta.failures.is_empty());
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_filters_non_allowlisted_erc4626_before_simulation() {
+        let fixture = Erc4626QuoteFixture::new(
+            "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
+            "USDe",
+            18,
+            "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
+            "sUSDe",
+            18,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-susde",
+            fixture.token_out_hex,
+            "",
+            "erc4626_pool",
+            fixture.pair_tokens(),
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(10u8),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-erc4626-filtered", &["2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert_eq!(computation.meta.matching_pools, 0);
+        assert_eq!(computation.meta.candidate_pools, 0);
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::NoPools
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_filters_allowlisted_erc4626_deposit_when_deposits_disabled() {
+        let fixture = Erc4626QuoteFixture::new(
+            "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
+            "USDS",
+            18,
+            "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+            "sUSDS",
+            18,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-susds",
+            fixture.token_out_hex,
+            "erc4626",
+            "erc4626_pool",
+            fixture.pair_tokens(),
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(10u8),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-erc4626-deposit-disabled", &["2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert_eq!(computation.meta.matching_pools, 0);
+        assert_eq!(computation.meta.candidate_pools, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_allowlisted_erc4626_redeem_when_deposits_disabled() {
+        let fixture = Erc4626QuoteFixture::new(
+            "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+            "sUSDS",
+            18,
+            "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
+            "USDS",
+            18,
+        );
+        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-erc4626-redeem",
+            fixture.token_in_hex,
+            "",
+            "erc4626_pool",
+            fixture.pair_tokens(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in,
+                expected_buy: token_out,
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-erc4626-redeem-disabled", &["2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_non_erc4626_candidates_when_unsupported_erc4626_is_filtered() {
+        let fixture = Erc4626QuoteFixture::new(
+            "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
+            "USDe",
+            18,
+            "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
+            "sUSDe",
+            18,
+        );
+        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
+        let erc4626_calls = Arc::new(AtomicUsize::new(0));
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-susde",
+            fixture.token_out_hex,
+            "erc4626",
+            "erc4626_pool",
+            fixture.pair_tokens(),
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(10u8),
+                calls: Arc::clone(&erc4626_calls),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-uniswap",
+            "0x0000000000000000000000000000000000000011",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in,
+                expected_buy: token_out,
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-erc4626-mixed", &["2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "pool-uniswap");
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(erc4626_calls.load(Ordering::SeqCst), 0);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
@@ -4794,7 +5167,7 @@ mod tests {
             _delta: ProtocolStateDelta,
             _tokens: &HashMap<Bytes, Token>,
             _balances: &Balances,
-        ) -> Result<(), TransitionError<String>> {
+        ) -> Result<(), TransitionError> {
             Ok(())
         }
 
@@ -5240,6 +5613,10 @@ mod tests {
         ));
         assert!(is_limits_exhaustion_probe_error(
             "Fatal error: Insufficient reserve: tokenOut amount exceeds withdrawable limit",
+            false
+        ));
+        assert!(is_limits_exhaustion_probe_error(
+            "Recoverable error: Withdrawal 57960015764091093503191 exceeds available liquidity 3543179769736901794933",
             false
         ));
         assert!(is_limits_exhaustion_probe_error(

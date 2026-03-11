@@ -1,7 +1,11 @@
 use num_bigint::BigUint;
 use num_traits::Zero;
+use tracing::debug;
 use tycho_simulation::tycho_common::Bytes;
 
+use crate::models::erc4626::{
+    is_erc4626_protocol, request_direction_supported, unsupported_direction_message,
+};
 use crate::models::messages::{HopDraft, PoolSwapDraft, RouteEncodeRequest, SegmentDraft};
 
 use super::allocation::{allocate_amounts_by_bps, BPS_DENOMINATOR};
@@ -19,6 +23,7 @@ pub(super) fn normalize_route(
     request_token_out: &Bytes,
     total_amount_in: &BigUint,
     native_address: &Bytes,
+    erc4626_deposits_enabled: bool,
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
@@ -44,7 +49,7 @@ pub(super) fn normalize_route(
         let hops = segment
             .hops
             .iter()
-            .map(|hop| normalize_hop(hop, native_address))
+            .map(|hop| normalize_hop(hop, native_address, erc4626_deposits_enabled))
             .collect::<Result<Vec<_>, _>>()?;
 
         let segment_amount_in = segment_amounts
@@ -123,6 +128,7 @@ fn validate_hop_continuity(
 fn normalize_hop(
     hop: &HopDraft,
     native_address: &Bytes,
+    erc4626_deposits_enabled: bool,
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
@@ -144,7 +150,7 @@ fn normalize_hop(
     let swaps = hop
         .swaps
         .iter()
-        .map(|swap| normalize_swap(swap, &token_in, &token_out))
+        .map(|swap| normalize_swap(swap, &token_in, &token_out, erc4626_deposits_enabled))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(NormalizedHopInternal {
@@ -158,6 +164,7 @@ fn normalize_swap(
     swap: &PoolSwapDraft,
     hop_token_in: &Bytes,
     hop_token_out: &Bytes,
+    erc4626_deposits_enabled: bool,
 ) -> Result<NormalizedSwapDraftInternal, EncodeError> {
     let token_in = parse_address(&swap.token_in)?;
     let token_out = parse_address(&swap.token_out)?;
@@ -171,6 +178,7 @@ fn normalize_swap(
             "swap tokenOut does not match hop tokenOut",
         ));
     }
+    validate_erc4626_swap_supported(swap, &token_in, &token_out, erc4626_deposits_enabled)?;
 
     if swap.split_bps > BPS_DENOMINATOR {
         return Err(EncodeError::invalid("swap splitBps must be <= 10000"));
@@ -182,6 +190,38 @@ fn normalize_swap(
         token_out,
         split_bps: swap.split_bps,
     })
+}
+
+fn validate_erc4626_swap_supported(
+    swap: &PoolSwapDraft,
+    token_in: &Bytes,
+    token_out: &Bytes,
+    erc4626_deposits_enabled: bool,
+) -> Result<(), EncodeError> {
+    if !is_erc4626_protocol(&swap.pool.protocol) {
+        return Ok(());
+    }
+    if request_direction_supported(
+        &swap.pool.protocol,
+        token_in,
+        token_out,
+        erc4626_deposits_enabled,
+    ) {
+        return Ok(());
+    }
+
+    debug!(
+        protocol = swap.pool.protocol.as_str(),
+        component_id = swap.pool.component_id.as_str(),
+        token_in = token_in.to_string(),
+        token_out = token_out.to_string(),
+        "Rejecting unsupported ERC4626 encode hop during normalization"
+    );
+    Err(EncodeError::invalid(unsupported_direction_message(
+        token_in,
+        token_out,
+        erc4626_deposits_enabled,
+    )))
 }
 
 #[cfg(test)]
@@ -260,8 +300,15 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
         let native_address = Chain::Ethereum.native_token().address;
-        let normalized =
-            normalize_route(&request, &token_in, &token_out, &amount_in, &native_address).unwrap();
+        let normalized = normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native_address,
+            false,
+        )
+        .unwrap();
         assert_eq!(normalized.segments.len(), 2);
         assert_eq!(normalized.segments[0].share_bps, 2000);
         assert_eq!(normalized.segments[1].share_bps, 0);
@@ -318,7 +365,8 @@ mod tests {
         let amount_in = BigUint::from(1u32);
         let native = Chain::Ethereum.native_token().address;
 
-        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native) {
+        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false)
+        {
             Ok(_) => panic!("Expected segment share rounding to zero to be rejected"),
             Err(err) => err,
         };
@@ -382,7 +430,14 @@ mod tests {
         let amount_in = parse_amount(&request.amount_in).unwrap();
         let native_address = Chain::Ethereum.native_token().address;
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native_address) {
+        match normalize_route(
+            &request,
+            &token_in,
+            &token_out,
+            &amount_in,
+            &native_address,
+            false,
+        ) {
             Err(err) => assert_eq!(
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -436,7 +491,7 @@ mod tests {
         let token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        match normalize_route(&request, &token_in, &token_out, &amount_in, &native) {
+        match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false) {
             Err(err) => assert_eq!(
                 err.kind(),
                 crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -483,12 +538,117 @@ mod tests {
         let request_token_out = parse_address(&request.token_out).unwrap();
         let amount_in = parse_amount(&request.amount_in).unwrap();
 
-        let normalized =
-            normalize_route(&request, &token_in, &request_token_out, &amount_in, &native)
-                .expect("rocketpool native route should normalize");
+        let normalized = normalize_route(
+            &request,
+            &token_in,
+            &request_token_out,
+            &amount_in,
+            &native,
+            false,
+        )
+        .expect("rocketpool native route should normalize");
         assert_eq!(normalized.segments.len(), 1);
         assert_eq!(normalized.segments[0].hops.len(), 1);
         assert_eq!(normalized.segments[0].hops[0].token_in, native);
         assert_eq!(normalized.segments[0].hops[0].token_out, token_out);
+    }
+
+    #[test]
+    fn normalize_route_rejects_allowlisted_erc4626_deposit_when_deposits_disabled() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+            token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+            amount_in: "10".to_string(),
+            min_amount_out: "8".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 0,
+                hops: vec![HopDraft {
+                    token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+                    token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "erc4626".to_string(),
+                            component_id: "p1".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+                        token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+            request_id: None,
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+        let native = Chain::Ethereum.native_token().address;
+
+        let err = match normalize_route(&request, &token_in, &token_out, &amount_in, &native, false)
+        {
+            Ok(_) => panic!("allowlisted deposit should be rejected when deposits are disabled"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::InvalidRequest
+        );
+        assert!(
+            err.message().contains("sUSDS -> USDS"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn normalize_route_allows_allowlisted_erc4626_deposit_when_deposits_enabled() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+            token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+            amount_in: "10".to_string(),
+            min_amount_out: "8".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 0,
+                hops: vec![HopDraft {
+                    token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+                    token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "erc4626".to_string(),
+                            component_id: "p1".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: "0xdC035D45d973E3EC169d2276DDab16f1e407384F".to_string(),
+                        token_out: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd".to_string(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+            request_id: None,
+        };
+
+        let token_in = parse_address(&request.token_in).unwrap();
+        let token_out = parse_address(&request.token_out).unwrap();
+        let amount_in = parse_amount(&request.amount_in).unwrap();
+        let native = Chain::Ethereum.native_token().address;
+
+        let normalized =
+            normalize_route(&request, &token_in, &token_out, &amount_in, &native, true)
+                .expect("allowlisted deposit should normalize when deposits are enabled");
+
+        assert_eq!(normalized.segments.len(), 1);
+        assert_eq!(normalized.segments[0].hops.len(), 1);
     }
 }

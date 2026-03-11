@@ -234,6 +234,7 @@ mod tests {
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
