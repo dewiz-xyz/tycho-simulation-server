@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 
 from presets import (
     TOKENS,
-    default_amounts_for_token,
+    amounts_for_pair,
     list_suites,
     list_tokens,
     parse_amounts,
@@ -148,7 +148,7 @@ def main() -> int:
     for idx, pair in enumerate(pairs, start=1):
         token_in = pair.token_in
         token_out = pair.token_out
-        amounts = amounts_override or default_amounts_for_token(token_in)
+        amounts = amounts_override or amounts_for_pair(token_in, token_out)
         payload = {
             "request_id": f"{args.request_id_prefix}-{idx}-{uuid.uuid4().hex[:8]}",
             "token_in": token_in,

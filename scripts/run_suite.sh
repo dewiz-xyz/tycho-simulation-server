@@ -3,12 +3,11 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--wait-vm-ready] [--allow-no-liquidity] [--allow-partial] [--stop]
+Usage: run_suite.sh --repo <path> [--base-url <url>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--allow-no-liquidity] [--allow-partial] [--stop]
 
 Run a small end-to-end test suite:
 1) start server (if not already running)
-2) wait for /status ready
-2.5) (optional) wait for VM pool readiness
+2) wait for readiness (/status ready, plus VM readiness when VM pools are enabled)
 3) smoke test /simulate
 4) coverage sweep (pool/protocol summary)
 5) latency percentiles (p50/p90/p99)
@@ -18,14 +17,13 @@ Options:
   --base-url         Base URL (default: http://localhost:3000)
   --suite            Pair suite for coverage/latency (default: core)
   --disable-vm-pools Start server with ENABLE_VM_POOLS=false
-  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default)
-  --wait-vm-ready    Wait for vm_status=ready after /status is ready (only when VM pools are enabled)
+  --enable-vm-pools  Start server with ENABLE_VM_POOLS=true (default; waits for vm_status=ready and vm_pools>=1)
   --allow-no-liquidity  Allow no_liquidity responses with only no_pools failures
   --allow-partial    Allow partial_success responses (and their failures)
   --stop             Stop server when done (only if started by this script)
   -h, --help         Show this help
 
-Tip: For mainnet variability, use --allow-partial --allow-no-liquidity for local runs.
+Tip: Use --disable-vm-pools for a faster native-only run, or --allow-partial --allow-no-liquidity for more tolerant local runs.
 USAGE
 }
 
@@ -35,7 +33,6 @@ suite="core"
 coverage_suite=""
 latency_suite=""
 enable_vm_pools="true"
-wait_vm_ready="false"
 allow_no_liquidity="false"
 allow_partial="false"
 stop_after="false"
@@ -60,10 +57,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --enable-vm-pools)
       enable_vm_pools="true"
-      shift 1
-      ;;
-    --wait-vm-ready)
-      wait_vm_ready="true"
       shift 1
       ;;
     --allow-no-liquidity)
@@ -107,7 +100,6 @@ started_by_me="false"
 echo "Base URL: $base_url"
 echo "Suite: $suite"
 echo "Enable VM pools: $enable_vm_pools"
-echo "Wait VM ready: $wait_vm_ready"
 echo "Allow no_liquidity: $allow_no_liquidity"
 echo "Allow partial_success: $allow_partial"
 
@@ -169,33 +161,6 @@ if [[ "$enable_vm_pools" == "true" ]]; then
 fi
 "$script_dir/wait_ready.sh" "${wait_args[@]}"
 
-if [[ "$enable_vm_pools" == "true" ]] && [[ "$wait_vm_ready" == "true" ]]; then
-  echo "Waiting for VM pool readiness..."
-  STATUS_URL="$status_url" python3 -u - <<'PY'
-import json
-import os
-import time
-import urllib.request
-
-status_url = os.environ["STATUS_URL"]
-deadline = time.time() + 300
-
-while True:
-    with urllib.request.urlopen(status_url, timeout=5) as r:
-        s = json.loads(r.read().decode())
-    vm_enabled = s.get("vm_enabled")
-    vm_status = s.get("vm_status")
-    vm_pools = s.get("vm_pools")
-    if not vm_enabled:
-        break
-    if vm_status == "ready":
-        break
-    if time.time() > deadline:
-        raise SystemExit(f"timeout waiting for vm ready (vm_status={vm_status} vm_pools={vm_pools})")
-    time.sleep(5)
-PY
-fi
-
 echo "Smoke testing /simulate..."
 python3 "$script_dir/simulate_smoke.py" --url "$simulate_url" --suite smoke --allow-status "$simulate_allow_status" --require-data --validate-data $allow_failures_flag
 
@@ -220,6 +185,16 @@ if [[ "$enable_vm_pools" == "true" ]]; then
     $allow_no_pools_flag \
     --expect-protocols maverick_v2 \
     --out "$repo/logs/coverage_protocol_presence.json"
+
+  echo "Protocol presence checks (Balancer)..."
+  python3 "$script_dir/coverage_sweep.py" \
+    --url "$simulate_url" \
+    --pair WETH:USDC \
+    --allow-status "$coverage_allow_status" \
+    $allow_failures_flag \
+    $allow_no_pools_flag \
+    --expect-protocols balancer_v2 \
+    --out "$repo/logs/coverage_balancer_presence.json"
 fi
 
 echo "Latency percentiles..."
