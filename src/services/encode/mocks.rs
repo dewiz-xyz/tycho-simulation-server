@@ -1,143 +1,14 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
-use chrono::NaiveDateTime;
 use num_bigint::BigUint;
 use num_traits::Zero;
-use tokio::sync::{RwLock, Semaphore};
 use tycho_execution::encoding::errors::EncodingError;
 use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
-use tycho_simulation::protocol::models::ProtocolComponent;
 use tycho_simulation::tycho_common::models::token::Token;
-use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
 use tycho_simulation::tycho_common::Bytes;
-
-use crate::models::messages::PoolRef;
-use crate::models::state::{AppState, StateStore, VmStreamStatus};
-use crate::models::stream_health::StreamHealth;
-use crate::models::tokens::TokenStore;
-
-pub(super) fn pool_ref(id: &str) -> PoolRef {
-    PoolRef {
-        protocol: "uniswap_v2".to_string(),
-        component_id: id.to_string(),
-        pool_address: None,
-    }
-}
-
-pub(super) fn dummy_component() -> ProtocolComponent {
-    component_with_tokens(
-        "0x0000000000000000000000000000000000000009",
-        vec![
-            dummy_token("0x0000000000000000000000000000000000000001"),
-            dummy_token("0x0000000000000000000000000000000000000002"),
-        ],
-    )
-}
-
-pub(super) fn component_with_protocol(
-    id: &str,
-    protocol_system: &str,
-    protocol_type_name: &str,
-    tokens: Vec<Token>,
-) -> ProtocolComponent {
-    ProtocolComponent::new(
-        Bytes::from_str(id).unwrap(),
-        protocol_system.to_string(),
-        protocol_type_name.to_string(),
-        Chain::Ethereum,
-        tokens,
-        Vec::new(),
-        HashMap::new(),
-        Bytes::default(),
-        NaiveDateTime::default(),
-    )
-}
-
-pub(super) fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolComponent {
-    component_with_protocol(id, "uniswap_v2", "uniswap_v2", tokens)
-}
-
-pub(super) fn dummy_token(address: &str) -> Token {
-    let bytes = Bytes::from_str(address).unwrap();
-    Token::new(&bytes, "TKN", 18, 0, &[], Chain::Ethereum, 100)
-}
-
-pub(super) fn token_store_with_tokens(tokens: impl IntoIterator<Item = Token>) -> Arc<TokenStore> {
-    let initial_tokens = tokens
-        .into_iter()
-        .map(|token| (token.address.clone(), token))
-        .collect();
-    Arc::new(TokenStore::new(
-        initial_tokens,
-        "http://localhost".to_string(),
-        "test".to_string(),
-        Chain::Ethereum,
-        Duration::from_millis(10),
-    ))
-}
-
-pub(super) fn test_state_stores(
-    token_store: &Arc<TokenStore>,
-) -> (Arc<StateStore>, Arc<StateStore>) {
-    (
-        Arc::new(StateStore::new(Arc::clone(token_store))),
-        Arc::new(StateStore::new(Arc::clone(token_store))),
-    )
-}
-
-pub(super) struct TestAppStateConfig {
-    pub(super) enable_vm_pools: bool,
-    pub(super) quote_timeout: Duration,
-    pub(super) pool_timeout_native: Duration,
-    pub(super) pool_timeout_vm: Duration,
-    pub(super) request_timeout: Duration,
-}
-
-impl Default for TestAppStateConfig {
-    fn default() -> Self {
-        Self {
-            enable_vm_pools: false,
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            request_timeout: Duration::from_millis(10),
-        }
-    }
-}
-
-pub(super) fn test_app_state(
-    token_store: Arc<TokenStore>,
-    native_state_store: Arc<StateStore>,
-    vm_state_store: Arc<StateStore>,
-    config: TestAppStateConfig,
-) -> AppState {
-    AppState {
-        tokens: token_store,
-        native_state_store,
-        vm_state_store,
-        native_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-        latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
-        native_gas_price_reporting_enabled: Arc::new(RwLock::new(false)),
-        enable_vm_pools: config.enable_vm_pools,
-        readiness_stale: Duration::from_secs(120),
-        quote_timeout: config.quote_timeout,
-        pool_timeout_native: config.pool_timeout_native,
-        pool_timeout_vm: config.pool_timeout_vm,
-        request_timeout: config.request_timeout,
-        native_sim_semaphore: Arc::new(Semaphore::new(1)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-        reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 1,
-        vm_sim_concurrency: 1,
-    }
-}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct MockProtocolSim;
@@ -296,6 +167,10 @@ impl ProtocolSim for StepProtocolSim {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Tests only call this helper with StepProtocolSim states."
+)]
 pub(super) fn step_multiplier(state: &Arc<dyn ProtocolSim>) -> u32 {
     state
         .as_any()

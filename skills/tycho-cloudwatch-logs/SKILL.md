@@ -11,6 +11,7 @@ Use AWS CLI to inspect Tycho simulation logs in CloudWatch. Default log group is
 If you hit `ExpiredTokenException`, refresh the `AWS_SESSION_TOKEN` in `.env` and retry.
 
 Simulate completion logs are now emitted at `info` level for successful requests and include extra context (tokens, latency, top pool details, and failure summaries). For detailed failure summaries, inspect the raw `@message` JSON.
+The raw completion logs now emit `quote_status` and `quote_result_quality`; the bundled query presets map those back to `status` and `result_quality` so existing reports and analyzers keep working.
 `uniswap-v4-filter` logs include `filter_rule`, `considered_pools`, `accepted_pools`, `filtered_pools`, `pools_with_hook_identifier`, and `pools_missing_hook_identifier` to explain hook-pool coverage.
 
 ## Quick start
@@ -37,7 +38,7 @@ Simulate completion logs are now emitted at `info` level for successful requests
 | router-timeouts | Router boundary timeouts. |
 | simulate-requests | Incoming simulate requests. |
 | simulate-completions | Completion logs for simulate calls. |
-| simulate-successes | Successful completion logs (`status=Ready`). |
+| simulate-successes | Successful completion logs (`status=Ready` via compatibility mapping from `quote_status`). |
 | simulate-rpm | Requests per minute (completion-based). |
 | simulate-rpm-by-auction | Requests per minute per auction_id. |
 | simulate-requests-per-auction | Total request count per auction_id. |

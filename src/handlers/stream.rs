@@ -82,6 +82,17 @@ pub struct VmStreamControls {
     pub vm_sim_concurrency: u32,
 }
 
+enum StreamMessage {
+    Stale,
+    Ended,
+    Update(TychoUpdate),
+    Error(String),
+}
+
+fn stream_exit(reason: StreamRestartReason, last_error: Option<String>) -> StreamExit {
+    StreamExit { reason, last_error }
+}
+
 pub async fn process_stream(
     kind: StreamKind,
     mut stream: impl futures::Stream<
@@ -98,165 +109,207 @@ pub async fn process_stream(
     let mut ready_logged = false;
 
     loop {
-        let next_item = timeout(cfg.stream_stale, stream.next()).await;
-        match next_item {
-            Err(_) => {
-                let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-                let last_block = health.last_block().await;
-                warn!(
-                    event = "stream_stale",
-                    stream = kind.as_str(),
-                    last_update_age_ms,
-                    last_block,
-                    "Stream stale; triggering restart"
-                );
-                return StreamExit {
-                    reason: StreamRestartReason::Stale,
-                    last_error: None,
-                };
-            }
-            Ok(None) => {
-                warn!(
-                    event = "stream_ended",
-                    stream = kind.as_str(),
-                    "Stream ended unexpectedly"
-                );
-                return StreamExit {
-                    reason: StreamRestartReason::Ended,
-                    last_error: None,
-                };
-            }
-            Ok(Some(msg)) => match msg {
-                Ok(update) => {
-                    let now = Instant::now();
-                    let has_advanced = update
-                        .sync_states
-                        .values()
-                        .any(|state| matches!(state, SynchronizerState::Advanced(_)));
-
-                    if has_advanced {
-                        let advanced = health.record_advanced(now).await;
-                        if advanced.window_started {
-                            info!(
-                                event = "stream_advanced",
-                                stream = kind.as_str(),
-                                advanced_total = advanced.total_count,
-                                burst_count = advanced.burst_count,
-                                window_secs = cfg.resync_grace.as_secs(),
-                                "Advanced synchronizer state detected"
-                            );
-                        }
-                        if advanced.elapsed >= cfg.resync_grace {
-                            return StreamExit {
-                                reason: StreamRestartReason::Advanced,
-                                last_error: Some("advanced_state_grace_exceeded".to_string()),
-                            };
-                        }
-                    } else {
-                        health.clear_advanced().await;
-                    }
-
-                    let metrics = state_store.apply_update(update).await;
-                    health.record_update(metrics.block_number).await;
-
-                    info!(
-                        event = "stream_update",
-                        stream = kind.as_str(),
-                        block = metrics.block_number,
-                        updated_states = metrics.updated_states,
-                        new_pairs = metrics.new_pairs,
-                        removed_pairs = metrics.removed_pairs,
-                        total_pairs = metrics.total_pairs,
-                        new_pairs_missing_state = metrics.new_pairs_missing_state,
-                        unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
-                        updates_for_unknown_pair = metrics.updates_for_unknown_pair,
-                        states_missing_in_shard = metrics.states_missing_in_shard,
-                        removed_unknown_pair = metrics.removed_unknown_pair,
-                        anomaly_samples = ?metrics.anomaly_samples,
-                        "Stream update processed"
-                    );
-                    if metrics.has_anomalies() {
-                        warn!(
-                            event = "stream_update_anomaly",
-                            stream = kind.as_str(),
-                            block = metrics.block_number,
-                            new_pairs_missing_state = metrics.new_pairs_missing_state,
-                            unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
-                            updates_for_unknown_pair = metrics.updates_for_unknown_pair,
-                            states_missing_in_shard = metrics.states_missing_in_shard,
-                            removed_unknown_pair = metrics.removed_unknown_pair,
-                            anomaly_samples = ?metrics.anomaly_samples,
-                            "Stream update contained ingest anomalies"
-                        );
-                    }
-                    maybe_log_memory_snapshot(
-                        kind.as_str(),
-                        "stream_update",
-                        Some(metrics.new_pairs),
-                        cfg.memory,
-                        false,
-                    );
-
-                    if !ready_logged && metrics.total_pairs > 0 {
-                        info!(
-                            stream = kind.as_str(),
-                            block = metrics.block_number,
-                            total_pairs = metrics.total_pairs,
-                            "Service ready: first pools ingested"
-                        );
-                        ready_logged = true;
-                    }
+        match next_stream_message(kind, &mut stream, &health, cfg.stream_stale).await {
+            StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
+            StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
+            StreamMessage::Update(update) => {
+                if let Some(exit) = handle_stream_update(
+                    kind,
+                    update,
+                    &state_store,
+                    &health,
+                    &cfg,
+                    &mut ready_logged,
+                )
+                .await
+                {
+                    return exit;
                 }
-                Err(err) => {
-                    let err_msg = err.to_string();
-                    let error_kind = classify_stream_error(&err_msg);
-                    if is_missing_block_error(&err_msg) {
-                        health.set_last_error(Some(err_msg.clone())).await;
-                        let now = Instant::now();
-                        let burst = health
-                            .record_missing_block(now, cfg.missing_block_window)
-                            .await;
-                        if burst.window_started {
-                            info!(
-                                event = "stream_missing_block",
-                                stream = kind.as_str(),
-                                error_kind,
-                                error = %err_msg,
-                                missing_block_total = burst.total_count,
-                                burst_count = burst.burst_count,
-                                window_secs = cfg.missing_block_window.as_secs(),
-                                "Missing block detected"
-                            );
-                        }
-                        if burst.burst_count >= cfg.missing_block_burst {
-                            return StreamExit {
-                                reason: StreamRestartReason::MissingBlock,
-                                last_error: Some(err_msg),
-                            };
-                        }
-                    } else {
-                        let now = Instant::now();
-                        let burst = health.record_error(now, cfg.error_window).await;
-                        health.set_last_error(Some(err_msg.clone())).await;
-                        warn!(
-                            stream = kind.as_str(),
-                            error_kind,
-                            error = %err_msg,
-                            error_total = burst.total_count,
-                            burst_count = burst.burst_count,
-                            "Stream error"
-                        );
-                        if burst.burst_count >= cfg.error_burst {
-                            return StreamExit {
-                                reason: StreamRestartReason::Error,
-                                last_error: Some(err_msg),
-                            };
-                        }
-                    }
+            }
+            StreamMessage::Error(err_msg) => {
+                if let Some(exit) = handle_stream_error(kind, err_msg, &health, &cfg).await {
+                    return exit;
                 }
-            },
+            }
         }
     }
+}
+
+async fn next_stream_message(
+    kind: StreamKind,
+    stream: &mut (impl futures::Stream<
+        Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
+    > + Unpin
+              + Send),
+    health: &Arc<StreamHealth>,
+    stream_stale: Duration,
+) -> StreamMessage {
+    match timeout(stream_stale, stream.next()).await {
+        Err(_) => {
+            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+            let last_block = health.last_block().await;
+            warn!(
+                event = "stream_stale",
+                stream = kind.as_str(),
+                last_update_age_ms,
+                last_block,
+                "Stream stale; triggering restart"
+            );
+            StreamMessage::Stale
+        }
+        Ok(None) => {
+            warn!(
+                event = "stream_ended",
+                stream = kind.as_str(),
+                "Stream ended unexpectedly"
+            );
+            StreamMessage::Ended
+        }
+        Ok(Some(Ok(update))) => StreamMessage::Update(update),
+        Ok(Some(Err(err))) => StreamMessage::Error(err.to_string()),
+    }
+}
+
+async fn handle_stream_update(
+    kind: StreamKind,
+    update: TychoUpdate,
+    state_store: &Arc<StateStore>,
+    health: &Arc<StreamHealth>,
+    cfg: &StreamSupervisorConfig,
+    ready_logged: &mut bool,
+) -> Option<StreamExit> {
+    let now = Instant::now();
+    let has_advanced = update
+        .sync_states
+        .values()
+        .any(|state| matches!(state, SynchronizerState::Advanced(_)));
+
+    if has_advanced {
+        let advanced = health.record_advanced(now).await;
+        if advanced.window_started {
+            info!(
+                event = "stream_advanced",
+                stream = kind.as_str(),
+                advanced_total = advanced.total_count,
+                burst_count = advanced.burst_count,
+                window_secs = cfg.resync_grace.as_secs(),
+                "Advanced synchronizer state detected"
+            );
+        }
+        if advanced.elapsed >= cfg.resync_grace {
+            return Some(stream_exit(
+                StreamRestartReason::Advanced,
+                Some("advanced_state_grace_exceeded".to_string()),
+            ));
+        }
+    } else {
+        health.clear_advanced().await;
+    }
+
+    let metrics = state_store.apply_update(update).await;
+    health.record_update(metrics.block_number).await;
+    log_stream_update(kind, &metrics);
+    maybe_log_memory_snapshot(
+        kind.as_str(),
+        "stream_update",
+        Some(metrics.new_pairs),
+        cfg.memory,
+        false,
+    );
+
+    if !*ready_logged && metrics.total_pairs > 0 {
+        info!(
+            stream = kind.as_str(),
+            block = metrics.block_number,
+            total_pairs = metrics.total_pairs,
+            "Service ready: first pools ingested"
+        );
+        *ready_logged = true;
+    }
+
+    None
+}
+
+fn log_stream_update(kind: StreamKind, metrics: &crate::models::state::UpdateMetrics) {
+    info!(
+        event = "stream_update",
+        stream = kind.as_str(),
+        block = metrics.block_number,
+        updated_states = metrics.updated_states,
+        new_pairs = metrics.new_pairs,
+        removed_pairs = metrics.removed_pairs,
+        total_pairs = metrics.total_pairs,
+        new_pairs_missing_state = metrics.new_pairs_missing_state,
+        unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
+        updates_for_unknown_pair = metrics.updates_for_unknown_pair,
+        states_missing_in_shard = metrics.states_missing_in_shard,
+        removed_unknown_pair = metrics.removed_unknown_pair,
+        anomaly_samples = ?metrics.anomaly_samples,
+        "Stream update processed"
+    );
+    if metrics.has_anomalies() {
+        warn!(
+            event = "stream_update_anomaly",
+            stream = kind.as_str(),
+            block = metrics.block_number,
+            new_pairs_missing_state = metrics.new_pairs_missing_state,
+            unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
+            updates_for_unknown_pair = metrics.updates_for_unknown_pair,
+            states_missing_in_shard = metrics.states_missing_in_shard,
+            removed_unknown_pair = metrics.removed_unknown_pair,
+            anomaly_samples = ?metrics.anomaly_samples,
+            "Stream update contained ingest anomalies"
+        );
+    }
+}
+
+async fn handle_stream_error(
+    kind: StreamKind,
+    err_msg: String,
+    health: &Arc<StreamHealth>,
+    cfg: &StreamSupervisorConfig,
+) -> Option<StreamExit> {
+    let error_kind = classify_stream_error(&err_msg);
+    if is_missing_block_error(&err_msg) {
+        health.set_last_error(Some(err_msg.clone())).await;
+        let burst = health
+            .record_missing_block(Instant::now(), cfg.missing_block_window)
+            .await;
+        if burst.window_started {
+            info!(
+                event = "stream_missing_block",
+                stream = kind.as_str(),
+                error_kind,
+                error = %err_msg,
+                missing_block_total = burst.total_count,
+                burst_count = burst.burst_count,
+                window_secs = cfg.missing_block_window.as_secs(),
+                "Missing block detected"
+            );
+        }
+        if burst.burst_count >= cfg.missing_block_burst {
+            return Some(stream_exit(
+                StreamRestartReason::MissingBlock,
+                Some(err_msg),
+            ));
+        }
+    } else {
+        let burst = health.record_error(Instant::now(), cfg.error_window).await;
+        health.set_last_error(Some(err_msg.clone())).await;
+        warn!(
+            stream = kind.as_str(),
+            error_kind,
+            error = %err_msg,
+            error_total = burst.total_count,
+            burst_count = burst.burst_count,
+            "Stream error"
+        );
+        if burst.burst_count >= cfg.error_burst {
+            return Some(stream_exit(StreamRestartReason::Error, Some(err_msg)));
+        }
+    }
+
+    None
 }
 
 pub async fn supervise_native_stream<F, Fut, S>(
@@ -432,12 +485,7 @@ async fn begin_vm_rebuild(
 
     state_store.reset().await;
 
-    let guard = controls
-        .vm_sim_semaphore
-        .clone()
-        .acquire_many_owned(controls.vm_sim_concurrency)
-        .await
-        .expect("vm semaphore closed during rebuild");
+    let guard = acquire_vm_rebuild_guard(controls).await;
 
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
@@ -449,6 +497,24 @@ async fn begin_vm_rebuild(
         guard,
         rebuild_id,
         started_at: Instant::now(),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "the VM rebuild semaphore should remain available for the process lifetime"
+)]
+async fn acquire_vm_rebuild_guard(
+    controls: &VmStreamControls,
+) -> tokio::sync::OwnedSemaphorePermit {
+    match controls
+        .vm_sim_semaphore
+        .clone()
+        .acquire_many_owned(controls.vm_sim_concurrency)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(_) => panic!("vm semaphore closed during rebuild"),
     }
 }
 

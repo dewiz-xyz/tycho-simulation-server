@@ -34,8 +34,10 @@ scripts/run_suite.sh --repo . --enable-vm-pools --stop
 ## Suite Configuration
 
 - **Suites** (see `scripts/presets.py`):
-  - `smoke`, `core`, `extended`, `stables`, `lst`, `governance`, `v4_candidates`
+  - `smoke`, `core`, `latency_core`, `coverage_core_vm`, `extended`, `stables`, `lst`, `governance`, `v4_candidates`
   - `extended` includes lower-liquidity pairs removed from `core`.
+  - `run_suite.sh --suite core` keeps the broad `core` set for smoke and coverage, then uses `latency_core` for the percentile leg so latency stays on consistently ready paths.
+  - With VM pools enabled, `run_suite.sh --suite core` uses `coverage_core_vm` for the coverage leg so the gate stays broad without depending on Balancer pools that currently return partial ladders at the default request sizes.
 - **Latency defaults** (override via env):
   - `LATENCY_REQUESTS` (default: 200)
   - `LATENCY_CONCURRENCY` (default: 8)

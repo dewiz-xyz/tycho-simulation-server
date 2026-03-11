@@ -32,7 +32,7 @@ pub fn create_router(app_state: AppState) -> Router {
                 .layer(TimeoutLayer::new(router_timeout))
                 .layer(HandleErrorLayer::new({
                     let timeout_ms = router_timeout_ms;
-                    move |err: BoxError| async move { handle_timeout_error(err, timeout_ms).await }
+                    move |err: BoxError| async move { handle_timeout_error(err, timeout_ms) }
                 })),
         )
         .route(
@@ -41,16 +41,14 @@ pub fn create_router(app_state: AppState) -> Router {
                 .layer(TimeoutLayer::new(router_timeout))
                 .layer(HandleErrorLayer::new({
                     let timeout_ms = router_timeout_ms;
-                    move |err: BoxError| async move {
-                        handle_encode_timeout_error(err, timeout_ms).await
-                    }
+                    move |err: BoxError| async move { handle_encode_timeout_error(err, timeout_ms) }
                 })),
         )
         .route("/status", get(status))
         .with_state(app_state)
 }
 
-async fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
+fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
     if err.is::<Elapsed>() {
         warn!(
             scope = "router_timeout",
@@ -66,7 +64,7 @@ async fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
-async fn handle_encode_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
+fn handle_encode_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
     if err.is::<Elapsed>() {
         warn!(
             scope = "router_timeout",

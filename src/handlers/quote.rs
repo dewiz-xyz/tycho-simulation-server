@@ -16,7 +16,7 @@ use crate::{
         },
         state::AppState,
     },
-    services::quotes::get_amounts_out,
+    services::quotes::{get_amounts_out, QuoteComputation},
 };
 
 pub async fn simulate(
@@ -24,151 +24,15 @@ pub async fn simulate(
     Json(request): Json<AmountOutRequest>,
 ) -> Json<QuoteResult> {
     let started_at = Instant::now();
-    let auction_id = request.auction_id.as_deref();
+    log_received_request(&request);
 
-    debug!(
-        request_id = request.request_id.as_str(),
-        auction_id,
-        token_in = request.token_in.as_str(),
-        token_out = request.token_out.as_str(),
-        amounts = request.amounts.len(),
-        "Received simulate request"
-    );
-
-    let cancel_token = CancellationToken::new();
-    let mut cancel_guard = CancelOnDrop::new(cancel_token.clone());
-    let request_timeout = state.request_timeout();
-
-    let state_for_computation = state.clone();
-    let request_for_computation = request.clone();
-    let computation_future = get_amounts_out(
-        state_for_computation,
-        request_for_computation,
-        Some(cancel_token.clone()),
-    );
-
-    let computation = match tokio::time::timeout(request_timeout, computation_future).await {
-        Ok(result) => {
-            cancel_guard.disarm();
-            result
-        }
-        Err(_) => {
-            // Rely on CancelOnDrop to cancel outstanding work
-            let block_number = state.current_block().await;
-            let vm_block_number = state.current_vm_block().await;
-            let total_pools = state.total_pools().await;
-            let timeout_ms = request_timeout.as_millis() as u64;
-
-            warn!(
-                scope = "handler_timeout",
-                request_id = request.request_id.as_str(),
-                auction_id,
-                latency_ms = started_at.elapsed().as_millis() as u64,
-                timeout_ms,
-                "Simulate request timed out at request-level guard"
-            );
-
-            let meta = build_request_guard_timeout_meta(
-                block_number,
-                vm_block_number,
-                total_pools,
-                request.auction_id.clone(),
-                timeout_ms,
-            );
-
-            emit_simulate_completion(QuoteStatus::PartialSuccess, true);
-            emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
-            emit_simulate_timeout(TimeoutKind::RequestGuard);
-
-            return Json(QuoteResult {
-                request_id: request.request_id,
-                data: Vec::new(),
-                meta,
-            });
-        }
+    let computation = match run_quote_computation(&state, &request, started_at).await {
+        Ok(computation) => computation,
+        Err(timeout_result) => return Json(timeout_result),
     };
 
-    let timed_out = computation
-        .meta
-        .failures
-        .iter()
-        .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout));
-
     let latency_ms = started_at.elapsed().as_millis() as u64;
-
-    let top_response = computation.responses.first();
-    let top_pool = top_response.map(|response| response.pool.as_str());
-    let top_pool_name = top_response.map(|response| response.pool_name.as_str());
-    let top_pool_address = top_response.map(|response| response.pool_address.as_str());
-    let top_amount_out =
-        top_response.and_then(|response| response.amounts_out.first().map(String::as_str));
-    let top_gas_used = top_response.and_then(|response| response.gas_used.first().copied());
-
-    let failure_summary = summarize_failures(&computation.meta.failures);
-    let pool_outcome_summary = summarize_pool_outcomes(&computation.meta.pool_results);
-
-    macro_rules! log_completion {
-        ($level:expr, $scope:expr, $msg:expr) => {
-            tracing::event!(
-                $level,
-                scope = $scope,
-                request_id = request.request_id.as_str(),
-                auction_id,
-                latency_ms,
-                status = ?computation.meta.status,
-                result_quality = ?computation.meta.result_quality,
-                vm_unavailable = computation.meta.vm_unavailable,
-                responses = computation.responses.len(),
-                failures = computation.meta.failures.len(),
-                pool_results = computation.meta.pool_results.len(),
-                scheduled_native_pools = computation.metrics.scheduled_native_pools,
-                scheduled_vm_pools = computation.metrics.scheduled_vm_pools,
-                simulation_runs = computation.metrics.scheduled_native_pools + computation.metrics.scheduled_vm_pools,
-                skipped_vm_unavailable = computation.metrics.skipped_vm_unavailable,
-                skipped_native_concurrency = computation.metrics.skipped_native_concurrency,
-                skipped_vm_concurrency = computation.metrics.skipped_vm_concurrency,
-                skipped_native_deadline = computation.metrics.skipped_native_deadline,
-                skipped_vm_deadline = computation.metrics.skipped_vm_deadline,
-                skipped_native_limits = computation.metrics.skipped_native_limits,
-                skipped_vm_limits = computation.metrics.skipped_vm_limits,
-                vm_completed_pools = computation.metrics.vm_completed_pools,
-                vm_median_first_gas = computation.metrics.vm_median_first_gas,
-                vm_low_first_gas_count = computation.metrics.vm_low_first_gas_count,
-                vm_low_first_gas_ratio = computation.metrics.vm_low_first_gas_ratio,
-                vm_low_first_gas_samples = ?computation.metrics.vm_low_first_gas_samples,
-                token_in = request.token_in.as_str(),
-                token_out = request.token_out.as_str(),
-                amounts = request.amounts.len(),
-                top_pool,
-                top_pool_name,
-                top_pool_address,
-                top_amount_out,
-                top_gas_used,
-                failure_kinds = ?failure_summary.kind_counts,
-                failure_protocols = ?failure_summary.protocol_counts,
-                failure_pool_kinds = ?failure_summary.pool_kind_counts,
-                failure_samples = ?failure_summary.samples,
-                outcome_kinds = ?pool_outcome_summary.kind_counts,
-                outcome_protocols = ?pool_outcome_summary.protocol_counts,
-                outcome_samples = ?pool_outcome_summary.samples,
-                $msg
-            );
-        };
-    }
-
-    if timed_out {
-        log_completion!(
-            tracing::Level::WARN,
-            "handler_timeout",
-            "Simulate computation completed with timeout"
-        );
-    } else {
-        log_completion!(
-            tracing::Level::INFO,
-            "handler_complete",
-            "Simulate computation completed"
-        );
-    }
+    let timed_out = log_completion(&request, &computation, latency_ms);
 
     emit_simulate_completion(computation.meta.status, timed_out);
     emit_simulate_result_quality(computation.meta.result_quality);
@@ -178,6 +42,252 @@ pub async fn simulate(
         data: computation.responses,
         meta: computation.meta,
     })
+}
+
+fn log_received_request(request: &AmountOutRequest) {
+    debug!(
+        request_id = request.request_id.as_str(),
+        auction_id = request.auction_id.as_deref(),
+        token_in = request.token_in.as_str(),
+        token_out = request.token_out.as_str(),
+        amounts = request.amounts.len(),
+        "Received simulate request"
+    );
+}
+
+async fn run_quote_computation(
+    state: &AppState,
+    request: &AmountOutRequest,
+    started_at: Instant,
+) -> Result<QuoteComputation, QuoteResult> {
+    let cancel_token = CancellationToken::new();
+    let mut cancel_guard = CancelOnDrop::new(cancel_token.clone());
+    let request_timeout = state.request_timeout();
+    let computation = get_amounts_out(state.clone(), request.clone(), Some(cancel_token));
+
+    let Ok(computation) = tokio::time::timeout(request_timeout, computation).await else {
+        return Err(build_request_guard_timeout_result(
+            state,
+            request,
+            started_at,
+            request_timeout,
+        )
+        .await);
+    };
+
+    cancel_guard.disarm();
+    Ok(computation)
+}
+
+async fn build_request_guard_timeout_result(
+    state: &AppState,
+    request: &AmountOutRequest,
+    started_at: Instant,
+    request_timeout: std::time::Duration,
+) -> QuoteResult {
+    let block_number = state.current_block().await;
+    let vm_block_number = state.current_vm_block().await;
+    let total_pools = state.total_pools().await;
+    let timeout_ms = request_timeout.as_millis() as u64;
+
+    warn!(
+        scope = "handler_timeout",
+        request_id = request.request_id.as_str(),
+        auction_id = request.auction_id.as_deref(),
+        latency_ms = started_at.elapsed().as_millis() as u64,
+        timeout_ms,
+        "Simulate request timed out at request-level guard"
+    );
+
+    emit_simulate_completion(QuoteStatus::PartialSuccess, true);
+    emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
+    emit_simulate_timeout(TimeoutKind::RequestGuard);
+
+    QuoteResult {
+        request_id: request.request_id.clone(),
+        data: Vec::new(),
+        meta: build_request_guard_timeout_meta(
+            block_number,
+            vm_block_number,
+            total_pools,
+            request.auction_id.clone(),
+            timeout_ms,
+        ),
+    }
+}
+
+fn log_completion(
+    request: &AmountOutRequest,
+    computation: &QuoteComputation,
+    latency_ms: u64,
+) -> bool {
+    let timed_out = computation
+        .meta
+        .failures
+        .iter()
+        .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout));
+    let failure_summary = summarize_failures(&computation.meta.failures);
+    let pool_outcome_summary = summarize_pool_outcomes(&computation.meta.pool_results);
+    let top_response = TopResponseSummary::from(computation.responses.first());
+
+    let scope = if timed_out {
+        "handler_timeout"
+    } else {
+        "handler_complete"
+    };
+    let message = if timed_out {
+        "Simulate computation completed with timeout"
+    } else {
+        "Simulate computation completed"
+    };
+    let event = CompletionEvent {
+        timed_out,
+        scope,
+        message,
+        request,
+        computation,
+        latency_ms,
+        failure_summary: &failure_summary,
+        pool_outcome_summary: &pool_outcome_summary,
+        top_response: &top_response,
+    };
+
+    emit_completion_event(event);
+
+    timed_out
+}
+
+struct CompletionEvent<'a> {
+    timed_out: bool,
+    scope: &'a str,
+    message: &'a str,
+    request: &'a AmountOutRequest,
+    computation: &'a QuoteComputation,
+    latency_ms: u64,
+    failure_summary: &'a FailureSummary,
+    pool_outcome_summary: &'a PoolOutcomeSummary,
+    top_response: &'a TopResponseSummary<'a>,
+}
+
+fn emit_completion_event(event: CompletionEvent<'_>) {
+    if event.timed_out {
+        tracing::event!(
+            tracing::Level::WARN,
+            scope = event.scope,
+            request_id = event.request.request_id.as_str(),
+            auction_id = event.request.auction_id.as_deref(),
+            latency_ms = event.latency_ms,
+            quote_status = ?event.computation.meta.status,
+            quote_result_quality = ?event.computation.meta.result_quality,
+            vm_unavailable = event.computation.meta.vm_unavailable,
+            responses = event.computation.responses.len(),
+            failures = event.computation.meta.failures.len(),
+            pool_results = event.computation.meta.pool_results.len(),
+            scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
+            scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
+            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
+            skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
+            skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
+            skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
+            skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
+            skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
+            skipped_native_limits = event.computation.metrics.skipped_native_limits,
+            skipped_vm_limits = event.computation.metrics.skipped_vm_limits,
+            vm_completed_pools = event.computation.metrics.vm_completed_pools,
+            vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
+            vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
+            vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
+            vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
+            token_in = event.request.token_in.as_str(),
+            token_out = event.request.token_out.as_str(),
+            amounts = event.request.amounts.len(),
+            top_pool = event.top_response.pool,
+            top_pool_name = event.top_response.pool_name,
+            top_pool_address = event.top_response.pool_address,
+            top_amount_out = event.top_response.amount_out,
+            top_gas_used = event.top_response.gas_used,
+            failure_kinds = ?event.failure_summary.kind_counts,
+            failure_protocols = ?event.failure_summary.protocol_counts,
+            failure_pool_kinds = ?event.failure_summary.pool_kind_counts,
+            failure_samples = ?event.failure_summary.samples,
+            outcome_kinds = ?event.pool_outcome_summary.kind_counts,
+            outcome_protocols = ?event.pool_outcome_summary.protocol_counts,
+            outcome_samples = ?event.pool_outcome_summary.samples,
+            "{}",
+            event.message
+        );
+    } else {
+        tracing::event!(
+            tracing::Level::INFO,
+            scope = event.scope,
+            request_id = event.request.request_id.as_str(),
+            auction_id = event.request.auction_id.as_deref(),
+            latency_ms = event.latency_ms,
+            quote_status = ?event.computation.meta.status,
+            quote_result_quality = ?event.computation.meta.result_quality,
+            vm_unavailable = event.computation.meta.vm_unavailable,
+            responses = event.computation.responses.len(),
+            failures = event.computation.meta.failures.len(),
+            pool_results = event.computation.meta.pool_results.len(),
+            scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
+            scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
+            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
+            skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
+            skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
+            skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
+            skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
+            skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
+            skipped_native_limits = event.computation.metrics.skipped_native_limits,
+            skipped_vm_limits = event.computation.metrics.skipped_vm_limits,
+            vm_completed_pools = event.computation.metrics.vm_completed_pools,
+            vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
+            vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
+            vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
+            vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
+            token_in = event.request.token_in.as_str(),
+            token_out = event.request.token_out.as_str(),
+            amounts = event.request.amounts.len(),
+            top_pool = event.top_response.pool,
+            top_pool_name = event.top_response.pool_name,
+            top_pool_address = event.top_response.pool_address,
+            top_amount_out = event.top_response.amount_out,
+            top_gas_used = event.top_response.gas_used,
+            failure_kinds = ?event.failure_summary.kind_counts,
+            failure_protocols = ?event.failure_summary.protocol_counts,
+            failure_pool_kinds = ?event.failure_summary.pool_kind_counts,
+            failure_samples = ?event.failure_summary.samples,
+            outcome_kinds = ?event.pool_outcome_summary.kind_counts,
+            outcome_protocols = ?event.pool_outcome_summary.protocol_counts,
+            outcome_samples = ?event.pool_outcome_summary.samples,
+            "{}",
+            event.message
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+struct TopResponseSummary<'a> {
+    pool: Option<&'a str>,
+    pool_name: Option<&'a str>,
+    pool_address: Option<&'a str>,
+    amount_out: Option<&'a str>,
+    gas_used: Option<u64>,
+}
+
+impl<'a> From<Option<&'a crate::models::messages::AmountOutResponse>> for TopResponseSummary<'a> {
+    fn from(response: Option<&'a crate::models::messages::AmountOutResponse>) -> Self {
+        let Some(response) = response else {
+            return Self::default();
+        };
+
+        Self {
+            pool: Some(response.pool.as_str()),
+            pool_name: Some(response.pool_name.as_str()),
+            pool_address: Some(response.pool_address.as_str()),
+            amount_out: response.amounts_out.first().map(String::as_str),
+            gas_used: response.gas_used.first().copied(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]

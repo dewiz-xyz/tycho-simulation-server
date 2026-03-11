@@ -185,13 +185,29 @@ fn normalize_swap(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "deterministic normalize fixtures use hard-coded addresses and amounts"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic normalize fixtures use hard-coded response assertions"
+)]
+#[expect(
+    clippy::panic,
+    reason = "negative test branches are expressed as explicit test invariants"
+)]
+#[expect(
+    clippy::manual_let_else,
+    reason = "negative test assertions read more clearly in match form here"
+)]
 mod tests {
     use std::str::FromStr;
 
     use super::*;
     use crate::models::messages::PoolRef;
     use crate::models::messages::{PoolSwapDraft, SwapKind};
-    use crate::services::encode::test_support::pool_ref;
+    use crate::services::encode::fixtures::pool_ref;
     use crate::services::encode::wire::{format_address, parse_address, parse_amount};
     use tycho_simulation::tycho_common::models::Chain;
 

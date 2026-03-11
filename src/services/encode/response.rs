@@ -75,13 +75,17 @@ pub(super) async fn build_debug(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "debug payload tests assert presence on deterministic fixtures"
+)]
 mod tests {
     use std::collections::HashMap;
     use tycho_simulation::protocol::models::Update;
 
     use super::*;
     use crate::models::messages::SwapKind;
-    use crate::services::encode::test_support::{
+    use crate::services::encode::fixtures::{
         test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
 

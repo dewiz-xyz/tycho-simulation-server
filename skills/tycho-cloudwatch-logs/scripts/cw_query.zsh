@@ -196,8 +196,8 @@ fields @timestamp, @logStream
 | parse @message /"token_in":"(?<token_in>[^"]+)"/
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
 | parse @message /"amounts":(?<amounts>[0-9]+)/
-| parse @message /"result_quality":"(?<result_quality>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -237,8 +237,8 @@ fields @timestamp, @logStream
 | parse @message /"token_in":"(?<token_in>[^"]+)"/
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
 | parse @message /"amounts":(?<amounts>[0-9]+)/
-| parse @message /"result_quality":"(?<result_quality>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -442,7 +442,7 @@ fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
 | parse @message /"request_id":"(?<request_id>[^"]+)"/
 | parse @message /"auction_id":"(?<auction_id>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"latency_ms":(?<latency_ms>[0-9]+)/

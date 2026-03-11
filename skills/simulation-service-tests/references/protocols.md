@@ -25,7 +25,8 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
   - `scripts/run_suite.sh --repo . --suite core --disable-vm-pools --stop`
   - Or start the server with `ENABLE_VM_POOLS=false`:
     - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --env ENABLE_VM_POOLS=false`
-- **Core suite coverage** includes `GHO:USDC`, `ETH:RETH`, and `RETH:ETH` to exercise Maverick/Rocketpool/native paths in normal runs.
+- **Core suite coverage** keeps `ETH:RETH` and `RETH:ETH` for Rocketpool/native paths.
+  Maverick coverage is checked separately with the protocol presence probe in `scripts/run_suite.sh`, which is more stable than relying on `GHO:USDC`.
 - **TVL filtering matters**: pools are included/removed based on `TVL_THRESHOLD` + `TVL_KEEP_RATIO`.
   - If your tests miss protocols/pools, try lowering `TVL_THRESHOLD` (at the cost of ingesting more pools).
 - **Uniswap v4 pairs**: some v4 pools may use native ETH (often represented as `0x000...000`).

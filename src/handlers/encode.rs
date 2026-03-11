@@ -31,24 +31,21 @@ pub async fn encode(
 
     let computation_future = encode_route(state_for_computation, request_for_computation);
 
-    let computation = match tokio::time::timeout(request_timeout, computation_future).await {
-        Ok(result) => result,
-        Err(_) => {
-            let timeout_ms = request_timeout.as_millis() as u64;
-            warn!(
-                scope = "handler_timeout",
-                request_id,
-                timeout_ms,
-                latency_ms = started_at.elapsed().as_millis() as u64,
-                "Encode request timed out at request-level guard"
-            );
+    let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await else {
+        let timeout_ms = request_timeout.as_millis() as u64;
+        warn!(
+            scope = "handler_timeout",
+            request_id,
+            timeout_ms,
+            latency_ms = started_at.elapsed().as_millis() as u64,
+            "Encode request timed out at request-level guard"
+        );
 
-            let body = Json(EncodeErrorResponse {
-                error: format!("Encode request timed out after {}ms", timeout_ms),
-                request_id: request.request_id.clone(),
-            });
-            return (StatusCode::REQUEST_TIMEOUT, body).into_response();
-        }
+        let body = Json(EncodeErrorResponse {
+            error: format!("Encode request timed out after {timeout_ms}ms"),
+            request_id: request.request_id.clone(),
+        });
+        return (StatusCode::REQUEST_TIMEOUT, body).into_response();
     };
 
     let latency_ms = started_at.elapsed().as_millis() as u64;

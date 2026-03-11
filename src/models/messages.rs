@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize, Serializer};
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive borrowed values"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -192,7 +196,6 @@ pub struct SegmentDraft {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
-#[allow(clippy::enum_variant_names)]
 pub enum SwapKind {
     SimpleSwap,
     MultiSwap,
@@ -269,33 +272,36 @@ pub struct EncodeErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::{AmountOutResponse, PoolOutcomeKind, QuoteResultQuality};
+    use anyhow::Result;
 
     #[test]
-    fn quote_result_quality_serializes_as_snake_case() {
+    fn quote_result_quality_serializes_as_snake_case() -> Result<()> {
         assert_eq!(
-            serde_json::to_string(&QuoteResultQuality::RequestLevelFailure).unwrap(),
+            serde_json::to_string(&QuoteResultQuality::RequestLevelFailure)?,
             "\"request_level_failure\""
         );
         assert_eq!(
-            serde_json::to_string(&QuoteResultQuality::NoResults).unwrap(),
+            serde_json::to_string(&QuoteResultQuality::NoResults)?,
             "\"no_results\""
         );
+        Ok(())
     }
 
     #[test]
-    fn pool_outcome_kind_serializes_as_snake_case() {
+    fn pool_outcome_kind_serializes_as_snake_case() -> Result<()> {
         assert_eq!(
-            serde_json::to_string(&PoolOutcomeKind::SkippedPrecheck).unwrap(),
+            serde_json::to_string(&PoolOutcomeKind::SkippedPrecheck)?,
             "\"skipped_precheck\""
         );
         assert_eq!(
-            serde_json::to_string(&PoolOutcomeKind::PartialOutput).unwrap(),
+            serde_json::to_string(&PoolOutcomeKind::PartialOutput)?,
             "\"partial_output\""
         );
+        Ok(())
     }
 
     #[test]
-    fn amount_out_response_serializes_gas_in_sell_snake_case() {
+    fn amount_out_response_serializes_gas_in_sell_snake_case() -> Result<()> {
         let response = AmountOutResponse {
             pool: "pool-1".to_string(),
             pool_name: "name".to_string(),
@@ -306,8 +312,9 @@ mod tests {
             block_number: 1,
         };
 
-        let value = serde_json::to_value(response).expect("serialize response");
+        let value = serde_json::to_value(response)?;
         assert_eq!(value["gas_in_sell"], "3000000");
         assert!(value.get("gasInSellToken").is_none());
+        Ok(())
     }
 }

@@ -32,6 +32,8 @@ USAGE
 repo=""
 base_url="http://localhost:3000"
 suite="core"
+coverage_suite=""
+latency_suite=""
 enable_vm_pools="true"
 wait_vm_ready="false"
 allow_no_liquidity="false"
@@ -108,6 +110,21 @@ echo "Enable VM pools: $enable_vm_pools"
 echo "Wait VM ready: $wait_vm_ready"
 echo "Allow no_liquidity: $allow_no_liquidity"
 echo "Allow partial_success: $allow_partial"
+
+if [[ "$suite" == "core" ]] && [[ "$enable_vm_pools" == "true" ]]; then
+  latency_suite="${LATENCY_SUITE:-latency_core_vm}"
+elif [[ "$suite" == "core" ]]; then
+  latency_suite="${LATENCY_SUITE:-latency_core}"
+else
+  latency_suite="${LATENCY_SUITE:-$suite}"
+fi
+if [[ "$suite" == "core" ]] && [[ "$enable_vm_pools" == "true" ]]; then
+  coverage_suite="${COVERAGE_SUITE:-coverage_core_vm}"
+else
+  coverage_suite="${COVERAGE_SUITE:-$suite}"
+fi
+echo "Coverage suite: $coverage_suite"
+echo "Latency suite: $latency_suite"
 
 simulate_allow_status="ready"
 coverage_allow_status="ready"
@@ -187,7 +204,7 @@ python3 "$script_dir/encode_smoke.py" --encode-url "$encode_url" --simulate-url 
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
-python3 "$script_dir/coverage_sweep.py" --url "$simulate_url" --suite "$suite" --allow-status "$coverage_allow_status" $allow_failures_flag $allow_no_pools_flag --out "$repo/logs/coverage_sweep.json"
+python3 "$script_dir/coverage_sweep.py" --url "$simulate_url" --suite "$coverage_suite" --allow-status "$coverage_allow_status" $allow_failures_flag $allow_no_pools_flag --out "$repo/logs/coverage_sweep.json"
 
 if [[ "$enable_vm_pools" == "true" ]]; then
   # Keep this check tied to protocols that are consistently surfaced by the probe pairs.
@@ -212,7 +229,7 @@ if [[ "$enable_vm_pools" == "true" ]]; then
 else
   latency_concurrency="${LATENCY_CONCURRENCY:-8}"
 fi
-python3 "$script_dir/latency_percentiles.py" --url "$simulate_url" --suite "$suite" --requests "$latency_requests" --concurrency "$latency_concurrency" --allow-status "$latency_allow_status" $allow_failures_flag $allow_no_pools_flag
+python3 "$script_dir/latency_percentiles.py" --url "$simulate_url" --suite "$latency_suite" --requests "$latency_requests" --concurrency "$latency_concurrency" --allow-status "$latency_allow_status" $allow_failures_flag $allow_no_pools_flag
 
 if [[ "$stop_after" == "true" ]] && [[ "$started_by_me" == "true" ]]; then
   echo "Stopping server..."

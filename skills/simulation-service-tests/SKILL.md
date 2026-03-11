@@ -100,7 +100,7 @@ python3 scripts/coverage_sweep.py --suite core --allow-no-pools
 
 ## Latency percentiles (p50/p90/p99)
 
-`latency_percentiles.py` measures only “good” responses by default (`meta.status=ready`, no `meta.failures`):
+`latency_percentiles.py` measures only “good” responses by default (`meta.status=ready`, no `meta.failures`). `scripts/run_suite.sh --suite core` uses the narrower `latency_core` pair set for this phase so the percentile pass stays on consistently ready paths:
 ```bash
 python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50
 ```

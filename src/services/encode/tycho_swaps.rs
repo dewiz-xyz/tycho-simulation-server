@@ -150,24 +150,187 @@ pub(super) fn compute_split_fraction(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "deterministic swap fixtures use hard-coded addresses and JSON values"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic swap fixtures use hard-coded response assertions"
+)]
 mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::services::encode::fixtures::{dummy_component, fixture_bytes, pool_ref};
+    use crate::services::encode::mocks::MockProtocolSim;
     use crate::services::encode::model::{
         ResimulatedHopInternal, ResimulatedRouteInternal, ResimulatedSegmentInternal,
         ResimulatedSwapInternal,
     };
-    use crate::services::encode::test_support::{dummy_component, pool_ref, MockProtocolSim};
     use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
+
+    struct RoutePoolFixture<'a> {
+        pool_state: &'a Arc<dyn ProtocolSim>,
+        component: &'a Arc<tycho_simulation::protocol::models::ProtocolComponent>,
+    }
+
+    struct RouteSwapSpec<'a> {
+        pool: &'a str,
+        token_in: &'a Bytes,
+        token_out: &'a Bytes,
+        split_bps: u32,
+        amount_in: u32,
+        expected_amount_out: u32,
+    }
 
     fn swap_split(swap: &Swap) -> f64 {
         // `Swap`'s fields are private; use the serialized view to validate split behavior.
         let value = serde_json::to_value(swap).expect("swap should serialize");
         value
             .get("split")
-            .and_then(|s| s.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .expect("swap.split should be a JSON number")
+    }
+
+    fn route_swap(
+        spec: RouteSwapSpec<'_>,
+        fixture: &RoutePoolFixture<'_>,
+    ) -> ResimulatedSwapInternal {
+        ResimulatedSwapInternal {
+            pool: pool_ref(spec.pool),
+            token_in: spec.token_in.clone(),
+            token_out: spec.token_out.clone(),
+            split_bps: spec.split_bps,
+            amount_in: BigUint::from(spec.amount_in),
+            expected_amount_out: BigUint::from(spec.expected_amount_out),
+            pool_state: Arc::clone(fixture.pool_state),
+            component: Arc::clone(fixture.component),
+        }
+    }
+
+    fn route_hop(
+        token_in: &Bytes,
+        token_out: &Bytes,
+        amount_in: u32,
+        expected_amount_out: u32,
+        swaps: Vec<ResimulatedSwapInternal>,
+    ) -> ResimulatedHopInternal {
+        ResimulatedHopInternal {
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amount_in: BigUint::from(amount_in),
+            expected_amount_out: BigUint::from(expected_amount_out),
+            swaps,
+        }
+    }
+
+    fn route_segment(
+        share_bps: u32,
+        amount_in: u32,
+        expected_amount_out: u32,
+        hops: Vec<ResimulatedHopInternal>,
+    ) -> ResimulatedSegmentInternal {
+        ResimulatedSegmentInternal {
+            share_bps,
+            amount_in: BigUint::from(amount_in),
+            expected_amount_out: BigUint::from(expected_amount_out),
+            hops,
+        }
+    }
+
+    fn shared_intermediate_route(fixture: &RoutePoolFixture<'_>) -> ResimulatedRouteInternal {
+        let token_a = fixture_bytes("0x0000000000000000000000000000000000000001");
+        let token_b = fixture_bytes("0x0000000000000000000000000000000000000002");
+        let token_c = fixture_bytes("0x0000000000000000000000000000000000000003");
+        let token_d = fixture_bytes("0x0000000000000000000000000000000000000004");
+
+        ResimulatedRouteInternal {
+            segments: vec![
+                route_segment(
+                    6_000,
+                    60,
+                    55,
+                    vec![
+                        route_hop(
+                            &token_a,
+                            &token_b,
+                            60,
+                            58,
+                            vec![route_swap(
+                                RouteSwapSpec {
+                                    pool: "p1",
+                                    token_in: &token_a,
+                                    token_out: &token_b,
+                                    split_bps: 6_000,
+                                    amount_in: 60,
+                                    expected_amount_out: 58,
+                                },
+                                fixture,
+                            )],
+                        ),
+                        route_hop(
+                            &token_b,
+                            &token_c,
+                            60,
+                            55,
+                            vec![route_swap(
+                                RouteSwapSpec {
+                                    pool: "p2",
+                                    token_in: &token_b,
+                                    token_out: &token_c,
+                                    split_bps: 6_000,
+                                    amount_in: 60,
+                                    expected_amount_out: 55,
+                                },
+                                fixture,
+                            )],
+                        ),
+                    ],
+                ),
+                route_segment(
+                    4_000,
+                    40,
+                    37,
+                    vec![
+                        route_hop(
+                            &token_a,
+                            &token_b,
+                            40,
+                            39,
+                            vec![route_swap(
+                                RouteSwapSpec {
+                                    pool: "p3",
+                                    token_in: &token_a,
+                                    token_out: &token_b,
+                                    split_bps: 4_000,
+                                    amount_in: 40,
+                                    expected_amount_out: 39,
+                                },
+                                fixture,
+                            )],
+                        ),
+                        route_hop(
+                            &token_b,
+                            &token_d,
+                            40,
+                            37,
+                            vec![route_swap(
+                                RouteSwapSpec {
+                                    pool: "p4",
+                                    token_in: &token_b,
+                                    token_out: &token_d,
+                                    split_bps: 4_000,
+                                    amount_in: 40,
+                                    expected_amount_out: 37,
+                                },
+                                fixture,
+                            )],
+                        ),
+                    ],
+                ),
+            ],
+        }
     }
 
     #[test]
@@ -238,94 +401,17 @@ mod tests {
 
     #[test]
     fn build_route_swaps_orders_by_hop_depth_with_shared_intermediate() {
-        let token_a = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
-        let token_b = Bytes::from_str("0x0000000000000000000000000000000000000002").unwrap();
-        let token_c = Bytes::from_str("0x0000000000000000000000000000000000000003").unwrap();
-        let token_d = Bytes::from_str("0x0000000000000000000000000000000000000004").unwrap();
         let pool_state: Arc<dyn ProtocolSim> = Arc::new(MockProtocolSim {});
         let component = Arc::new(dummy_component());
-        let resimulated = ResimulatedRouteInternal {
-            segments: vec![
-                ResimulatedSegmentInternal {
-                    share_bps: 6_000,
-                    amount_in: BigUint::from(60u32),
-                    expected_amount_out: BigUint::from(55u32),
-                    hops: vec![
-                        ResimulatedHopInternal {
-                            token_in: token_a.clone(),
-                            token_out: token_b.clone(),
-                            amount_in: BigUint::from(60u32),
-                            expected_amount_out: BigUint::from(58u32),
-                            swaps: vec![ResimulatedSwapInternal {
-                                pool: pool_ref("p1"),
-                                token_in: token_a.clone(),
-                                token_out: token_b.clone(),
-                                split_bps: 6_000,
-                                amount_in: BigUint::from(60u32),
-                                expected_amount_out: BigUint::from(58u32),
-                                pool_state: Arc::clone(&pool_state),
-                                component: Arc::clone(&component),
-                            }],
-                        },
-                        ResimulatedHopInternal {
-                            token_in: token_b.clone(),
-                            token_out: token_c.clone(),
-                            amount_in: BigUint::from(60u32),
-                            expected_amount_out: BigUint::from(55u32),
-                            swaps: vec![ResimulatedSwapInternal {
-                                pool: pool_ref("p2"),
-                                token_in: token_b.clone(),
-                                token_out: token_c.clone(),
-                                split_bps: 6_000,
-                                amount_in: BigUint::from(60u32),
-                                expected_amount_out: BigUint::from(55u32),
-                                pool_state: Arc::clone(&pool_state),
-                                component: Arc::clone(&component),
-                            }],
-                        },
-                    ],
-                },
-                ResimulatedSegmentInternal {
-                    share_bps: 4_000,
-                    amount_in: BigUint::from(40u32),
-                    expected_amount_out: BigUint::from(37u32),
-                    hops: vec![
-                        ResimulatedHopInternal {
-                            token_in: token_a.clone(),
-                            token_out: token_b.clone(),
-                            amount_in: BigUint::from(40u32),
-                            expected_amount_out: BigUint::from(39u32),
-                            swaps: vec![ResimulatedSwapInternal {
-                                pool: pool_ref("p3"),
-                                token_in: token_a.clone(),
-                                token_out: token_b.clone(),
-                                split_bps: 4_000,
-                                amount_in: BigUint::from(40u32),
-                                expected_amount_out: BigUint::from(39u32),
-                                pool_state: Arc::clone(&pool_state),
-                                component: Arc::clone(&component),
-                            }],
-                        },
-                        ResimulatedHopInternal {
-                            token_in: token_b.clone(),
-                            token_out: token_d.clone(),
-                            amount_in: BigUint::from(40u32),
-                            expected_amount_out: BigUint::from(37u32),
-                            swaps: vec![ResimulatedSwapInternal {
-                                pool: pool_ref("p4"),
-                                token_in: token_b.clone(),
-                                token_out: token_d.clone(),
-                                split_bps: 4_000,
-                                amount_in: BigUint::from(40u32),
-                                expected_amount_out: BigUint::from(37u32),
-                                pool_state: Arc::clone(&pool_state),
-                                component: Arc::clone(&component),
-                            }],
-                        },
-                    ],
-                },
-            ],
+        let fixture = RoutePoolFixture {
+            pool_state: &pool_state,
+            component: &component,
         };
+        let token_a = fixture_bytes("0x0000000000000000000000000000000000000001");
+        let token_b = fixture_bytes("0x0000000000000000000000000000000000000002");
+        let token_c = fixture_bytes("0x0000000000000000000000000000000000000003");
+        let token_d = fixture_bytes("0x0000000000000000000000000000000000000004");
+        let resimulated = shared_intermediate_route(&fixture);
 
         let swaps = build_route_swaps(&resimulated).unwrap();
 

@@ -187,6 +187,10 @@ fn parse_hex_u128(value: &str) -> Result<u128> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "hex parser tests use fixed literals and straightforward assertions"
+)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;

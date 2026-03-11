@@ -10,7 +10,9 @@ mod tycho_swaps;
 mod wire;
 
 #[cfg(test)]
-mod test_support;
+mod fixtures;
+#[cfg(test)]
+mod mocks;
 
 pub use error::{EncodeError, EncodeErrorKind};
 
