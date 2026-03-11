@@ -23,6 +23,16 @@ pub struct AmountOutResponse {
     pub gas_used: Vec<u64>,
     pub gas_in_sell: String,
     pub block_number: u64,
+    /// Per-ladder-step slippage in basis points (1 bps = 0.01%).
+    /// Positive = price impact against the trader; negative = favourable fill.
+    /// `None` for a step when the pool's spot price was unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slippage_bps: Vec<Option<i32>>,
+    /// Fraction of the pool's reported `max_in` consumed by the largest requested
+    /// amount, expressed in basis points (10_000 = 100 %).  `None` when the pool
+    /// did not return valid limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_utilization_bps: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -304,6 +314,8 @@ mod tests {
             gas_used: vec![1],
             gas_in_sell: "3000000".to_string(),
             block_number: 1,
+            slippage_bps: Vec::new(),
+            pool_utilization_bps: None,
         };
 
         let value = serde_json::to_value(response).expect("serialize response");
