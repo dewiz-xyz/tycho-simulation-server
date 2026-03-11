@@ -432,10 +432,11 @@ impl StateStore {
             stats.record_anomaly("new_pairs_missing_state", id.as_str());
             return;
         };
-        let shard = self
-            .shards
-            .get(&kind)
-            .unwrap_or_else(|| unreachable!("all protocol kinds must have a shard"));
+        let Some(shard) = self.shards.get(&kind) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            return;
+        };
 
         let component = Arc::new(component);
         self.id_to_kind.write().await.insert(id.clone(), kind);
