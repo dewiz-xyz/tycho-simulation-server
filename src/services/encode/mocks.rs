@@ -61,8 +61,7 @@ impl ProtocolSim for MockProtocolSim {
         _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
-    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
-    {
+    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError> {
         Ok(())
     }
 
@@ -140,8 +139,7 @@ impl ProtocolSim for StepProtocolSim {
         _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
-    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
-    {
+    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError> {
         Ok(())
     }
 

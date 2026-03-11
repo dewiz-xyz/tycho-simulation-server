@@ -164,7 +164,7 @@ mod tests {
         ("erc4626_pool", ProtocolKind::ERC4626),
     ];
 
-    const NON_CANONICAL_ALIASES: [&str; 13] = [
+    const NON_CANONICAL_ALIASES: [&str; 11] = [
         "uniswapv2",
         "uniswapv3",
         "uniswapv4",
@@ -173,11 +173,9 @@ mod tests {
         "maverick_v2",
         "ekubov3",
         "fluidv1",
-        "erc4626",
         "balancerv2_pool",
         "rocketpool_pool",
         "base_pool",
-        "erc4626_pool",
     ];
 
     fn protocol_component(protocol_system: &str, protocol_type_name: &str) -> ProtocolComponent {

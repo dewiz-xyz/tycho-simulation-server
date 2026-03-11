@@ -77,7 +77,7 @@ impl ProtocolSim for DummySim {
         _delta: ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &Balances,
-    ) -> Result<(), TransitionError<String>> {
+    ) -> Result<(), TransitionError> {
         Ok(())
     }
 

@@ -97,11 +97,7 @@ pub async fn build_vm_stream(
         true,
     );
 
-    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-        "vm:curve",
-        tvl_filter.clone(),
-        None,
-    );
+    builder = builder.exchange::<EVMPoolState<PreCachedDB>>("vm:curve", tvl_filter.clone(), None);
     builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
         "vm:balancer_v2",
         tvl_filter.clone(),
