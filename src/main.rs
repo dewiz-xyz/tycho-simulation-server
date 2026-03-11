@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -319,7 +319,7 @@ async fn serve(
     app: axum::Router,
     config: &tycho_simulation_server::config::AppConfig,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from((parse_host_address(&config.host), config.port));
+    let addr = SocketAddr::from((config.host, config.port));
     info!("Starting HTTP server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -346,16 +346,5 @@ fn vm_sim_concurrency_u32(value: usize) -> u32 {
     match u32::try_from(value) {
         Ok(concurrency) => concurrency,
         Err(_) => panic!("VM simulation concurrency exceeds u32 range"),
-    }
-}
-
-#[expect(
-    clippy::panic,
-    reason = "invalid host config should still fail fast during startup"
-)]
-fn parse_host_address(host: &str) -> IpAddr {
-    match host.parse() {
-        Ok(ip_addr) => ip_addr,
-        Err(_) => panic!("Invalid host address"),
     }
 }

@@ -142,16 +142,17 @@ impl TokenStore {
             "Token not in cache, trying to fetch from Tycho RPC"
         );
 
-        let start = Instant::now();
-
-        let body = build_tokens_request_body(address, self.chain);
-        let result = match self.send_fetch_request(address, &body, start).await {
-            Ok(response) => self.parse_token_response(address, response, start).await,
-            Err(err) => Err(err),
-        };
+        let result = self.fetch_token_result(address).await;
 
         let _ = tx.send(Some(result.clone()));
         result
+    }
+
+    async fn fetch_token_result(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
+        let start = Instant::now();
+        let body = build_tokens_request_body(address, self.chain);
+        let response = self.send_fetch_request(address, &body, start).await?;
+        self.parse_token_response(address, response, start).await
     }
 
     async fn send_fetch_request(

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -61,7 +62,7 @@ struct NetworkConfig {
     tvl_threshold: f64,
     tvl_keep_threshold: f64,
     port: u16,
-    host: String,
+    host: IpAddr,
     enable_vm_pools: bool,
 }
 
@@ -103,10 +104,8 @@ fn load_network_config() -> NetworkConfig {
     let tvl_keep_ratio: f64 = parse_env_or_default("TVL_KEEP_RATIO", "0.2");
     let tvl_keep_threshold: f64 = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
     let port: u16 = parse_env_or_default("PORT", "3000");
-    let host = env_or_default("HOST", "127.0.0.1");
+    let host = parse_host_env();
 
-    // Basic validation
-    assert_valid_host(&host);
     assert!(tvl_threshold > 0.0, "TVL_THRESHOLD must be > 0");
     assert!(
         tvl_keep_ratio > 0.0 && tvl_keep_ratio <= 1.0,
@@ -252,7 +251,7 @@ pub struct AppConfig {
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,
-    pub host: String,
+    pub host: IpAddr,
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,
@@ -288,9 +287,7 @@ fn default_reset_allowance_tokens() -> HashMap<u64, HashSet<Bytes>> {
 }
 
 fn parse_address(value: &str) -> Bytes {
-    let Ok(bytes) = Bytes::from_str(value) else {
-        invalid_startup_config("reset_allowance_tokens address is invalid");
-    };
+    let bytes: Bytes = parse_value_or_panic("reset_allowance_tokens address", value);
     assert!(
         bytes.len() == 20,
         "reset_allowance_tokens address must be 20 bytes"
@@ -300,6 +297,11 @@ fn parse_address(value: &str) -> Bytes {
 
 fn env_or_default(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn parse_host_env() -> IpAddr {
+    let host = env_or_default("HOST", "127.0.0.1");
+    parse_value_or_panic("HOST", &host)
 }
 
 fn optional_trimmed_env(key: &str) -> Option<String> {
@@ -348,20 +350,5 @@ where
     match value.parse() {
         Ok(parsed) => parsed,
         Err(_) => panic!("Invalid {key}"),
-    }
-}
-
-#[expect(
-    clippy::panic,
-    reason = "startup config remains fail-fast on invalid env"
-)]
-fn invalid_startup_config(message: &str) -> ! {
-    panic!("{message}");
-}
-
-fn assert_valid_host(host: &str) {
-    match host.parse::<std::net::IpAddr>() {
-        Ok(_) => {}
-        Err(_) => invalid_startup_config("Invalid HOST"),
     }
 }
