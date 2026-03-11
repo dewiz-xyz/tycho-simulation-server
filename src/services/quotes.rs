@@ -4746,6 +4746,75 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ProbeLimitMessageSim {
+        max_in: BigUint,
+        message: String,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for ProbeLimitMessageSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in > self.max_in {
+                return Err(SimulationError::InvalidInput(self.message.clone(), None));
+            }
+            Ok(GetAmountOutResult::new(
+                BigUint::zero(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError<String>> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     #[tokio::test]
     async fn probe_non_limit_invalid_input_continues_ladder() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
@@ -4855,6 +4924,132 @@ mod tests {
             PoolOutcomeKind::SimulatorError
         );
         assert_eq!(computation.metrics.skipped_native_limits, 0);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_skips_borrowable_limit_pool_when_other_pool_completes() {
+        let fixture = BasicQuoteFixture::new();
+
+        let borrowable_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-good",
+            "0x0000000000000000000000000000000000000011",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(SoftLimitSim {
+                max_in: BigUint::from(100u8),
+                calls: default_calls(),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-borrowable",
+            "0x0000000000000000000000000000000000000012",
+            "fluid_v1",
+            "fluid_v1",
+            fixture.pair_tokens(),
+            Box::new(ProbeLimitMessageSim {
+                max_in: BigUint::zero(),
+                message: "Fatal error: tokenOut amount exceeds borrowable limit".to_string(),
+                calls: Arc::clone(&borrowable_calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 2,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-borrowable-limit", &["1", "11"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(borrowable_calls.load(Ordering::SeqCst), 1, "probe-only");
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert!(computation.meta.failures.is_empty());
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedPrecheck));
+        assert_eq!(computation.metrics.skipped_native_limits, 1);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_returns_no_liquidity_when_insufficient_reserve_hits_all_pools() {
+        let fixture = BasicQuoteFixture::new();
+
+        let insufficient_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-gho",
+            "0x0000000000000000000000000000000000000013",
+            "fluid_v1",
+            "fluid_v1",
+            fixture.pair_tokens(),
+            Box::new(ProbeLimitMessageSim {
+                max_in: BigUint::zero(),
+                message:
+                    "Fatal error: Insufficient reserve: tokenOut amount exceeds withdrawable limit"
+                        .to_string(),
+                calls: Arc::clone(&insufficient_calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-insufficient-reserve", &["1", "11"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(insufficient_calls.load(Ordering::SeqCst), 1, "probe-only");
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::NoResults
+        );
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::NoPools
+        ));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedPrecheck));
+        assert_eq!(computation.metrics.skipped_native_limits, 1);
     }
 
     #[tokio::test]
@@ -5038,6 +5233,14 @@ mod tests {
         assert!(!is_limits_exhaustion_probe_error(
             "token_in invalid for probe",
             true
+        ));
+        assert!(is_limits_exhaustion_probe_error(
+            "tokenOut amount exceeds borrowable limit",
+            false
+        ));
+        assert!(is_limits_exhaustion_probe_error(
+            "Fatal error: Insufficient reserve: tokenOut amount exceeds withdrawable limit",
+            false
         ));
         assert!(is_limits_exhaustion_probe_error(
             "Sell amount exceeds limit 42",
