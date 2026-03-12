@@ -21,6 +21,31 @@ pub struct ChainProfile {
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
 }
 
+pub(crate) const ETHEREUM_NATIVE_PROTOCOLS: &[&str] = &[
+    "uniswap_v2",
+    "sushiswap_v2",
+    "pancakeswap_v2",
+    "uniswap_v3",
+    "pancakeswap_v3",
+    "uniswap_v4",
+    "ekubo_v2",
+    "fluid_v1",
+    "rocketpool",
+    "ekubo_v3",
+    "erc4626",
+];
+pub(crate) const ETHEREUM_VM_PROTOCOLS: &[&str] = &["vm:curve", "vm:balancer_v2", "vm:maverick_v2"];
+pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] =
+    &["uniswap_v2", "uniswap_v3", "uniswap_v4", "pancakeswap_v3"];
+pub(crate) const BASE_VM_PROTOCOLS: &[&str] = &[];
+
+fn profile_protocols(protocols: &[&str]) -> Vec<String> {
+    protocols
+        .iter()
+        .map(|protocol| (*protocol).to_string())
+        .collect()
+}
+
 fn ethereum_profile() -> ChainProfile {
     let mut reset_tokens = HashMap::new();
     let mut mainnet = HashSet::new();
@@ -29,24 +54,8 @@ fn ethereum_profile() -> ChainProfile {
 
     ChainProfile {
         chain: Chain::Ethereum,
-        native_protocols: vec![
-            "uniswap_v2".into(),
-            "sushiswap_v2".into(),
-            "pancakeswap_v2".into(),
-            "uniswap_v3".into(),
-            "pancakeswap_v3".into(),
-            "uniswap_v4".into(),
-            "ekubo_v2".into(),
-            "fluid_v1".into(),
-            "rocketpool".into(),
-            "ekubo_v3".into(),
-            "erc4626".into(),
-        ],
-        vm_protocols: vec![
-            "vm:curve".into(),
-            "vm:balancer_v2".into(),
-            "vm:maverick_v2".into(),
-        ],
+        native_protocols: profile_protocols(ETHEREUM_NATIVE_PROTOCOLS),
+        vm_protocols: profile_protocols(ETHEREUM_VM_PROTOCOLS),
         native_token_protocol_allowlist: vec!["rocketpool".into()],
         reset_allowance_tokens: reset_tokens,
     }
@@ -55,13 +64,8 @@ fn ethereum_profile() -> ChainProfile {
 fn base_profile() -> ChainProfile {
     ChainProfile {
         chain: Chain::Base,
-        native_protocols: vec![
-            "uniswap_v2".into(),
-            "uniswap_v3".into(),
-            "uniswap_v4".into(),
-            "pancakeswap_v3".into(),
-        ],
-        vm_protocols: vec![],
+        native_protocols: profile_protocols(BASE_NATIVE_PROTOCOLS),
+        vm_protocols: profile_protocols(BASE_VM_PROTOCOLS),
         native_token_protocol_allowlist: vec![],
         reset_allowance_tokens: HashMap::new(),
     }

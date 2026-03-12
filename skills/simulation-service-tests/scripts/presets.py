@@ -201,6 +201,14 @@ RETH_ETH_TARGET_BASE_UNITS: list[int] = [
     50_000_000_000_000_000_000,
 ]
 RETH_ETH_CONSERVATIVE_RATE_BPS = 11_200
+BASE_USDC_ETH_TARGET_BASE_UNITS: list[int] = [
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    50_000_000,
+    100_000_000,
+    500_000_000,
+]
 
 
 def reth_base_units_for_eth_targets(eth_targets: list[int]) -> list[int]:
@@ -322,7 +330,10 @@ PAIR_BASE_UNITS_BY_CHAIN: dict[int, dict[Pair, list[int]]] = {
             10_000_000_000_000_000_000_000,
         ],
     },
-    8453: {},
+    8453: {
+        ("USDC", "WETH"): BASE_USDC_ETH_TARGET_BASE_UNITS,
+        ("USDC", "ETH"): BASE_USDC_ETH_TARGET_BASE_UNITS,
+    },
 }
 
 CORE_PAIRS: list[Pair] = [

@@ -386,3 +386,143 @@ fn vm_sim_concurrency_u32(value: usize) -> u32 {
         Err(_) => panic!("VM simulation concurrency exceeds u32 range"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use tycho_simulation_server::config::{AppConfig, ChainProfile, MemoryConfig};
+    use tycho_simulation_server::models::tokens::TokenStore;
+
+    use super::{build_app_state, create_stream_resources};
+
+    fn build_test_config(
+        chain_profile: ChainProfile,
+        enable_vm_pools: bool,
+        rpc_url: Option<&str>,
+    ) -> AppConfig {
+        let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
+
+        AppConfig {
+            chain_profile,
+            tycho_url: "http://localhost".to_string(),
+            api_key: "test-api-key".to_string(),
+            rpc_url: rpc_url.map(str::to_string),
+            gas_price_refresh_interval_ms: 5_000,
+            gas_price_failure_tolerance: 5,
+            tvl_threshold: 100.0,
+            tvl_keep_threshold: 20.0,
+            port: 3000,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            quote_timeout_ms: 150,
+            pool_timeout_native_ms: 20,
+            pool_timeout_vm_ms: 150,
+            request_timeout_ms: 4_000,
+            token_refresh_timeout_ms: 1_000,
+            enable_vm_pools,
+            global_native_sim_concurrency: 8,
+            global_vm_sim_concurrency: 4,
+            reset_allowance_tokens,
+            stream_stale_secs: 120,
+            stream_missing_block_burst: 3,
+            stream_missing_block_window_secs: 60,
+            stream_error_burst: 3,
+            stream_error_window_secs: 60,
+            resync_grace_secs: 60,
+            stream_restart_backoff_min_ms: 500,
+            stream_restart_backoff_max_ms: 30_000,
+            stream_restart_backoff_jitter_pct: 0.2,
+            readiness_stale_secs: 120,
+            memory: MemoryConfig {
+                purge_enabled: true,
+                snapshots_enabled: false,
+                snapshots_min_interval_secs: 60,
+                snapshots_min_new_pairs: 1_000,
+                snapshots_emit_emf: false,
+            },
+        }
+    }
+
+    fn build_test_token_store(chain: Chain) -> Arc<TokenStore> {
+        Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test-api-key".to_string(),
+            chain,
+            Duration::from_millis(10),
+        ))
+    }
+
+    fn base_chain_profile() -> ChainProfile {
+        ChainProfile {
+            chain: Chain::Base,
+            native_protocols: vec![
+                "uniswap_v2".to_string(),
+                "uniswap_v3".to_string(),
+                "uniswap_v4".to_string(),
+                "pancakeswap_v3".to_string(),
+            ],
+            vm_protocols: Vec::new(),
+            native_token_protocol_allowlist: Vec::new(),
+            reset_allowance_tokens: HashMap::new(),
+        }
+    }
+
+    fn ethereum_chain_profile() -> ChainProfile {
+        let mut reset_allowance_tokens = HashMap::new();
+        reset_allowance_tokens.insert(1, HashSet::from([Bytes::from([7_u8; 20])]));
+
+        ChainProfile {
+            chain: Chain::Ethereum,
+            native_protocols: vec![
+                "uniswap_v2".to_string(),
+                "uniswap_v3".to_string(),
+                "rocketpool".to_string(),
+            ],
+            vm_protocols: vec!["vm:curve".to_string()],
+            native_token_protocol_allowlist: vec!["rocketpool".to_string()],
+            reset_allowance_tokens,
+        }
+    }
+
+    #[test]
+    fn build_app_state_disables_effective_vm_for_base_profile() {
+        let config = build_test_config(base_chain_profile(), true, None);
+        let tokens = build_test_token_store(Chain::Base);
+        let resources = create_stream_resources(&tokens);
+
+        let app_state = build_app_state(&config, &tokens, &resources);
+
+        assert_eq!(app_state.chain, Chain::Base);
+        assert!(!app_state.enable_vm_pools);
+        assert!(app_state.native_token_protocol_allowlist.is_empty());
+        assert!(app_state.reset_allowance_tokens.is_empty());
+        assert!(!app_state.erc4626_deposits_enabled);
+    }
+
+    #[test]
+    fn build_app_state_keeps_effective_vm_for_ethereum_profile() {
+        let config = build_test_config(
+            ethereum_chain_profile(),
+            true,
+            Some("http://localhost:8545"),
+        );
+        let tokens = build_test_token_store(Chain::Ethereum);
+        let resources = create_stream_resources(&tokens);
+
+        let app_state = build_app_state(&config, &tokens, &resources);
+
+        assert_eq!(app_state.chain, Chain::Ethereum);
+        assert!(app_state.enable_vm_pools);
+        assert_eq!(
+            app_state.native_token_protocol_allowlist.as_ref(),
+            &vec!["rocketpool".to_string()]
+        );
+        assert!(app_state.reset_allowance_tokens.contains_key(&1));
+        assert!(app_state.erc4626_deposits_enabled);
+    }
+}

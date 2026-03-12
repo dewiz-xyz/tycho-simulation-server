@@ -185,21 +185,38 @@ fn base_builder(
 }
 
 fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    matches!(
-        policy,
-        StreamDecodePolicy::Native | StreamDecodePolicy::Vm
-    )
+    matches!(policy, StreamDecodePolicy::Native | StreamDecodePolicy::Vm)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         decode_skip_state_failures, register_native_protocol, register_vm_protocol,
         StreamDecodePolicy,
     };
+    use crate::config::{
+        BASE_NATIVE_PROTOCOLS, BASE_VM_PROTOCOLS, ETHEREUM_NATIVE_PROTOCOLS, ETHEREUM_VM_PROTOCOLS,
+    };
     use tycho_simulation::{
         evm::stream::ProtocolStreamBuilder, tycho_client::feed::component_tracker::ComponentFilter,
     };
+
+    fn test_builder() -> ProtocolStreamBuilder {
+        ProtocolStreamBuilder::new(
+            "localhost",
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        )
+    }
+
+    fn test_filter() -> ComponentFilter {
+        ComponentFilter::with_tvl_range(0.0, 1.0)
+    }
+
+    fn unique_protocols<'a>(left: &'a [&'a str], right: &'a [&'a str]) -> BTreeSet<&'a str> {
+        left.iter().chain(right.iter()).copied().collect()
+    }
 
     #[test]
     fn native_stream_keeps_decode_skip_enabled() {
@@ -213,11 +230,8 @@ mod tests {
 
     #[test]
     fn unknown_native_protocol_returns_error() {
-        let builder = ProtocolStreamBuilder::new(
-            "localhost",
-            tycho_simulation::tycho_common::models::Chain::Ethereum,
-        );
-        let filter = ComponentFilter::with_tvl_range(0.0, 1.0);
+        let builder = test_builder();
+        let filter = test_filter();
         let result = register_native_protocol(builder, "unknown_protocol", &filter);
         assert!(result.is_err());
         let Err(err) = result else {
@@ -228,16 +242,39 @@ mod tests {
 
     #[test]
     fn unknown_vm_protocol_returns_error() {
-        let builder = ProtocolStreamBuilder::new(
-            "localhost",
-            tycho_simulation::tycho_common::models::Chain::Ethereum,
-        );
-        let filter = ComponentFilter::with_tvl_range(0.0, 1.0);
+        let builder = test_builder();
+        let filter = test_filter();
         let result = register_vm_protocol(builder, "vm:unknown", &filter);
         assert!(result.is_err());
         let Err(err) = result else {
             unreachable!("expected error for unknown VM protocol");
         };
         assert!(err.to_string().contains("Unknown VM protocol"));
+    }
+
+    #[test]
+    fn chain_profile_native_protocols_all_register_successfully() {
+        let filter = test_filter();
+
+        for protocol in unique_protocols(ETHEREUM_NATIVE_PROTOCOLS, BASE_NATIVE_PROTOCOLS) {
+            let result = register_native_protocol(test_builder(), protocol, &filter);
+            assert!(
+                result.is_ok(),
+                "expected native protocol {protocol} to register"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_profile_vm_protocols_all_register_successfully() {
+        let filter = test_filter();
+
+        for protocol in unique_protocols(ETHEREUM_VM_PROTOCOLS, BASE_VM_PROTOCOLS) {
+            let result = register_vm_protocol(test_builder(), protocol, &filter);
+            assert!(
+                result.is_ok(),
+                "expected VM protocol {protocol} to register"
+            );
+        }
     }
 }
