@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -114,6 +115,40 @@ fn decode_transfer_from_allowed(calldata: &[u8]) -> Result<bool> {
         .copied()
         .ok_or_else(|| anyhow!("single-swap calldata should include transferFrom flag"))?
         == 1)
+}
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 #[expect(
@@ -639,6 +674,9 @@ async fn encode_route_rejects_allowlisted_erc4626_deposit_when_deposits_disabled
 
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_route_succeeds_for_allowlisted_erc4626_redeem() -> Result<()> {
+    // The real encoder touches its ERC4626 provider path for redeems, so keep the test
+    // self-contained instead of depending on a developer-local `.env`.
+    let _rpc_url = ScopedEnvVar::set("RPC_URL", "http://localhost:8545");
     let config = EncodeFixtureConfig {
         token_in_hex: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
         token_out_hex: "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
