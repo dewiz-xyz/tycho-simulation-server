@@ -124,7 +124,7 @@ python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 3
 
 Run a CI-like pass:
 ```bash
-zsh skills/simulation-service-tests/scripts/run_checks.zsh --repo /path/to/tycho-simulation-server
+bash skills/simulation-service-tests/scripts/run_checks.sh --repo /path/to/tycho-simulation-server
 ```
 
 ## Memory tracking (jemalloc)
@@ -143,7 +143,7 @@ zsh skills/simulation-service-tests/scripts/run_checks.zsh --repo /path/to/tycho
 
 1. Bump `tycho-simulation` tag/version (or other deps).
 2. Run: `cargo fmt`, `cargo clippy ...`, `cargo nextest run`, `cargo build --release`.
-3. Run the end-to-end suite (`run_suite.zsh`) on both chains (typically one run with `--chain-id 1`, one with `--chain-id 8453`; with/without VM pools as needed).
+3. Run the end-to-end suite (`scripts/run_suite.sh`) on both chains (typically one run with `--chain-id 1`, one with `--chain-id 8453`; with/without VM pools as needed).
 4. If infra changes are involved: `npm ci`, `npx cdk synth`, `npx cdk diff`.
 
 ## Deploy workflow (CDK + Docker)
@@ -153,9 +153,7 @@ See `references/deploy.md`.
 ## Included scripts
 
 - Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
-- Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus Python runners in `scripts/`.
-- Skill fallback scripts: chain-aware mirrors under `skills/simulation-service-tests/scripts/` (used when repo scripts are unavailable).
-- Skill utilities: `scripts/run_checks.zsh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`).
+- Skill utility: `skills/simulation-service-tests/scripts/run_checks.sh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`).
 
 ## References
 

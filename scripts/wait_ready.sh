@@ -70,22 +70,19 @@ while true; do
   body="${response%$'\n'*}"
   status_code="${response##*$'\n'}"
 
-  if [[ "$status_code" == "200" ]]; then
-    if check_output="$(python3 -c '
+  if check_output="$(python3 -c '
 import json
 import sys
 
-require_vm = sys.argv[1] == "true"
-vm_pools_min = int(sys.argv[2])
-expected_chain_raw = sys.argv[3].strip()
+status_code = sys.argv[1]
+require_vm = sys.argv[2] == "true"
+vm_pools_min = int(sys.argv[3])
+expected_chain_raw = sys.argv[4].strip()
 expected_chain = int(expected_chain_raw) if expected_chain_raw else None
 
 try:
     payload = json.load(sys.stdin)
 except Exception:
-    raise SystemExit(2)
-
-if payload.get("status") != "ready":
     raise SystemExit(2)
 
 if expected_chain is not None:
@@ -94,6 +91,12 @@ if expected_chain is not None:
         print(f"expected chain_id={expected_chain}, got {actual_chain}")
         raise SystemExit(42)
 
+if status_code != "200":
+    raise SystemExit(2)
+
+if payload.get("status") != "ready":
+    raise SystemExit(2)
+
 if require_vm:
     if not payload.get("vm_enabled"):
         raise SystemExit(2)
@@ -101,16 +104,15 @@ if require_vm:
         raise SystemExit(2)
     if int(payload.get("vm_pools") or 0) < vm_pools_min:
         raise SystemExit(2)
-' "$require_vm_ready" "$require_vm_pools_min" "$expect_chain_id" <<<"$body" 2>&1)"
-    then
-      echo "ready"
-      exit 0
-    else
-      check_code=$?
-      if [[ "$check_code" -eq 42 ]]; then
-        echo "Chain mismatch while waiting for readiness: $check_output" >&2
-        exit 1
-      fi
+' "$status_code" "$require_vm_ready" "$require_vm_pools_min" "$expect_chain_id" <<<"$body" 2>&1)"
+  then
+    echo "ready"
+    exit 0
+  else
+    check_code=$?
+    if [[ "$check_code" -eq 42 ]]; then
+      echo "Chain mismatch while waiting for readiness: $check_output" >&2
+      exit 1
     fi
   fi
 

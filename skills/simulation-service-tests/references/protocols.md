@@ -46,7 +46,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 - To test native-only behavior on Ethereum:
   - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop`
 - Or start with VM disabled:
-  - `zsh skills/simulation-service-tests/scripts/start_server.zsh --repo /path/to/tycho-simulation-server --chain-id 1 --env ENABLE_VM_POOLS=false`
+  - `scripts/start_server.sh --repo /path/to/tycho-simulation-server --chain-id 1 --env ENABLE_VM_POOLS=false`
 - Default repo suite runs are VM-aware when VM pools stay enabled on Ethereum.
   - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --stop` waits for `vm_status=ready` and at least one VM pool before the Maverick/Balancer presence checks run.
   - There is no supported repo-runner mode that keeps VM pools enabled while skipping that wait.
