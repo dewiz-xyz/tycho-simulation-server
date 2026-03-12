@@ -178,13 +178,17 @@ mod tests {
 
     #[test]
     fn validate_chain_accepts_matching_chain() {
-        let chain = validate_chain(1, Chain::Ethereum).unwrap();
+        let Ok(chain) = validate_chain(1, Chain::Ethereum) else {
+            unreachable!("expected matching chain to validate");
+        };
         assert_eq!(chain, Chain::Ethereum);
     }
 
     #[test]
     fn validate_chain_rejects_mismatched_chain() {
-        let err = validate_chain(8453, Chain::Ethereum).unwrap_err();
+        let Err(err) = validate_chain(8453, Chain::Ethereum) else {
+            unreachable!("expected mismatched chain to fail validation");
+        };
         assert_eq!(
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
@@ -193,7 +197,9 @@ mod tests {
 
     #[test]
     fn validate_chain_accepts_base() {
-        let chain = validate_chain(8453, Chain::Base).unwrap();
+        let Ok(chain) = validate_chain(8453, Chain::Base) else {
+            unreachable!("expected base chain to validate");
+        };
         assert_eq!(chain, Chain::Base);
     }
 }

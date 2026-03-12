@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
@@ -12,7 +13,7 @@ use axum::{
 use reqwest::Client;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep, timeout};
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 use tycho_simulation_server::models::{
     state::{AppState, StateStore, VmStreamStatus},
@@ -110,7 +111,7 @@ async fn mock_rpc(
 
 async fn spawn_mock_rpc_server(
     scenario: RpcScenario,
-) -> (String, Arc<RpcMockState>, tokio::task::JoinHandle<()>) {
+) -> Result<(String, Arc<RpcMockState>, tokio::task::JoinHandle<()>)> {
     let state = Arc::new(RpcMockState {
         scenario,
         counters: RpcCounters::default(),
@@ -119,19 +120,19 @@ async fn spawn_mock_rpc_server(
         .route("/", post(mock_rpc))
         .with_state(Arc::clone(&state));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app).await;
     });
 
-    (format!("http://{}", addr), state, server)
+    Ok((format!("http://{}", addr), state, server))
 }
 
 #[tokio::test]
-async fn startup_task_retries_chain_validation_then_enables_reporting() {
+async fn startup_task_retries_chain_validation_then_enables_reporting() -> Result<()> {
     let (rpc_url, rpc_state, server_handle) =
-        spawn_mock_rpc_server(RpcScenario::RetryThenSuccess).await;
+        spawn_mock_rpc_server(RpcScenario::RetryThenSuccess).await?;
     let app_state = build_test_app_state();
 
     let startup_handle = spawn_gas_price_startup_task(
@@ -143,20 +144,15 @@ async fn startup_task_retries_chain_validation_then_enables_reporting() {
         Client::new(),
     );
 
-    let start = Instant::now();
     timeout(Duration::from_secs(1), async {
         loop {
             if app_state.native_gas_price_reporting_enabled().await {
                 break;
             }
-            if start.elapsed() > Duration::from_secs(1) {
-                panic!("reporting did not become enabled in time");
-            }
             sleep(Duration::from_millis(5)).await;
         }
     })
-    .await
-    .expect("timed out waiting for gas reporting to become enabled");
+    .await?;
 
     assert_eq!(
         app_state.latest_native_gas_price_wei().await,
@@ -169,12 +165,13 @@ async fn startup_task_retries_chain_validation_then_enables_reporting() {
     let _ = startup_handle.await;
     server_handle.abort();
     let _ = server_handle.await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn startup_task_fails_fast_on_chain_mismatch() {
+async fn startup_task_fails_fast_on_chain_mismatch() -> Result<()> {
     let (rpc_url, rpc_state, server_handle) =
-        spawn_mock_rpc_server(RpcScenario::ChainMismatch).await;
+        spawn_mock_rpc_server(RpcScenario::ChainMismatch).await?;
     let app_state = build_test_app_state();
 
     let startup_handle = spawn_gas_price_startup_task(
@@ -186,10 +183,7 @@ async fn startup_task_fails_fast_on_chain_mismatch() {
         Client::new(),
     );
 
-    timeout(Duration::from_secs(1), startup_handle)
-        .await
-        .expect("startup task should exit on chain mismatch")
-        .expect("startup task join should not panic");
+    timeout(Duration::from_secs(1), startup_handle).await??;
 
     assert!(!app_state.native_gas_price_reporting_enabled().await);
     assert_eq!(app_state.latest_native_gas_price_wei().await, None);
@@ -197,4 +191,5 @@ async fn startup_task_fails_fast_on_chain_mismatch() {
 
     server_handle.abort();
     let _ = server_handle.await;
+    Ok(())
 }

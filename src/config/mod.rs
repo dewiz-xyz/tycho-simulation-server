@@ -67,24 +67,34 @@ fn base_profile() -> ChainProfile {
     }
 }
 
-fn resolve_chain_profile(chain_id: u64) -> ChainProfile {
+fn resolve_chain_profile(chain_id: u64) -> Result<ChainProfile, String> {
     match chain_id {
-        1 => ethereum_profile(),
-        8453 => base_profile(),
-        other => panic!(
+        1 => Ok(ethereum_profile()),
+        8453 => Ok(base_profile()),
+        other => Err(format!(
             "Unsupported CHAIN_ID={}: supported values are 1 (Ethereum), 8453 (Base)",
             other
-        ),
+        )),
     }
 }
 
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
-    let chain_id: u64 = require_env("CHAIN_ID")
-        .parse()
-        .expect("CHAIN_ID must be a valid u64");
-    let chain_profile = resolve_chain_profile(chain_id);
+    let chain_id: u64 = match require_env("CHAIN_ID").parse() {
+        Ok(chain_id) => chain_id,
+        Err(_) => {
+            eprintln!("CHAIN_ID must be a valid u64");
+            std::process::exit(2);
+        }
+    };
+    let chain_profile = match resolve_chain_profile(chain_id) {
+        Ok(profile) => profile,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
     let network = load_network_config();
     let timeouts = load_timeout_config();
     let concurrency = load_concurrency_config();
@@ -423,7 +433,9 @@ mod tests {
 
     #[test]
     fn resolve_ethereum_profile() {
-        let profile = resolve_chain_profile(1);
+        let Ok(profile) = resolve_chain_profile(1) else {
+            unreachable!("expected ethereum profile");
+        };
         assert_eq!(profile.chain, Chain::Ethereum);
         assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
         assert!(profile.native_protocols.contains(&"rocketpool".to_string()));
@@ -437,7 +449,9 @@ mod tests {
 
     #[test]
     fn resolve_base_profile() {
-        let profile = resolve_chain_profile(8453);
+        let Ok(profile) = resolve_chain_profile(8453) else {
+            unreachable!("expected base profile");
+        };
         assert_eq!(profile.chain, Chain::Base);
         assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
         assert!(profile.native_protocols.contains(&"uniswap_v3".to_string()));
@@ -452,8 +466,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported CHAIN_ID=999")]
-    fn resolve_unsupported_chain_panics() {
-        resolve_chain_profile(999);
+    fn resolve_unsupported_chain_errors() {
+        let Err(err) = resolve_chain_profile(999) else {
+            unreachable!("expected unsupported chain to error");
+        };
+        assert!(err.contains("Unsupported CHAIN_ID=999"));
     }
 }

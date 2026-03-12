@@ -148,15 +148,12 @@ fn register_vm_protocol(
     tvl_filter: &ComponentFilter,
 ) -> Result<ProtocolStreamBuilder> {
     match protocol {
-        "vm:curve" => {
-            Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(protocol, tvl_filter.clone(), None))
-        }
         "vm:balancer_v2" => Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(
             protocol,
             tvl_filter.clone(),
             Some(balancer_v2_pool_filter),
         )),
-        "vm:maverick_v2" => {
+        "vm:curve" | "vm:maverick_v2" => {
             Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(protocol, tvl_filter.clone(), None))
         }
         other => bail!("Unknown VM protocol in chain profile: {}", other),
@@ -188,10 +185,10 @@ fn base_builder(
 }
 
 fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    match policy {
-        StreamDecodePolicy::Native => true,
-        StreamDecodePolicy::Vm => true,
-    }
+    matches!(
+        policy,
+        StreamDecodePolicy::Native | StreamDecodePolicy::Vm
+    )
 }
 
 #[cfg(test)]
@@ -223,9 +220,9 @@ mod tests {
         let filter = ComponentFilter::with_tvl_range(0.0, 1.0);
         let result = register_native_protocol(builder, "unknown_protocol", &filter);
         assert!(result.is_err());
-        let err = result
-            .err()
-            .expect("expected error for unknown native protocol");
+        let Err(err) = result else {
+            unreachable!("expected error for unknown native protocol");
+        };
         assert!(err.to_string().contains("Unknown native protocol"));
     }
 
@@ -238,9 +235,9 @@ mod tests {
         let filter = ComponentFilter::with_tvl_range(0.0, 1.0);
         let result = register_vm_protocol(builder, "vm:unknown", &filter);
         assert!(result.is_err());
-        let err = result
-            .err()
-            .expect("expected error for unknown VM protocol");
+        let Err(err) = result else {
+            unreachable!("expected error for unknown VM protocol");
+        };
         assert!(err.to_string().contains("Unknown VM protocol"));
     }
 }
