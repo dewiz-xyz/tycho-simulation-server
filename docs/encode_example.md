@@ -26,8 +26,8 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
   "minAmountOut": "9980000",
-  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
-  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41", // Cowswap's settlement contract on Ethereum mainnet
+  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35", // Tycho router contract on Ethereum mainnet
   "swapKind": "MegaSwap",
   "segments": [
     {
@@ -190,6 +190,7 @@ To guarantee `amount[i] >= 1` for a non-remainder leg with `bps = b`:
   - invalid (the 1 bps leg would execute with 0 input)
 
 Note: this validation is deterministic for the **first hop** (route `amountIn` and segment `shareBps` are known). For later hops, validate using your best estimate of hop amounts (typically derived from `/simulate` outputs).
+
 - Hops are sequential in the order provided; there is no hop-level share.
 - SimpleSwap has a single hop. All swaps in that hop must share the same tokenIn and tokenOut.
 - MultiSwap has multiple hops. Each hop transitions between different tokens.
