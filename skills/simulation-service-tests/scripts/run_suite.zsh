@@ -277,7 +277,7 @@ python3 "$skill_dir/simulate_smoke.py" --url "$simulate_url" --chain-id "$chain_
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"
-python3 "$skill_dir/coverage_sweep.py" --url "$simulate_url" --chain-id "$chain_id" --suite "$coverage_suite" --allow-status "$coverage_allow_status" "${coverage_flags[@]}" --out "$repo/logs/coverage_sweep.json"
+python3 "$skill_dir/coverage_sweep.py" --url "$simulate_url" --chain-id "$chain_id" --suite "$coverage_suite" --allow-status "$coverage_allow_status" ${coverage_flags[@]+"${coverage_flags[@]}"} --out "$repo/logs/coverage_sweep.json"
 
 if [[ "$runtime_vm_enabled" == "true" ]] && [[ "$chain_id" == "1" ]]; then
   echo "Protocol presence checks (chain-aware VM expectations)..."
@@ -288,7 +288,7 @@ if [[ "$runtime_vm_enabled" == "true" ]] && [[ "$chain_id" == "1" ]]; then
     --pair USDT:USDC \
     --pair ETH:RETH \
     --allow-status "$coverage_allow_status" \
-    "${coverage_flags[@]}" \
+    ${coverage_flags[@]+"${coverage_flags[@]}"} \
     --expect-protocols maverick_v2 \
     --out "$repo/logs/coverage_protocol_presence.json"
 
@@ -298,7 +298,7 @@ if [[ "$runtime_vm_enabled" == "true" ]] && [[ "$chain_id" == "1" ]]; then
     --chain-id "$chain_id" \
     --pair WETH:USDC \
     --allow-status "$coverage_allow_status" \
-    "${coverage_flags[@]}" \
+    ${coverage_flags[@]+"${coverage_flags[@]}"} \
     --expect-protocols balancer_v2 \
     --out "$repo/logs/coverage_balancer_presence.json"
 fi

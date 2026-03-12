@@ -22,6 +22,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 - `uniswap_v3`
 - `uniswap_v4`
 - `pancakeswap_v3`
+- `aerodrome_slipstreams`
 
 ## VM feeds by chain
 

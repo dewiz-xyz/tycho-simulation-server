@@ -35,8 +35,13 @@ pub(crate) const ETHEREUM_NATIVE_PROTOCOLS: &[&str] = &[
     "erc4626",
 ];
 pub(crate) const ETHEREUM_VM_PROTOCOLS: &[&str] = &["vm:curve", "vm:balancer_v2", "vm:maverick_v2"];
-pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] =
-    &["uniswap_v2", "uniswap_v3", "uniswap_v4", "pancakeswap_v3"];
+pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
+    "uniswap_v2",
+    "uniswap_v3",
+    "uniswap_v4",
+    "pancakeswap_v3",
+    "aerodrome_slipstreams",
+];
 pub(crate) const BASE_VM_PROTOCOLS: &[&str] = &[];
 
 fn profile_protocols(protocols: &[&str]) -> Vec<String> {
@@ -463,7 +468,10 @@ mod tests {
         assert!(profile
             .native_protocols
             .contains(&"pancakeswap_v3".to_string()));
-        assert_eq!(profile.native_protocols.len(), 4);
+        assert!(profile
+            .native_protocols
+            .contains(&"aerodrome_slipstreams".to_string()));
+        assert_eq!(profile.native_protocols.len(), 5);
         assert!(profile.vm_protocols.is_empty());
         assert!(profile.native_token_protocol_allowlist.is_empty());
         assert!(profile.reset_allowance_tokens.is_empty());

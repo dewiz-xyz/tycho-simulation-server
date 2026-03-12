@@ -287,6 +287,16 @@ class RunSuiteContractTest(unittest.TestCase):
         self.assertIn('chain_supports_vm="false"', self.run_suite_text)
         self.assertIn('if [[ "$chain_id" == "1" ]]; then', self.run_suite_text)
 
+    def test_balancer_check_guards_empty_coverage_flags(self) -> None:
+        self.assertIn(
+            '${coverage_flags[@]+"${coverage_flags[@]}"} \\',
+            self.run_suite_text,
+        )
+        self.assertNotIn(
+            '"${coverage_flags[@]}" \\\n      --expect-protocols balancer_v2',
+            self.run_suite_text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

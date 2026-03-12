@@ -327,7 +327,7 @@ if [[ "$runtime_vm_enabled" == "true" ]]; then
       --chain-id "$chain_id" \
       --pair WETH:USDC \
       --allow-status "$coverage_allow_status" \
-      "${coverage_flags[@]}" \
+      ${coverage_flags[@]+"${coverage_flags[@]}"} \
       --expect-protocols balancer_v2 \
       --out "$repo/logs/coverage_balancer_presence.json"
   else
