@@ -1,9 +1,9 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_checks.zsh --repo <path> [--fmt-check] [--cdk] [--docker]
+Usage: run_checks.sh --repo <path> [--fmt-check] [--cdk] [--docker]
 
 Run a CI-like verification pass for this repo.
 

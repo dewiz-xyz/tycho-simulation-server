@@ -321,6 +321,8 @@ async fn setup_app_state_and_request(
     }
 
     let state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
@@ -478,6 +480,31 @@ async fn encode_route_rejects_when_min_amount_out_exceeds_expected() -> Result<(
     let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert!(
         response.error.contains("below minAmountOut"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_when_request_chain_does_not_match_runtime_chain() -> Result<()> {
+    let (app, mut request) = setup_app_state_and_request(EncodeFixtureConfig::default()).await?;
+    request.chain_id = 8453;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response
+            .error
+            .contains("Unsupported chainId: 8453 (this instance serves chain 1)"),
         "unexpected error: {}",
         response.error
     );
@@ -784,6 +811,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_state_store,
         vm_state_store,

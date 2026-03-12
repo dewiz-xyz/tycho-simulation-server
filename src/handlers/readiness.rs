@@ -6,6 +6,7 @@ use crate::models::state::AppState;
 #[derive(Serialize)]
 pub struct StatusPayload {
     status: &'static str,
+    chain_id: u64,
     block: u64,
     pools: usize,
     vm_enabled: bool,
@@ -74,6 +75,7 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
         status_code,
         Json(StatusPayload {
             status,
+            chain_id: state.chain.id(),
             block,
             pools,
             vm_enabled,

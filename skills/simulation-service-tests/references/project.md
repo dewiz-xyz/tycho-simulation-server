@@ -6,6 +6,7 @@
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
+- Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to scripts.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the server:
   ```bash
@@ -15,9 +16,10 @@
 
 ## Readiness
 - `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "block": <u64>, "pools": <usize> }`
+  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }`
   - `503 Service Unavailable` with `{ "status": "warming_up", ... }`
 - Cold starts can take several minutes (3–5+ mins; longer with VM pools); wait before concluding readiness is stuck.
+- `scripts/wait_ready.sh --expect-chain-id <id>` should be used to guard against hitting the wrong deployment.
 
 ## Quote simulation
 - `POST /simulate` request body:
@@ -33,22 +35,21 @@
 
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
-  - `scripts/run_suite.sh --repo . --suite core --stop`
-  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds (Curve/Balancer/Maverick).
-  - With VM pools enabled, the suite waits for `vm_status=ready` and `vm_pools>=1` before running the VM-specific coverage checks, so cold starts are slower but the default gate is stable.
+  - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --stop`
+  - `scripts/run_suite.sh --repo . --chain-id 8453 --suite core --stop`
+  - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds.
+  - On Ethereum, VM-enabled runs wait for `vm_status=ready` and `vm_pools>=1` before the VM protocol probes run.
   - There is no repo-runner mode that leaves VM pools enabled while skipping that wait; use `--disable-vm-pools` for the native-only fast path.
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
-  - Core coverage keeps `ETH:RETH` and `RETH:ETH`, while Maverick coverage is checked by the dedicated protocol presence probe in `scripts/run_suite.sh`.
-  - With VM pools enabled, the coverage leg uses `coverage_core_vm` so the gate stays broad without depending on Balancer pools that currently return partial ladders at the default request sizes.
-  - The latency leg uses `latency_core` when `--suite core` is selected, so p50/p90/p99 stays on pairs that reliably return `ready`.
+  - On Ethereum, `--suite core` keeps the tuned defaults: `coverage_core_vm` + `latency_core_vm` when VM is enabled, `latency_core` when it is not.
 - Individual runners:
-  - `python3 scripts/simulate_smoke.py --suite smoke`
-  - `python3 scripts/encode_smoke.py --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`
-  - `python3 scripts/coverage_sweep.py --suite core --out logs/coverage_sweep.json`
-  - `python3 scripts/coverage_sweep.py --suite erc4626_allowlisted --expect-protocols erc4626`
-  - `python3 scripts/coverage_sweep.py --suite erc4626_negative --allow-no-pools`
-  - `python3 scripts/latency_percentiles.py --suite core --requests 300 --concurrency 50`
+  - `python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke`
+  - `python3 scripts/encode_smoke.py --chain-id 1 --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`
+  - `python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50`
 - See `STRESS_TEST_README.md` for suites, defaults, and latency knobs.
 
 ## Useful commands
@@ -56,5 +57,5 @@
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
 - Test: `cargo nextest run`
 - ERC4626 rollout checks:
-  - `python3 scripts/coverage_sweep.py --suite erc4626_allowlisted --expect-protocols erc4626`
-  - `python3 scripts/coverage_sweep.py --suite erc4626_negative --allow-no-pools`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
+  - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`

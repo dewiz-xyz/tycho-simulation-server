@@ -7,7 +7,11 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
-    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
+    tycho_common::{
+        models::{token::Token, Chain},
+        simulation::protocol_sim::ProtocolSim,
+        Bytes,
+    },
 };
 
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
@@ -21,6 +25,8 @@ fn native_token_address() -> Bytes {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub chain: Chain,
+    pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
@@ -898,6 +904,8 @@ mod tests {
         vm_sim_concurrency: usize,
     ) -> AppState {
         AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: token_store,
             native_state_store,
             vm_state_store,

@@ -3,25 +3,119 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tycho_simulation::tycho_common::Bytes;
+use tycho_simulation::{
+    tycho_common::{models::Chain, Bytes},
+    utils::get_default_url,
+};
 
 mod logging;
 mod memory;
 pub use logging::init_logging;
 pub use memory::MemoryConfig;
 
+/// Per-chain runtime profile resolved from `CHAIN_ID`.
+#[derive(Clone, Debug)]
+pub struct ChainProfile {
+    pub chain: Chain,
+    pub native_protocols: Vec<String>,
+    pub vm_protocols: Vec<String>,
+    /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
+    pub native_token_protocol_allowlist: Vec<String>,
+    pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
+}
+
+pub(crate) const ETHEREUM_NATIVE_PROTOCOLS: &[&str] = &[
+    "uniswap_v2",
+    "sushiswap_v2",
+    "pancakeswap_v2",
+    "uniswap_v3",
+    "pancakeswap_v3",
+    "uniswap_v4",
+    "ekubo_v2",
+    "fluid_v1",
+    "rocketpool",
+    "ekubo_v3",
+    "erc4626",
+];
+pub(crate) const ETHEREUM_VM_PROTOCOLS: &[&str] = &["vm:curve", "vm:balancer_v2", "vm:maverick_v2"];
+pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
+    "uniswap_v2",
+    "uniswap_v3",
+    "uniswap_v4",
+    "pancakeswap_v3",
+    "aerodrome_slipstreams",
+];
+pub(crate) const BASE_VM_PROTOCOLS: &[&str] = &[];
+
+fn profile_protocols(protocols: &[&str]) -> Vec<String> {
+    protocols
+        .iter()
+        .map(|protocol| (*protocol).to_string())
+        .collect()
+}
+
+fn ethereum_profile() -> ChainProfile {
+    let mut reset_tokens = HashMap::new();
+    let mut mainnet = HashSet::new();
+    mainnet.insert(parse_address(ETHEREUM_USDT));
+    reset_tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
+
+    ChainProfile {
+        chain: Chain::Ethereum,
+        native_protocols: profile_protocols(ETHEREUM_NATIVE_PROTOCOLS),
+        vm_protocols: profile_protocols(ETHEREUM_VM_PROTOCOLS),
+        native_token_protocol_allowlist: vec!["rocketpool".into()],
+        reset_allowance_tokens: reset_tokens,
+    }
+}
+
+fn base_profile() -> ChainProfile {
+    ChainProfile {
+        chain: Chain::Base,
+        native_protocols: profile_protocols(BASE_NATIVE_PROTOCOLS),
+        vm_protocols: profile_protocols(BASE_VM_PROTOCOLS),
+        native_token_protocol_allowlist: vec![],
+        reset_allowance_tokens: HashMap::new(),
+    }
+}
+
+fn resolve_chain_profile(chain_id: u64) -> Result<ChainProfile, String> {
+    match chain_id {
+        1 => Ok(ethereum_profile()),
+        8453 => Ok(base_profile()),
+        other => Err(format!(
+            "Unsupported CHAIN_ID={}: supported values are 1 (Ethereum), 8453 (Base)",
+            other
+        )),
+    }
+}
+
 pub fn load_config() -> AppConfig {
     dotenv::dotenv().ok();
 
+    let chain_id: u64 = match require_env("CHAIN_ID").parse() {
+        Ok(chain_id) => chain_id,
+        Err(_) => {
+            eprintln!("CHAIN_ID must be a valid u64");
+            std::process::exit(2);
+        }
+    };
+    let chain_profile = match resolve_chain_profile(chain_id) {
+        Ok(profile) => profile,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
     let network = load_network_config();
     let timeouts = load_timeout_config();
     let concurrency = load_concurrency_config();
     let stream = load_stream_config();
-    let reset_allowance_tokens = Arc::new(default_reset_allowance_tokens());
+    let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
 
     AppConfig {
-        tycho_url: network.tycho_url,
+        chain_profile,
         api_key: network.api_key,
         rpc_url: network.rpc_url,
         gas_price_refresh_interval_ms: network.gas_price_refresh_interval_ms,
@@ -54,7 +148,6 @@ pub fn load_config() -> AppConfig {
 }
 
 struct NetworkConfig {
-    tycho_url: String,
     api_key: String,
     rpc_url: Option<String>,
     gas_price_refresh_interval_ms: u64,
@@ -92,8 +185,13 @@ struct StreamConfig {
     readiness_stale_secs: u64,
 }
 
+/// Resolve the hosted Tycho endpoint for a supported runtime chain.
+pub fn hosted_tycho_url(chain: Chain) -> Result<String, String> {
+    get_default_url(&chain)
+        .ok_or_else(|| format!("No default Tycho URL configured for supported chain {chain}"))
+}
+
 fn load_network_config() -> NetworkConfig {
-    let tycho_url = env_or_default("TYCHO_URL", "tycho-beta.propellerheads.xyz");
     let api_key = require_env("TYCHO_API_KEY");
     let rpc_url = optional_trimmed_env("RPC_URL");
     let gas_price_refresh_interval_ms: u64 =
@@ -120,7 +218,6 @@ fn load_network_config() -> NetworkConfig {
     );
 
     NetworkConfig {
-        tycho_url,
         api_key,
         rpc_url,
         gas_price_refresh_interval_ms,
@@ -242,7 +339,7 @@ fn load_stream_config() -> StreamConfig {
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub tycho_url: String,
+    pub chain_profile: ChainProfile,
     pub api_key: String,
     pub rpc_url: Option<String>,
     pub gas_price_refresh_interval_ms: u64,
@@ -275,15 +372,6 @@ pub struct AppConfig {
 
 const ETHEREUM_CHAIN_ID: u64 = 1;
 const ETHEREUM_USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
-
-fn default_reset_allowance_tokens() -> HashMap<u64, HashSet<Bytes>> {
-    // Tokens that require approve(0) before approve(amount).
-    let mut tokens = HashMap::new();
-    let mut mainnet = HashSet::new();
-    mainnet.insert(parse_address(ETHEREUM_USDT));
-    tokens.insert(ETHEREUM_CHAIN_ID, mainnet);
-    tokens
-}
 
 fn parse_address(value: &str) -> Bytes {
     let bytes: Bytes = parse_value_or_panic("reset_allowance_tokens address", value);
@@ -349,5 +437,71 @@ where
     match value.parse() {
         Ok(parsed) => parsed,
         Err(_) => panic!("Invalid {key}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ethereum_profile() {
+        let Ok(profile) = resolve_chain_profile(1) else {
+            unreachable!("expected ethereum profile");
+        };
+        assert_eq!(profile.chain, Chain::Ethereum);
+        assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
+        assert!(profile.native_protocols.contains(&"rocketpool".to_string()));
+        assert!(profile.native_protocols.contains(&"erc4626".to_string()));
+        assert!(profile.vm_protocols.contains(&"vm:curve".to_string()));
+        assert!(profile
+            .native_token_protocol_allowlist
+            .contains(&"rocketpool".to_string()));
+        assert!(profile.reset_allowance_tokens.contains_key(&1));
+    }
+
+    #[test]
+    fn resolve_base_profile() {
+        let Ok(profile) = resolve_chain_profile(8453) else {
+            unreachable!("expected base profile");
+        };
+        assert_eq!(profile.chain, Chain::Base);
+        assert!(profile.native_protocols.contains(&"uniswap_v2".to_string()));
+        assert!(profile.native_protocols.contains(&"uniswap_v3".to_string()));
+        assert!(profile.native_protocols.contains(&"uniswap_v4".to_string()));
+        assert!(profile
+            .native_protocols
+            .contains(&"pancakeswap_v3".to_string()));
+        assert!(profile
+            .native_protocols
+            .contains(&"aerodrome_slipstreams".to_string()));
+        assert_eq!(profile.native_protocols.len(), 5);
+        assert!(profile.vm_protocols.is_empty());
+        assert!(profile.native_token_protocol_allowlist.is_empty());
+        assert!(profile.reset_allowance_tokens.is_empty());
+    }
+
+    #[test]
+    fn resolve_unsupported_chain_errors() {
+        let Err(err) = resolve_chain_profile(999) else {
+            unreachable!("expected unsupported chain to error");
+        };
+        assert!(err.contains("Unsupported CHAIN_ID=999"));
+    }
+
+    #[test]
+    fn hosted_tycho_url_uses_ethereum_default() {
+        let Ok(url) = hosted_tycho_url(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Tycho URL");
+        };
+        assert_eq!(url, "tycho-beta.propellerheads.xyz");
+    }
+
+    #[test]
+    fn hosted_tycho_url_uses_base_default() {
+        let Ok(url) = hosted_tycho_url(Chain::Base) else {
+            unreachable!("expected base hosted Tycho URL");
+        };
+        assert_eq!(url, "tycho-base-beta.propellerheads.xyz");
     }
 }

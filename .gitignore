@@ -30,6 +30,8 @@ logs/
 AGENTS.md
 CLAUDE.md
 tycho_node.log
+review_guide.md
+review-viewer/
 
 # Environment
 .env

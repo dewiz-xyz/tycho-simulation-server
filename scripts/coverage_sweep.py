@@ -14,7 +14,16 @@ from pathlib import Path
 from urllib import request
 from urllib.error import HTTPError, URLError
 
-from presets import amounts_for_pair, list_suites, list_tokens, parse_amounts, parse_pairs, suite_pairs
+from presets import (
+    amounts_for_pair,
+    chain_label,
+    list_suites,
+    list_tokens,
+    parse_amounts,
+    parse_pairs,
+    resolve_chain_id,
+    suite_pairs,
+)
 
 
 def request_simulate(url: str, payload: dict, timeout: float) -> tuple[int, bytes, float]:
@@ -27,15 +36,6 @@ def request_simulate(url: str, payload: dict, timeout: float) -> tuple[int, byte
         return response.status, body, elapsed
 
 
-def normalize_protocol(protocol: str | None) -> str:
-    if not protocol:
-        return "unknown"
-    # VM pools can use prefixes like vm:maverick_v2; normalize for stable assertions.
-    if protocol.startswith("vm:"):
-        return protocol.split(":", 1)[1]
-    return protocol
-
-
 def protocol_from_pool_name(pool_name: str | None) -> str:
     if not pool_name:
         return "unknown"
@@ -43,12 +43,17 @@ def protocol_from_pool_name(pool_name: str | None) -> str:
         protocol = pool_name.split("::", 1)[0]
     else:
         protocol = pool_name
-    return normalize_protocol(protocol)
+    # VM pools can use prefixes like vm:maverick_v2; normalize for stable assertions.
+    if protocol.startswith("vm:"):
+        return protocol.split(":", 1)[1]
+    return protocol
 
 
 def protocol_from_fields(protocol: str | None, pool_name: str | None) -> str:
     if protocol:
-        return normalize_protocol(protocol)
+        if protocol.startswith("vm:"):
+            return protocol.split(":", 1)[1]
+        return protocol
     return protocol_from_pool_name(pool_name)
 
 
@@ -92,25 +97,19 @@ def resolve_allowed_statuses(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Coverage sweep for POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--suite", default="core", help="Named pair suite from presets")
     parser.add_argument("--pair", action="append", help="token_in:token_out (symbol or address)")
     parser.add_argument("--pairs", help="Comma-separated token_in:token_out pairs")
     parser.add_argument("--amounts", help="Comma-separated amounts in wei")
     parser.add_argument("--allow-status", default="ready", help="Comma-separated allowed meta.status values")
-    parser.add_argument(
-        "--allow-failures",
-        action="store_true",
-        help="Allow meta.failures to be non-empty and accept partial_success responses",
-    )
+    parser.add_argument("--allow-failures", action="store_true", help="Allow meta.failures to be non-empty")
     parser.add_argument(
         "--allow-no-pools",
         action="store_true",
         help="Allow no_liquidity responses that only report no_pools failures",
     )
-    parser.add_argument(
-        "--expect-protocols",
-        help="Comma-separated protocol names expected across candidate pools and winners",
-    )
+    parser.add_argument("--expect-protocols", help="Comma-separated protocol names expected in pool_name")
     parser.add_argument("--out", help="Write JSON report to this path")
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--request-id-prefix", default="coverage")
@@ -120,20 +119,26 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     if args.list_suites:
-        for name in list_suites():
+        for name in list_suites(chain_id):
             print(name)
         return 0
 
     if args.list_tokens:
-        for symbol, address in list_tokens():
+        for symbol, address in list_tokens(chain_id):
             print(f"{symbol} {address}")
         return 0
 
     try:
-        pairs = parse_pairs(args.pair, args.pairs)
+        pairs = parse_pairs(args.pair, args.pairs, chain_id)
         if not pairs:
-            pairs = suite_pairs(args.suite)
+            pairs = suite_pairs(args.suite, chain_id)
         amounts_override = parse_amounts(args.amounts) if args.amounts else None
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -153,6 +158,8 @@ def main() -> int:
         expected_protocols = {p.strip().lower() for p in args.expect_protocols.split(",") if p.strip()}
 
     report = {
+        "chain_id": chain_id,
+        "chain": chain_label(chain_id),
         "url": args.url,
         "suite": args.suite,
         "pairs": [asdict(p) for p in pairs],
@@ -173,7 +180,7 @@ def main() -> int:
     allowed_no_pools = 0
 
     for idx, pair in enumerate(pairs, start=1):
-        amounts = amounts_override or amounts_for_pair(pair.token_in, pair.token_out)
+        amounts = amounts_override or amounts_for_pair(pair.token_in, pair.token_out, chain_id)
         payload = {
             "request_id": f"{args.request_id_prefix}-{idx}-{uuid.uuid4().hex[:8]}",
             "token_in": pair.token_in,
@@ -296,7 +303,13 @@ def main() -> int:
                     )
 
         report["requests"].append(
-            {"pair": asdict(pair), "elapsed_s": elapsed, "meta": meta, "pool_count": pool_count, "amounts": amounts}
+            {
+                "pair": asdict(pair),
+                "elapsed_s": elapsed,
+                "meta": meta,
+                "pool_count": pool_count,
+                "amounts": amounts,
+            }
         )
 
         if args.verbose:
@@ -332,7 +345,7 @@ def main() -> int:
         pools_seen.values(), key=lambda item: (item.get("protocol", ""), item.get("pool_name", ""))
     )
 
-    print("Coverage sweep summary")
+    print(f"Coverage sweep summary ({chain_label(chain_id)}:{chain_id})")
     print("=====================")
     print(f"Pairs: {len(pairs)}")
     print(f"Failures: {failures}")

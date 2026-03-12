@@ -4,21 +4,22 @@ An HTTP service that brokers Tycho protocol streams into on-demand quote simulat
 
 ## Description
 
-The server ingests Tycho protocol updates, keeps an in-memory view of pool state, and exposes an HTTP API for requesting swap quotes or checking readiness. It runs on Axum atop Tokio and relies on the `tycho-simulation` crate for all pricing logic.
+The server ingests Tycho protocol updates, keeps an in-memory view of pool state, and exposes an HTTP API for requesting swap quotes, route encoding, and readiness checks. It runs on Axum atop Tokio and relies on the `tycho-simulation` crate for pricing and pool-state execution.
 
 ## Features
 
 - Background ingestion of Tycho protocol streams with TVL-based filtering.
-- `POST /simulate` endpoint that returns laddered amount-out simulated quotes with rich metadata.
-- `POST /encode` endpoint that returns CoW-ready calldata for client-provided routes.
-- `GET /status` endpoint for readiness polling (native + VM block height, pool count).
+- `POST /simulate` for laddered amount-out quote simulations with rich metadata.
+- `POST /encode` for CoW-ready calldata generation from client-provided routes.
+- `GET /status` for readiness polling, chain verification, and VM stream diagnostics.
 - Structured logging with `tracing`.
 - Fully asynchronous execution with Tokio.
 
 ## Prerequisites
 
-- Rust (latest stable toolchain)
-- Cargo
+- Rust stable and Cargo
+- Python 3 for the bundled verification scripts under `scripts/`
+- Node.js and npm only if you need the AWS CDK pipeline/service stacks
 
 ## Installation
 
@@ -31,7 +32,7 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
    ```bash
    cp .env.example .env
    ```
-   Populate `.env` with your Tycho credentials and optional tuning knobs.
+   `.env.example` contains sample and locally tuned values. Runtime defaults still come from the Rust config code.
 3. Build the binary:
    ```bash
    cargo build --release
@@ -39,24 +40,22 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 
 ## Configuration
 
-The following environment variables are read at startup:
+The following environment variables are read by the server at startup:
 
-- `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
-- `RPC_URL` – Optional Ethereum JSON-RPC endpoint used for background `eth_gasPrice` refresh
-- `GAS_PRICE_REFRESH_INTERVAL_MS` – Poll interval for `eth_gasPrice` refresh task (default: `5000`)
+- `CHAIN_ID` – Runtime chain ID (**required**); supported values: `1` (Ethereum), `8453` (Base)
+- `RPC_URL` – Optional JSON-RPC endpoint matching `CHAIN_ID`, used for background `eth_gasPrice` refreshes
+- `GAS_PRICE_REFRESH_INTERVAL_MS` – Poll interval for `eth_gasPrice` refreshes (default: `5000`)
 - `GAS_PRICE_FAILURE_TOLERANCE` – Disable gas reporting when consecutive refresh failures exceed this value (default: `50`)
-- `TVL_THRESHOLD` – Minimum TVL (in native units) for adding a pool to the stream (default: `100`)
-- `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep/remove pools (default: `0.2`)
+- `TVL_THRESHOLD` – Minimum TVL, in native-token units, for adding a pool to the stream (default: `100`)
+- `TVL_KEEP_RATIO` – Fraction of `TVL_THRESHOLD` used to decide when to keep or remove pools (default: `0.2`)
 - `PORT` – HTTP port (default: `3000`)
 - `HOST` – Bind address (default: `127.0.0.1`)
-- `COW_SETTLEMENT_CONTRACT` – Default settlement address for `scripts/encode_smoke.py` (optional)
-- `TYCHO_ROUTER_ADDRESS` – Default router address for `scripts/encode_smoke.py` (optional)
 - `RUST_LOG` – Logging filter (default: `info`)
 - `QUOTE_TIMEOUT_MS` – Wall-clock timeout for an entire quote request (default: `150`)
 - `POOL_TIMEOUT_NATIVE_MS` – Per-pool timeout for native integrations (default: `20`)
 - `POOL_TIMEOUT_VM_MS` – Per-pool timeout for VM-backed integrations (default: `150`)
-- `REQUEST_TIMEOUT_MS` – Request-level guard applied at handler, router adds +250ms headroom (default: `4000`)
+- `REQUEST_TIMEOUT_MS` – Request-level guard applied at the handler; the router adds `250ms` headroom (default: `4000`)
 - `TOKEN_REFRESH_TIMEOUT_MS` – Timeout for refreshing token metadata from Tycho (default: `1000`)
 - `ENABLE_VM_POOLS` – Enable VM pool feeds (default: `true`)
 - `GLOBAL_NATIVE_SIM_CONCURRENCY` – Global native simulation concurrency cap (default: `4 * num_cpus`)
@@ -70,21 +69,74 @@ The following environment variables are read at startup:
 - `STREAM_RESTART_BACKOFF_MIN_MS` – Minimum restart backoff (default: `500`)
 - `STREAM_RESTART_BACKOFF_MAX_MS` – Maximum restart backoff (default: `30000`)
 - `STREAM_RESTART_BACKOFF_JITTER_PCT` – Jitter fraction applied to restart backoff (default: `0.2`)
-- `READINESS_STALE_SECS` – Readiness stale threshold for native/VM readiness checks (default: `120`)
-- `STREAM_MEM_PURGE` – Purge jemalloc arenas on stream restarts/rebuilds (default: `true`)
-- `STREAM_MEM_LOG` – Enable periodic + event-triggered memory snapshots (default: `true`)
+- `READINESS_STALE_SECS` – Readiness stale threshold for native and VM readiness checks (default: `120`)
+- `STREAM_MEM_PURGE` – Purge jemalloc arenas on stream restarts and rebuilds (default: `true`)
+- `STREAM_MEM_LOG` – Enable periodic and event-triggered memory snapshots (default: `true`)
 - `STREAM_MEM_LOG_MIN_INTERVAL_SECS` – Minimum seconds between snapshots (default: `60`)
 - `STREAM_MEM_LOG_MIN_NEW_PAIRS` – Only snapshot on stream updates with at least this many new pairs (default: `1000`)
 - `STREAM_MEM_LOG_EMF` – Emit CloudWatch EMF metrics for snapshots (default: `true`)
 
-Note: when concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. `meta.status` remains an operational/reliability signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
+Notes:
 
-## Docs
+- The defaults above come from the Rust config in `src/config/mod.rs`. `.env.example` intentionally uses different sample values for some knobs such as TVL, timeouts, concurrency, and memory logging.
+- `COW_SETTLEMENT_CONTRACT` and `TYCHO_ROUTER_ADDRESS` are not runtime server config. They are optional helper values used by `scripts/encode_smoke.py`.
+- When concurrency caps are saturated or a pool would exceed the quote deadline, pools are skipped instead of queued. `meta.status` remains an operational signal, while `meta.result_quality` and `meta.pool_results` explain quote completeness and per-pool anomalies.
 
-- `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request/response examples.
-- `docs/high-level-architecture.md` – high-level system architecture and data flow overview.
-- `docs/state-anchor-architecture.md` – implementation design where ingest provides full-state bootstrap and live deltas (no bus/snapshot store).
-- `docs/stream-worker-architecture.md` – proposed architecture for single Tycho ingest + scalable simulation workers.
+## Usage
+
+Launch the server after exporting the required environment variables:
+
+```bash
+cargo run --release
+```
+
+The application binds to the configured `HOST:PORT` and begins streaming protocol data before serving HTTP requests.
+
+## Validation
+
+CI currently runs these commands:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo nextest run
+cargo build --release
+```
+
+For an end-to-end local verification pass, use the repo harness:
+
+```bash
+scripts/run_suite.sh --repo . --chain-id 1 --stop
+scripts/run_suite.sh --repo . --chain-id 8453 --stop
+```
+
+Useful `run_suite.sh` flags:
+
+- `--disable-vm-pools` for a native-only Ethereum run
+- `--allow-partial` to tolerate `partial_success`
+- `--allow-no-liquidity` to tolerate `no_liquidity` responses that only report `no_pools`
+
+Script helpers:
+
+- `scripts/start_server.sh` – start the server with a repo-local PID file and log file
+- `scripts/wait_ready.sh` – poll `/status` and optionally enforce `chain_id` and VM readiness
+- `scripts/stop_server.sh` – stop a server started by `start_server.sh`
+- `scripts/run_suite.sh` – start, wait, smoke test, encode smoke test, coverage sweep, and latency pass
+
+For deeper coverage, latency, and stress-test knobs, see `STRESS_TEST_README.md`.
+
+## Docs And Tooling
+
+- `docs/encode_example.md` – `/encode` schema walkthrough with shape-focused request and response examples
+- `STRESS_TEST_README.md` – verification, coverage, latency, and stress-test workflows
+- `skills/simulation-service-tests/SKILL.md` – repo-local workflow for local verification, upgrades, and maintenance checks
+- `skills/tycho-cloudwatch-logs/SKILL.md` – repo-local workflow for production CloudWatch log inspection
+
+Infrastructure note:
+
+- This repo includes AWS CDK pipeline and service stacks under `bin/` and `lib/`.
+- Use `npm ci` to install the CDK dependencies.
+- Use `npx cdk synth` to synthesize the stacks when working on infra changes.
 
 ## HTTP API
 
@@ -97,11 +149,14 @@ curl -X POST "http://localhost:3000/simulate" \
   -H "Content-Type: application/json" \
   -d '{
     "request_id": "req-123",
+    "auction_id": "auction-42",
     "token_in": "0x6b175474e89094c44da98b954eedeac495271d0f",
     "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
     "amounts": ["1000000000000000000", "5000000000000000000"]
   }'
 ```
+
+`auction_id` is optional. When present, it is echoed back as `meta.auction_id`.
 
 Response body:
 
@@ -127,6 +182,7 @@ Response body:
     "matching_pools": 4,
     "candidate_pools": 4,
     "total_pools": 412,
+    "auction_id": "auction-42",
     "failures": []
   }
 }
@@ -136,82 +192,34 @@ Response body:
 
 `meta.pool_results` contains anomaly-only per-pool outcomes (`partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `skipped_precheck`, `timed_out`, `simulator_error`, `internal_error`). `meta.vm_unavailable=true` indicates VM pools were skipped because VM state was not ready.
 
-`gas_in_sell` is computed per pool from the latest background-refreshed cached `eth_gasPrice` (from `RPC_URL`), the request-scoped `spot_price(ETH, sellToken)`, and the pool's last `gas_used` ladder entry; it is returned in sell-token base units. When spot price, gas reporting is disabled due to consecutive RPC failures, cached gas price, or gas usage is unavailable, it is `"0"`.
+`gas_in_sell` is computed per pool from the latest cached `eth_gasPrice` from `RPC_URL`, the request-scoped `spot_price(ETH, sellToken)`, and the pool's last `gas_used` ladder entry. It is returned in sell-token base units. When spot price, cached gas price, gas usage, or gas reporting are unavailable, it is `"0"`.
 
-`block_number` is the native stream block; `vm_block_number` is the last VM stream block when VM pools are enabled (it may be omitted while VM pools are disabled or still warming up).
-
-Mixed-outcome example (one usable result + one anomalous pool):
-
-```json
-{
-  "request_id": "req-456",
-  "data": [
-    {
-      "pool": "pool-good",
-      "pool_name": "uniswap_v2::DAI/USDC",
-      "pool_address": "0x1111...",
-      "amounts_out": ["100", "990"],
-      "gas_used": [120000, 120000],
-      "gas_in_sell": "360000000000000",
-      "block_number": 19876543
-    }
-  ],
-  "meta": {
-    "status": "partial_success",
-    "result_quality": "partial",
-    "block_number": 19876543,
-    "vm_block_number": 19876540,
-    "matching_pools": 2,
-    "candidate_pools": 2,
-    "total_pools": 412,
-    "pool_results": [
-      {
-        "pool": "pool-bad",
-        "pool_name": "uniswap_v2::DAI/USDC",
-        "pool_address": "0x2222...",
-        "protocol": "uniswap_v2",
-        "outcome": "simulator_error",
-        "reported_steps": 0,
-        "expected_steps": 2,
-        "reason": "Probe quote failed..."
-      }
-    ],
-    "failures": [
-      {
-        "kind": "simulator",
-        "message": "...",
-        "pool": "pool-bad",
-        "pool_name": "uniswap_v2::DAI/USDC",
-        "pool_address": "0x2222...",
-        "protocol": "uniswap_v2"
-      }
-    ]
-  }
-}
-```
+`block_number` is the native stream block. `vm_block_number` is the last VM stream block when VM pools are enabled and available.
 
 Timeout behavior:
-- `/simulate` handler-level timeouts return `200 OK` with `partial_success`, including a `timeout` failure.
-- `/simulate` router-level timeouts return `200 OK` with `partial_success`. Logs include `scope="router_timeout"`.
-- `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
-  - `/status` is not subject to router-level timeouts.
+
+- `/simulate` handler-level timeouts return `200 OK` with `partial_success`, including a `timeout` failure
+- `/simulate` router-level timeouts return `200 OK` with `partial_success`; logs include `scope="router_timeout"`
+- `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`
+- `/status` is not subject to router-level timeouts
 
 ### `POST /encode`
 
-`POST /encode` builds Tycho router calldata (`singleSwap`, `sequentialSwap`, or `splitSwap`) for a client-provided route. It **re-simulates** each pool swap, derives per-hop/per-swap amounts internally, and enforces only the route-level `minAmountOut`.
+`POST /encode` builds Tycho router calldata (`singleSwap`, `sequentialSwap`, or `splitSwap`) for a client-provided route. It re-simulates each pool swap, derives per-hop and per-swap amounts internally, and enforces only the route-level `minAmountOut`.
 
 Notes:
-- The request shape follows `RouteEncodeRequest` (camelCase fields).
-- `settlementAddress` and `tychoRouterAddress` are required.
-- `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).
-- Requests include route-level `amountIn` and `minAmountOut`, plus segment `shareBps` and swap `splitBps` for splits.
-- Hops are sequential in the order provided; there is no hop-level share.
-- The encoder chooses `singleSwap` for one swap, `sequentialSwap` for multi-hop without splits, and `splitSwap` when any split is present.
-- Per-hop and per-swap amounts are not accepted and not returned.
-- The response is `RouteEncodeResponse` with settlement `interactions` (and optional `debug`).
-- Errors return 4xx/5xx with `{ error, requestId }`.
 
-Example request (shape only):
+- The request shape follows `RouteEncodeRequest` with camelCase fields
+- `settlementAddress` and `tychoRouterAddress` are required
+- `swapKind` describes the route shape: `SimpleSwap`, `MultiSwap`, or `MegaSwap`
+- Requests include route-level `amountIn` and `minAmountOut`, plus segment `shareBps` and swap `splitBps` for splits
+- Hops are sequential in the order provided; there is no hop-level share
+- The encoder chooses `singleSwap` for one swap, `sequentialSwap` for multi-hop routes without splits, and `splitSwap` when any split is present
+- Per-hop and per-swap amounts are not accepted and are not returned
+- The response is `RouteEncodeResponse` with ordered settlement `interactions` and optional `debug`
+- Errors return 4xx or 5xx with `{ error, requestId }`
+
+Example request:
 
 ```bash
 curl -X POST "http://localhost:3000/encode" \
@@ -249,7 +257,7 @@ curl -X POST "http://localhost:3000/encode" \
   }'
 ```
 
-The response includes ordered `interactions[]` (approve + router call). Computed per-hop/per-swap amounts are logged server-side, not returned.
+The response includes ordered `interactions[]` such as approval and router-call interactions. Computed per-hop and per-swap amounts are logged server-side, not returned.
 
 ### `GET /status`
 
@@ -258,59 +266,34 @@ Returns readiness information for health checks and pollers:
 ```json
 {
   "status": "ready",
+  "chain_id": 1,
   "block": 19876543,
+  "pools": 412,
+  "vm_enabled": true,
+  "vm_status": "ready",
   "vm_block": 19876540,
-  "pools": 412
+  "vm_pools": 36,
+  "vm_restarts": 0,
+  "vm_last_update_age_ms": 1200
 }
 ```
 
-If the service is still ingesting initial state the endpoint responds with `503 Service Unavailable` and `"status": "warming_up"`.
+`vm_status` is one of `disabled`, `warming_up`, `rebuilding`, or `ready`. Optional fields such as `vm_last_error`, `vm_rebuild_duration_ms`, and `vm_last_update_age_ms` are omitted when they are not relevant.
 
-## Usage
+If the service is still ingesting initial state, the endpoint responds with `503 Service Unavailable` and `"status": "warming_up"`.
 
-Launch the server after exporting the necessary environment variables:
-
-```bash
-cargo run --release
-```
-
-The application binds to the configured `HOST:PORT` and begins streaming protocol data before serving HTTP requests.
-
-## Testing
-
-- `cargo test` runs unit and integration tests.
-- Integration tests live under `tests/integration/` and are wired by `tests/integration/main.rs`.
-- The memory plateau check uses jemalloc (`jemallocator` + `jemalloc-ctl`) to assert that allocator bytes return to baseline after a resync warm-up. Jemalloc is the default allocator for the service.
-
-Run only the integration tests:
-
-```bash
-cargo test --test integration
-```
-
-Run just the jemalloc plateau test:
-
-```bash
-cargo test --test integration jemalloc_memory_plateau_after_reset
-```
-
-## Dependencies
-
-- `tycho-simulation` – protocol stream and simulator client
-- `tokio` – asynchronous runtime
-- `axum` – HTTP router and extractors
-- `serde`/`serde_json` – serialization
-- `anyhow` – error propagation
-- `tracing` & `tracing-subscriber` – structured logging
+The readiness scripts in `scripts/wait_ready.sh` and `scripts/run_suite.sh` rely on `chain_id`, `vm_enabled`, `vm_status`, and `vm_pools` to confirm they are talking to the expected runtime.
 
 ## Project Structure
 
 - `src/api` – router wiring for public endpoints
 - `src/config` – environment loading and logging setup
-- `src/handlers` – HTTP handlers (`quote`, `status`) and stream ingester
-- `src/models` – request/response models and shared state
-- `src/services` – stream builder and quote engine
+- `src/handlers` – HTTP handlers and stream ingesters
+- `src/models` – request and response models plus shared state
+- `src/services` – quote engine, encoding flow, gas-price refresh, and stream builders
 - `src/main.rs` – application entrypoint
+- `scripts/` – local server lifecycle helpers and verification harnesses
+- `tests/integration/` – integration coverage wired by `tests/integration/main.rs`
 
 ## License
 

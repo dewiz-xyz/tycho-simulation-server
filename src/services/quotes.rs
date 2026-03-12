@@ -2053,6 +2053,10 @@ fn compute_gas_in_sell_base_units(
     eth_to_sell_spot_price: Option<f64>,
     sell_token_decimals: u32,
 ) -> String {
+    // TODO: This still treats gas cost as `gas_used * cached_native_gas_price`. That's fine on
+    // Ethereum, but on Base we're still missing the L1 data fee part of the tx cost. We'll clean
+    // this up in a follow-up PR once the quote path has enough tx context to price Base more
+    // accurately.
     let Some(gas_price_wei) = gas_price_wei else {
         return "0".to_string();
     };
@@ -2880,6 +2884,8 @@ mod tests {
         config: TestAppStateConfig,
     ) -> AppState {
         AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: token_store,
             native_state_store,
             vm_state_store,

@@ -26,7 +26,7 @@ use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
 };
-use super::request::{is_native_protocol_allowlisted, native_protocol_allowlist};
+use super::request::{format_native_protocol_allowlist, is_native_protocol_allowlisted};
 use super::EncodeError;
 
 type CachedPoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
@@ -62,6 +62,7 @@ pub(super) async fn resimulate_route(
     chain: Chain,
     request_token_in: &Bytes,
     request_token_out: &Bytes,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<ResimulatedRouteInternal, EncodeError> {
     let mut resimulator = RouteResimulator::new(state, normalized, chain);
 
@@ -75,6 +76,7 @@ pub(super) async fn resimulate_route(
     }
 
     validate_request_tokens(request_token_in, request_token_out)?;
+    validate_native_request_tokens(normalized, chain, native_token_protocol_allowlist)?;
     let segments = resimulator.build_resimulated_segments()?;
     Ok(ResimulatedRouteInternal { segments })
 }
@@ -183,6 +185,7 @@ impl<'a> RouteResimulator<'a> {
             &allocated.token_out,
             &pool_entry.1,
             &allocated.pool.component_id,
+            &self.state.native_token_protocol_allowlist,
         )?;
         let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
@@ -430,13 +433,15 @@ fn ensure_native_swap_supported(
     token_out: &Bytes,
     component: &ProtocolComponent,
     component_id: &str,
+    native_token_protocol_allowlist: &[String],
 ) -> Result<bool, EncodeError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
-    let protocol_supports_native = is_native_protocol_allowlisted(&component.protocol_system);
+    let protocol_supports_native =
+        is_native_protocol_allowlisted(&component.protocol_system, native_token_protocol_allowlist);
 
     if swap_uses_native && !protocol_supports_native {
-        let supported = native_protocol_allowlist().join(", ");
+        let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
         return Err(EncodeError::invalid(format!(
             "native tokenIn/tokenOut is only supported for protocols [{}]; pool {} uses {}",
             supported, component_id, component.protocol_system
@@ -444,6 +449,40 @@ fn ensure_native_swap_supported(
     }
 
     Ok(protocol_supports_native)
+}
+
+fn validate_native_request_tokens(
+    normalized: &NormalizedRouteInternal,
+    chain: Chain,
+    native_token_protocol_allowlist: &[String],
+) -> Result<(), EncodeError> {
+    let native_address = chain.native_token().address;
+
+    for segment in &normalized.segments {
+        for hop in &segment.hops {
+            let swap_uses_native =
+                hop.token_in == native_address || hop.token_out == native_address;
+            if !swap_uses_native {
+                continue;
+            }
+
+            for swap in &hop.swaps {
+                if !is_native_protocol_allowlisted(
+                    &swap.pool.protocol,
+                    native_token_protocol_allowlist,
+                ) {
+                    let supported =
+                        format_native_protocol_allowlist(native_token_protocol_allowlist);
+                    return Err(EncodeError::invalid(format!(
+                        "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
+                        supported, swap.pool.protocol
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_erc4626_swap_supported(
@@ -725,6 +764,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &app_state.native_token_protocol_allowlist,
         )
         .await
         .unwrap();
@@ -789,6 +829,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &disabled_state.native_token_protocol_allowlist,
         )
         .await
         {
@@ -815,6 +856,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &enabled_state.native_token_protocol_allowlist,
         )
         .await
         {
@@ -922,6 +964,7 @@ mod tests {
             Chain::Ethereum,
             &token_a.address,
             &token_c.address,
+            &app_state.native_token_protocol_allowlist,
         )
         .await
         .unwrap();
@@ -993,6 +1036,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &app_state.native_token_protocol_allowlist,
         )
         .await
         {
@@ -1060,6 +1104,7 @@ mod tests {
             Chain::Ethereum,
             &token_in.address,
             &token_out.address,
+            &app_state.native_token_protocol_allowlist,
         )
         .await
         {
