@@ -235,6 +235,9 @@ fn spawn_gas_price_refresh(
     let chain = config.chain_profile.chain;
     let refresh_interval = Duration::from_millis(config.gas_price_refresh_interval_ms);
     let failure_tolerance = config.gas_price_failure_tolerance;
+    // TODO: On Base, total tx cost also includes the L1 data fee, so `eth_gasPrice` on its own
+    // doesn't tell the whole story. Keeping the shared refresh loop for now and fixing the Base
+    // side properly in a follow-up PR.
     let _startup_task = spawn_gas_price_startup_task(
         app_state.clone(),
         chain,
