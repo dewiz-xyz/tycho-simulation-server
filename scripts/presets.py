@@ -494,10 +494,6 @@ PAIR_SUITES_BY_CHAIN: dict[int, dict[str, list[Pair]]] = {
             ("DAI", "USDC"),
             ("USDC", "DAI"),
         ],
-        "lst": [
-            ("ETH", "WETH"),
-            ("WETH", "ETH"),
-        ],
         "governance": [
             ("WETH", "USDC"),
         ],

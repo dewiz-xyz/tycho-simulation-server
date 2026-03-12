@@ -170,6 +170,16 @@ class PresetsTest(unittest.TestCase):
 
         self.assertNotIn("coverage_core_vm", suites)
         self.assertNotIn("latency_core_vm", suites)
+        self.assertNotIn("lst", suites)
+
+    def test_base_lst_suite_is_unavailable_in_repo_and_fallback_presets(self) -> None:
+        fallback_presets = load_fallback_presets_module()
+
+        self.assertNotIn("lst", fallback_presets.list_suites(BASE_CHAIN_ID))
+        with self.assertRaisesRegex(ValueError, "Unknown suite for chain 8453"):
+            suite_pairs("lst", BASE_CHAIN_ID)
+        with self.assertRaisesRegex(ValueError, "Unknown suite for chain 8453"):
+            fallback_presets.suite_pairs("lst", BASE_CHAIN_ID)
 
     def test_base_default_encode_route_is_chain_specific(self) -> None:
         self.assertEqual(default_encode_route(BASE_CHAIN_ID), ("USDC", "WETH", "USDC"))
