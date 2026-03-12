@@ -21,8 +21,14 @@ from presets import (
     resolve_token,
 )
 
-DEFAULT_SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
-DEFAULT_TYCHO_ROUTER = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
+DEFAULT_SETTLEMENT_BY_CHAIN = {
+    1: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+    8453: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+}
+DEFAULT_TYCHO_ROUTER_BY_CHAIN = {
+    1: "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
+    8453: "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
+}
 DEFAULT_SLIPPAGE_BPS = 25
 
 
@@ -53,11 +59,36 @@ def load_env_value(repo: Path, key: str) -> str | None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             name, value = line.split("=", 1)
-            if name.strip() == key:
-                return value.strip()
+            name = name.strip()
+            if name.startswith("export "):
+                name = name.removeprefix("export ").strip()
+            if name == key:
+                value = value.strip()
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                elif value.startswith("'") and value.endswith("'"):
+                    value = value[1:-1]
+                return value
     except OSError:
         return None
     return None
+
+
+def default_contract_address(
+    chain_id: int, defaults_by_chain: dict[int, str], label: str
+) -> str:
+    address = defaults_by_chain.get(chain_id)
+    if address is None:
+        raise ValueError(f"No default {label} configured for chain {chain_id}")
+    return address
+
+
+def resolve_contract_address(
+    repo: Path, env_key: str, chain_id: int, defaults_by_chain: dict[int, str], label: str
+) -> str:
+    return load_env_value(repo, env_key) or default_contract_address(
+        chain_id, defaults_by_chain, label
+    )
 
 
 def assert_hex(value: str, label: str) -> None:
@@ -156,8 +187,20 @@ def main() -> int:
         return 2
 
     repo = Path(args.repo)
-    settlement = load_env_value(repo, "COW_SETTLEMENT_CONTRACT") or DEFAULT_SETTLEMENT
-    tycho_router = load_env_value(repo, "TYCHO_ROUTER_ADDRESS") or DEFAULT_TYCHO_ROUTER
+    settlement = resolve_contract_address(
+        repo,
+        "COW_SETTLEMENT_CONTRACT",
+        chain_id,
+        DEFAULT_SETTLEMENT_BY_CHAIN,
+        "settlement address",
+    )
+    tycho_router = resolve_contract_address(
+        repo,
+        "TYCHO_ROUTER_ADDRESS",
+        chain_id,
+        DEFAULT_TYCHO_ROUTER_BY_CHAIN,
+        "Tycho router address",
+    )
     allowed_statuses = {status.strip() for status in args.allow_status.split(",") if status.strip()}
     if not allowed_statuses:
         print("Error: --allow-status produced no values", file=sys.stderr)

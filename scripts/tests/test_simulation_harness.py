@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from coverage_sweep import collect_candidate_protocols, protocol_from_fields, resolve_allowed_statuses
+from encode_smoke import (
+    DEFAULT_SETTLEMENT_BY_CHAIN,
+    DEFAULT_TYCHO_ROUTER_BY_CHAIN,
+    default_contract_address,
+    resolve_contract_address,
+)
 from presets import (
     RETH_ETH_TARGET_BASE_UNITS,
     TOKENS,
@@ -247,6 +254,77 @@ class CoverageSweepTest(unittest.TestCase):
         self.assertEqual(protocols["uniswap_v3"], 1)
         self.assertEqual(protocols["balancer_v2"], 1)
         self.assertEqual(protocols["fluid_v1"], 1)
+
+
+class EncodeSmokeConfigTest(unittest.TestCase):
+    def test_default_contract_address_returns_chain_specific_router(self) -> None:
+        self.assertEqual(
+            default_contract_address(BASE_CHAIN_ID, DEFAULT_TYCHO_ROUTER_BY_CHAIN, "router"),
+            "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
+        )
+
+    def test_default_contract_address_returns_chain_specific_settlement(self) -> None:
+        self.assertEqual(
+            default_contract_address(BASE_CHAIN_ID, DEFAULT_SETTLEMENT_BY_CHAIN, "settlement"),
+            "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+        )
+
+    def test_resolve_contract_address_prefers_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Path(tmp_dir)
+            with patch.dict(
+                os.environ,
+                {"TYCHO_ROUTER_ADDRESS": "0x1111111111111111111111111111111111111111"},
+                clear=True,
+            ):
+                self.assertEqual(
+                    resolve_contract_address(
+                        repo,
+                        "TYCHO_ROUTER_ADDRESS",
+                        BASE_CHAIN_ID,
+                        DEFAULT_TYCHO_ROUTER_BY_CHAIN,
+                        "router",
+                    ),
+                    "0x1111111111111111111111111111111111111111",
+                )
+
+    def test_resolve_contract_address_prefers_dotenv_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Path(tmp_dir)
+            (repo / ".env").write_text(
+                "COW_SETTLEMENT_CONTRACT=0x2222222222222222222222222222222222222222\n"
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    resolve_contract_address(
+                        repo,
+                        "COW_SETTLEMENT_CONTRACT",
+                        BASE_CHAIN_ID,
+                        DEFAULT_SETTLEMENT_BY_CHAIN,
+                        "settlement",
+                    ),
+                    "0x2222222222222222222222222222222222222222",
+                )
+
+    def test_resolve_contract_address_parses_exported_and_quoted_dotenv_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Path(tmp_dir)
+            (repo / ".env").write_text(
+                'export TYCHO_ROUTER_ADDRESS="0x3333333333333333333333333333333333333333"\n'
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    resolve_contract_address(
+                        repo,
+                        "TYCHO_ROUTER_ADDRESS",
+                        BASE_CHAIN_ID,
+                        DEFAULT_TYCHO_ROUTER_BY_CHAIN,
+                        "router",
+                    ),
+                    "0x3333333333333333333333333333333333333333",
+                )
 
 
 class RunSuiteContractTest(unittest.TestCase):
