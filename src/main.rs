@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config();
     info!("Initializing price service...");
     log_memory_config(config.memory);
+    log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
     let tokens = load_token_store(&config).await?;
@@ -156,9 +157,18 @@ fn build_app_state(
         request_timeout: Duration::from_millis(config.request_timeout_ms),
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        erc4626_deposits_enabled: config.rpc_url.is_some(),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
         native_sim_concurrency,
         vm_sim_concurrency,
+    }
+}
+
+fn log_erc4626_capability(config: &tycho_simulation_server::config::AppConfig) {
+    if config.rpc_url.is_some() {
+        info!("ERC4626 deposits enabled: RPC_URL is configured");
+    } else {
+        info!("ERC4626 deposits disabled: RPC_URL is not configured; redeems remain enabled");
     }
 }
 

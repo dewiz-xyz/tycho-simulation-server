@@ -11,6 +11,7 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - `uniswap_v4`
 - `ekubo_v2`
 - `ekubo_v3`
+- `erc4626`
 - `fluid_v1`
 - `rocketpool`
 
@@ -31,6 +32,16 @@ The service subscribes to specific Tycho exchanges at startup (see `src/services
 - **Core suite coverage** keeps `ETH:RETH` and `RETH:ETH` for Rocketpool/native paths.
   Maverick coverage is checked separately with the protocol presence probe in `scripts/run_suite.sh`, which is more stable than relying on `GHO:USDC`.
   Balancer coverage is also checked separately with a capped `WETH:USDC` probe.
+- **ERC4626 support is server-gated** to the `erc4626_allowlisted` suite only:
+  - `USDS:SUSDS`
+  - `SUSDS:USDS`
+  - `USDC:SUSDC`
+  - `SUSDC:USDC`
+  - `PYUSD:SPPYUSD`
+  - `SPPYUSD:PYUSD`
+  Use `python3 scripts/coverage_sweep.py --suite erc4626_allowlisted --expect-protocols erc4626`.
+- **Negative ERC4626 probe**: `sUSDe -> USDe` should remain unsupported for now.
+  Use `python3 scripts/coverage_sweep.py --suite erc4626_negative --allow-no-pools` when verifying the gate.
 - **Exploratory coverage** lives in the `exploratory_protocols` suite.
   Use it for pairs like `GHO:USDC`, `CBETH:WETH`, and `SUSHI:WETH` that are useful for visibility but too live-state-sensitive for the default green path.
 - **TVL filtering matters**: pools are included/removed based on `TVL_THRESHOLD` + `TVL_KEEP_RATIO`.

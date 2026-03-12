@@ -105,7 +105,6 @@ fn load_network_config() -> NetworkConfig {
     let tvl_keep_threshold: f64 = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
     let port: u16 = parse_env_or_default("PORT", "3000");
     let host = parse_host_env();
-
     assert!(tvl_threshold > 0.0, "TVL_THRESHOLD must be > 0");
     assert!(
         tvl_keep_ratio > 0.0 && tvl_keep_ratio <= 1.0,

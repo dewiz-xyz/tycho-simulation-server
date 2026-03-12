@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -68,7 +69,7 @@ impl ProtocolSim for EchoAmountSim {
         _delta: ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &Balances,
-    ) -> Result<(), TransitionError<String>> {
+    ) -> Result<(), TransitionError> {
         Ok(())
     }
 
@@ -116,16 +117,56 @@ fn decode_transfer_from_allowed(calldata: &[u8]) -> Result<bool> {
         == 1)
 }
 
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "integration fixture keeps test knobs explicit and local to this file"
+)]
 struct EncodeFixtureConfig<'a> {
     min_amount_out: &'a str,
     token_in_hex: &'a str,
     token_out_hex: &'a str,
+    component_address_hex: &'a str,
     request_pool_protocol: &'a str,
     component_protocol_system: &'a str,
     component_protocol_type_name: &'a str,
     component_static_attributes: HashMap<String, Bytes>,
     vm_pool: bool,
     enable_vm_pools: bool,
+    erc4626_deposits_enabled: bool,
     reset_allowance: bool,
     request_id: &'a str,
 }
@@ -136,12 +177,14 @@ impl Default for EncodeFixtureConfig<'_> {
             min_amount_out: "8",
             token_in_hex: "0x0000000000000000000000000000000000000001",
             token_out_hex: "0x0000000000000000000000000000000000000002",
+            component_address_hex: "0x0000000000000000000000000000000000000009",
             request_pool_protocol: "uniswap_v2",
             component_protocol_system: "uniswap_v2",
             component_protocol_type_name: "uniswap_v2",
             component_static_attributes: HashMap::new(),
             vm_pool: false,
             enable_vm_pools: false,
+            erc4626_deposits_enabled: false,
             reset_allowance: true,
             request_id: "req-1",
         }
@@ -192,7 +235,7 @@ async fn build_fixture_stores(
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let component = ProtocolComponent::new(
-        parse_bytes("0x0000000000000000000000000000000000000009")?,
+        parse_bytes(config.component_address_hex)?,
         config.component_protocol_system.to_string(),
         config.component_protocol_type_name.to_string(),
         Chain::Ethereum,
@@ -294,6 +337,7 @@ async fn setup_app_state_and_request(
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
@@ -586,6 +630,239 @@ async fn encode_route_rejects_native_input_for_non_allowlisted_protocol() -> Res
         response
             .error
             .contains("only supported for protocols [rocketpool]"),
+        "unexpected error: {}",
+        response.error
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_rejects_allowlisted_erc4626_deposit_when_deposits_disabled() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
+        token_out_hex: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+        component_address_hex: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+        request_pool_protocol: "erc4626",
+        component_protocol_system: "erc4626",
+        component_protocol_type_name: "erc4626_pool",
+        reset_allowance: false,
+        request_id: "req-erc4626-deposit",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response.error.contains("USDS -> sUSDS"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert!(
+        response.error.contains("sUSDS -> USDS"),
+        "unexpected error: {}",
+        response.error
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_succeeds_for_allowlisted_erc4626_redeem() -> Result<()> {
+    // The real encoder touches its ERC4626 provider path for redeems, so keep the test
+    // self-contained instead of depending on a developer-local `.env`.
+    let _rpc_url = ScopedEnvVar::set("RPC_URL", "http://localhost:8545");
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+        token_out_hex: "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
+        component_address_hex: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+        request_pool_protocol: "erc4626",
+        component_protocol_system: "erc4626",
+        component_protocol_type_name: "erc4626_pool",
+        reset_allowance: false,
+        request_id: "req-erc4626-redeem",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+    assert_eq!(response.interactions.len(), 2);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
+    assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_unsupported_erc4626_direction() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        token_in_hex: "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
+        token_out_hex: "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
+        component_address_hex: "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
+        request_pool_protocol: "erc4626",
+        component_protocol_system: "erc4626",
+        component_protocol_type_name: "erc4626_pool",
+        reset_allowance: false,
+        request_id: "req-erc4626-reject",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response.error.contains("ERC4626 direction"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert!(
+        response.error.contains("not currently supported"),
+        "unexpected error: {}",
+        response.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "mixed-route rejection test keeps the full request setup inline for clarity"
+)]
+async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Result<()> {
+    let token_a = "0x0000000000000000000000000000000000000011";
+    let token_b = "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3";
+    let token_d = "0x9d39a5de30e57443bff2a8307a4256c8797a3497";
+    let token_store = Arc::new(TokenStore::new(
+        HashMap::from([
+            (
+                parse_bytes(token_a)?,
+                Token::new(
+                    &parse_bytes(token_a)?,
+                    "TKA",
+                    18,
+                    0,
+                    &[],
+                    Chain::Ethereum,
+                    100,
+                ),
+            ),
+            (
+                parse_bytes(token_b)?,
+                Token::new(
+                    &parse_bytes(token_b)?,
+                    "TKB",
+                    18,
+                    0,
+                    &[],
+                    Chain::Ethereum,
+                    100,
+                ),
+            ),
+        ]),
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_millis(10),
+    ));
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let state = AppState {
+        tokens: token_store,
+        native_state_store,
+        vm_state_store,
+        native_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
+        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+        enable_vm_pools: false,
+        readiness_stale: Duration::from_secs(120),
+        quote_timeout: Duration::from_secs(1),
+        pool_timeout_native: Duration::from_secs(1),
+        pool_timeout_vm: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(2),
+        native_sim_semaphore: Arc::new(Semaphore::new(4)),
+        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        erc4626_deposits_enabled: false,
+        reset_allowance_tokens: Arc::new(HashMap::new()),
+        native_sim_concurrency: 4,
+        vm_sim_concurrency: 1,
+    };
+    let app = create_router(state);
+    let request = RouteEncodeRequest {
+        chain_id: 1,
+        token_in: token_a.to_string(),
+        token_out: token_d.to_string(),
+        amount_in: "10".to_string(),
+        min_amount_out: "8".to_string(),
+        settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+        tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+        swap_kind: SwapKind::MultiSwap,
+        segments: vec![SegmentDraft {
+            kind: SwapKind::MultiSwap,
+            share_bps: 0,
+            hops: vec![
+                HopDraft {
+                    token_in: token_a.to_string(),
+                    token_out: token_b.to_string(),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "uniswap_v2".to_string(),
+                            component_id: "pool-uniswap".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: token_a.to_string(),
+                        token_out: token_b.to_string(),
+                        split_bps: 0,
+                    }],
+                },
+                HopDraft {
+                    token_in: token_b.to_string(),
+                    token_out: token_d.to_string(),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "erc4626".to_string(),
+                            component_id: "pool-susde".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: token_b.to_string(),
+                        token_out: token_d.to_string(),
+                        split_bps: 0,
+                    }],
+                },
+            ],
+        }],
+        request_id: Some("req-erc4626-mixed".to_string()),
+    };
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response.error.contains("ERC4626 direction"),
         "unexpected error: {}",
         response.error
     );

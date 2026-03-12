@@ -96,7 +96,7 @@ impl ProtocolSim for SimPool {
         _delta: ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &Balances,
-    ) -> Result<(), TransitionError<String>> {
+    ) -> Result<(), TransitionError> {
         Ok(())
     }
 
@@ -378,6 +378,7 @@ fn build_quote_app(
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
         native_sim_concurrency,
         vm_sim_concurrency: 1,
@@ -654,6 +655,7 @@ async fn simulate_gas_in_sell_is_zero_when_reporting_disabled() -> Result<()> {
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(2)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
         native_sim_concurrency: 2,
         vm_sim_concurrency: 1,

@@ -6,6 +6,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
+use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
@@ -15,6 +16,9 @@ use tycho_simulation::{
     },
 };
 
+use crate::models::erc4626::{
+    component_direction_supported, component_is_erc4626, unsupported_direction_message,
+};
 use crate::models::state::AppState;
 
 use super::allocation::allocate_swaps_by_bps;
@@ -166,6 +170,13 @@ impl<'a> RouteResimulator<'a> {
         allocated: super::allocation::AllocatedSwap,
     ) -> Result<ResimulatedSwapInternal, EncodeError> {
         let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
+        ensure_erc4626_swap_supported(
+            &pool_entry.1,
+            &allocated.pool.component_id,
+            &allocated.token_in,
+            &allocated.token_out,
+            self.state.erc4626_deposits_enabled,
+        )?;
         let keep_native_unwrapped = ensure_native_swap_supported(
             self.chain,
             &allocated.token_in,
@@ -435,6 +446,35 @@ fn ensure_native_swap_supported(
     Ok(protocol_supports_native)
 }
 
+fn ensure_erc4626_swap_supported(
+    component: &ProtocolComponent,
+    pool_id: &str,
+    token_in: &Bytes,
+    token_out: &Bytes,
+    erc4626_deposits_enabled: bool,
+) -> Result<(), EncodeError> {
+    if !component_is_erc4626(component) {
+        return Ok(());
+    }
+    if component_direction_supported(component, token_in, token_out, erc4626_deposits_enabled) {
+        return Ok(());
+    }
+
+    debug!(
+        protocol = component.protocol_system.as_str(),
+        pool_id,
+        component_id = %component.id,
+        token_in = token_in.to_string(),
+        token_out = token_out.to_string(),
+        "Rejecting unsupported ERC4626 encode hop during resimulation"
+    );
+    Err(EncodeError::invalid(unsupported_direction_message(
+        token_in,
+        token_out,
+        erc4626_deposits_enabled,
+    )))
+}
+
 fn map_swap_token(address: &Bytes, chain: Chain, keep_native_unwrapped: bool) -> Bytes {
     if !keep_native_unwrapped && *address == chain.native_token().address {
         chain.wrapped_native_token().address
@@ -572,7 +612,7 @@ mod tests {
             _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
             _tokens: &HashMap<Bytes, Token>,
             _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
-        ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
+        ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError>
         {
             Ok(())
         }
@@ -606,6 +646,7 @@ mod tests {
     ) -> TestAppStateConfig {
         TestAppStateConfig {
             enable_vm_pools,
+            erc4626_deposits_enabled: false,
             quote_timeout: Duration::from_millis(1000),
             pool_timeout_native,
             pool_timeout_vm,
@@ -693,6 +734,101 @@ mod tests {
         assert_eq!(swaps[1].expected_amount_out, BigUint::from(10u32));
         assert_eq!(step_multiplier(&swaps[0].pool_state), 1);
         assert_eq!(step_multiplier(&swaps[1].pool_state), 2);
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_requires_erc4626_deposit_capability_for_type_name_only_component() {
+        let token_in = dummy_token("0xdC035D45d973E3EC169d2276DDab16f1e407384F");
+        let token_out = dummy_token("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+
+        let component = component_with_protocol(
+            "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
+            "",
+            "erc4626_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-erc4626".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-erc4626".to_string(), component);
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref("pool-erc4626"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let disabled_state = test_app_state(
+            Arc::clone(&tokens_store),
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let err = match resimulate_route(
+            &disabled_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+        )
+        .await
+        {
+            Ok(_) => panic!("deposit should be rejected when deposits are disabled"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::InvalidRequest
+        );
+
+        let enabled_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig {
+                erc4626_deposits_enabled: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let resimulated = match resimulate_route(
+            &enabled_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+        )
+        .await
+        {
+            Ok(resimulated) => resimulated,
+            Err(err) => panic!(
+                "deposit should resimulate when deposits are enabled: {}",
+                err.message()
+            ),
+        };
+
+        assert_eq!(
+            resimulated.segments[0].hops[0].swaps[0].expected_amount_out,
+            BigUint::from(10u32)
+        );
     }
 
     #[tokio::test]

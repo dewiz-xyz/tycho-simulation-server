@@ -9,7 +9,13 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from coverage_sweep import collect_candidate_protocols, protocol_from_fields, resolve_allowed_statuses
-from presets import TOKENS, amounts_for_pair, default_amounts_for_token
+from presets import (
+    RETH_ETH_TARGET_BASE_UNITS,
+    TOKENS,
+    amounts_for_pair,
+    default_amounts_for_token,
+    suite_pairs,
+)
 
 
 class PresetsTest(unittest.TestCase):
@@ -26,6 +32,25 @@ class PresetsTest(unittest.TestCase):
             ],
         )
 
+    def test_amounts_for_pair_uses_reth_eth_override(self) -> None:
+        actual = amounts_for_pair("RETH", "ETH")
+        self.assertEqual(
+            actual,
+            [
+                "89285714285714285",
+                "446428571428571428",
+                "892857142857142857",
+                "1785714285714285714",
+                "4464285714285714285",
+                "8928571428571428571",
+                "17857142857142857142",
+                "44642857142857142857",
+            ],
+        )
+        self.assertTrue(
+            all(int(amount) < target for amount, target in zip(actual, RETH_ETH_TARGET_BASE_UNITS)),
+        )
+
     def test_amounts_for_pair_falls_back_to_token_defaults(self) -> None:
         self.assertEqual(
             amounts_for_pair("LINK", "WETH"),
@@ -36,6 +61,42 @@ class PresetsTest(unittest.TestCase):
         self.assertEqual(
             amounts_for_pair(TOKENS["USDC"], TOKENS["GHO"]),
             ["1000000", "5000000", "10000000", "50000000", "100000000", "500000000"],
+        )
+
+    def test_amounts_for_pair_uses_erc4626_pair_overrides(self) -> None:
+        self.assertEqual(
+            amounts_for_pair("USDC", "SUSDC"),
+            ["1000000", "5000000", "10000000", "50000000", "100000000", "500000000"],
+        )
+        self.assertEqual(
+            amounts_for_pair("SUSDS", "USDS"),
+            [
+                "1000000000000000000",
+                "5000000000000000000",
+                "10000000000000000000",
+                "50000000000000000000",
+                "100000000000000000000",
+                "500000000000000000000",
+            ],
+        )
+
+    def test_erc4626_allowlisted_suite_contains_only_supported_pairs(self) -> None:
+        self.assertEqual(
+            [(pair.token_in, pair.token_out) for pair in suite_pairs("erc4626_allowlisted")],
+            [
+                (TOKENS["USDS"], TOKENS["SUSDS"]),
+                (TOKENS["SUSDS"], TOKENS["USDS"]),
+                (TOKENS["USDC"], TOKENS["SUSDC"]),
+                (TOKENS["SUSDC"], TOKENS["USDC"]),
+                (TOKENS["PYUSD"], TOKENS["SPPYUSD"]),
+                (TOKENS["SPPYUSD"], TOKENS["PYUSD"]),
+            ],
+        )
+
+    def test_erc4626_negative_suite_targets_susde_redeem(self) -> None:
+        self.assertEqual(
+            [(pair.token_in, pair.token_out) for pair in suite_pairs("erc4626_negative")],
+            [(TOKENS["SUSDE"], TOKENS["USDE"])],
         )
 
 

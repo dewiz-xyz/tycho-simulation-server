@@ -159,7 +159,7 @@ async fn process_refresh_result(
                 }
 
                 *disabled_failure_counter = disabled_failure_counter.saturating_add(1);
-                if *disabled_failure_counter % DISABLED_REMINDER_EVERY_FAILURES == 0 {
+                if (*disabled_failure_counter).is_multiple_of(DISABLED_REMINDER_EVERY_FAILURES) {
                     warn!(
                         event = "native_gas_price_reporting_still_disabled",
                         consecutive_failures = *consecutive_failures,
@@ -234,6 +234,7 @@ mod tests {
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+            erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
