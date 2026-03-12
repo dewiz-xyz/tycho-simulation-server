@@ -74,7 +74,6 @@ export class PipelineStack extends cdk.Stack {
         memoryMiB: 8192,
         desiredCount: 13,
         tycho_tvl: "10",
-        tycho_url: "tycho-beta.propellerheads.xyz",
         chainId: "1",
       }),
     );
@@ -89,7 +88,6 @@ export class PipelineStack extends cdk.Stack {
         cpu: 512,
         memoryMiB: 1024,
         tycho_tvl: "50",
-        tycho_url: "tycho-beta.propellerheads.xyz",
         chainId: "1",
       }),
     );

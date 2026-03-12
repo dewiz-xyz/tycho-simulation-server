@@ -41,7 +41,6 @@ The server ingests Tycho protocol updates, keeps an in-memory view of pool state
 
 The following environment variables are read at startup:
 
-- `TYCHO_URL` – Tycho API base URL (default: `tycho-beta.propellerheads.xyz`)
 - `TYCHO_API_KEY` – API key for authenticated Tycho access (**required**)
 - `CHAIN_ID` – Runtime chain ID (**required**); supported values: `1` (Ethereum), `8453` (Base)
 - `RPC_URL` – Optional JSON-RPC endpoint matching `CHAIN_ID`, used for background `eth_gasPrice` refresh
@@ -205,6 +204,7 @@ Mixed-outcome example (one usable result + one anomalous pool):
 ```
 
 Timeout behavior:
+
 - `/simulate` handler-level timeouts return `200 OK` with `partial_success`, including a `timeout` failure.
 - `/simulate` router-level timeouts return `200 OK` with `partial_success`. Logs include `scope="router_timeout"`.
 - `/encode` timeouts return `408 Request Timeout` with `{ error, requestId }`.
@@ -215,6 +215,7 @@ Timeout behavior:
 `POST /encode` builds Tycho router calldata (`singleSwap`, `sequentialSwap`, or `splitSwap`) for a client-provided route. It **re-simulates** each pool swap, derives per-hop/per-swap amounts internally, and enforces only the route-level `minAmountOut`.
 
 Notes:
+
 - The request shape follows `RouteEncodeRequest` (camelCase fields).
 - `settlementAddress` and `tychoRouterAddress` are required.
 - `swapKind` describes the route shape (`SimpleSwap`, `MultiSwap`, `MegaSwap`).

@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 use tycho_simulation::utils::load_all_tokens;
 
 use tycho_simulation_server::api::create_router;
-use tycho_simulation_server::config::{init_logging, load_config};
+use tycho_simulation_server::config::{hosted_tycho_url, init_logging, load_config};
 use tycho_simulation_server::handlers::stream::{
     supervise_native_stream, supervise_vm_stream, StreamSupervisorConfig, VmStreamControls,
 };
@@ -27,21 +27,29 @@ async fn main() -> anyhow::Result<()> {
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
+    let tycho_url = hosted_tycho_url(chain).map_err(anyhow::Error::msg)?;
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
-    let tokens = load_token_store(&config).await?;
+    let tokens = load_token_store(&config, &tycho_url).await?;
     let stream_resources = create_stream_resources(&tokens);
     let app_state = build_app_state(&config, &tokens, &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
 
     log_concurrency_config(&config);
     spawn_gas_price_refresh(&config, &app_state);
-    spawn_native_stream_task(&config, &supervisor_cfg, &tokens, &stream_resources);
+    spawn_native_stream_task(
+        &config,
+        &tycho_url,
+        &supervisor_cfg,
+        &tokens,
+        &stream_resources,
+    );
     spawn_vm_stream_task(
         &config,
+        &tycho_url,
         &supervisor_cfg,
         &tokens,
         &stream_resources,
@@ -94,10 +102,11 @@ fn spawn_memory_snapshot_task(memory_cfg: tycho_simulation_server::config::Memor
 
 async fn load_token_store(
     config: &tycho_simulation_server::config::AppConfig,
+    tycho_url: &str,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let chain = config.chain_profile.chain;
     let all_tokens = load_all_tokens(
-        &config.tycho_url,
+        tycho_url,
         false,
         Some(&config.api_key),
         true,
@@ -110,7 +119,7 @@ async fn load_token_store(
 
     Ok(Arc::new(TokenStore::new(
         all_tokens,
-        config.tycho_url.clone(),
+        tycho_url.to_string(),
         config.api_key.clone(),
         chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
@@ -238,6 +247,7 @@ fn spawn_gas_price_refresh(
 
 fn spawn_native_stream_task(
     config: &tycho_simulation_server::config::AppConfig,
+    tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: &Arc<TokenStore>,
     resources: &StreamResources,
@@ -247,7 +257,7 @@ fn spawn_native_stream_task(
     let tokens_bg = Arc::clone(tokens);
     let state_store_bg = Arc::clone(&resources.native_state_store);
     let health_bg = Arc::clone(&resources.native_stream_health);
-    let tycho_url = config.tycho_url.clone();
+    let tycho_url = tycho_url.to_string();
     let api_key = config.api_key.clone();
     let tvl_threshold = config.tvl_threshold;
     let tvl_keep_threshold = config.tvl_keep_threshold;
@@ -285,6 +295,7 @@ fn spawn_native_stream_task(
 
 fn spawn_vm_stream_task(
     config: &tycho_simulation_server::config::AppConfig,
+    tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: &Arc<TokenStore>,
     resources: &StreamResources,
@@ -311,7 +322,7 @@ fn spawn_vm_stream_task(
     let health_bg = Arc::clone(&resources.vm_stream_health);
     let vm_stream_bg = Arc::clone(&resources.vm_stream);
     let vm_semaphore_bg = app_state.vm_sim_semaphore();
-    let tycho_url = config.tycho_url.clone();
+    let tycho_url = tycho_url.to_string();
     let api_key = config.api_key.clone();
     let tvl_threshold = config.tvl_threshold;
     let tvl_keep_threshold = config.tvl_keep_threshold;
@@ -409,7 +420,6 @@ mod tests {
 
         AppConfig {
             chain_profile,
-            tycho_url: "http://localhost".to_string(),
             api_key: "test-api-key".to_string(),
             rpc_url: rpc_url.map(str::to_string),
             gas_price_refresh_interval_ms: 5_000,

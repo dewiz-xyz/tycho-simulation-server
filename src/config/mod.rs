@@ -3,7 +3,10 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tycho_simulation::tycho_common::{models::Chain, Bytes};
+use tycho_simulation::{
+    tycho_common::{models::Chain, Bytes},
+    utils::get_default_url,
+};
 
 mod logging;
 mod memory;
@@ -113,7 +116,6 @@ pub fn load_config() -> AppConfig {
 
     AppConfig {
         chain_profile,
-        tycho_url: network.tycho_url,
         api_key: network.api_key,
         rpc_url: network.rpc_url,
         gas_price_refresh_interval_ms: network.gas_price_refresh_interval_ms,
@@ -146,7 +148,6 @@ pub fn load_config() -> AppConfig {
 }
 
 struct NetworkConfig {
-    tycho_url: String,
     api_key: String,
     rpc_url: Option<String>,
     gas_price_refresh_interval_ms: u64,
@@ -184,8 +185,13 @@ struct StreamConfig {
     readiness_stale_secs: u64,
 }
 
+/// Resolve the hosted Tycho endpoint for a supported runtime chain.
+pub fn hosted_tycho_url(chain: Chain) -> Result<String, String> {
+    get_default_url(&chain)
+        .ok_or_else(|| format!("No default Tycho URL configured for supported chain {chain}"))
+}
+
 fn load_network_config() -> NetworkConfig {
-    let tycho_url = env_or_default("TYCHO_URL", "tycho-beta.propellerheads.xyz");
     let api_key = require_env("TYCHO_API_KEY");
     let rpc_url = optional_trimmed_env("RPC_URL");
     let gas_price_refresh_interval_ms: u64 =
@@ -212,7 +218,6 @@ fn load_network_config() -> NetworkConfig {
     );
 
     NetworkConfig {
-        tycho_url,
         api_key,
         rpc_url,
         gas_price_refresh_interval_ms,
@@ -335,7 +340,6 @@ fn load_stream_config() -> StreamConfig {
 #[derive(Clone)]
 pub struct AppConfig {
     pub chain_profile: ChainProfile,
-    pub tycho_url: String,
     pub api_key: String,
     pub rpc_url: Option<String>,
     pub gas_price_refresh_interval_ms: u64,
@@ -483,5 +487,21 @@ mod tests {
             unreachable!("expected unsupported chain to error");
         };
         assert!(err.contains("Unsupported CHAIN_ID=999"));
+    }
+
+    #[test]
+    fn hosted_tycho_url_uses_ethereum_default() {
+        let Ok(url) = hosted_tycho_url(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Tycho URL");
+        };
+        assert_eq!(url, "tycho-beta.propellerheads.xyz");
+    }
+
+    #[test]
+    fn hosted_tycho_url_uses_base_default() {
+        let Ok(url) = hosted_tycho_url(Chain::Base) else {
+            unreachable!("expected base hosted Tycho URL");
+        };
+        assert_eq!(url, "tycho-base-beta.propellerheads.xyz");
     }
 }

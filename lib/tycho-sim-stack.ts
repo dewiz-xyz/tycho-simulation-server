@@ -14,7 +14,6 @@ import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
 export interface AppServiceStackProps extends cdk.StackProps {
   serviceName: string;
   tycho_tvl: string;
-  tycho_url: string;
   chainId: "1";
   containerPort?: number;
   environment: string;
@@ -112,7 +111,6 @@ export class AppServiceStack extends cdk.Stack {
           containerPort: props.containerPort ?? 3000,
           environment: {
             TVL_THRESHOLD: props.tycho_tvl,
-            TYCHO_URL: props.tycho_url,
             CHAIN_ID: props.chainId,
             QUOTE_TIMEOUT_MS: "4000",
             POOL_TIMEOUT_NATIVE_MS: "250",
