@@ -178,6 +178,22 @@ class PresetsTest(unittest.TestCase):
         self.assertNotIn("coverage_core_vm", suites)
         self.assertNotIn("latency_core_vm", suites)
         self.assertNotIn("lst", suites)
+        self.assertIn("aerodrome_presence", suites)
+
+    def test_base_aerodrome_presence_suite_matches_expected_pairs(self) -> None:
+        self.assertEqual(
+            [(pair.token_in, pair.token_out) for pair in suite_pairs("aerodrome_presence", BASE_CHAIN_ID)],
+            [
+                (
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                    "0x4200000000000000000000000000000000000006",
+                ),
+                (
+                    "0x4200000000000000000000000000000000000006",
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                ),
+            ],
+        )
 
     def test_base_lst_suite_is_unavailable_in_repo_and_fallback_presets(self) -> None:
         fallback_presets = load_fallback_presets_module()
@@ -187,6 +203,21 @@ class PresetsTest(unittest.TestCase):
             suite_pairs("lst", BASE_CHAIN_ID)
         with self.assertRaisesRegex(ValueError, "Unknown suite for chain 8453"):
             fallback_presets.suite_pairs("lst", BASE_CHAIN_ID)
+
+    def test_fallback_presets_match_base_aerodrome_presence_suite(self) -> None:
+        fallback_presets = load_fallback_presets_module()
+
+        self.assertIn("aerodrome_presence", fallback_presets.list_suites(BASE_CHAIN_ID))
+        self.assertEqual(
+            [
+                (pair.token_in, pair.token_out)
+                for pair in fallback_presets.suite_pairs("aerodrome_presence", BASE_CHAIN_ID)
+            ],
+            [
+                (pair.token_in, pair.token_out)
+                for pair in suite_pairs("aerodrome_presence", BASE_CHAIN_ID)
+            ],
+        )
 
     def test_base_default_encode_route_is_chain_specific(self) -> None:
         self.assertEqual(default_encode_route(BASE_CHAIN_ID), ("USDC", "WETH", "USDC"))
@@ -360,6 +391,13 @@ class RunSuiteContractTest(unittest.TestCase):
             'echo "Skipping VM protocol presence checks (runtime VM is effectively disabled)."',
             self.run_suite_text,
         )
+
+    def test_base_runner_adds_aerodrome_presence_gate(self) -> None:
+        self.assertIn('if [[ "$chain_id" == "8453" ]]; then', self.run_suite_text)
+        self.assertIn('echo "Protocol presence checks (Aerodrome Slipstreams)..."', self.run_suite_text)
+        self.assertIn('--suite aerodrome_presence \\', self.run_suite_text)
+        self.assertIn('--expect-protocols aerodrome_slipstreams \\', self.run_suite_text)
+        self.assertIn('coverage_aerodrome_presence.json', self.run_suite_text)
 
     def test_base_is_not_treated_as_vm_capable(self) -> None:
         self.assertIn('chain_supports_vm="false"', self.run_suite_text)

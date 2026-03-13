@@ -33,6 +33,8 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 
 ### Base (`CHAIN_ID=8453`)
 - No VM protocols configured in this iteration.
+- Native Aerodrome presence is gated separately with the `aerodrome_presence` sweep:
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --expect-protocols aerodrome_slipstreams`
 
 ## Effective VM enablement
 
@@ -43,6 +45,8 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 ## Notes that affect test coverage
 
 - Always pass chain context to scripts (`--chain-id` or env `CHAIN_ID`).
+- Base protocol finalization should keep Aerodrome in the candidate path:
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`
 - To test native-only behavior on Ethereum:
   - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop`
 - Or start with VM disabled:
@@ -53,6 +57,8 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 - Core Ethereum suite coverage keeps `ETH:RETH` and `RETH:ETH` for Rocketpool/native paths.
   Maverick coverage is checked separately with the protocol presence probe in `scripts/run_suite.sh`, which is more stable than relying on `GHO:USDC`.
   Balancer coverage is also checked separately with a capped `WETH:USDC` probe.
+- Base coverage should keep Aerodrome visible with the dedicated presence sweep.
+  `scripts/run_suite.sh --repo . --chain-id 8453 --suite core --stop` now runs that strict check after the broader Base sweep.
 - ERC4626 support is server-gated to the `erc4626_allowlisted` suite only:
   - `USDS:SUSDS`
   - `SUSDS:USDS`
