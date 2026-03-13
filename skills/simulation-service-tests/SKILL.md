@@ -89,6 +89,7 @@ python3 scripts/encode_smoke.py --chain-id 8453 --allow-status ready,partial_suc
 python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json
 python3 scripts/coverage_sweep.py --chain-id 1 --suite v4_candidates
 python3 scripts/coverage_sweep.py --chain-id 1 --suite exploratory_protocols --allow-failures --allow-no-pools
+python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams
 ```
 
 VM pool feeds are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --chain-id 1 --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.

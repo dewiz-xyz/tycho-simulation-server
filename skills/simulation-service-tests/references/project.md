@@ -39,6 +39,7 @@
   - `scripts/run_suite.sh --repo . --chain-id 8453 --suite core --stop`
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds.
   - On Ethereum, VM-enabled runs wait for `vm_status=ready` and `vm_pools>=1` before the VM protocol probes run.
+  - On Base, the runner also executes a strict native Aerodrome presence probe after the broader coverage sweep.
   - There is no repo-runner mode that leaves VM pools enabled while skipping that wait; use `--disable-vm-pools` for the native-only fast path.
   - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
@@ -49,6 +50,7 @@
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`
   - `python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50`
 - See `STRESS_TEST_README.md` for suites, defaults, and latency knobs.
 
@@ -59,3 +61,5 @@
 - ERC4626 rollout checks:
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`
+- Base Aerodrome rollout checks:
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`

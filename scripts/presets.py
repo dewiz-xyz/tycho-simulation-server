@@ -482,6 +482,12 @@ PAIR_SUITES_BY_CHAIN: dict[int, dict[str, list[Pair]]] = {
             ("DAI", "USDC"),
             ("USDC", "DAI"),
         ],
+        "aerodrome_presence": [
+            # Keep this suite pinned to the path that consistently surfaces Aerodrome
+            # in the repo-level Base verification flow.
+            ("USDC", "WETH"),
+            ("WETH", "USDC"),
+        ],
         "extended": [
             ("USDC", "WETH"),
             ("WETH", "USDC"),

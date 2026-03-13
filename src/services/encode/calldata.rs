@@ -713,4 +713,16 @@ mod tests {
             "expected ekubo_v3 encoder in default registry"
         );
     }
+
+    #[test]
+    fn default_registry_supports_aerodrome_slipstreams() {
+        let registry = SwapEncoderRegistry::new(Chain::Base)
+            .add_default_encoders(None)
+            .expect("default encoder registry should initialize");
+
+        assert!(
+            registry.get_encoder("aerodrome_slipstreams").is_some(),
+            "expected aerodrome_slipstreams encoder in default registry"
+        );
+    }
 }

@@ -288,6 +288,19 @@ python3 "$script_dir/coverage_sweep.py" \
   ${coverage_flags[@]+"${coverage_flags[@]}"} \
   --out "$repo/logs/coverage_sweep.json"
 
+if [[ "$chain_id" == "8453" ]]; then
+  # Keep the Base-native Aerodrome guard separate from the VM presence gates below.
+  echo "Protocol presence checks (Aerodrome Slipstreams)..."
+  python3 "$script_dir/coverage_sweep.py" \
+    --url "$simulate_url" \
+    --chain-id "$chain_id" \
+    --suite aerodrome_presence \
+    --allow-status "$coverage_allow_status" \
+    ${coverage_flags[@]+"${coverage_flags[@]}"} \
+    --expect-protocols aerodrome_slipstreams \
+    --out "$repo/logs/coverage_aerodrome_presence.json"
+fi
+
 if [[ "$runtime_vm_enabled" == "true" ]]; then
   expected_vm_protocols=""
   case "$chain_id" in

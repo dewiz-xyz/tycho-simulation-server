@@ -90,8 +90,8 @@ impl ProtocolSim for EchoAmountSim {
     }
 }
 
-fn make_token(address: &Bytes, symbol: &str) -> Token {
-    Token::new(address, symbol, 18, 0, &[], Chain::Ethereum, 100)
+fn make_token(address: &Bytes, symbol: &str, chain: Chain) -> Token {
+    Token::new(address, symbol, 18, 0, &[], chain, 100)
 }
 
 fn parse_bytes(value: &str) -> Result<Bytes> {
@@ -156,6 +156,8 @@ impl Drop for ScopedEnvVar {
     reason = "integration fixture keeps test knobs explicit and local to this file"
 )]
 struct EncodeFixtureConfig<'a> {
+    chain: Chain,
+    pool_id: &'a str,
     min_amount_out: &'a str,
     token_in_hex: &'a str,
     token_out_hex: &'a str,
@@ -174,6 +176,8 @@ struct EncodeFixtureConfig<'a> {
 impl Default for EncodeFixtureConfig<'_> {
     fn default() -> Self {
         Self {
+            chain: Chain::Ethereum,
+            pool_id: "pool-1",
             min_amount_out: "8",
             token_in_hex: "0x0000000000000000000000000000000000000001",
             token_out_hex: "0x0000000000000000000000000000000000000002",
@@ -201,13 +205,13 @@ struct FixtureTokens {
 fn build_fixture_tokens(config: &EncodeFixtureConfig<'_>) -> Result<FixtureTokens> {
     let token_in = parse_bytes(config.token_in_hex)?;
     let token_out = parse_bytes(config.token_out_hex)?;
-    let token_in_symbol = if token_in == Chain::Ethereum.native_token().address {
+    let token_in_symbol = if token_in == config.chain.native_token().address {
         "ETH"
     } else {
         "TK1"
     };
-    let token_in_meta = make_token(&token_in, token_in_symbol);
-    let token_out_meta = make_token(&token_out, "TK2");
+    let token_in_meta = make_token(&token_in, token_in_symbol, config.chain);
+    let token_out_meta = make_token(&token_out, "TK2", config.chain);
 
     let mut initial_tokens = HashMap::new();
     initial_tokens.insert(token_in.clone(), token_in_meta.clone());
@@ -221,7 +225,7 @@ fn build_fixture_tokens(config: &EncodeFixtureConfig<'_>) -> Result<FixtureToken
             initial_tokens,
             "http://localhost".to_string(),
             "test".to_string(),
-            Chain::Ethereum,
+            config.chain,
             Duration::from_millis(10),
         )),
     })
@@ -238,7 +242,7 @@ async fn build_fixture_stores(
         parse_bytes(config.component_address_hex)?,
         config.component_protocol_system.to_string(),
         config.component_protocol_type_name.to_string(),
-        Chain::Ethereum,
+        config.chain,
         vec![
             fixture_tokens.token_in_meta.clone(),
             fixture_tokens.token_out_meta.clone(),
@@ -270,7 +274,7 @@ fn build_route_encode_request(
     router: String,
 ) -> RouteEncodeRequest {
     RouteEncodeRequest {
-        chain_id: 1,
+        chain_id: config.chain.id(),
         token_in: config.token_in_hex.to_string(),
         token_out: config.token_out_hex.to_string(),
         amount_in: "10".to_string(),
@@ -308,20 +312,20 @@ async fn setup_app_state_and_request(
     let fixture_tokens = build_fixture_tokens(&config)?;
     let settlement = "0x0000000000000000000000000000000000000003".to_string();
     let router = "0x0000000000000000000000000000000000000004".to_string();
-    let pool_id = "pool-1".to_string();
+    let pool_id = config.pool_id.to_string();
     let (native_state_store, vm_state_store) =
         build_fixture_stores(&config, &fixture_tokens, &pool_id).await?;
 
     let mut reset_allowance_tokens: HashMap<u64, HashSet<Bytes>> = HashMap::new();
     if config.reset_allowance {
         reset_allowance_tokens
-            .entry(1)
+            .entry(config.chain.id())
             .or_default()
             .insert(fixture_tokens.token_in.clone());
     }
 
     let state = AppState {
-        chain: Chain::Ethereum,
+        chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store: Arc::clone(&native_state_store),
@@ -569,6 +573,72 @@ async fn encode_route_succeeds_for_ekubo_v3_pool() -> Result<()> {
     assert_eq!(response.interactions.len(), 2);
     assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
     assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_succeeds_for_aerodrome_slipstreams_pool() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        chain: Chain::Base,
+        pool_id: "0x0000000000000000000000000000000000000009",
+        request_pool_protocol: "aerodrome_slipstreams",
+        component_protocol_system: "aerodrome_slipstreams",
+        component_protocol_type_name: "aerodrome_slipstreams",
+        component_static_attributes: HashMap::from([(
+            "tick_spacing".to_string(),
+            Bytes::from(100_u32),
+        )]),
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+    assert_eq!(response.interactions.len(), 2);
+    assert_eq!(response.interactions[0].kind, InteractionKind::Erc20Approve);
+    assert_eq!(response.interactions[1].kind, InteractionKind::Call);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_aerodrome_slipstreams_pool_without_tick_spacing() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        chain: Chain::Base,
+        pool_id: "0x0000000000000000000000000000000000000009",
+        request_pool_protocol: "aerodrome_slipstreams",
+        component_protocol_system: "aerodrome_slipstreams",
+        component_protocol_type_name: "aerodrome_slipstreams",
+        component_static_attributes: HashMap::new(),
+        reset_allowance: false,
+        request_id: "req-aerodrome-missing-tick-spacing",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response.error.contains("tick_spacing"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert_eq!(
+        response.request_id.as_deref(),
+        Some("req-aerodrome-missing-tick-spacing")
+    );
     Ok(())
 }
 

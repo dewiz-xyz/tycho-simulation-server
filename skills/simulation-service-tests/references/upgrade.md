@@ -33,6 +33,7 @@ Run verification per target chain.
 2. Run smoke tests + sweep:
    - `python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-status ready,partial_success --allow-failures`
    - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite core --allow-status ready,partial_success --allow-failures --out logs/coverage_sweep.base.json`
+   - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams --out logs/coverage_aerodrome_presence.json`
 3. Run latency percentiles:
    - `python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 300 --concurrency 50 --allow-status ready,partial_success --allow-failures`
 
@@ -42,6 +43,7 @@ Run verification per target chain.
   - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop`
 - With VM pools enabled on Ethereum, `scripts/run_suite.sh` waits for VM readiness and then runs dedicated Maverick/Balancer protocol presence probes.
 - Core coverage should still exercise representative native paths with `ETH:RETH` and `RETH:ETH`.
+- Base runs should keep the strict native Aerodrome presence probe green after the general sweep.
 
 ## Load testing / regressions
 - Prefer `scripts/run_suite.sh` and/or `scripts/latency_percentiles.py` with higher `--requests`/`--concurrency`.
