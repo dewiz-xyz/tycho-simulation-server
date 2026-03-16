@@ -15,17 +15,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
-    tycho_common::{
-        models::token::Token,
-        simulation::{errors::SimulationError, protocol_sim::ProtocolSim},
-        Bytes,
-    },
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
-    QuoteFailureKind, QuoteMeta, QuoteResultQuality, QuoteStatus,
+    QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
@@ -60,8 +56,6 @@ pub struct QuoteMetrics {
     pub skipped_vm_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
-    pub skipped_native_limits: usize,
-    pub skipped_vm_limits: usize,
     pub vm_completed_pools: usize,
     pub vm_median_first_gas: Option<u64>,
     pub vm_low_first_gas_count: usize,
@@ -85,11 +79,11 @@ fn build_request_exit(
     metrics: QuoteMetrics,
     pool_results: Vec<PoolSimulationOutcome>,
     failures: Vec<QuoteFailure>,
-    status: QuoteStatus,
-    result_quality: QuoteResultQuality,
+    exit: RequestExit,
 ) -> QuoteComputation {
-    meta.status = status;
-    meta.result_quality = result_quality;
+    meta.status = exit.status;
+    meta.result_quality = exit.result_quality;
+    meta.partial_kind = exit.partial_kind;
     meta.pool_results = pool_results;
     meta.vm_unavailable = metrics.skipped_vm_unavailable;
     meta.failures = failures;
@@ -196,7 +190,6 @@ struct SimulatePoolInput {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
-    requested_max_in: BigUint,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -217,18 +210,18 @@ struct QuoteRunState {
     pool_results: Vec<PoolSimulationOutcome>,
     metrics: QuoteMetrics,
     meta: QuoteMeta,
+    classification: QuoteClassification,
 }
 
 impl QuoteRunState {
-    fn finish(self, status: QuoteStatus, result_quality: QuoteResultQuality) -> QuoteComputation {
+    fn finish(self, exit: RequestExit) -> QuoteComputation {
         build_request_exit(
             self.responses,
             self.meta,
             self.metrics,
             self.pool_results,
             self.failures,
-            status,
-            result_quality,
+            exit,
         )
     }
 }
@@ -237,6 +230,7 @@ impl QuoteRunState {
 struct RequestExit {
     status: QuoteStatus,
     result_quality: QuoteResultQuality,
+    partial_kind: Option<QuotePartialKind>,
 }
 
 impl RequestExit {
@@ -244,6 +238,92 @@ impl RequestExit {
         Self {
             status,
             result_quality,
+            partial_kind: None,
+        }
+    }
+
+    const fn with_partial_kind(mut self, partial_kind: QuotePartialKind) -> Self {
+        self.partial_kind = Some(partial_kind);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum PartialClassification {
+    #[default]
+    None,
+    AmountLadders,
+    PoolCoverage,
+    Mixed,
+}
+
+impl PartialClassification {
+    fn note_partial_ladder(&mut self) {
+        *self = match self {
+            Self::None | Self::AmountLadders => Self::AmountLadders,
+            Self::PoolCoverage | Self::Mixed => Self::Mixed,
+        };
+    }
+
+    fn note_pool_coverage_gap(&mut self) {
+        *self = match self {
+            Self::None | Self::PoolCoverage => Self::PoolCoverage,
+            Self::AmountLadders | Self::Mixed => Self::Mixed,
+        };
+    }
+
+    const fn as_partial_kind(self) -> Option<QuotePartialKind> {
+        match self {
+            Self::None => None,
+            Self::AmountLadders => Some(QuotePartialKind::AmountLadders),
+            Self::PoolCoverage => Some(QuotePartialKind::PoolCoverage),
+            Self::Mixed => Some(QuotePartialKind::Mixed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum NoResultFailureClassification {
+    #[default]
+    LiquidityLike,
+    OperationallyDegraded,
+}
+
+#[derive(Debug, Default)]
+struct QuoteClassification {
+    partial: PartialClassification,
+    had_usable_response: bool,
+    no_result_failures: NoResultFailureClassification,
+}
+
+impl QuoteClassification {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn mark_request_degradation(&mut self) {
+        self.no_result_failures = NoResultFailureClassification::OperationallyDegraded;
+    }
+
+    fn note_response(&mut self) {
+        self.had_usable_response = true;
+    }
+
+    fn note_pool_outcome(&mut self, outcome: PoolOutcomeKind) {
+        match outcome {
+            PoolOutcomeKind::PartialOutput => self.partial.note_partial_ladder(),
+            PoolOutcomeKind::ZeroOutput
+            | PoolOutcomeKind::SkippedConcurrency
+            | PoolOutcomeKind::SkippedDeadline
+            | PoolOutcomeKind::TimedOut
+            | PoolOutcomeKind::SimulatorError
+            | PoolOutcomeKind::InternalError => self.partial.note_pool_coverage_gap(),
+        }
+    }
+
+    fn note_failure(&mut self, failure: &QuoteFailure) {
+        if !is_liquidity_like_failure(failure) {
+            self.no_result_failures = NoResultFailureClassification::OperationallyDegraded;
         }
     }
 }
@@ -265,7 +345,6 @@ struct PreparedQuoteExecution {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts_in: Arc<Vec<BigUint>>,
-    requested_max_in: BigUint,
     expected_len: usize,
     quote_deadline: Instant,
     gas_price_wei: Option<u128>,
@@ -389,6 +468,7 @@ impl QuoteRequestRunner {
         let meta = QuoteMeta {
             status: QuoteStatus::Ready,
             result_quality: QuoteResultQuality::RequestLevelFailure,
+            partial_kind: None,
             block_number: current_block,
             vm_block_number: current_vm_block,
             matching_pools: 0,
@@ -408,6 +488,7 @@ impl QuoteRequestRunner {
                 pool_results: Vec::new(),
                 metrics: QuoteMetrics::default(),
                 meta,
+                classification: QuoteClassification::new(),
             },
             cancel,
             readiness_wait: Duration::from_secs(2),
@@ -417,8 +498,14 @@ impl QuoteRequestRunner {
 
     async fn run(mut self) -> QuoteComputation {
         if self.is_cancelled() {
+            self.run.classification.mark_request_degradation();
+            self.push_failure(make_failure(
+                QuoteFailureKind::Timeout,
+                "Quote request cancelled before execution".to_string(),
+                None,
+            ));
             return self.finish(RequestExit::new(
-                QuoteStatus::PartialSuccess,
+                QuoteStatus::Ready,
                 QuoteResultQuality::RequestLevelFailure,
             ));
         }
@@ -449,21 +536,14 @@ impl QuoteRequestRunner {
     }
 
     fn finish(self, exit: RequestExit) -> QuoteComputation {
-        self.run.finish(exit.status, exit.result_quality)
+        self.run.finish(exit)
     }
 
     fn finish_current_state(mut self) -> QuoteComputation {
         self.finalize_responses();
         self.finalize_pool_results();
-        let result_quality = if self.run.responses.is_empty() {
-            QuoteResultQuality::NoResults
-        } else if self.run.pool_results.is_empty() && self.run.failures.is_empty() {
-            QuoteResultQuality::Complete
-        } else {
-            QuoteResultQuality::Partial
-        };
-        let status = self.run.meta.status;
-        self.run.finish(status, result_quality)
+        let exit = self.classify_current_exit();
+        self.run.finish(exit)
     }
 
     fn is_cancelled(&self) -> bool {
@@ -471,6 +551,54 @@ impl QuoteRequestRunner {
             .as_ref()
             .map(CancellationToken::is_cancelled)
             .unwrap_or(false)
+    }
+
+    fn push_failure(&mut self, failure: QuoteFailure) {
+        self.run.classification.note_failure(&failure);
+        self.run.failures.push(failure);
+    }
+
+    fn classify_current_exit(&self) -> RequestExit {
+        match self.run.meta.status {
+            QuoteStatus::Ready => self.classify_ready_exit(),
+            QuoteStatus::NoLiquidity => {
+                RequestExit::new(QuoteStatus::NoLiquidity, QuoteResultQuality::NoResults)
+            }
+            QuoteStatus::WarmingUp
+            | QuoteStatus::TokenMissing
+            | QuoteStatus::InvalidRequest
+            | QuoteStatus::InternalError => RequestExit::new(
+                self.run.meta.status,
+                QuoteResultQuality::RequestLevelFailure,
+            ),
+        }
+    }
+
+    fn classify_ready_exit(&self) -> RequestExit {
+        if self.run.classification.had_usable_response {
+            if self.run.pool_results.is_empty() && self.run.failures.is_empty() {
+                return RequestExit::new(QuoteStatus::Ready, QuoteResultQuality::Complete);
+            }
+
+            let partial_kind = self
+                .run
+                .classification
+                .partial
+                .as_partial_kind()
+                .unwrap_or(QuotePartialKind::PoolCoverage);
+
+            return RequestExit::new(QuoteStatus::Ready, QuoteResultQuality::Partial)
+                .with_partial_kind(partial_kind);
+        }
+
+        if matches!(
+            self.run.classification.no_result_failures,
+            NoResultFailureClassification::LiquidityLike
+        ) {
+            return RequestExit::new(QuoteStatus::NoLiquidity, QuoteResultQuality::NoResults);
+        }
+
+        RequestExit::new(QuoteStatus::Ready, QuoteResultQuality::RequestLevelFailure)
     }
 
     fn parse_pair(&mut self) -> Result<RequestPair, RequestExit> {
@@ -482,7 +610,7 @@ impl QuoteRequestRunner {
         let wrapped_native = self.state.tokens.wrapped_native_token();
         if is_direct_native_wrapped_pair(&token_in_bytes, &token_out_bytes, wrapped_native.as_ref())
         {
-            self.run.failures.push(make_failure(
+            self.push_failure(make_failure(
                 QuoteFailureKind::InvalidRequest,
                 "Direct native/wrapped quotes are unsupported".to_string(),
                 None,
@@ -505,7 +633,7 @@ impl QuoteRequestRunner {
         match Bytes::from_str(&address) {
             Ok(bytes) => Ok((address, bytes)),
             Err(err) => {
-                self.run.failures.push(make_failure(
+                self.push_failure(make_failure(
                     QuoteFailureKind::TokenValidation,
                     format!("Invalid {field} address: {err}"),
                     None,
@@ -524,7 +652,7 @@ impl QuoteRequestRunner {
         }
         let ready = self.state.wait_for_readiness(self.readiness_wait).await;
         if !ready {
-            self.run.failures.push(make_failure(
+            self.push_failure(make_failure(
                 QuoteFailureKind::WarmUp,
                 format!(
                     "Service warming up: block={}, pools={}",
@@ -562,7 +690,7 @@ impl QuoteRequestRunner {
         match lookup {
             Ok(Some(token)) => Ok(token),
             Ok(None) => {
-                self.run.failures.push(make_failure(
+                self.push_failure(make_failure(
                     QuoteFailureKind::TokenCoverage,
                     format!("Token not found: {token_address}"),
                     None,
@@ -581,7 +709,7 @@ impl QuoteRequestRunner {
                     timeout_ms,
                     "Token metadata fetch timed out"
                 );
-                self.run.failures.push(make_failure(
+                self.push_failure(make_failure(
                     QuoteFailureKind::TokenCoverage,
                     format!(
                         "Token metadata fetch timed out after {}ms: {}",
@@ -602,7 +730,7 @@ impl QuoteRequestRunner {
                     error = %message,
                     "Token metadata fetch failed"
                 );
-                self.run.failures.push(make_failure(
+                self.push_failure(make_failure(
                     QuoteFailureKind::TokenCoverage,
                     format!("Token metadata fetch failed: {}", message),
                     None,
@@ -625,7 +753,7 @@ impl QuoteRequestRunner {
         {
             Ok(vec) => vec,
             Err(err) => {
-                self.run.failures.push(make_failure(
+                self.push_failure(make_failure(
                     QuoteFailureKind::InvalidRequest,
                     format!("Invalid amount: {}", err),
                     None,
@@ -653,7 +781,6 @@ impl QuoteRequestRunner {
             token_out_ref.symbol,
             pair.token_out_address
         );
-        let requested_max_in = amounts_in.iter().max().cloned().unwrap_or_default();
         let quote_deadline = Instant::now() + self.quote_timeout;
         let expected_len = amounts_in.len();
         let sell_token_decimals = token_in_ref.decimals;
@@ -675,7 +802,6 @@ impl QuoteRequestRunner {
             token_in: Arc::new(token_in_ref),
             token_out: Arc::new(token_out_ref),
             amounts_in,
-            requested_max_in,
             expected_len,
             quote_deadline,
             gas_price_wei: self.state.effective_native_gas_price_wei_for_quotes().await,
@@ -776,7 +902,7 @@ impl QuoteRequestRunner {
         self.run.meta.candidate_pools = total_candidates;
         self.run.failures.reserve(total_candidates);
         if total_candidates == 0 {
-            self.run.failures.push(make_failure(
+            self.push_failure(make_failure(
                 QuoteFailureKind::NoPools,
                 format!(
                     "No matching pools found for pair {}-{}",
@@ -896,7 +1022,6 @@ impl QuoteRequestRunner {
                 token_in: scheduled.sim_token_in,
                 token_out: scheduled.sim_token_out,
                 amounts: Arc::clone(&prepared.amounts_in),
-                requested_max_in: prepared.requested_max_in.clone(),
                 expected_len: prepared.expected_len,
                 deadline: scheduled.pool_deadline,
                 cancel_token: scheduled.pool_cancel,
@@ -921,16 +1046,21 @@ impl QuoteRequestRunner {
             tokio::select! {
                 _ = &mut quote_timeout_sleep => {
                     prepared.cancel_token.cancel();
-                    self.run.failures.push(make_failure(
+                    self.run.classification.mark_request_degradation();
+                    self.push_failure(make_failure(
                         QuoteFailureKind::Timeout,
                         format!("Quote computation timed out after {}ms", self.quote_timeout.as_millis()),
                         None,
                     ));
-                    self.run.meta.status = QuoteStatus::PartialSuccess;
                     break;
                 }
                 _ = prepared.cancel_token.cancelled() => {
-                    self.run.meta.status = QuoteStatus::PartialSuccess;
+                    self.run.classification.mark_request_degradation();
+                    self.push_failure(make_failure(
+                        QuoteFailureKind::Timeout,
+                        "Quote computation cancelled before all pools completed".to_string(),
+                        None,
+                    ));
                     break;
                 }
                 maybe_outcome = tasks.next() => {
@@ -953,20 +1083,6 @@ impl QuoteRequestRunner {
             Ok(PoolSimOutcome::Simulated(result)) => {
                 self.handle_simulated_pool_result(result, prepared, vm_first_gases)
             }
-            Ok(PoolSimOutcome::SkippedDueToLimits {
-                pool,
-                pool_name,
-                pool_address,
-                protocol,
-                reason,
-            }) => self.handle_prechecked_limit_skip(
-                pool,
-                pool_name,
-                pool_address,
-                protocol,
-                reason,
-                prepared.expected_len,
-            ),
             Err(failure) => self.handle_pool_failure(failure, prepared.expected_len),
         }
     }
@@ -1004,11 +1120,13 @@ impl QuoteRequestRunner {
                 gas_in_sell,
                 block_number: self.run.meta.block_number,
             });
+            self.run.classification.note_response();
         }
     }
 
     fn record_pool_outcome(&mut self, result: &PoolQuoteResult, expected_len: usize) {
         if let Some((outcome, reason)) = classify_pool_outcome(result, expected_len) {
+            self.run.classification.note_pool_outcome(outcome);
             self.run
                 .pool_results
                 .push(make_pool_outcome(PoolOutcomeInput {
@@ -1057,64 +1175,38 @@ impl QuoteRequestRunner {
                 .cloned()
                 .unwrap_or_else(|| "Pool returned no quotes".to_string());
             format!("{}: {}", descriptor, base_error)
+        } else if is_partial {
+            let Some(base_error) = result.errors.first().cloned() else {
+                return;
+            };
+            if is_limit_like_error_message(&base_error) {
+                return;
+            }
+            format!("{}: {}", descriptor, base_error)
         } else {
-            format!(
-                "{} produced partial ladder ({} of {} steps)",
-                descriptor,
-                result.amounts_out.len(),
-                expected_len
-            )
+            let base_error = result
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Pool returned a malformed result".to_string());
+            format!("{}: {}", descriptor, base_error)
         };
         let kind = if had_timeout {
             QuoteFailureKind::Timeout
-        } else if result.amounts_out.is_empty() {
+        } else {
             classify_failure(&message, true)
-        } else {
-            QuoteFailureKind::InconsistentResult
         };
-        self.run
-            .failures
-            .push(make_failure(kind, message, Some(context)));
-    }
-
-    fn handle_prechecked_limit_skip(
-        &mut self,
-        pool: String,
-        pool_name: String,
-        pool_address: String,
-        protocol: String,
-        reason: Option<String>,
-        expected_len: usize,
-    ) {
-        if protocol.starts_with("vm:") {
-            self.run.metrics.skipped_vm_limits += 1;
-        } else {
-            self.run.metrics.skipped_native_limits += 1;
-        }
-        self.run
-            .pool_results
-            .push(make_pool_outcome(PoolOutcomeInput {
-                descriptor: PoolDescriptor {
-                    id: pool,
-                    name: pool_name,
-                    address: pool_address,
-                    protocol,
-                },
-                outcome: PoolOutcomeKind::SkippedPrecheck,
-                reported_steps: 0,
-                expected_steps: expected_len,
-                reason,
-            }));
+        self.push_failure(make_failure(kind, message, Some(context)));
     }
 
     fn handle_pool_failure(&mut self, failure: QuoteFailure, expected_len: usize) {
         if let Some(pool_outcome) = pool_outcome_from_failure(&failure, expected_len) {
+            self.run
+                .classification
+                .note_pool_outcome(pool_outcome.outcome);
             self.run.pool_results.push(pool_outcome);
         }
-        if matches!(failure.kind, QuoteFailureKind::Internal) {
-            self.run.meta.status = QuoteStatus::InternalError;
-        }
-        self.run.failures.push(failure);
+        self.push_failure(failure);
     }
 
     fn apply_scheduling_failures(&mut self) {
@@ -1125,7 +1217,8 @@ impl QuoteRequestRunner {
         {
             return;
         }
-        self.run.failures.push(make_failure(
+        self.run.classification.mark_request_degradation();
+        self.push_failure(make_failure(
             QuoteFailureKind::ConcurrencyLimit,
             format!(
                 "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
@@ -1136,36 +1229,14 @@ impl QuoteRequestRunner {
             ),
             None,
         ));
-        if matches!(self.run.meta.status, QuoteStatus::Ready) {
-            self.run.meta.status = QuoteStatus::PartialSuccess;
-        }
     }
 
     fn apply_empty_response_state(&mut self) {
-        if !self.run.responses.is_empty() {
-            if !self.run.failures.is_empty() && matches!(self.run.meta.status, QuoteStatus::Ready) {
-                self.run.meta.status = QuoteStatus::PartialSuccess;
-            }
+        if self.run.classification.had_usable_response {
             return;
-        }
-        if self.run.failures.is_empty()
-            && matches!(self.run.meta.status, QuoteStatus::Ready)
-            && (self.run.metrics.skipped_native_limits > 0
-                || self.run.metrics.skipped_vm_limits > 0)
-        {
-            self.run.meta.status = QuoteStatus::NoLiquidity;
-            self.run.failures.push(make_failure(
-                QuoteFailureKind::NoPools,
-                "All matching pools exceed liquidity limits for requested amount; check get_limits before quoting".to_string(),
-                None,
-            ));
-            return;
-        }
-        if matches!(self.run.meta.status, QuoteStatus::Ready) {
-            self.run.meta.status = QuoteStatus::PartialSuccess;
         }
         if self.run.failures.is_empty() {
-            self.run.failures.push(make_failure(
+            self.push_failure(make_failure(
                 QuoteFailureKind::Simulator,
                 "All pools returned zero amounts".to_string(),
                 None,
@@ -1348,13 +1419,6 @@ struct PoolQuoteResult {
 
 enum PoolSimOutcome {
     Simulated(PoolQuoteResult),
-    SkippedDueToLimits {
-        pool: String,
-        pool_name: String,
-        pool_address: String,
-        protocol: String,
-        reason: Option<String>,
-    },
 }
 
 struct FailureContext<'a> {
@@ -1364,39 +1428,12 @@ struct FailureContext<'a> {
     protocol: Option<&'a str>,
 }
 
-type ProbeQuote = (String, u64);
-
-#[derive(Default)]
-struct ProbeState {
-    amount_in: Option<BigUint>,
-    amount: Option<ProbeQuote>,
-    error: Option<String>,
-}
-
-impl ProbeState {
-    fn cached_step(&self, amount_in: &BigUint) -> Option<Result<ProbeQuote, String>> {
-        if self.amount_in.as_ref() != Some(amount_in) {
-            return None;
-        }
-        if let Some((amount_out, gas_u64)) = &self.amount {
-            return Some(Ok((amount_out.clone(), *gas_u64)));
-        }
-        self.error.clone().map(Err)
-    }
-}
-
-enum ProbeDecision {
-    Continue(ProbeState),
-    Finish(PoolSimOutcome),
-}
-
 struct BlockingPoolRunner {
     descriptor: PoolDescriptor,
     pool_state: Arc<dyn ProtocolSim>,
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
-    requested_max_in: BigUint,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -1407,11 +1444,7 @@ impl BlockingPoolRunner {
         if let Some(outcome) = self.preflight_outcome() {
             return outcome;
         }
-        let probe_state = match self.probe_limits() {
-            ProbeDecision::Continue(state) => state,
-            ProbeDecision::Finish(outcome) => return outcome,
-        };
-        self.quote_ladder(probe_state)
+        self.quote_ladder()
     }
 
     fn preflight_outcome(&self) -> Option<PoolSimOutcome> {
@@ -1446,201 +1479,30 @@ impl BlockingPoolRunner {
         })
     }
 
-    fn probe_limits(&self) -> ProbeDecision {
-        let probe_state = ProbeState::default();
-        if self.requested_max_in.is_zero() {
-            return ProbeDecision::Continue(probe_state);
-        }
-        let Ok((max_in, _)) = self.pool_state.get_limits(
-            self.token_in.address.clone(),
-            self.token_out.address.clone(),
-        ) else {
-            return ProbeDecision::Continue(probe_state);
-        };
-        if self.requested_max_in <= max_in {
-            return ProbeDecision::Continue(probe_state);
-        }
-        let all_amounts_exceed_limit = self.amounts.iter().all(|amount| amount > &max_in);
-        let probe_amount_in = if all_amounts_exceed_limit {
-            self.amounts
-                .iter()
-                .min()
-                .cloned()
-                .unwrap_or_else(|| self.requested_max_in.clone())
-        } else {
-            self.requested_max_in.clone()
-        };
-        match self.pool_state.get_amount_out(
-            probe_amount_in.clone(),
-            &self.token_in,
-            &self.token_out,
-        ) {
-            Ok(result) => self.record_probe_success(probe_amount_in, max_in, result, probe_state),
-            Err(SimulationError::InvalidInput(message, maybe_result)) => self.handle_invalid_probe(
-                probe_amount_in,
-                max_in,
-                message,
-                maybe_result.is_some(),
-                all_amounts_exceed_limit,
-                probe_state,
-            ),
-            Err(other) => self.handle_probe_other_error(
-                probe_amount_in,
-                max_in,
-                other.to_string(),
-                all_amounts_exceed_limit,
-                probe_state,
-            ),
-        }
-    }
-
-    fn record_probe_success(
-        &self,
-        probe_amount_in: BigUint,
-        max_in: BigUint,
-        result: tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
-        mut probe_state: ProbeState,
-    ) -> ProbeDecision {
-        let Some(gas_u64) = result.gas.to_u64() else {
-            return ProbeDecision::Finish(self.simulated_error_outcome(format!(
-                "Probe quote returned gas that does not fit u64 (amount_in={}, max_in={})",
-                probe_amount_in, max_in,
-            )));
-        };
-        probe_state.amount_in = Some(probe_amount_in);
-        probe_state.amount = Some((result.amount.to_string(), gas_u64));
-        ProbeDecision::Continue(probe_state)
-    }
-
-    fn handle_invalid_probe(
-        &self,
-        probe_amount_in: BigUint,
-        max_in: BigUint,
-        message: String,
-        has_partial_result: bool,
-        all_amounts_exceed_limit: bool,
-        mut probe_state: ProbeState,
-    ) -> ProbeDecision {
-        let probe_error = format!(
-            "Probe quote failed (amount_in={}, max_in={}): Invalid input: {}",
-            probe_amount_in, max_in, message,
-        );
-        if is_limits_exhaustion_probe_error(&message, has_partial_result) {
-            return self.handle_limit_probe_message(
-                probe_amount_in,
-                max_in,
-                message,
-                all_amounts_exceed_limit,
-                probe_state,
-                Some(probe_error),
-            );
-        }
-
-        {
-            self.log_limits_debug(
-                &probe_amount_in,
-                &max_in,
-                "Probe invalid-input was not a limits signal; continuing ladder",
-                &message,
-            );
-        }
-        // Holding onto the probe error keeps the ladder deterministic when it hits that same step.
-        probe_state.amount_in = Some(probe_amount_in);
-        probe_state.error = Some(probe_error);
-        ProbeDecision::Continue(probe_state)
-    }
-
-    fn handle_probe_other_error(
-        &self,
-        probe_amount_in: BigUint,
-        max_in: BigUint,
-        message: String,
-        all_amounts_exceed_limit: bool,
-        probe_state: ProbeState,
-    ) -> ProbeDecision {
-        if is_limits_exhaustion_probe_error(&message, false) {
-            return self.handle_limit_probe_message(
-                probe_amount_in,
-                max_in,
-                message,
-                all_amounts_exceed_limit,
-                probe_state,
-                None,
-            );
-        }
-
-        ProbeDecision::Finish(self.simulated_error_outcome(format!(
-            "Probe quote failed (amount_in={}, max_in={}): {}",
-            probe_amount_in, max_in, message,
-        )))
-    }
-
-    fn handle_limit_probe_message(
-        &self,
-        probe_amount_in: BigUint,
-        max_in: BigUint,
-        message: String,
-        all_amounts_exceed_limit: bool,
-        mut probe_state: ProbeState,
-        probe_error: Option<String>,
-    ) -> ProbeDecision {
-        if all_amounts_exceed_limit {
-            self.log_limits_debug(
-                &probe_amount_in,
-                &max_in,
-                "Skipping pool due to get_limits precheck",
-                &message,
-            );
-            return ProbeDecision::Finish(PoolSimOutcome::SkippedDueToLimits {
-                pool: self.descriptor.id.clone(),
-                pool_name: self.descriptor.name.clone(),
-                pool_address: self.descriptor.address.clone(),
-                protocol: self.descriptor.protocol.clone(),
-                reason: Some(format!(
-                    "Exceeded pool limits during precheck (amount_in={}, max_in={}): {}",
-                    probe_amount_in, max_in, message
-                )),
-            });
-        }
-
-        self.log_limits_debug(
-            &probe_amount_in,
-            &max_in,
-            "Probe indicates limit on max amount; continuing with lower amounts",
-            &message,
-        );
-        let error_message = probe_error.unwrap_or_else(|| {
-            format!(
-                "Probe quote failed (amount_in={}, max_in={}): {}",
-                probe_amount_in, max_in, message,
-            )
-        });
-        probe_state.amount_in = Some(probe_amount_in);
-        probe_state.error = Some(error_message);
-        ProbeDecision::Continue(probe_state)
-    }
-
-    fn quote_ladder(&self, probe_state: ProbeState) -> PoolSimOutcome {
+    fn quote_ladder(&self) -> PoolSimOutcome {
         let mut amounts_out = Vec::with_capacity(self.expected_len);
         let mut gas_used = Vec::with_capacity(self.expected_len);
         let mut errors = Vec::new();
         let mut timed_out = false;
+        let limit_max_in = self
+            .pool_state
+            .get_limits(
+                self.token_in.address.clone(),
+                self.token_out.address.clone(),
+            )
+            .ok()
+            .map(|(max_in, _)| max_in);
         for amount_in in self.amounts.iter() {
             if self.record_cancellation_or_timeout(&mut errors, &mut timed_out) {
                 break;
             }
-            if let Some(cached_step) = probe_state.cached_step(amount_in) {
-                // The probe path already paid for this exact ladder step, so we reuse it here.
-                match cached_step {
-                    Ok((amount_out, gas_u64)) => {
-                        amounts_out.push(amount_out);
-                        gas_used.push(gas_u64);
-                        continue;
-                    }
-                    Err(error) => {
-                        errors.push(error);
-                        continue;
-                    }
+            if let Some(max_in) = limit_max_in.as_ref() {
+                if amount_in > max_in {
+                    self.log_soft_limit_context(
+                        amount_in,
+                        max_in,
+                        "Attempting quote above reported soft limit",
+                    );
                 }
             }
             match self
@@ -1661,6 +1523,9 @@ impl BlockingPoolRunner {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    if let Some(max_in) = limit_max_in.as_ref() {
+                        self.log_soft_limit_failure(amount_in, max_in, &message);
+                    }
                     self.log_pool_error(&message);
                     errors.push(message);
                 }
@@ -1711,37 +1576,40 @@ impl BlockingPoolRunner {
         false
     }
 
-    fn simulated_error_outcome(&self, message: String) -> PoolSimOutcome {
-        self.log_pool_error(&message);
-        PoolSimOutcome::Simulated(PoolQuoteResult {
-            pool: self.descriptor.id.clone(),
-            pool_name: self.descriptor.name.clone(),
-            pool_address: self.descriptor.address.clone(),
-            protocol: self.descriptor.protocol.clone(),
-            amounts_out: Vec::new(),
-            gas_used: Vec::new(),
-            errors: vec![message],
-            timed_out: false,
-        })
-    }
-
     fn log_pool_error(&self, message: &str) {
         self.log_pool_debug("pool_timeout", &format!("Pool quote error: {}", message));
     }
 
-    fn log_limits_debug(&self, amount_in: &BigUint, max_in: &BigUint, prefix: &str, message: &str) {
+    fn log_soft_limit_context(&self, amount_in: &BigUint, max_in: &BigUint, message: &str) {
         debug!(
-            scope = "limits_precheck",
+            scope = "limits_context",
             pool_id = %self.descriptor.id,
             protocol = %self.descriptor.protocol,
             pool_name = %self.descriptor.name,
             pool_address = %self.descriptor.address,
             amount_in = %amount_in,
             max_in = %max_in,
-            "{}: {}",
-            prefix,
+            "{}",
             message,
         );
+    }
+
+    fn log_soft_limit_failure(&self, amount_in: &BigUint, max_in: &BigUint, message: &str) {
+        if amount_in > max_in {
+            self.log_soft_limit_context(
+                amount_in,
+                max_in,
+                "Quote failed above reported soft limit",
+            );
+            return;
+        }
+        if is_limit_like_error_message(message) {
+            self.log_soft_limit_context(
+                amount_in,
+                max_in,
+                "Quote failed within reported soft limit",
+            );
+        }
     }
 
     fn log_pool_debug(&self, scope: &'static str, message: &str) {
@@ -1764,7 +1632,6 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
         token_in,
         token_out,
         amounts,
-        requested_max_in,
         expected_len,
         deadline,
         cancel_token,
@@ -1783,7 +1650,6 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
             token_in,
             token_out,
             amounts,
-            requested_max_in,
             expected_len,
             deadline,
             cancel_token: blocking_cancel_token,
@@ -2120,7 +1986,6 @@ fn outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
         PoolOutcomeKind::ZeroOutput => "zero_output",
         PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
         PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
-        PoolOutcomeKind::SkippedPrecheck => "skipped_precheck",
         PoolOutcomeKind::TimedOut => "timed_out",
         PoolOutcomeKind::SimulatorError => "simulator_error",
         PoolOutcomeKind::InternalError => "internal_error",
@@ -2159,14 +2024,13 @@ fn classify_pool_outcome(
         ));
     }
 
-    if !result.errors.is_empty() {
-        return Some((
-            PoolOutcomeKind::SimulatorError,
-            result.errors.first().cloned(),
-        ));
-    }
-
     if result.amounts_out.is_empty() {
+        if !result.errors.is_empty() {
+            return Some((
+                PoolOutcomeKind::SimulatorError,
+                result.errors.first().cloned(),
+            ));
+        }
         return Some((PoolOutcomeKind::ZeroOutput, None));
     }
 
@@ -2178,6 +2042,13 @@ fn classify_pool_outcome(
                 result.amounts_out.len(),
                 expected_len
             )),
+        ));
+    }
+
+    if !result.errors.is_empty() {
+        return Some((
+            PoolOutcomeKind::SimulatorError,
+            result.errors.first().cloned(),
         ));
     }
 
@@ -2225,9 +2096,9 @@ fn pool_outcome_from_failure(
     }))
 }
 
-fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> bool {
+fn is_limit_like_error_message(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
-    let limit_signal = lowered.contains("max_in")
+    lowered.contains("max_in")
         || lowered.contains("get_limits")
         || lowered.contains("sell amount exceeds limit")
         || lowered.contains("exceeds limit")
@@ -2236,13 +2107,29 @@ fn is_limits_exhaustion_probe_error(message: &str, has_partial_result: bool) -> 
         || lowered.contains("insufficient reserve")
         || lowered.contains("ticks exceeded")
         || lowered.contains("not enough liquidity")
-        || lowered.contains("support complete swap");
-    if has_partial_result {
-        // Partial results are commonly attached to limit exhaustion errors, but are not a
-        // sufficient signal on their own.
-        return limit_signal;
+        || lowered.contains("support complete swap")
+}
+
+fn is_liquidity_like_failure(failure: &QuoteFailure) -> bool {
+    match failure.kind {
+        QuoteFailureKind::NoPools => true,
+        QuoteFailureKind::Simulator => {
+            is_limit_like_error_message(&failure.message)
+                || failure
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("all pools returned zero amounts")
+        }
+        QuoteFailureKind::WarmUp
+        | QuoteFailureKind::TokenValidation
+        | QuoteFailureKind::TokenCoverage
+        | QuoteFailureKind::Timeout
+        | QuoteFailureKind::ConcurrencyLimit
+        | QuoteFailureKind::Overflow
+        | QuoteFailureKind::InconsistentResult
+        | QuoteFailureKind::Internal
+        | QuoteFailureKind::InvalidRequest => false,
     }
-    limit_signal
 }
 
 fn record_vm_first_gas_metrics(
@@ -2405,10 +2292,6 @@ fn make_failure(
 #[expect(
     clippy::expect_used,
     reason = "quote tests use deterministic fixture setup and direct invariant checks"
-)]
-#[expect(
-    clippy::panic,
-    reason = "negative quote tests use explicit invariant assertions"
 )]
 mod tests {
     use super::*;
@@ -4685,29 +4568,28 @@ mod tests {
         let request = fixture.request("req-1", &["1", "5", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(computation.responses.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert_eq!(
             computation.meta.result_quality,
             QuoteResultQuality::NoResults
         );
+        assert!(computation.meta.partial_kind.is_none());
         assert_eq!(computation.meta.failures.len(), 1);
         assert!(matches!(
             computation.meta.failures[0].kind,
-            QuoteFailureKind::NoPools
+            QuoteFailureKind::Simulator
         ));
-        assert!(computation.meta.failures[0].message.contains("get_limits"));
         assert_eq!(computation.meta.pool_results.len(), 1);
         assert_eq!(
             computation.meta.pool_results[0].outcome,
-            PoolOutcomeKind::SkippedPrecheck
+            PoolOutcomeKind::SimulatorError
         );
-        assert_eq!(computation.metrics.skipped_native_limits, 1);
     }
 
     #[tokio::test]
-    async fn does_not_skip_when_lower_ladder_amounts_are_within_limit() {
+    async fn executes_mixed_ladder_when_some_steps_exceed_reported_limit() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -4735,7 +4617,6 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
-            requested_max_in: BigUint::from(11u8),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -4744,22 +4625,19 @@ mod tests {
         .await
         .expect("simulate_pool should return outcome");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
                 assert_eq!(result.amounts_out.len(), 1);
                 assert_eq!(result.gas_used.len(), 1);
                 assert_eq!(result.errors.len(), 1);
-                assert!(result.errors[0].contains("Probe quote failed"));
-            }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
-                panic!("mixed ladder should still quote lower amounts")
+                assert!(result.errors[0].contains("amount_in exceeds get_limits max_in"));
             }
         }
     }
 
     #[tokio::test]
-    async fn does_not_skip_when_all_amounts_exceed_reported_limit_but_some_are_quotable() {
+    async fn returns_partial_result_when_soft_limit_is_conservative() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -4788,7 +4666,6 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(11u8), BigUint::from(20u8)]),
-            requested_max_in: BigUint::from(20u8),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -4797,7 +4674,7 @@ mod tests {
         .await
         .expect("simulate_pool should return outcome");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + remaining amount");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
                 assert_eq!(result.amounts_out.len(), 1);
@@ -4806,9 +4683,6 @@ mod tests {
                 assert!(result.errors[0]
                     .to_ascii_lowercase()
                     .contains("sell amount exceeds limit"));
-            }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
-                panic!("min-amount probe should prevent conservative get_limits skip")
             }
         }
     }
@@ -4920,7 +4794,6 @@ mod tests {
         );
         assert!(computation.meta.failures.is_empty());
         assert!(computation.meta.pool_results.is_empty());
-        assert_eq!(computation.metrics.skipped_native_limits, 0);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out.len(), 2);
@@ -4995,7 +4868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_fatal_error_is_not_reported_as_limits_skip() {
+    async fn fatal_error_above_reported_soft_limit_keeps_partial_ladder() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5029,29 +4902,25 @@ mod tests {
         let request = fixture.request("req-3", &["1", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "probe-only");
-        assert!(computation.responses.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
-            computation.meta.result_quality,
-            QuoteResultQuality::NoResults
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::AmountLadders)
         );
-        assert!(matches!(
-            computation.meta.status,
-            QuoteStatus::PartialSuccess
-        ));
         assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::Simulator
+        ));
         assert_eq!(computation.meta.pool_results.len(), 1);
         assert_eq!(
             computation.meta.pool_results[0].outcome,
-            PoolOutcomeKind::SimulatorError
+            PoolOutcomeKind::PartialOutput
         );
-        assert!(
-            computation.meta.failures[0]
-                .message
-                .contains("Probe quote failed"),
-            "message should explain this was a probe error"
-        );
-        assert_eq!(computation.metrics.skipped_native_limits, 0);
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5195,7 +5064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_non_limit_invalid_input_continues_ladder() {
+    async fn non_limit_invalid_input_above_soft_limit_still_executes_ladder() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -5223,7 +5092,6 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
-            requested_max_in: BigUint::from(11u8),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -5232,24 +5100,21 @@ mod tests {
         .await
         .expect("simulate_pool should return outcome");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
                 assert_eq!(result.amounts_out.len(), 1);
                 assert_eq!(result.gas_used.len(), 1);
                 assert!(!result.timed_out);
                 assert_eq!(result.errors.len(), 1);
-                assert!(result.errors[0].contains("Probe quote failed"));
                 assert!(result.errors[0].contains("Invalid input"));
-            }
-            PoolSimOutcome::SkippedDueToLimits { .. } => {
-                panic!("non-limit invalid input should not be treated as limits skip")
+                assert!(result.errors[0].contains("token_in invalid for probe"));
             }
         }
     }
 
     #[tokio::test]
-    async fn get_amounts_out_keeps_lower_quotes_on_non_limit_probe_error() {
+    async fn get_amounts_out_returns_partial_output_on_non_limit_step_failure() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5284,29 +5149,29 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "probe + lower amount");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out.len(), 1);
-        assert!(matches!(
-            computation.meta.status,
-            QuoteStatus::PartialSuccess
-        ));
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::AmountLadders)
+        );
         assert_eq!(computation.meta.failures.len(), 1);
         assert!(matches!(
             computation.meta.failures[0].kind,
-            QuoteFailureKind::InconsistentResult
+            QuoteFailureKind::Simulator
         ));
         assert_eq!(computation.meta.pool_results.len(), 1);
         assert_eq!(
             computation.meta.pool_results[0].outcome,
-            PoolOutcomeKind::SimulatorError
+            PoolOutcomeKind::PartialOutput
         );
-        assert_eq!(computation.metrics.skipped_native_limits, 0);
     }
 
     #[tokio::test]
-    async fn get_amounts_out_skips_borrowable_limit_pool_when_other_pool_completes() {
+    async fn limit_like_failure_pool_reports_simulator_error_when_other_pool_completes() {
         let fixture = BasicQuoteFixture::new();
 
         let borrowable_calls = Arc::new(AtomicUsize::new(0));
@@ -5358,22 +5223,25 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(borrowable_calls.load(Ordering::SeqCst), 1, "probe-only");
+        assert_eq!(borrowable_calls.load(Ordering::SeqCst), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
-        assert!(computation.meta.failures.is_empty());
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::PoolCoverage)
+        );
+        assert_eq!(computation.meta.failures.len(), 1);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(computation
             .meta
             .pool_results
             .iter()
-            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedPrecheck));
-        assert_eq!(computation.metrics.skipped_native_limits, 1);
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SimulatorError));
     }
 
     #[tokio::test]
-    async fn get_amounts_out_returns_no_liquidity_when_insufficient_reserve_hits_all_pools() {
+    async fn limit_like_failures_on_all_steps_return_real_no_results() {
         let fixture = BasicQuoteFixture::new();
 
         let insufficient_calls = Arc::new(AtomicUsize::new(0));
@@ -5411,24 +5279,24 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(insufficient_calls.load(Ordering::SeqCst), 1, "probe-only");
+        assert_eq!(insufficient_calls.load(Ordering::SeqCst), 2);
         assert!(computation.responses.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert_eq!(
             computation.meta.result_quality,
             QuoteResultQuality::NoResults
         );
+        assert!(computation.meta.partial_kind.is_none());
         assert_eq!(computation.meta.failures.len(), 1);
         assert!(matches!(
             computation.meta.failures[0].kind,
-            QuoteFailureKind::NoPools
+            QuoteFailureKind::Simulator
         ));
         assert!(computation
             .meta
             .pool_results
             .iter()
-            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedPrecheck));
-        assert_eq!(computation.metrics.skipped_native_limits, 1);
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SimulatorError));
     }
 
     #[tokio::test]
@@ -5481,12 +5349,82 @@ mod tests {
         let request = fixture.request("req-mixed", &["1", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
-        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses.len(), 2);
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
-        assert!(matches!(
-            computation.meta.status,
-            QuoteStatus::PartialSuccess
-        ));
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::AmountLadders)
+        );
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::PartialOutput));
+    }
+
+    #[tokio::test]
+    async fn mixed_partial_results_set_partial_kind_mixed() {
+        let fixture = BasicQuoteFixture::new();
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-partial",
+            "0x0000000000000000000000000000000000000031",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(ProbeFatalSim {
+                max_in: BigUint::from(10u8),
+                calls: default_calls(),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-empty",
+            "0x0000000000000000000000000000000000000032",
+            "fluid_v1",
+            "fluid_v1",
+            fixture.pair_tokens(),
+            Box::new(ProbeLimitMessageSim {
+                max_in: BigUint::zero(),
+                message: "Fatal error: tokenOut amount exceeds borrowable limit".to_string(),
+                calls: default_calls(),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 2,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-mixed-partial-kind", &["1", "11"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.meta.failures.len(), 2);
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::PartialOutput));
         assert!(computation
             .meta
             .pool_results
@@ -5534,12 +5472,10 @@ mod tests {
         assert!(computation.responses.is_empty());
         assert_eq!(
             computation.meta.result_quality,
-            QuoteResultQuality::NoResults
+            QuoteResultQuality::RequestLevelFailure
         );
-        assert!(matches!(
-            computation.meta.status,
-            QuoteStatus::PartialSuccess
-        ));
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(computation.meta.partial_kind.is_none());
         assert_eq!(computation.metrics.skipped_native_concurrency, 1);
         assert!(computation
             .meta
@@ -5593,12 +5529,10 @@ mod tests {
         assert!(computation.responses.is_empty());
         assert_eq!(
             computation.meta.result_quality,
-            QuoteResultQuality::NoResults
+            QuoteResultQuality::RequestLevelFailure
         );
-        assert!(matches!(
-            computation.meta.status,
-            QuoteStatus::PartialSuccess
-        ));
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(computation.meta.partial_kind.is_none());
         assert_eq!(computation.metrics.skipped_native_deadline, 1);
         assert!(computation
             .meta
@@ -5608,27 +5542,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_result_probe_error_still_requires_limit_signals() {
-        assert!(!is_limits_exhaustion_probe_error(
-            "token_in invalid for probe",
-            true
+    fn limit_like_error_message_matches_known_liquidity_signals() {
+        assert!(!is_limit_like_error_message("token_in invalid for probe"));
+        assert!(is_limit_like_error_message(
+            "tokenOut amount exceeds borrowable limit"
         ));
-        assert!(is_limits_exhaustion_probe_error(
-            "tokenOut amount exceeds borrowable limit",
-            false
+        assert!(is_limit_like_error_message(
+            "Fatal error: Insufficient reserve: tokenOut amount exceeds withdrawable limit"
         ));
-        assert!(is_limits_exhaustion_probe_error(
-            "Fatal error: Insufficient reserve: tokenOut amount exceeds withdrawable limit",
-            false
+        assert!(is_limit_like_error_message(
+            "Recoverable error: Withdrawal 57960015764091093503191 exceeds available liquidity 3543179769736901794933"
         ));
-        assert!(is_limits_exhaustion_probe_error(
-            "Recoverable error: Withdrawal 57960015764091093503191 exceeds available liquidity 3543179769736901794933",
-            false
-        ));
-        assert!(is_limits_exhaustion_probe_error(
-            "Sell amount exceeds limit 42",
-            true
-        ));
-        assert!(is_limits_exhaustion_probe_error("Ticks exceeded", true));
+        assert!(is_limit_like_error_message("Sell amount exceeds limit 42"));
+        assert!(is_limit_like_error_message("Ticks exceeded"));
     }
 }

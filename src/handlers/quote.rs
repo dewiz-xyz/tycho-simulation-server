@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use axum::{extract::State, Json};
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -9,10 +10,11 @@ use crate::{
     metrics::{
         emit_simulate_completion, emit_simulate_result_quality, emit_simulate_timeout, TimeoutKind,
     },
+    models::factories::simulate_timeout_meta,
     models::{
         messages::{
             AmountOutRequest, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
-            QuoteFailureKind, QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus,
+            QuoteFailureKind, QuotePartialKind, QuoteResult, QuoteResultQuality, QuoteStatus,
         },
         state::AppState,
     },
@@ -99,19 +101,19 @@ async fn build_request_guard_timeout_result(
         "Simulate request timed out at request-level guard"
     );
 
-    emit_simulate_completion(QuoteStatus::PartialSuccess, true);
+    emit_simulate_completion(QuoteStatus::Ready, true);
     emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
     emit_simulate_timeout(TimeoutKind::RequestGuard);
 
     QuoteResult {
         request_id: request.request_id.clone(),
         data: Vec::new(),
-        meta: build_request_guard_timeout_meta(
+        meta: simulate_timeout_meta(
             block_number,
             vm_block_number,
-            total_pools,
+            Some(total_pools),
             request.auction_id.clone(),
-            timeout_ms,
+            format!("Simulate request timed out after {}ms", timeout_ms),
         ),
     }
 }
@@ -177,8 +179,9 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             request_id = event.request.request_id.as_str(),
             auction_id = event.request.auction_id.as_deref(),
             latency_ms = event.latency_ms,
-            quote_status = ?event.computation.meta.status,
-            quote_result_quality = ?event.computation.meta.result_quality,
+            quote_status = quote_status_label(event.computation.meta.status),
+            quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
+            partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
             vm_unavailable = event.computation.meta.vm_unavailable,
             responses = event.computation.responses.len(),
             failures = event.computation.meta.failures.len(),
@@ -191,8 +194,6 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
-            skipped_native_limits = event.computation.metrics.skipped_native_limits,
-            skipped_vm_limits = event.computation.metrics.skipped_vm_limits,
             vm_completed_pools = event.computation.metrics.vm_completed_pools,
             vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
             vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
@@ -223,8 +224,9 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             request_id = event.request.request_id.as_str(),
             auction_id = event.request.auction_id.as_deref(),
             latency_ms = event.latency_ms,
-            quote_status = ?event.computation.meta.status,
-            quote_result_quality = ?event.computation.meta.result_quality,
+            quote_status = quote_status_label(event.computation.meta.status),
+            quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
+            partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
             vm_unavailable = event.computation.meta.vm_unavailable,
             responses = event.computation.responses.len(),
             failures = event.computation.meta.failures.len(),
@@ -237,8 +239,6 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
             skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
-            skipped_native_limits = event.computation.metrics.skipped_native_limits,
-            skipped_vm_limits = event.computation.metrics.skipped_vm_limits,
             vm_completed_pools = event.computation.metrics.vm_completed_pools,
             vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
             vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
@@ -396,47 +396,34 @@ fn pool_outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
         PoolOutcomeKind::ZeroOutput => "zero_output",
         PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
         PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
-        PoolOutcomeKind::SkippedPrecheck => "skipped_precheck",
         PoolOutcomeKind::TimedOut => "timed_out",
         PoolOutcomeKind::SimulatorError => "simulator_error",
         PoolOutcomeKind::InternalError => "internal_error",
     }
 }
 
+fn serialized_enum_label<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn quote_status_label(status: QuoteStatus) -> String {
+    serialized_enum_label(status)
+}
+
+fn quote_result_quality_label(result_quality: QuoteResultQuality) -> String {
+    serialized_enum_label(result_quality)
+}
+
+fn quote_partial_kind_label(partial_kind: QuotePartialKind) -> String {
+    serialized_enum_label(partial_kind)
+}
+
 struct CancelOnDrop {
     token: CancellationToken,
     armed: bool,
-}
-
-fn build_request_guard_timeout_meta(
-    block_number: u64,
-    vm_block_number: Option<u64>,
-    total_pools: usize,
-    auction_id: Option<String>,
-    timeout_ms: u64,
-) -> QuoteMeta {
-    let failure = QuoteFailure {
-        kind: QuoteFailureKind::Timeout,
-        message: format!("Simulate request timed out after {}ms", timeout_ms),
-        pool: None,
-        pool_name: None,
-        pool_address: None,
-        protocol: None,
-    };
-
-    QuoteMeta {
-        status: QuoteStatus::PartialSuccess,
-        result_quality: QuoteResultQuality::RequestLevelFailure,
-        block_number,
-        vm_block_number,
-        matching_pools: 0,
-        candidate_pools: 0,
-        total_pools: Some(total_pools),
-        auction_id,
-        pool_results: Vec::new(),
-        vm_unavailable: false,
-        failures: vec![failure],
-    }
 }
 
 impl CancelOnDrop {
@@ -558,10 +545,16 @@ mod tests {
 
     #[test]
     fn request_guard_timeout_meta_uses_request_level_failure_quality() {
-        let meta =
-            build_request_guard_timeout_meta(12, Some(11), 42, Some("auction-1".to_string()), 1500);
-        assert!(matches!(meta.status, QuoteStatus::PartialSuccess));
+        let meta = simulate_timeout_meta(
+            12,
+            Some(11),
+            Some(42),
+            Some("auction-1".to_string()),
+            "Simulate request timed out after 1500ms".to_string(),
+        );
+        assert!(matches!(meta.status, QuoteStatus::Ready));
         assert_eq!(meta.result_quality, QuoteResultQuality::RequestLevelFailure);
+        assert!(meta.partial_kind.is_none());
         assert_eq!(meta.block_number, 12);
         assert_eq!(meta.vm_block_number, Some(11));
         assert_eq!(meta.total_pools, Some(42));
