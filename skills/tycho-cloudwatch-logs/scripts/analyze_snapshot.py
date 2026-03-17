@@ -368,8 +368,12 @@ def build_report(input_dir: Path, period: str) -> str:
     latency_by_status: dict[str, list[int]] = defaultdict(list)
     latency_by_bucket: dict[str, list[int]] = defaultdict(list)
     failures_by_status: dict[str, int] = defaultdict(int)
+    failures_by_cohort: dict[tuple[str, str], int] = defaultdict(int)
+    cohort_counts: Counter[tuple[str, str]] = Counter()
+    degraded_cohort_counts: Counter[tuple[str, str]] = Counter()
     status_counts: Counter[str] = Counter()
     result_quality_counts: Counter[str] = Counter()
+    degraded_request_count = 0
 
     for row in completions_rows:
         status = row.get("status") or "Unknown"
@@ -377,9 +381,15 @@ def build_report(input_dir: Path, period: str) -> str:
         latency = to_int(row.get("latency_ms"))
         failures = to_int(row.get("failures"))
         scheduled = to_int(row.get("scheduled_native_pools")) + to_int(row.get("scheduled_vm_pools"))
+        cohort = (status, result_quality)
         status_counts[status] += 1
         result_quality_counts[result_quality] += 1
         failures_by_status[status] += failures
+        cohort_counts[cohort] += 1
+        failures_by_cohort[cohort] += failures
+        if status != "ready" or result_quality != "complete" or failures > 0:
+            degraded_request_count += 1
+            degraded_cohort_counts[cohort] += 1
         if latency:
             latency_by_status[status].append(latency)
             if scheduled <= 5:
@@ -789,13 +799,20 @@ def build_report(input_dir: Path, period: str) -> str:
 
     failure_lines = [
         f"Total failures reported: {fmt_int(sum(failures_by_status.values()))}",
-        f"Non-ready requests in sample: {fmt_int(status_total - ready_count)} / {fmt_int(status_total)}",
+        f"Degraded or failure-bearing requests in sample: {fmt_int(degraded_request_count)} / {fmt_int(status_total)}",
     ]
-    for status, count in status_counts.most_common():
-        if status != "ready":
+    if degraded_cohort_counts:
+        for (status, result_quality), count in sorted(
+            degraded_cohort_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        ):
             failure_lines.append(
-                f"{status}: {fmt_int(count)} requests, {fmt_int(failures_by_status.get(status, 0))} failures"
+                f"{status} + {result_quality}: {fmt_int(count)} requests, {fmt_int(failures_by_cohort[(status, result_quality)])} failures"
             )
+    else:
+        failure_lines.append("All sampled requests were ready + complete with zero reported failures.")
+    if other_status_parts:
+        failure_lines.append(f"Other statuses observed: {', '.join(other_status_parts)}")
     report_lines.append(fenced_text(summary_box(failure_lines)))
 
     report_lines.append("")

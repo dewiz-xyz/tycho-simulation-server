@@ -13,6 +13,7 @@ RUN_SUITE_PATH = SCRIPTS_DIR / "run_suite.sh"
 SIMULATION_SKILL_SCRIPTS_DIR = REPO_ROOT / "skills/simulation-service-tests/scripts"
 FALLBACK_PRESETS_PATH = REPO_ROOT / "skills/simulation-service-tests/scripts/presets.py"
 CLOUDWATCH_QUERY_PATH = REPO_ROOT / "skills/tycho-cloudwatch-logs/scripts/cw_query.zsh"
+ANALYZE_SNAPSHOT_PATH = REPO_ROOT / "skills/tycho-cloudwatch-logs/scripts/analyze_snapshot.py"
 DOC_PATHS_WITHOUT_LIVE_PARTIAL_SUCCESS = [
     REPO_ROOT / "README.md",
     REPO_ROOT / "STRESS_TEST_README.md",
@@ -55,6 +56,17 @@ def load_fallback_presets_module():
     spec = importlib.util.spec_from_file_location(module_name, FALLBACK_PRESETS_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load fallback presets module from {FALLBACK_PRESETS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_analyze_snapshot_module():
+    module_name = "tycho_cloudwatch_logs_analyze_snapshot"
+    spec = importlib.util.spec_from_file_location(module_name, ANALYZE_SNAPSHOT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load analyzer module from {ANALYZE_SNAPSHOT_PATH}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -548,6 +560,127 @@ class CloudWatchQueryContractTest(unittest.TestCase):
             'status = "ready" and (result_quality = "complete" or result_quality = "partial")',
             self.cw_query_text,
         )
+
+
+class SnapshotAnalyzerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.analyze_snapshot = load_analyze_snapshot_module()
+
+    def write_query_file(self, directory: Path, name: str, results: list[dict[str, object]]) -> None:
+        (directory / name).write_text(
+            self.analyze_snapshot.json.dumps(
+                {
+                    "results": results,
+                    "statistics": {"recordsMatched": len(results)},
+                }
+            )
+        )
+
+    def test_failure_summary_reports_ready_request_level_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_dir = Path(tmp_dir)
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-runs.json",
+                [
+                    {"simulation_runs": "2", "scheduled_native_pools": "1", "scheduled_vm_pools": "0"},
+                    {"simulation_runs": "2", "scheduled_native_pools": "1", "scheduled_vm_pools": "0"},
+                    {"simulation_runs": "2", "scheduled_native_pools": "1", "scheduled_vm_pools": "0"},
+                ],
+            )
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-completions.json",
+                [
+                    {
+                        "status": "ready",
+                        "result_quality": "request_level_failure",
+                        "failures": "1",
+                        "latency_ms": "105",
+                        "amounts": "2",
+                        "scheduled_native_pools": "1",
+                        "scheduled_vm_pools": "0",
+                        "token_in": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                        "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    },
+                    {
+                        "status": "ready",
+                        "result_quality": "request_level_failure",
+                        "failures": "2",
+                        "latency_ms": "110",
+                        "amounts": "2",
+                        "scheduled_native_pools": "1",
+                        "scheduled_vm_pools": "0",
+                        "token_in": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                        "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    },
+                    {
+                        "status": "ready",
+                        "result_quality": "complete",
+                        "failures": "0",
+                        "latency_ms": "95",
+                        "amounts": "2",
+                        "scheduled_native_pools": "1",
+                        "scheduled_vm_pools": "0",
+                        "token_in": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                        "token_out": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    },
+                ],
+            )
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-runs-per-minute.json",
+                [{"minute": "2026-03-17 12:00:00", "requests": "3", "total_runs": "3"}],
+            )
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-runs-per-auction.json",
+                [{"auction_id": "auction-1", "requests": "3", "total_runs": "3"}],
+            )
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-requests-per-auction.json",
+                [{"auction_id": "auction-1"}],
+            )
+            self.write_query_file(
+                snapshot_dir,
+                "simulate-workload-summary.json",
+                [
+                    {
+                        "requests": "3",
+                        "pool_simulation_runs": "3",
+                        "pool_simulation_runs_per_request": "1",
+                        "amounts_simulated_per_request": "2",
+                        "simulation_runs_total": "6",
+                        "simulation_runs_per_request": "2",
+                        "p50_simulation_runs": "2",
+                        "p90_simulation_runs": "2",
+                        "max_simulation_runs": "2",
+                    }
+                ],
+            )
+            (snapshot_dir / "cw-metrics.json").write_text(
+                self.analyze_snapshot.json.dumps(
+                    {
+                        "meta": {
+                            "since": "2026-03-17T12:00:00Z",
+                            "until": "2026-03-17T12:05:00Z",
+                        },
+                        "summary": [],
+                        "series": [],
+                    }
+                )
+            )
+
+            report = self.analyze_snapshot.build_report(snapshot_dir, "5m")
+
+            self.assertIn("request_level_failure", report)
+            self.assertIn("Ready: 100.0% (3)", report)
+            self.assertIn("Non-ready:   0.0% (0)", report)
+            self.assertIn("Degraded or failure-bearing requests in sample: 2 / 3", report)
+            self.assertIn("ready + request_level_failure: 2 requests, 3 failures", report)
+            self.assertNotIn("Non-ready requests in sample", report)
 
 
 class DocsContractTest(unittest.TestCase):
