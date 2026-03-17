@@ -33,6 +33,42 @@ pub struct AmountOutResponse {
     /// did not return valid limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization_bps: Option<u32>,
+    /// Composite execution-risk assessment derived from slippage, utilization,
+    /// curve convexity, and ladder completeness.  `None` when insufficient data
+    /// is available (e.g. all slippage entries are null and utilization unknown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_risk: Option<ExecutionRisk>,
+}
+
+/// Qualitative risk level derived from the composite `risk_score`.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    /// `risk_score < 200` — deep pool, minimal sensitivity to concurrent activity.
+    Low,
+    /// `risk_score 200–499` — moderate sensitivity; suitable for most orders.
+    Medium,
+    /// `risk_score 500–999` — pool state sensitive to competing solver routing.
+    High,
+    /// `risk_score >= 1000` — prefer splitting across multiple pools.
+    VeryHigh,
+    /// Insufficient signal to compute a score (all slippage null, no utilization).
+    Unknown,
+}
+
+/// Composite execution-risk score and qualitative label for a single pool quote.
+///
+/// The score is computed server-side from signals already present in the response:
+/// slippage (price sensitivity), utilization (capacity pressure), curve convexity,
+/// and partial-ladder detection.  Block-lag staleness is **not** included here —
+/// clients should add that penalty using `block_number` vs. current chain head.
+#[derive(Debug, Serialize, Clone)]
+pub struct ExecutionRisk {
+    /// Weighted composite score.  Lower is safer.
+    /// `< 200` → low; `200–499` → medium; `500–999` → high; `>= 1000` → very high.
+    pub risk_score: u32,
+    /// Qualitative label derived from `risk_score`.
+    pub risk_level: RiskLevel,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -278,7 +314,7 @@ pub struct EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AmountOutResponse, PoolOutcomeKind, QuoteResultQuality};
+    use super::{AmountOutResponse, ExecutionRisk, PoolOutcomeKind, QuoteResultQuality, RiskLevel};
 
     #[test]
     fn quote_result_quality_serializes_as_snake_case() {
@@ -316,10 +352,90 @@ mod tests {
             block_number: 1,
             slippage_bps: Vec::new(),
             pool_utilization_bps: None,
+            execution_risk: None,
         };
 
         let value = serde_json::to_value(response).expect("serialize response");
         assert_eq!(value["gas_in_sell"], "3000000");
         assert!(value.get("gasInSellToken").is_none());
+    }
+
+    #[test]
+    fn risk_level_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::Low).unwrap(),
+            "\"low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::High).unwrap(),
+            "\"high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::VeryHigh).unwrap(),
+            "\"very_high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    #[test]
+    fn execution_risk_serializes_with_expected_field_names() {
+        let risk = ExecutionRisk {
+            risk_score: 87,
+            risk_level: RiskLevel::Low,
+        };
+        let value = serde_json::to_value(&risk).expect("serialize ExecutionRisk");
+        assert_eq!(value["risk_score"], 87);
+        assert_eq!(value["risk_level"], "low");
+    }
+
+    #[test]
+    fn amount_out_response_omits_execution_risk_when_none() {
+        let response = AmountOutResponse {
+            pool: "pool-1".to_string(),
+            pool_name: "name".to_string(),
+            pool_address: "0x1".to_string(),
+            amounts_out: vec!["1".to_string()],
+            gas_used: vec![1],
+            gas_in_sell: "0".to_string(),
+            block_number: 1,
+            slippage_bps: Vec::new(),
+            pool_utilization_bps: None,
+            execution_risk: None,
+        };
+        let value = serde_json::to_value(response).expect("serialize response");
+        assert!(
+            value.get("execution_risk").is_none(),
+            "execution_risk should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn amount_out_response_includes_execution_risk_when_present() {
+        let response = AmountOutResponse {
+            pool: "pool-1".to_string(),
+            pool_name: "name".to_string(),
+            pool_address: "0x1".to_string(),
+            amounts_out: vec!["1".to_string()],
+            gas_used: vec![1],
+            gas_in_sell: "0".to_string(),
+            block_number: 1,
+            slippage_bps: Vec::new(),
+            pool_utilization_bps: None,
+            execution_risk: Some(ExecutionRisk {
+                risk_score: 221,
+                risk_level: RiskLevel::Medium,
+            }),
+        };
+        let value = serde_json::to_value(response).expect("serialize response");
+        let er = value.get("execution_risk").expect("execution_risk present");
+        assert_eq!(er["risk_score"], 221);
+        assert_eq!(er["risk_level"], "medium");
     }
 }

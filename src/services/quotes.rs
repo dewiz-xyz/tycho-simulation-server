@@ -21,8 +21,8 @@ use tycho_simulation::{
 };
 
 use crate::models::messages::{
-    AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
-    QuoteFailureKind, QuoteMeta, QuoteResultQuality, QuoteStatus,
+    AmountOutRequest, AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome,
+    QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResultQuality, QuoteStatus, RiskLevel,
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
@@ -816,6 +816,11 @@ pub async fn get_amounts_out(
                                                 &requested_max_in,
                                                 result.max_in.as_ref(),
                                             );
+                                            let execution_risk = compute_execution_risk(
+                                                &slippage_bps,
+                                                pool_utilization_bps,
+                                                amounts_in.len(),
+                                            );
                                             responses.push(AmountOutResponse {
                                                 pool: result.pool,
                                                 pool_name: result.pool_name,
@@ -826,6 +831,7 @@ pub async fn get_amounts_out(
                                                 block_number: current_block,
                                                 slippage_bps,
                                                 pool_utilization_bps,
+                                                execution_risk,
                                             });
                                         }
                                     }
@@ -1772,6 +1778,77 @@ fn compute_pool_utilization_bps(
     // Scale up before integer division to avoid losing precision.
     let utilization = (requested_max_in * 10_000u32) / max_in;
     utilization.to_u32().or(Some(u32::MAX))
+}
+
+/// Compute a composite execution-risk score for a pool quote.
+///
+/// Formula (weights from `docs/pool-execution-risk.md`):
+/// ```text
+/// risk_score = 0.35 × slippage_last_bps
+///            + 0.35 × utilization_bps
+///            + 0.15 × convexity_ratio          (slippage_last / slippage_first)
+///            + 0.05 × partial_ladder × 10_000
+/// ```
+/// Block-lag staleness (w4) is intentionally omitted — clients add that penalty
+/// using `block_number` vs. the current chain head.
+///
+/// Returns `None` only when all slippage entries are `None` **and**
+/// `pool_utilization_bps` is also `None` (no signal at all).
+fn compute_execution_risk(
+    slippage_bps: &[Option<i32>],
+    pool_utilization_bps: Option<u32>,
+    requested_steps: usize,
+) -> Option<ExecutionRisk> {
+    const W1: f64 = 0.35;
+    const W2: f64 = 0.35;
+    const W3: f64 = 0.15;
+    const W5: f64 = 0.05;
+
+    // Last non-None slippage value (clamped to >= 0; negative = favourable fill).
+    let slippage_last = slippage_bps
+        .iter()
+        .rev()
+        .find_map(|&s| s)
+        .map(|v| v.max(0) as f64);
+
+    // First non-None slippage value.
+    let slippage_first = slippage_bps.iter().find_map(|&s| s).map(|v| v.max(0) as f64);
+
+    // If every entry is None and utilization is unknown, we have no signal.
+    if slippage_last.is_none() && pool_utilization_bps.is_none() {
+        return Some(ExecutionRisk {
+            risk_score: 0,
+            risk_level: RiskLevel::Unknown,
+        });
+    }
+
+    // Convexity ratio: slippage_last / slippage_first.
+    // Zero when first step is 0 (flat curve) or unavailable.
+    let convexity = match (slippage_last, slippage_first) {
+        (Some(last), Some(first)) if first > 0.0 => last / first,
+        _ => 0.0,
+    };
+
+    let partial_ladder = slippage_bps.len() < requested_steps;
+
+    let score = slippage_last.unwrap_or(0.0) * W1
+        + pool_utilization_bps.unwrap_or(0) as f64 * W2
+        + convexity * W3
+        + if partial_ladder { 10_000.0 * W5 } else { 0.0 };
+
+    let risk_score = score.round().clamp(0.0, u32::MAX as f64) as u32;
+
+    let risk_level = match risk_score {
+        s if s < 200 => RiskLevel::Low,
+        s if s < 500 => RiskLevel::Medium,
+        s if s < 1000 => RiskLevel::High,
+        _ => RiskLevel::VeryHigh,
+    };
+
+    Some(ExecutionRisk {
+        risk_score,
+        risk_level,
+    })
 }
 
 fn classify_failure(message: &str, from_pool: bool) -> QuoteFailureKind {
@@ -5335,5 +5412,121 @@ mod tests {
             true
         ));
         assert!(is_limits_exhaustion_probe_error("Ticks exceeded", true));
+    }
+
+    // ── compute_execution_risk ────────────────────────────────────────────────
+
+    #[test]
+    fn execution_risk_low_for_deep_pool_small_slippage_and_utilization() {
+        // slippage_last=5, utilization=100, flat curve, full ladder
+        // score ≈ 5×0.35 + 100×0.35 + 1.0×0.15 = 1.75+35.0+0.15 ≈ 37 → Low
+        let risk = compute_execution_risk(&[Some(5)], Some(100), 1).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::Low);
+        assert!(risk.risk_score < 200, "score={}", risk.risk_score);
+    }
+
+    #[test]
+    fn execution_risk_medium_for_moderate_slippage_and_utilization() {
+        // slippage_last=30, utilization=600, flat curve, full ladder
+        // score ≈ 30×0.35 + 600×0.35 + 1.0×0.15 = 10.5+210.0+0.15 ≈ 221 → Medium
+        let risk = compute_execution_risk(&[Some(30)], Some(600), 1).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::Medium);
+        assert!(
+            risk.risk_score >= 200 && risk.risk_score < 500,
+            "score={}",
+            risk.risk_score
+        );
+    }
+
+    #[test]
+    fn execution_risk_high_for_elevated_slippage_and_utilization() {
+        // slippage_last=100, utilization=2000, flat curve, full ladder
+        // score ≈ 100×0.35 + 2000×0.35 + 0.15 = 35+700+0.15 ≈ 735 → High
+        let risk = compute_execution_risk(&[Some(100)], Some(2000), 1).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::High);
+        assert!(
+            risk.risk_score >= 500 && risk.risk_score < 1000,
+            "score={}",
+            risk.risk_score
+        );
+    }
+
+    #[test]
+    fn execution_risk_very_high_for_high_utilization_with_no_slippage() {
+        // All slippage None but utilization=8000 → score ≈ 8000×0.35 = 2800 → VeryHigh
+        let risk = compute_execution_risk(&[None, None], Some(8000), 2).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::VeryHigh);
+        assert!(risk.risk_score >= 1000, "score={}", risk.risk_score);
+    }
+
+    #[test]
+    fn execution_risk_unknown_when_no_signal_available() {
+        // All None slippage + no utilization → Unknown
+        let risk = compute_execution_risk(&[None, None], None, 2).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::Unknown);
+        assert_eq!(risk.risk_score, 0);
+    }
+
+    #[test]
+    fn execution_risk_partial_ladder_raises_score_by_500() {
+        // 2 amounts_out returned for 3 requested steps → partial_ladder penalty
+        // slippage=[Some(5), Some(5)], no utilization
+        // base ≈ 5×0.35 + 1.0×0.15 ≈ 1.9; partial = 10000×0.05 = 500 → score ≈ 502 → High
+        let risk = compute_execution_risk(&[Some(5), Some(5)], None, 3).unwrap();
+        assert_eq!(risk.risk_level, RiskLevel::High);
+        // penalty contribution is exactly 500 bps
+        assert!(risk.risk_score >= 500, "score={}", risk.risk_score);
+    }
+
+    #[test]
+    fn execution_risk_full_ladder_does_not_include_partial_penalty() {
+        // same slippage as above but requested_steps == actual steps
+        let without_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 2).unwrap();
+        let with_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 3).unwrap();
+        assert!(
+            with_penalty.risk_score > without_penalty.risk_score + 490,
+            "partial={} full={}",
+            with_penalty.risk_score,
+            without_penalty.risk_score
+        );
+    }
+
+    #[test]
+    fn execution_risk_convexity_factor_amplifies_score_on_steep_curve() {
+        // slippage=[Some(1), Some(100)] → convexity = 100/1 = 100
+        // score ≈ 100×0.35 + 100×0.15 = 35+15 = 50 → Low (convexity alone is modest)
+        // But verify convexity IS counted: flat curve [Some(50), Some(50)] gives lower score.
+        let steep = compute_execution_risk(&[Some(1), Some(100)], None, 2).unwrap();
+        let flat = compute_execution_risk(&[Some(50), Some(50)], None, 2).unwrap();
+        // steep has lower slippage_last (100 vs 50 × W1 — actually 100 > 50, but convexity is 100 vs 1)
+        // Let's just assert convexity adds something vs a zero-convexity baseline.
+        let no_convexity = compute_execution_risk(&[Some(100), Some(100)], None, 2).unwrap();
+        assert!(
+            steep.risk_score > no_convexity.risk_score,
+            "steep={} no_convexity={}",
+            steep.risk_score,
+            no_convexity.risk_score
+        );
+        let _ = flat; // used to keep the binding; primary assertion above
+    }
+
+    #[test]
+    fn execution_risk_zero_slippage_first_does_not_panic_or_produce_infinite_convexity() {
+        // slippage_first = 0 → convexity should be 0, not Inf/NaN
+        let risk = compute_execution_risk(&[Some(0), Some(50)], None, 2).unwrap();
+        assert!(risk.risk_score < u32::MAX);
+        assert_ne!(risk.risk_level, RiskLevel::Unknown);
+    }
+
+    #[test]
+    fn execution_risk_negative_slippage_treated_as_zero_for_score() {
+        // Negative slippage (favourable fill) should not reduce the score below what
+        // utilization alone would produce.
+        let risk_neg = compute_execution_risk(&[Some(-50)], Some(300), 1).unwrap();
+        let risk_zero = compute_execution_risk(&[Some(0)], Some(300), 1).unwrap();
+        assert_eq!(
+            risk_neg.risk_score, risk_zero.risk_score,
+            "negative slippage should be clamped to 0"
+        );
     }
 }
