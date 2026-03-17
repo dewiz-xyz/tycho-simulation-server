@@ -2,9 +2,10 @@
 
 ## Schema (latest)
 - `/encode` uses `RouteEncodeRequest` / `RouteEncodeResponse` with camelCase fields.
-- Execution is **singleSwap-only** (no splitSwap or sequentialSwap in v1).
+- The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` depending on route shape and splits.
 - Requests include only route-level `amountIn` and `minAmountOut` plus `shareBps`/`splitBps` for splits.
 - Per-hop and per-swap amounts are not accepted and not returned.
+- `/encode` keeps its current success/error response contract. `/simulate` selection semantics are documented in [docs/simulate_example.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/simulate_example.md).
 
 ## Smoke test helper
 
@@ -33,3 +34,4 @@ python3 scripts/encode_smoke.py --chain-id 8453 --encode-url http://localhost:30
 ## Reference docs
 
 - `docs/encode_example.md` for schema shape examples.
+- `docs/simulate_example.md` for `/simulate` quoteability rules used during pool selection.

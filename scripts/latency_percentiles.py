@@ -64,6 +64,52 @@ def parse_tokens(tokens_csv: str | None, chain_id: int) -> list[str]:
     return [resolve_token(token, chain_id) for token in tokens]
 
 
+def validate_response_meta(
+    meta: object,
+    *,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+    allow_no_pools: bool,
+) -> tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, "meta_not_object"
+
+    status = meta.get("status")
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+
+    if status not in allowed_statuses:
+        return False, f"meta_status:{status}"
+
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            return False, "partial_kind_invalid"
+    elif partial_kind is not None:
+        return False, "partial_kind_unexpected"
+
+    if status == "ready" and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_ready_result_quality:{result_quality}"
+
+    if status == "no_liquidity":
+        if result_quality != "no_results":
+            return False, f"unexpected_no_liquidity_quality:{result_quality}"
+        if not allow_no_pools:
+            return False, "meta_status:no_liquidity"
+
+    if failures and not allow_failures:
+        if allow_no_pools and status == "no_liquidity":
+            only_no_pools = all(
+                isinstance(item, dict) and item.get("kind") == "no_pools"
+                for item in failures
+            )
+            if only_no_pools:
+                return True, ""
+        return False, "meta_failures"
+
+    return True, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Latency percentiles for POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
@@ -206,25 +252,19 @@ def main() -> int:
             meta = response_json.get("meta", {})
             status = meta.get("status")
             failures_list = meta.get("failures", [])
+            result_quality = meta.get("result_quality")
 
             with status_lock:
                 status_counts[str(status)] += 1
 
-            if status not in allowed_statuses:
-                return None, f"meta_status:{status}"
-
-            if failures_list and not args.allow_failures:
-                if args.allow_no_pools and status == "no_liquidity":
-                    only_no_pools = all(
-                        isinstance(item, dict) and item.get("kind") == "no_pools"
-                        for item in failures_list
-                    )
-                    if only_no_pools:
-                        failures_list = []
-                    else:
-                        return None, "meta_failures"
-                else:
-                    return None, "meta_failures"
+            meta_valid, meta_error = validate_response_meta(
+                meta,
+                allowed_statuses=allowed_statuses,
+                allow_failures=args.allow_failures,
+                allow_no_pools=args.allow_no_pools,
+            )
+            if not meta_valid:
+                return None, meta_error
 
             return elapsed, None
         except HTTPError as exc:

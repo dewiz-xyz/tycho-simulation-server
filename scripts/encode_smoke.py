@@ -118,6 +118,40 @@ def select_pool(response: dict, label: str) -> dict:
     return pool
 
 
+def validate_simulate_meta(
+    meta: object,
+    *,
+    label: str,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+) -> None:
+    if not isinstance(meta, dict):
+        raise AssertionError(f"{label}: meta is not an object")
+
+    status = meta.get("status")
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+
+    if status not in allowed_statuses:
+        raise AssertionError(
+            f"{label}: expected {sorted(allowed_statuses)}, got status {status!r}"
+        )
+    if status != "ready":
+        raise AssertionError(f"{label}: pool selection requires status=ready")
+    if result_quality not in {"complete", "partial"}:
+        raise AssertionError(
+            f"{label}: pool selection requires result_quality complete/partial, got {result_quality!r}"
+        )
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            raise AssertionError(f"{label}: partial result missing valid partial_kind")
+    elif partial_kind is not None:
+        raise AssertionError(f"{label}: partial_kind must be omitted unless result_quality=partial")
+    if failures and not allow_failures:
+        raise AssertionError(f"{label}: had {len(failures)} failures")
+
+
 def protocol_from_pool_name(pool_name: str) -> str:
     if "::" in pool_name:
         return pool_name.split("::", 1)[0]
@@ -231,15 +265,15 @@ def main() -> int:
         return 1
 
     meta = response.get("meta", {})
-    status_value = meta.get("status") if isinstance(meta, dict) else None
-    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
-    if status_value not in allowed_statuses:
-        print(
-            f"[FAIL] simulate {token_in_symbol}->{mid_symbol} expected {sorted(allowed_statuses)}, got {status_value}"
+    try:
+        validate_simulate_meta(
+            meta,
+            label=f"simulate {token_in_symbol}->{mid_symbol}",
+            allowed_statuses=allowed_statuses,
+            allow_failures=args.allow_failures,
         )
-        return 1
-    if failures_list and not args.allow_failures:
-        print(f"[FAIL] simulate {token_in_symbol}->{mid_symbol} had {len(failures_list)} failures")
+    except AssertionError as exc:
+        print(f"[FAIL] {exc}")
         return 1
 
     pool_first = select_pool(response, f"simulate {token_in_symbol}->{mid_symbol}")
@@ -266,15 +300,15 @@ def main() -> int:
         return 1
 
     meta = response_second.get("meta", {})
-    status_value = meta.get("status") if isinstance(meta, dict) else None
-    failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
-    if status_value not in allowed_statuses:
-        print(
-            f"[FAIL] simulate {mid_symbol}->{token_out_symbol} expected {sorted(allowed_statuses)}, got {status_value}"
+    try:
+        validate_simulate_meta(
+            meta,
+            label=f"simulate {mid_symbol}->{token_out_symbol}",
+            allowed_statuses=allowed_statuses,
+            allow_failures=args.allow_failures,
         )
-        return 1
-    if failures_list and not args.allow_failures:
-        print(f"[FAIL] simulate {mid_symbol}->{token_out_symbol} had {len(failures_list)} failures")
+    except AssertionError as exc:
+        print(f"[FAIL] {exc}")
         return 1
 
     pool_second = select_pool(response_second, f"simulate {mid_symbol}->{token_out_symbol}")

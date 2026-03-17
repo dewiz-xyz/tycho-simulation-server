@@ -2,6 +2,9 @@
 
 Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or concurrency).
 
+Quote-contract note:
+- The live `/simulate` contract is summarized in [README.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/README.md) and detailed for maintainers in [docs/quote_service.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/quote_service.md).
+
 ## Dependency bump
 1. Update `Cargo.toml` (e.g., `tycho-simulation` git tag).
 2. Run `cargo build --release` to refresh `Cargo.lock`.
@@ -31,11 +34,13 @@ Run verification per target chain.
    - `scripts/start_server.sh --repo . --chain-id 8453`
    - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 8453`
 2. Run smoke tests + sweep:
-   - `python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-status ready,partial_success --allow-failures`
-   - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite core --allow-status ready,partial_success --allow-failures --out logs/coverage_sweep.base.json`
-   - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams --out logs/coverage_aerodrome_presence.json`
+   - `python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-failures`
+   - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite core --allow-failures --out logs/coverage_sweep.base.json`
+   - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams --out logs/coverage_aerodrome_presence.json`
 3. Run latency percentiles:
-   - `python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 300 --concurrency 50 --allow-status ready,partial_success --allow-failures`
+   - `python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 300 --concurrency 50 --allow-failures`
+
+These relaxed helper invocations still require usable `result_quality=complete|partial`; they do not treat `request_level_failure` or `no_results` as success.
 
 ## VM pools (Curve/Balancer/Maverick)
 - VM checks are meaningful only when `/status.vm_enabled=true`.

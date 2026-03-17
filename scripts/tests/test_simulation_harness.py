@@ -10,7 +10,19 @@ from unittest.mock import patch
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SCRIPTS_DIR.parent
 RUN_SUITE_PATH = SCRIPTS_DIR / "run_suite.sh"
+SIMULATION_SKILL_SCRIPTS_DIR = REPO_ROOT / "skills/simulation-service-tests/scripts"
 FALLBACK_PRESETS_PATH = REPO_ROOT / "skills/simulation-service-tests/scripts/presets.py"
+CLOUDWATCH_QUERY_PATH = REPO_ROOT / "skills/tycho-cloudwatch-logs/scripts/cw_query.zsh"
+DOC_PATHS_WITHOUT_LIVE_PARTIAL_SUCCESS = [
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "STRESS_TEST_README.md",
+    REPO_ROOT / "skills/simulation-service-tests/SKILL.md",
+    REPO_ROOT / "skills/simulation-service-tests/references/project.md",
+    REPO_ROOT / "skills/simulation-service-tests/references/protocols.md",
+    REPO_ROOT / "skills/simulation-service-tests/references/upgrade.md",
+    REPO_ROOT / "skills/tycho-cloudwatch-logs/SKILL.md",
+    REPO_ROOT / "skills/tycho-cloudwatch-logs/references/queries.md",
+]
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -20,6 +32,7 @@ from encode_smoke import (
     DEFAULT_TYCHO_ROUTER_BY_CHAIN,
     default_contract_address,
     resolve_contract_address,
+    validate_simulate_meta,
 )
 from presets import (
     RETH_ETH_TARGET_BASE_UNITS,
@@ -31,6 +44,7 @@ from presets import (
     resolve_chain_id,
     suite_pairs,
 )
+from simulate_smoke import allows_partial_ladder_prefix, validate_pool_entry
 
 ETHEREUM_CHAIN_ID = 1
 BASE_CHAIN_ID = 8453
@@ -48,6 +62,13 @@ def load_fallback_presets_module():
 
 
 class PresetsTest(unittest.TestCase):
+    def test_skill_scripts_directory_keeps_only_utilities_and_fallback_presets(self) -> None:
+        self.assertTrue(FALLBACK_PRESETS_PATH.is_file())
+        actual = {
+            path.name for path in SIMULATION_SKILL_SCRIPTS_DIR.iterdir() if path.is_file()
+        }
+        self.assertEqual(actual, {"memory_diff.py", "presets.py", "run_checks.sh"})
+
     def test_amounts_for_pair_uses_pair_override(self) -> None:
         self.assertEqual(
             amounts_for_pair("WETH", "USDC", ETHEREUM_CHAIN_ID),
@@ -249,7 +270,7 @@ class CoverageSweepTest(unittest.TestCase):
                 allow_failures=True,
                 allow_no_pools=True,
             ),
-            {"ready", "partial_success", "no_liquidity"},
+            {"ready", "no_liquidity"},
         )
 
     def test_protocol_from_fields_prefers_explicit_protocol(self) -> None:
@@ -338,6 +359,34 @@ class EncodeSmokeConfigTest(unittest.TestCase):
                     "0x2222222222222222222222222222222222222222",
                 )
 
+
+class EncodeSmokeMetaValidationTest(unittest.TestCase):
+    def test_validate_simulate_meta_accepts_ready_partial_with_partial_kind(self) -> None:
+        validate_simulate_meta(
+            {
+                "status": "ready",
+                "result_quality": "partial",
+                "partial_kind": "mixed",
+                "failures": [],
+            },
+            label="hop",
+            allowed_statuses={"ready"},
+            allow_failures=False,
+        )
+
+    def test_validate_simulate_meta_rejects_request_level_failure_for_pool_selection(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "result_quality"):
+            validate_simulate_meta(
+                {
+                    "status": "ready",
+                    "result_quality": "request_level_failure",
+                    "failures": [],
+                },
+                label="hop",
+                allowed_statuses={"ready"},
+                allow_failures=False,
+            )
+
     def test_resolve_contract_address_parses_exported_and_quoted_dotenv_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             repo = Path(tmp_dir)
@@ -356,6 +405,78 @@ class EncodeSmokeConfigTest(unittest.TestCase):
                     ),
                     "0x3333333333333333333333333333333333333333",
                 )
+
+
+class SimulateSmokeValidationTest(unittest.TestCase):
+    @staticmethod
+    def make_pool_entry(
+        amounts_out: list[str],
+        gas_used=None,
+    ) -> dict:
+        return {
+            "amounts_out": amounts_out,
+            "gas_used": gas_used if gas_used is not None else [21000] * len(amounts_out),
+            "gas_in_sell": "123",
+            "block_number": 1,
+        }
+
+    def test_complete_result_keeps_strict_full_ladder_validation(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry(["1", "2"]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("complete", None),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("amounts_out length mismatch", error)
+
+    def test_partial_pool_coverage_keeps_strict_full_ladder_validation(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry(["1", "2"]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("partial", "pool_coverage"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("amounts_out length mismatch", error)
+
+    def test_partial_amount_ladders_accepts_non_empty_prefix(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry(["1", "2"]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("partial", "amount_ladders"),
+        )
+
+        self.assertTrue(ok, error)
+
+    def test_partial_mixed_accepts_non_empty_prefix(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry(["1", "2"]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("partial", "mixed"),
+        )
+
+        self.assertTrue(ok, error)
+
+    def test_validation_rejects_mismatched_gas_length_in_any_mode(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry(["1", "2"], gas_used=[21000]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("partial", "amount_ladders"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("gas_used length mismatch", error)
+
+    def test_validation_rejects_empty_prefix_for_partial_amount_ladders(self) -> None:
+        ok, error = validate_pool_entry(
+            self.make_pool_entry([]),
+            expected_len=3,
+            allow_partial_prefix=allows_partial_ladder_prefix("partial", "amount_ladders"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("amounts_out length mismatch", error)
 
 
 class RunSuiteContractTest(unittest.TestCase):
@@ -412,6 +533,28 @@ class RunSuiteContractTest(unittest.TestCase):
             '"${coverage_flags[@]}" \\\n      --expect-protocols balancer_v2',
             self.run_suite_text,
         )
+
+    def test_run_suite_remains_strict_without_allow_failures_flag(self) -> None:
+        self.assertNotIn("--allow-failures", self.run_suite_text)
+
+
+class CloudWatchQueryContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cw_query_text = CLOUDWATCH_QUERY_PATH.read_text()
+
+    def test_simulate_successes_filters_quoteable_result_quality(self) -> None:
+        self.assertIn(
+            'status = "ready" and (result_quality = "complete" or result_quality = "partial")',
+            self.cw_query_text,
+        )
+
+
+class DocsContractTest(unittest.TestCase):
+    def test_user_facing_docs_do_not_describe_partial_success_as_live_behavior(self) -> None:
+        for path in DOC_PATHS_WITHOUT_LIVE_PARTIAL_SUCCESS:
+            with self.subTest(path=path):
+                self.assertNotIn("partial_success", path.read_text())
 
 
 if __name__ == "__main__":

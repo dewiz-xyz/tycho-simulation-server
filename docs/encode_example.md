@@ -1,6 +1,6 @@
 # /encode example (RouteEncodeRequest)
 
-This document describes the target `/encode` schema.
+This document describes the `/encode` request and response shape.
 
 ## Terminology
 
@@ -12,7 +12,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 
 ## Workflow
 
-- Call `/simulate` for candidate pools.
+- Call `/simulate` for candidate pools. Keep only quoteable results (`status = "ready"` with `result_quality = "complete"` or `"partial"`). See [simulate_example.md](simulate_example.md).
 - Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.

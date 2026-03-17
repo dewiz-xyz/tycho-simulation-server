@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: run_suite.sh --repo <path> [--base-url <url>] [--chain-id <id>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--allow-no-liquidity] [--allow-partial] [--stop]
+Usage: run_suite.sh --repo <path> [--base-url <url>] [--chain-id <id>] [--suite <name>] [--disable-vm-pools] [--enable-vm-pools] [--allow-no-liquidity] [--stop]
 
 Run a small end-to-end test suite:
 1) start server (if not already running)
@@ -21,11 +21,10 @@ Options:
   --disable-vm-pools   Start server with ENABLE_VM_POOLS=false
   --enable-vm-pools    Start server with ENABLE_VM_POOLS=true (default; waits for vm_status=ready on supported chains)
   --allow-no-liquidity Allow no_liquidity responses with only no_pools failures
-  --allow-partial      Allow partial_success responses (and their failures)
   --stop               Stop server when done (only if started by this script)
   -h, --help           Show this help
 
-Tip: For mainnet variability, use --allow-partial --allow-no-liquidity for local runs.
+Tip: For mainnet variability, use --allow-no-liquidity only when you intentionally want to tolerate no-pools/no-results responses.
 USAGE
 }
 
@@ -80,7 +79,6 @@ chain_id_arg=""
 suite="core"
 enable_vm_pools="true"
 allow_no_liquidity="false"
-allow_partial="false"
 stop_after="false"
 
 while [[ $# -gt 0 ]]; do
@@ -111,10 +109,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-no-liquidity)
       allow_no_liquidity="true"
-      shift 1
-      ;;
-    --allow-partial)
-      allow_partial="true"
       shift 1
       ;;
     --stop)
@@ -168,23 +162,12 @@ echo "Chain: $chain_name ($chain_id)"
 echo "Suite: $suite"
 echo "Enable VM pools (requested): $enable_vm_pools"
 echo "Allow no_liquidity: $allow_no_liquidity"
-echo "Allow partial_success: $allow_partial"
 
 simulate_allow_status="ready"
 coverage_allow_status="ready"
 latency_allow_status="ready"
-simulate_flags=()
 coverage_flags=()
 latency_flags=()
-
-if [[ "$allow_partial" == "true" ]]; then
-  simulate_allow_status="${simulate_allow_status},partial_success"
-  coverage_allow_status="${coverage_allow_status},partial_success"
-  latency_allow_status="${latency_allow_status},partial_success"
-  simulate_flags+=(--allow-failures)
-  coverage_flags+=(--allow-failures)
-  latency_flags+=(--allow-failures)
-fi
 
 if [[ "$allow_no_liquidity" == "true" ]]; then
   coverage_allow_status="${coverage_allow_status},no_liquidity"
@@ -266,8 +249,7 @@ python3 "$script_dir/simulate_smoke.py" \
   --suite smoke \
   --allow-status "$simulate_allow_status" \
   --require-data \
-  --validate-data \
-  ${simulate_flags[@]+"${simulate_flags[@]}"}
+  --validate-data
 
 echo "Encode smoke testing..."
 python3 "$script_dir/encode_smoke.py" \
@@ -275,8 +257,7 @@ python3 "$script_dir/encode_smoke.py" \
   --simulate-url "$simulate_url" \
   --chain-id "$chain_id" \
   --repo "$repo" \
-  --allow-status "$simulate_allow_status" \
-  ${simulate_flags[@]+"${simulate_flags[@]}"}
+  --allow-status "$simulate_allow_status"
 
 echo "Coverage sweep..."
 mkdir -p "$repo/logs"

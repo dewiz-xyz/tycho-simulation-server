@@ -11,7 +11,7 @@ Use AWS CLI to inspect Tycho simulation logs in CloudWatch. Default log group is
 If you hit `ExpiredTokenException`, refresh the `AWS_SESSION_TOKEN` in `.env` and retry.
 
 Simulate completion logs are now emitted at `info` level for successful requests and include extra context (tokens, latency, top pool details, and failure summaries). For detailed failure summaries, inspect the raw `@message` JSON.
-The raw completion logs now emit `quote_status` and `quote_result_quality`; the bundled query presets map those back to `status` and `result_quality` so existing reports and analyzers keep working.
+The raw completion logs emit wire-aligned `quote_status`, `quote_result_quality`, and `partial_kind`; the bundled query presets map those back to concise columns for triage.
 `uniswap-v4-filter` logs include `filter_rule`, `considered_pools`, `accepted_pools`, `filtered_pools`, `pools_with_hook_identifier`, and `pools_missing_hook_identifier` to explain hook-pool coverage.
 
 ## Quick start
@@ -24,6 +24,8 @@ The raw completion logs now emit `quote_status` and `quote_result_quality`; the 
 ## ERC4626 rollout checks
 For ERC4626 `/simulate` rollout triage, use the existing presets instead of adding a new one:
 `simulate-requests`, `simulate-completions`, `simulate-successes`, and `simulate-runs`.
+
+Use `simulate-completions` when you need to inspect degraded `ready` outcomes. `simulate-successes` is intentionally narrower and only shows quoteable `ready` completions (`result_quality=complete|partial`).
 
 Supported ERC4626 directions on this server today:
 - `USDS -> sUSDS`
@@ -59,7 +61,7 @@ Start with `references/queries.md` for copyable ERC4626 pair filters built on to
 | router-timeouts | Router boundary timeouts. |
 | simulate-requests | Incoming simulate requests. |
 | simulate-completions | Completion logs for simulate calls. |
-| simulate-successes | Successful completion logs (`status=Ready` via compatibility mapping from `quote_status`). |
+| simulate-successes | Quoteable successful completion logs (`status=ready` with `result_quality=complete|partial`). |
 | simulate-rpm | Requests per minute (completion-based). |
 | simulate-rpm-by-auction | Requests per minute per auction_id. |
 | simulate-requests-per-auction | Total request count per auction_id. |
@@ -118,3 +120,4 @@ Quick checks for memory and CPU utilization using ECS ContainerInsights.
 
 ## References
 Use `references/queries.md` for the full preset index and filter/query snippets.
+Use [docs/quote_service.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/quote_service.md) for the `/simulate` quote-status, result-quality, and partial-kind contract.

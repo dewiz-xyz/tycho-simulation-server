@@ -33,6 +33,8 @@ scripts/run_suite.sh --repo . --chain-id 1 --suite core --stop
 
 `run_suite.sh` is the stable, VM-aware repo verification path. With VM pools enabled (the default), it waits for `vm_status=ready` and at least one VM pool before running VM protocol presence checks, so cold starts can take longer than native-only runs.
 
+`run_suite.sh` is intentionally a strict healthy-path gate. It fails on request-visible degradation even when `/simulate` returns `200 OK` with a contract-valid degraded payload. Use the individual Python helpers when you want relaxed contract exploration.
+
 `run_suite.sh` smoke checks require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `gas_in_sell` is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
 
 VM pools (Curve/Balancer/Maverick feeds) are enabled by default. The supported fast path is to exclude them entirely:
@@ -42,15 +44,16 @@ scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --sto
 
 There is no repo-runner mode that keeps VM pools enabled while skipping VM readiness waiting.
 
-Tolerate partial failures/no-liquidity while still running the suite:
+Tolerate explicit no-liquidity/no-pools responses while still running the suite:
 ```bash
-scripts/run_suite.sh --repo . --chain-id 8453 --suite core --allow-partial --allow-no-liquidity --stop
+scripts/run_suite.sh --repo . --chain-id 8453 --suite core --allow-no-liquidity --stop
 ```
 
 ## Smoke test /simulate
 
 - Use curated chain-aware presets (token/suite sets differ by chain).
-- Remember: `/simulate` returns `200 OK` even on partial failure; use `meta.status` / `meta.failures`.
+- Remember: `/simulate` returns `200 OK` for complete, partial, no-result, and selected request-level degraded outcomes; use `meta.result_quality`, `meta.partial_kind`, and `meta.failures` to judge whether the response is quoteable.
+- `/simulate` semantics are summarized in [README.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/README.md) and detailed for integrations in [docs/simulate_example.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/simulate_example.md).
 
 Examples:
 ```bash
@@ -64,22 +67,26 @@ For stricter checks (fail on empty data and validate pool entries, including `ga
 python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke --require-data --validate-data
 ```
 
-Allow partial responses explicitly:
+Allow partial ready responses with request-visible failures:
 ```bash
-python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-status ready,partial_success --allow-failures
+python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-failures
 ```
+
+`--allow-failures` only relaxes request-visible failures on otherwise usable `complete`/`partial` results. It does not turn `request_level_failure` or `no_results` into smoke-test success.
 
 ## Smoke test /encode
 
-- `/encode` follows the latest schema (singleSwap-only execution).
+- `/encode` follows the live route schema. The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` depending on route shape and splits.
 - The smoke test performs two `/simulate` calls to pick pools, then posts a 2-hop route.
 - Route tokens are chain-aware (`scripts/presets.py` `default_encode_route`).
 - Default addresses can be overridden via `.env` (`COW_SETTLEMENT_CONTRACT`, `TYCHO_ROUTER_ADDRESS`).
+- `/encode` keeps its current success/error response contract, but its pool-picking guidance follows the live `/simulate` contract.
+- Pool selection remains strict: encode smoke requires `status=ready` plus `result_quality=complete|partial`; `request_level_failure` and `no_results` are not usable quote sources.
 
 Examples:
 ```bash
 python3 scripts/encode_smoke.py --chain-id 1 --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .
-python3 scripts/encode_smoke.py --chain-id 8453 --allow-status ready,partial_success --allow-failures --verbose
+python3 scripts/encode_smoke.py --chain-id 8453 --allow-failures --verbose
 ```
 
 ## Pool/protocol coverage sweeps
@@ -89,8 +96,10 @@ python3 scripts/encode_smoke.py --chain-id 8453 --allow-status ready,partial_suc
 python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json
 python3 scripts/coverage_sweep.py --chain-id 1 --suite v4_candidates
 python3 scripts/coverage_sweep.py --chain-id 1 --suite exploratory_protocols --allow-failures --allow-no-pools
-python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams
+python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams
 ```
+
+`coverage_sweep.py` validates `result_quality` and `partial_kind`, not just `status`. `--allow-failures` only relaxes request-visible failures on otherwise usable `complete`/`partial` results. Use `--allow-no-pools` when you intentionally want to tolerate `no_liquidity + no_pools`.
 
 VM pool feeds are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --chain-id 1 --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
 
@@ -108,11 +117,13 @@ python3 scripts/coverage_sweep.py --chain-id 8453 --suite core --allow-no-pools
 
 ## Latency percentiles (p50/p90/p99)
 
-`latency_percentiles.py` measures only "good" responses by default (`meta.status=ready`, no `meta.failures`). `scripts/run_suite.sh --suite core` uses the narrower `latency_core` pair set for this phase so the percentile pass stays on consistently ready paths:
+`latency_percentiles.py` measures only quoteable `ready` responses by default (`result_quality=complete|partial`, no `meta.failures`). `scripts/run_suite.sh --suite core` uses the narrower `latency_core` pair set for this phase so the percentile pass stays on consistently ready paths:
 ```bash
 python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50
 python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 300 --concurrency 50
 ```
+
+Even with `--allow-failures`, the percentile runner still excludes unusable `request_level_failure` and `no_results` outcomes.
 
 ## Load / stress testing
 
@@ -154,7 +165,7 @@ See `references/deploy.md`.
 ## Included scripts
 
 - Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
-- Skill utility: `skills/simulation-service-tests/scripts/run_checks.sh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`).
+- Skill utilities: `skills/simulation-service-tests/scripts/run_checks.sh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`), `skills/simulation-service-tests/scripts/memory_diff.py`, and the fallback `skills/simulation-service-tests/scripts/presets.py` used by the harness tests.
 
 ## References
 
