@@ -32,7 +32,7 @@
   }
   ```
 - HTTP status is always `200 OK`. Validate `meta.result_quality`, `meta.partial_kind`, and `meta.failures`; `meta.status` alone is not enough to decide whether a response is quoteable.
-- The live `/simulate` contract is summarized in [README.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/README.md) and detailed for integrations in [docs/simulate_example.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/simulate_example.md).
+- The live `/simulate` contract is summarized in [README.md](../../../README.md) and detailed for integrations in [docs/simulate_example.md](../../../docs/simulate_example.md).
 
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):

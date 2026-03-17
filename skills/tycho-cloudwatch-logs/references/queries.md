@@ -52,7 +52,7 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 
 Quote-contract note:
 - These queries target the live runtime log contract.
-- Detailed semantics are documented in [docs/quote_service.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/quote_service.md).
+- Detailed semantics are documented in [docs/quote_service.md](../../../docs/quote_service.md).
 
 ## Tail/filter patterns (aws logs tail/filter-log-events)
 - Block updates: Block update:

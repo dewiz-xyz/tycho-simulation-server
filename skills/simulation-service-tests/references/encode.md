@@ -5,7 +5,7 @@
 - The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` depending on route shape and splits.
 - Requests include only route-level `amountIn` and `minAmountOut` plus `shareBps`/`splitBps` for splits.
 - Per-hop and per-swap amounts are not accepted and not returned.
-- `/encode` keeps its current success/error response contract. `/simulate` selection semantics are documented in [docs/simulate_example.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/simulate_example.md).
+- `/encode` keeps its current success/error response contract. `/simulate` selection semantics are documented in [docs/simulate_example.md](../../../docs/simulate_example.md).
 
 ## Smoke test helper
 

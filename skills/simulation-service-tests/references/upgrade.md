@@ -3,7 +3,7 @@
 Use this when bumping `tycho-simulation` (or changing stream logic, timeouts, or concurrency).
 
 Quote-contract note:
-- The live `/simulate` contract is summarized in [README.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/README.md) and detailed for maintainers in [docs/quote_service.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/quote_service.md).
+- The live `/simulate` contract is summarized in [README.md](../../../README.md) and detailed for maintainers in [docs/quote_service.md](../../../docs/quote_service.md).
 
 ## Dependency bump
 1. Update `Cargo.toml` (e.g., `tycho-simulation` git tag).

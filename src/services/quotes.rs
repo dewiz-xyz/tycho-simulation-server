@@ -182,6 +182,7 @@ struct PoolSchedulingContext<'a> {
     pool_results: &'a mut Vec<PoolSimulationOutcome>,
     failures: &'a mut Vec<QuoteFailure>,
     meta: &'a mut QuoteMeta,
+    classification: &'a mut QuoteClassification,
 }
 
 struct SimulatePoolInput {
@@ -402,6 +403,9 @@ fn prepare_pool_simulation(
     if pool_deadline <= now {
         kind.mark_deadline_skip(context.metrics);
         context
+            .classification
+            .note_pool_outcome(PoolOutcomeKind::SkippedDeadline);
+        context
             .pool_results
             .push(make_pool_outcome(PoolOutcomeInput {
                 descriptor,
@@ -419,6 +423,9 @@ fn prepare_pool_simulation(
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => {
             kind.mark_concurrency_skip(context.metrics);
+            context
+                .classification
+                .note_pool_outcome(PoolOutcomeKind::SkippedConcurrency);
             context
                 .pool_results
                 .push(make_pool_outcome(PoolOutcomeInput {
@@ -1025,6 +1032,7 @@ impl QuoteRequestRunner {
                 pool_results: &mut self.run.pool_results,
                 failures: &mut self.run.failures,
                 meta: &mut self.run.meta,
+                classification: &mut self.run.classification,
             };
             let scheduled = match prepare_pool_simulation(
                 kind,
@@ -1068,6 +1076,9 @@ impl QuoteRequestRunner {
                 _ = &mut quote_timeout_sleep => {
                     prepared.cancel_token.cancel();
                     self.run.classification.mark_request_degradation();
+                    self.run
+                        .classification
+                        .note_pool_outcome(PoolOutcomeKind::TimedOut);
                     self.push_failure(make_failure(
                         QuoteFailureKind::Timeout,
                         format!("Quote computation timed out after {}ms", self.quote_timeout.as_millis()),
@@ -1077,6 +1088,9 @@ impl QuoteRequestRunner {
                 }
                 _ = prepared.cancel_token.cancelled() => {
                     self.run.classification.mark_request_degradation();
+                    self.run
+                        .classification
+                        .note_pool_outcome(PoolOutcomeKind::TimedOut);
                     self.push_failure(make_failure(
                         QuoteFailureKind::Timeout,
                         "Quote computation cancelled before all pools completed".to_string(),
@@ -5406,6 +5420,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timeout_after_partial_ladder_sets_partial_kind_mixed() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                quote_timeout: Duration::from_millis(10),
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-timeout-after-partial-ladder", &["1", "2"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        let prepared = PreparedQuoteExecution {
+            token_in: Arc::new(fixture.token_in_meta.clone()),
+            token_out: Arc::new(fixture.token_out_meta.clone()),
+            amounts_in: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            quote_deadline: Instant::now() + Duration::from_millis(10),
+            gas_price_wei: None,
+            eth_to_sell_spot_price: None,
+            sell_token_decimals: fixture.token_in_meta.decimals,
+            native_candidates: Vec::new(),
+            vm_candidates: Vec::new(),
+            cancel_token: CancellationToken::new(),
+        };
+        let partial_result = PoolQuoteResult {
+            pool: "pool-partial".to_string(),
+            pool_name: "uniswap_v2".to_string(),
+            pool_address: "0x0000000000000000000000000000000000000033".to_string(),
+            protocol: "uniswap_v2".to_string(),
+            amounts_out: vec!["42".to_string()],
+            gas_used: vec![0],
+            errors: vec!["amount_in exceeds get_limits max_in".to_string()],
+            timed_out: false,
+        };
+        let mut vm_first_gases = Vec::new();
+        runner.handle_simulated_pool_result(partial_result, &prepared, &mut vm_first_gases);
+
+        let mut tasks = FuturesUnordered::new();
+        tasks.push(Box::pin(async move {
+            sleep(Duration::from_millis(50)).await;
+            Ok(PoolSimOutcome::Simulated(PoolQuoteResult {
+                pool: "pool-slow".to_string(),
+                pool_name: "uniswap_v2".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000034".to_string(),
+                protocol: "uniswap_v2".to_string(),
+                amounts_out: vec!["99".to_string()],
+                gas_used: vec![0],
+                errors: Vec::new(),
+                timed_out: false,
+            }))
+        }) as PoolTask);
+
+        runner
+            .collect_pool_task_results(&prepared, &mut tasks, &mut vm_first_gases)
+            .await;
+        drop(tasks);
+        let computation = runner.finish_current_state();
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "pool-partial");
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
+        assert_eq!(computation.meta.failures.len(), 2);
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::Timeout)));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::PartialOutput));
+    }
+
+    #[tokio::test]
     async fn limit_like_failure_pool_reports_simulator_error_when_other_pool_completes() {
         let fixture = BasicQuoteFixture::new();
 
@@ -5544,6 +5637,74 @@ mod tests {
             .iter()
             .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
         assert_eq!(computation.metrics.skipped_native_concurrency, 1);
+    }
+
+    #[tokio::test]
+    async fn skipped_concurrency_after_partial_ladder_sets_partial_kind_mixed() {
+        let fixture = BasicQuoteFixture::new();
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000025",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(ProbeFatalSim {
+                max_in: BigUint::from(10u8),
+                calls: default_calls(),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-2",
+            "0x0000000000000000000000000000000000000026",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(SoftLimitSim {
+                max_in: BigUint::from(100u8),
+                calls: default_calls(),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 1,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-skip-concurrency-mixed", &["1", "11"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::PartialOutput));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
     }
 
     #[tokio::test]

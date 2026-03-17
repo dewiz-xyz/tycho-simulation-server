@@ -120,4 +120,4 @@ Quick checks for memory and CPU utilization using ECS ContainerInsights.
 
 ## References
 Use `references/queries.md` for the full preset index and filter/query snippets.
-Use [docs/quote_service.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/quote_service.md) for the `/simulate` quote-status, result-quality, and partial-kind contract.
+Use [docs/quote_service.md](../../docs/quote_service.md) for the `/simulate` quote-status, result-quality, and partial-kind contract.

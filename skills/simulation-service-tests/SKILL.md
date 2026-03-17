@@ -53,7 +53,7 @@ scripts/run_suite.sh --repo . --chain-id 8453 --suite core --allow-no-liquidity 
 
 - Use curated chain-aware presets (token/suite sets differ by chain).
 - Remember: `/simulate` returns `200 OK` for complete, partial, no-result, and selected request-level degraded outcomes; use `meta.result_quality`, `meta.partial_kind`, and `meta.failures` to judge whether the response is quoteable.
-- `/simulate` semantics are summarized in [README.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/README.md) and detailed for integrations in [docs/simulate_example.md](/Users/pedrobergamini/Dev/dewiz/tycho-simulation-server/docs/simulate_example.md).
+- `/simulate` semantics are summarized in [README.md](../../README.md) and detailed for integrations in [docs/simulate_example.md](../../docs/simulate_example.md).
 
 Examples:
 ```bash
