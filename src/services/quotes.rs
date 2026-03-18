@@ -259,7 +259,7 @@ enum PartialClassification {
 }
 
 impl PartialClassification {
-    fn note_partial_ladder(&mut self) {
+    fn note_partial_amount_coverage(&mut self) {
         *self = match self {
             Self::None | Self::AmountLadders => Self::AmountLadders,
             Self::PoolCoverage | Self::Mixed => Self::Mixed,
@@ -324,12 +324,12 @@ impl QuoteClassification {
             && reported_steps > 0
             && reported_steps < expected_steps
         {
-            self.partial.note_partial_ladder();
+            self.partial.note_partial_amount_coverage();
             return;
         }
 
         match outcome {
-            PoolOutcomeKind::PartialOutput => self.partial.note_partial_ladder(),
+            PoolOutcomeKind::PartialOutput => self.partial.note_partial_amount_coverage(),
             PoolOutcomeKind::ZeroOutput
             | PoolOutcomeKind::SkippedConcurrency
             | PoolOutcomeKind::SkippedDeadline
@@ -1124,25 +1124,32 @@ impl QuoteRequestRunner {
 
     fn handle_simulated_pool_result(
         &mut self,
-        result: PoolQuoteResult,
+        mut result: PoolQuoteResult,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
     ) {
+        if result.successful_steps > 0 {
+            while result.amounts_out.len() < prepared.expected_len {
+                result.amounts_out.push("0".to_string());
+                result.gas_used.push(0);
+            }
+        }
+        let has_usable_output = amounts_out_include_positive_quote(&result.amounts_out);
         let had_timeout = is_timeout_like_outcome(&result);
-        let is_partial = result.amounts_out.len() < prepared.expected_len;
+        let is_partial = has_usable_output && result.successful_steps < prepared.expected_len;
         record_vm_first_gas_metrics(
             &mut self.run.metrics,
             vm_first_gases,
             result.protocol.as_str(),
             result.pool.as_str(),
-            result.gas_used.first().copied(),
+            result.first_successful_gas_used,
         );
         self.record_pool_outcome(&result, prepared.expected_len);
         self.record_pool_errors(&result, had_timeout, is_partial, prepared.expected_len);
-        if !result.amounts_out.is_empty() {
+        if has_usable_output {
             let gas_in_sell = compute_gas_in_sell_base_units(
                 prepared.gas_price_wei,
-                result.gas_used.last().copied(),
+                result.last_successful_gas_used,
                 prepared.eth_to_sell_spot_price,
                 prepared.sell_token_decimals,
             );
@@ -1163,7 +1170,7 @@ impl QuoteRequestRunner {
         if let Some((outcome, reason)) = classify_pool_outcome(result, expected_len) {
             self.run.classification.note_pool_outcome_with_steps(
                 outcome,
-                result.amounts_out.len(),
+                result.successful_steps,
                 expected_len,
             );
             self.run
@@ -1176,7 +1183,7 @@ impl QuoteRequestRunner {
                         protocol: result.protocol.clone(),
                     },
                     outcome,
-                    reported_steps: result.amounts_out.len(),
+                    reported_steps: result.successful_steps,
                     expected_steps: expected_len,
                     reason,
                 }));
@@ -1202,12 +1209,10 @@ impl QuoteRequestRunner {
         let descriptor = format_pool_descriptor(&context);
         let message = if had_timeout {
             format!(
-                "{}: Quote computation timed out (partial ladder {} of {} steps)",
-                descriptor,
-                result.amounts_out.len(),
-                expected_len
+                "{}: Quote computation timed out after {} of {} requested amounts produced usable quotes",
+                descriptor, result.successful_steps, expected_len
             )
-        } else if result.amounts_out.is_empty() {
+        } else if result.successful_steps == 0 {
             let base_error = result
                 .errors
                 .first()
@@ -1285,26 +1290,18 @@ impl QuoteRequestRunner {
             return;
         }
         self.run.responses.sort_by(|a, b| {
-            let a_amount = a
-                .amounts_out
-                .first()
-                .and_then(|v| BigUint::from_str(v).ok())
-                .unwrap_or_default();
-            let b_amount = b
-                .amounts_out
-                .first()
-                .and_then(|v| BigUint::from_str(v).ok())
-                .unwrap_or_default();
-            b_amount.cmp(&a_amount)
+            a.pool
+                .cmp(&b.pool)
+                .then(a.pool_address.cmp(&b.pool_address))
         });
-        let top = &self.run.responses[0];
+        let first = &self.run.responses[0];
         debug!(
-            "Quote response: total_results={} top_pool={} address={} first_amount_out={} block={} vm_block={:?}",
+            "Quote response sample: total_results={} first_pool={} address={} first_amount_out={} block={} vm_block={:?}",
             self.run.responses.len(),
-            top.pool_name,
-            top.pool_address,
-            top.amounts_out.first().cloned().unwrap_or_else(|| "0".to_string()),
-            top.block_number,
+            first.pool_name,
+            first.pool_address,
+            first.amounts_out.first().cloned().unwrap_or_else(|| "0".to_string()),
+            first.block_number,
             self.run.meta.vm_block_number
         );
     }
@@ -1449,6 +1446,9 @@ struct PoolQuoteResult {
     protocol: String,
     amounts_out: Vec<String>,
     gas_used: Vec<u64>,
+    successful_steps: usize,
+    first_successful_gas_used: Option<u64>,
+    last_successful_gas_used: Option<u64>,
     errors: Vec<String>,
     timed_out: bool,
 }
@@ -1480,7 +1480,7 @@ impl BlockingPoolRunner {
         if let Some(outcome) = self.preflight_outcome() {
             return outcome;
         }
-        self.quote_ladder()
+        self.quote_amounts()
     }
 
     fn preflight_outcome(&self) -> Option<PoolSimOutcome> {
@@ -1510,14 +1510,20 @@ impl BlockingPoolRunner {
             protocol: self.descriptor.protocol.clone(),
             amounts_out: Vec::new(),
             gas_used: Vec::new(),
+            successful_steps: 0,
+            first_successful_gas_used: None,
+            last_successful_gas_used: None,
             errors: vec![error.to_string()],
             timed_out,
         })
     }
 
-    fn quote_ladder(&self) -> PoolSimOutcome {
+    fn quote_amounts(&self) -> PoolSimOutcome {
         let mut amounts_out = Vec::with_capacity(self.expected_len);
         let mut gas_used = Vec::with_capacity(self.expected_len);
+        let mut successful_steps = 0;
+        let mut first_successful_gas_used = None;
+        let mut last_successful_gas_used = None;
         let mut errors = Vec::new();
         let mut timed_out = false;
         let limit_max_in = self
@@ -1552,10 +1558,23 @@ impl BlockingPoolRunner {
                         errors.push(message);
                         amounts_out.clear();
                         gas_used.clear();
+                        successful_steps = 0;
+                        first_successful_gas_used = None;
+                        last_successful_gas_used = None;
                         break;
                     };
-                    amounts_out.push(result.amount.to_string());
-                    gas_used.push(gas_u64);
+                    if result.amount.is_zero() {
+                        // Zero outputs mean this requested amount did not produce a usable quote,
+                        // even when the simulator returned Ok(...).
+                        amounts_out.push("0".to_string());
+                        gas_used.push(0);
+                    } else {
+                        amounts_out.push(result.amount.to_string());
+                        gas_used.push(gas_u64);
+                        successful_steps += 1;
+                        first_successful_gas_used.get_or_insert(gas_u64);
+                        last_successful_gas_used = Some(gas_u64);
+                    }
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -1563,19 +1582,29 @@ impl BlockingPoolRunner {
                         self.log_soft_limit_failure(amount_in, max_in, &message);
                     }
                     self.log_pool_error(&message);
+                    amounts_out.push("0".to_string());
+                    gas_used.push(0);
                     errors.push(message);
                 }
             }
             if Instant::now() >= self.deadline {
                 self.log_pool_debug(
                     "pool_timeout",
-                    "Pool quote deadline reached after ladder step",
+                    "Pool quote deadline reached while evaluating requested amounts",
                 );
                 if errors.is_empty() {
                     errors.push("Timed out".to_string());
                 }
                 timed_out = true;
                 break;
+            }
+        }
+        // Only pools with at least one usable amount output are emitted, but they still need
+        // full requested-amount alignment.
+        if successful_steps > 0 {
+            while amounts_out.len() < self.expected_len {
+                amounts_out.push("0".to_string());
+                gas_used.push(0);
             }
         }
         PoolSimOutcome::Simulated(PoolQuoteResult {
@@ -1585,6 +1614,9 @@ impl BlockingPoolRunner {
             protocol: self.descriptor.protocol.clone(),
             amounts_out,
             gas_used,
+            successful_steps,
+            first_successful_gas_used,
+            last_successful_gas_used,
             errors,
             timed_out,
         })
@@ -2054,13 +2086,13 @@ fn classify_pool_outcome(
             result.errors.first().cloned().or_else(|| {
                 Some(format!(
                     "Pool simulation timed out after {} reported step(s)",
-                    result.amounts_out.len()
+                    result.successful_steps
                 ))
             }),
         ));
     }
 
-    if result.amounts_out.is_empty() {
+    if result.successful_steps == 0 {
         if !result.errors.is_empty() {
             return Some((
                 PoolOutcomeKind::SimulatorError,
@@ -2070,13 +2102,16 @@ fn classify_pool_outcome(
         return Some((PoolOutcomeKind::ZeroOutput, None));
     }
 
-    if result.amounts_out.len() < expected_len {
+    if result.errors.is_empty() && !amounts_out_include_positive_quote(&result.amounts_out) {
+        return Some((PoolOutcomeKind::ZeroOutput, None));
+    }
+
+    if result.successful_steps < expected_len {
         return Some((
             PoolOutcomeKind::PartialOutput,
             Some(format!(
-                "Pool returned {} of {} ladder steps",
-                result.amounts_out.len(),
-                expected_len
+                "Pool returned usable quotes for {} of {} requested amounts",
+                result.successful_steps, expected_len
             )),
         ));
     }
@@ -2130,6 +2165,13 @@ fn pool_outcome_from_failure(
         expected_steps: expected_len,
         reason: Some(failure.message.clone()),
     }))
+}
+
+fn amounts_out_include_positive_quote(amounts_out: &[String]) -> bool {
+    amounts_out
+        .iter()
+        .filter_map(|amount| BigUint::from_str(amount).ok())
+        .any(|amount| !amount.is_zero())
 }
 
 fn is_limit_like_error_message(message: &str) -> bool {
@@ -4625,7 +4667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executes_mixed_ladder_when_some_steps_exceed_reported_limit() {
+    async fn executes_mixed_amount_series_when_some_steps_exceed_reported_limit() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -4664,8 +4706,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
-                assert_eq!(result.amounts_out.len(), 1);
-                assert_eq!(result.gas_used.len(), 1);
+                assert_eq!(result.amounts_out.len(), 2);
+                assert_eq!(result.gas_used.len(), 2);
+                assert_eq!(result.amounts_out, vec!["0".to_string(), "0".to_string()]);
+                assert_eq!(result.gas_used, vec![0, 0]);
+                assert_eq!(result.successful_steps, 0);
                 assert_eq!(result.errors.len(), 1);
                 assert!(result.errors[0].contains("amount_in exceeds get_limits max_in"));
             }
@@ -4673,7 +4718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_partial_result_when_soft_limit_is_conservative() {
+    async fn conservative_soft_limit_zero_output_does_not_count_as_successful() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -4713,8 +4758,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
-                assert_eq!(result.amounts_out.len(), 1);
-                assert_eq!(result.gas_used.len(), 1);
+                assert_eq!(result.amounts_out.len(), 2);
+                assert_eq!(result.gas_used.len(), 2);
+                assert_eq!(result.amounts_out, vec!["0".to_string(), "0".to_string()]);
+                assert_eq!(result.gas_used, vec![0, 0]);
+                assert_eq!(result.successful_steps, 0);
                 assert_eq!(result.errors.len(), 1);
                 assert!(result.errors[0]
                     .to_ascii_lowercase()
@@ -4788,8 +4836,145 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PositiveOutputSim {
+        max_in: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for PositiveOutputSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ZeroThenPositiveSim {
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for ZeroThenPositiveSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(GetAmountOutResult::new(
+                    BigUint::zero(),
+                    BigUint::from(7u8),
+                    self.clone_box(),
+                ));
+            }
+
+            Ok(GetAmountOutResult::new(
+                amount_in,
+                BigUint::from(11u8),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(u64::MAX), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     #[tokio::test]
-    async fn does_not_skip_when_pool_can_quote_beyond_soft_limit() {
+    async fn all_zero_soft_limit_quotes_are_filtered_from_responses() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4823,16 +5008,127 @@ mod tests {
         let request = fixture.request("req-2", &["1", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
-        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert_eq!(
             computation.meta.result_quality,
-            QuoteResultQuality::Complete
+            QuoteResultQuality::NoResults
+        );
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(computation.meta.failures[0]
+            .message
+            .contains("All pools returned zero amounts"));
+        assert_eq!(computation.meta.pool_results.len(), 1);
+        assert_eq!(
+            computation.meta.pool_results[0].outcome,
+            PoolOutcomeKind::ZeroOutput
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(computation.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_amount_outputs_do_not_count_as_successful_steps() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = ZeroThenPositiveSim {
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(SimulatePoolInput {
+            descriptor: PoolDescriptor {
+                id: "pool-zero-then-positive".to_string(),
+                name: "uniswap_v2".to_string(),
+                address: "0x0000000000000000000000000000000000000048".to_string(),
+                protocol: "uniswap_v2".to_string(),
+            },
+            pool_state: Arc::new(sim),
+            token_in: Arc::new(make_token(&token_in, "TK1")),
+            token_out: Arc::new(make_token(&token_out, "TK2")),
+            amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel_token: CancellationToken::new(),
+            permit,
+        })
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(result.amounts_out, vec!["0".to_string(), "2".to_string()]);
+                assert_eq!(result.gas_used, vec![0, 11]);
+                assert_eq!(result.successful_steps, 1);
+                assert_eq!(result.first_successful_gas_used, Some(11));
+                assert_eq!(result.last_successful_gas_used, Some(11));
+                assert!(result.errors.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_zero_and_positive_outputs_are_classified_as_partial() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-zero-then-positive",
+            "0x0000000000000000000000000000000000000049",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(ZeroThenPositiveSim {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-zero-then-positive", &["1", "2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::AmountLadders)
         );
         assert!(computation.meta.failures.is_empty());
-        assert!(computation.meta.pool_results.is_empty());
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out.len(), 2);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["0".to_string(), "2".to_string()]
+        );
+        assert_eq!(computation.responses[0].gas_used, vec![0, 11]);
+        assert_eq!(computation.meta.pool_results.len(), 1);
+        assert_eq!(
+            computation.meta.pool_results[0].outcome,
+            PoolOutcomeKind::PartialOutput
+        );
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4863,7 +5159,7 @@ mod tests {
                 return Err(SimulationError::FatalError("probe blew up".to_string()));
             }
             Ok(GetAmountOutResult::new(
-                BigUint::zero(),
+                amount_in,
                 BigUint::zero(),
                 self.clone_box(),
             ))
@@ -4904,7 +5200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_error_above_reported_soft_limit_keeps_partial_ladder() {
+    async fn fatal_error_above_reported_soft_limit_keeps_partial_amount_coverage() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4940,7 +5236,7 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
@@ -4990,7 +5286,7 @@ mod tests {
                 ));
             }
             Ok(GetAmountOutResult::new(
-                BigUint::zero(),
+                amount_in,
                 BigUint::zero(),
                 self.clone_box(),
             ))
@@ -5002,6 +5298,76 @@ mod tests {
             _buy_token: Bytes,
         ) -> Result<(BigUint, BigUint), SimulationError> {
             Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct StepSelectiveFailureSim {
+        fail_on_calls: Vec<usize>,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for StepSelectiveFailureSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_on_calls.contains(&call_index) {
+                return Err(SimulationError::FatalError(format!(
+                    "simulated requested amount {call_index} failure"
+                )));
+            }
+            Ok(GetAmountOutResult::new(
+                amount_in.clone(),
+                BigUint::from((call_index + 1) as u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(u64::MAX), BigUint::zero()))
         }
 
         fn delta_transition(
@@ -5059,7 +5425,7 @@ mod tests {
                 return Err(SimulationError::InvalidInput(self.message.clone(), None));
             }
             Ok(GetAmountOutResult::new(
-                BigUint::zero(),
+                amount_in,
                 BigUint::zero(),
                 self.clone_box(),
             ))
@@ -5100,7 +5466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_limit_invalid_input_above_soft_limit_still_executes_ladder() {
+    async fn non_limit_invalid_input_above_soft_limit_still_executes_requested_amounts() {
         let token_in_hex = "0x0000000000000000000000000000000000000001";
         let token_out_hex = "0x0000000000000000000000000000000000000002";
         let token_in = Bytes::from_str(token_in_hex).expect("valid address");
@@ -5139,12 +5505,120 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         match outcome {
             PoolSimOutcome::Simulated(result) => {
-                assert_eq!(result.amounts_out.len(), 1);
-                assert_eq!(result.gas_used.len(), 1);
+                assert_eq!(result.amounts_out.len(), 2);
+                assert_eq!(result.gas_used.len(), 2);
+                assert_eq!(result.successful_steps, 1);
                 assert!(!result.timed_out);
                 assert_eq!(result.errors.len(), 1);
                 assert!(result.errors[0].contains("Invalid input"));
                 assert!(result.errors[0].contains("token_in invalid for probe"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_zero_fills_failed_middle_amount_and_preserves_order() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = StepSelectiveFailureSim {
+            fail_on_calls: vec![1],
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(SimulatePoolInput {
+            descriptor: PoolDescriptor {
+                id: "pool-order".to_string(),
+                name: "uniswap_v2".to_string(),
+                address: "0x0000000000000000000000000000000000000041".to_string(),
+                protocol: "uniswap_v2".to_string(),
+            },
+            pool_state: Arc::new(sim),
+            token_in: Arc::new(make_token(&token_in, "TK1")),
+            token_out: Arc::new(make_token(&token_out, "TK2")),
+            amounts: Arc::new(vec![
+                BigUint::from(1u8),
+                BigUint::from(2u8),
+                BigUint::from(3u8),
+            ]),
+            expected_len: 3,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel_token: CancellationToken::new(),
+            permit,
+        })
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(
+                    result.amounts_out,
+                    vec!["1".to_string(), "0".to_string(), "3".to_string()]
+                );
+                assert_eq!(result.gas_used, vec![1, 0, 3]);
+                assert_eq!(result.successful_steps, 2);
+                assert_eq!(result.first_successful_gas_used, Some(1));
+                assert_eq!(result.last_successful_gas_used, Some(3));
+                assert_eq!(result.errors.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_zero_fills_failed_first_amount_when_later_steps_succeed() {
+        let token_in_hex = "0x0000000000000000000000000000000000000001";
+        let token_out_hex = "0x0000000000000000000000000000000000000002";
+        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sim = StepSelectiveFailureSim {
+            fail_on_calls: vec![0],
+            calls: Arc::clone(&calls),
+        };
+
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let outcome = simulate_pool(SimulatePoolInput {
+            descriptor: PoolDescriptor {
+                id: "pool-leading-zero".to_string(),
+                name: "uniswap_v2".to_string(),
+                address: "0x0000000000000000000000000000000000000042".to_string(),
+                protocol: "uniswap_v2".to_string(),
+            },
+            pool_state: Arc::new(sim),
+            token_in: Arc::new(make_token(&token_in, "TK1")),
+            token_out: Arc::new(make_token(&token_out, "TK2")),
+            amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel_token: CancellationToken::new(),
+            permit,
+        })
+        .await
+        .expect("simulate_pool should return outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(result.amounts_out, vec!["0".to_string(), "2".to_string()]);
+                assert_eq!(result.gas_used, vec![0, 2]);
+                assert_eq!(result.successful_steps, 1);
+                assert_eq!(result.first_successful_gas_used, Some(2));
+                assert_eq!(result.last_successful_gas_used, Some(2));
+                assert_eq!(result.errors.len(), 1);
             }
         }
     }
@@ -5187,7 +5661,7 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
@@ -5207,7 +5681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_amounts_out_keeps_limit_like_partial_ladder_failure_visible() {
+    async fn get_amounts_out_keeps_limit_like_partial_amount_failure_visible() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5239,13 +5713,13 @@ mod tests {
             Arc::clone(&fixture.vm_state_store),
             TestAppStateConfig::default(),
         );
-        let request = fixture.request("req-limit-partial-ladder", &["1", "11"]);
+        let request = fixture.request("req-limit-partial-amounts", &["1", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
@@ -5267,6 +5741,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn get_amounts_out_keeps_partial_amount_coverage_and_filters_zero_only_row() {
+        let fixture = BasicQuoteFixture::new();
+
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-partial",
+            "0x0000000000000000000000000000000000000046",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(StepSelectiveFailureSim {
+                fail_on_calls: vec![1],
+                calls: default_calls(),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-zero",
+            "0x0000000000000000000000000000000000000047",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(SoftLimitSim {
+                max_in: BigUint::from(100u8),
+                calls: default_calls(),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig {
+                native_sim_concurrency: 2,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-partial-and-zero-only", &["1", "2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "pool-partial");
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["1".to_string(), "0".to_string()]
+        );
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::PartialOutput));
+        assert!(computation
+            .meta
+            .pool_results
+            .iter()
+            .any(|outcome| outcome.outcome == PoolOutcomeKind::ZeroOutput));
+    }
+
     #[test]
     fn timed_out_pool_outcome_with_partial_steps_counts_as_amount_ladders() {
         let mut classification = QuoteClassification::new();
@@ -5280,7 +5826,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_simulated_pool_result_keeps_timed_out_partial_ladder_as_amount_ladders() {
+    async fn handle_simulated_pool_result_keeps_timed_out_partial_amount_coverage_as_amount_ladders(
+    ) {
         let fixture = BasicQuoteFixture::new();
         let app_state = make_test_app_state(
             Arc::clone(&fixture.token_store),
@@ -5288,7 +5835,7 @@ mod tests {
             Arc::clone(&fixture.vm_state_store),
             TestAppStateConfig::default(),
         );
-        let request = fixture.request("req-timeout-partial-ladder", &["1", "2"]);
+        let request = fixture.request("req-timeout-partial-amounts", &["1", "2"]);
         let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
         let prepared = PreparedQuoteExecution {
             token_in: Arc::new(fixture.token_in_meta.clone()),
@@ -5308,8 +5855,11 @@ mod tests {
             pool_name: "uniswap_v2".to_string(),
             pool_address: "0x0000000000000000000000000000000000000015".to_string(),
             protocol: "uniswap_v2".to_string(),
-            amounts_out: vec!["42".to_string()],
-            gas_used: vec![0],
+            amounts_out: vec!["42".to_string(), "0".to_string()],
+            gas_used: vec![0, 0],
+            successful_steps: 1,
+            first_successful_gas_used: Some(0),
+            last_successful_gas_used: Some(0),
             errors: vec!["Timed out".to_string()],
             timed_out: true,
         };
@@ -5318,7 +5868,10 @@ mod tests {
         runner.handle_simulated_pool_result(result, &prepared, &mut vm_first_gases);
 
         assert_eq!(runner.run.responses.len(), 1);
-        assert_eq!(runner.run.responses[0].amounts_out, vec!["42".to_string()]);
+        assert_eq!(
+            runner.run.responses[0].amounts_out,
+            vec!["42".to_string(), "0".to_string()]
+        );
         assert_eq!(runner.run.failures.len(), 1);
         assert!(matches!(
             runner.run.failures[0].kind,
@@ -5326,7 +5879,7 @@ mod tests {
         ));
         assert!(runner.run.failures[0]
             .message
-            .contains("partial ladder 1 of 2 steps"));
+            .contains("1 of 2 requested amounts produced usable quotes"));
         assert_eq!(runner.run.pool_results.len(), 1);
         assert_eq!(
             runner.run.pool_results[0].outcome,
@@ -5337,6 +5890,161 @@ mod tests {
         assert!(matches!(exit.status, QuoteStatus::Ready));
         assert_eq!(exit.result_quality, QuoteResultQuality::Partial);
         assert_eq!(exit.partial_kind, Some(QuotePartialKind::AmountLadders));
+    }
+
+    #[tokio::test]
+    async fn handle_simulated_pool_result_uses_last_successful_gas_for_partial_amount_coverage() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-last-successful-gas", &["1", "2"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        let prepared = PreparedQuoteExecution {
+            token_in: Arc::new(fixture.token_in_meta.clone()),
+            token_out: Arc::new(fixture.token_out_meta.clone()),
+            amounts_in: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            quote_deadline: Instant::now() + Duration::from_secs(1),
+            gas_price_wei: Some(2_000_000_000_000_000_000),
+            eth_to_sell_spot_price: Some(1.5),
+            sell_token_decimals: 0,
+            native_candidates: Vec::new(),
+            vm_candidates: Vec::new(),
+            cancel_token: CancellationToken::new(),
+        };
+        let result = PoolQuoteResult {
+            pool: "pool-gas".to_string(),
+            pool_name: "uniswap_v2".to_string(),
+            pool_address: "0x0000000000000000000000000000000000000043".to_string(),
+            protocol: "uniswap_v2".to_string(),
+            amounts_out: vec!["42".to_string(), "0".to_string()],
+            gas_used: vec![21_000, 0],
+            successful_steps: 1,
+            first_successful_gas_used: Some(21_000),
+            last_successful_gas_used: Some(21_000),
+            errors: vec!["requested amount failed".to_string()],
+            timed_out: false,
+        };
+        let expected_gas_in_sell = compute_gas_in_sell_base_units(
+            prepared.gas_price_wei,
+            result.last_successful_gas_used,
+            prepared.eth_to_sell_spot_price,
+            prepared.sell_token_decimals,
+        );
+        let mut vm_first_gases = Vec::new();
+
+        runner.handle_simulated_pool_result(result, &prepared, &mut vm_first_gases);
+
+        assert_eq!(runner.run.responses.len(), 1);
+        assert_eq!(runner.run.responses[0].gas_in_sell, expected_gas_in_sell);
+    }
+
+    #[tokio::test]
+    async fn handle_simulated_pool_result_omits_fully_failed_zero_filled_pool() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-fully-failed-amounts", &["1", "2"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        let prepared = PreparedQuoteExecution {
+            token_in: Arc::new(fixture.token_in_meta.clone()),
+            token_out: Arc::new(fixture.token_out_meta.clone()),
+            amounts_in: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            quote_deadline: Instant::now() + Duration::from_secs(1),
+            gas_price_wei: None,
+            eth_to_sell_spot_price: None,
+            sell_token_decimals: fixture.token_in_meta.decimals,
+            native_candidates: Vec::new(),
+            vm_candidates: Vec::new(),
+            cancel_token: CancellationToken::new(),
+        };
+        let result = PoolQuoteResult {
+            pool: "pool-failed".to_string(),
+            pool_name: "uniswap_v2".to_string(),
+            pool_address: "0x0000000000000000000000000000000000000044".to_string(),
+            protocol: "uniswap_v2".to_string(),
+            amounts_out: vec!["0".to_string(), "0".to_string()],
+            gas_used: vec![0, 0],
+            successful_steps: 0,
+            first_successful_gas_used: None,
+            last_successful_gas_used: None,
+            errors: vec!["all requested amounts failed".to_string()],
+            timed_out: false,
+        };
+        let mut vm_first_gases = Vec::new();
+
+        runner.handle_simulated_pool_result(result, &prepared, &mut vm_first_gases);
+
+        assert!(runner.run.responses.is_empty());
+        assert_eq!(runner.run.failures.len(), 1);
+        assert_eq!(runner.run.pool_results.len(), 1);
+        assert_eq!(
+            runner.run.pool_results[0].outcome,
+            PoolOutcomeKind::SimulatorError
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_simulated_pool_result_filters_successful_all_zero_amounts() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-all-zero-success", &["1", "2"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        let prepared = PreparedQuoteExecution {
+            token_in: Arc::new(fixture.token_in_meta.clone()),
+            token_out: Arc::new(fixture.token_out_meta.clone()),
+            amounts_in: Arc::new(vec![BigUint::from(1u8), BigUint::from(2u8)]),
+            expected_len: 2,
+            quote_deadline: Instant::now() + Duration::from_secs(1),
+            gas_price_wei: None,
+            eth_to_sell_spot_price: None,
+            sell_token_decimals: fixture.token_in_meta.decimals,
+            native_candidates: Vec::new(),
+            vm_candidates: Vec::new(),
+            cancel_token: CancellationToken::new(),
+        };
+        let result = PoolQuoteResult {
+            pool: "pool-zero".to_string(),
+            pool_name: "uniswap_v2".to_string(),
+            pool_address: "0x0000000000000000000000000000000000000045".to_string(),
+            protocol: "uniswap_v2".to_string(),
+            amounts_out: vec!["0".to_string(), "0".to_string()],
+            gas_used: vec![0, 0],
+            successful_steps: 2,
+            first_successful_gas_used: Some(0),
+            last_successful_gas_used: Some(0),
+            errors: Vec::new(),
+            timed_out: false,
+        };
+        let mut vm_first_gases = Vec::new();
+
+        runner.handle_simulated_pool_result(result, &prepared, &mut vm_first_gases);
+
+        assert!(runner.run.responses.is_empty());
+        assert!(runner.run.failures.is_empty());
+        assert_eq!(runner.run.pool_results.len(), 1);
+        assert_eq!(
+            runner.run.pool_results[0].outcome,
+            PoolOutcomeKind::ZeroOutput
+        );
+
+        let exit = runner.classify_current_exit();
+        assert!(matches!(exit.status, QuoteStatus::NoLiquidity));
+        assert_eq!(exit.result_quality, QuoteResultQuality::NoResults);
     }
 
     #[tokio::test]
@@ -5373,6 +6081,9 @@ mod tests {
             protocol: "uniswap_v2".to_string(),
             amounts_out: vec!["42".to_string()],
             gas_used: vec![0],
+            successful_steps: 1,
+            first_successful_gas_used: Some(0),
+            last_successful_gas_used: Some(0),
             errors: Vec::new(),
             timed_out: false,
         };
@@ -5389,6 +6100,9 @@ mod tests {
                 protocol: "uniswap_v2".to_string(),
                 amounts_out: vec!["99".to_string()],
                 gas_used: vec![0],
+                successful_steps: 1,
+                first_successful_gas_used: Some(0),
+                last_successful_gas_used: Some(0),
                 errors: Vec::new(),
                 timed_out: false,
             }))
@@ -5420,7 +6134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_timeout_after_partial_ladder_sets_partial_kind_mixed() {
+    async fn request_timeout_after_partial_amount_coverage_sets_partial_kind_mixed() {
         let fixture = BasicQuoteFixture::new();
         let app_state = make_test_app_state(
             Arc::clone(&fixture.token_store),
@@ -5431,7 +6145,7 @@ mod tests {
                 ..TestAppStateConfig::default()
             },
         );
-        let request = fixture.request("req-timeout-after-partial-ladder", &["1", "2"]);
+        let request = fixture.request("req-timeout-after-partial-amounts", &["1", "2"]);
         let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
         let prepared = PreparedQuoteExecution {
             token_in: Arc::new(fixture.token_in_meta.clone()),
@@ -5451,8 +6165,11 @@ mod tests {
             pool_name: "uniswap_v2".to_string(),
             pool_address: "0x0000000000000000000000000000000000000033".to_string(),
             protocol: "uniswap_v2".to_string(),
-            amounts_out: vec!["42".to_string()],
-            gas_used: vec![0],
+            amounts_out: vec!["42".to_string(), "0".to_string()],
+            gas_used: vec![0, 0],
+            successful_steps: 1,
+            first_successful_gas_used: Some(0),
+            last_successful_gas_used: Some(0),
             errors: vec!["amount_in exceeds get_limits max_in".to_string()],
             timed_out: false,
         };
@@ -5469,6 +6186,9 @@ mod tests {
                 protocol: "uniswap_v2".to_string(),
                 amounts_out: vec!["99".to_string()],
                 gas_used: vec![0],
+                successful_steps: 1,
+                first_successful_gas_used: Some(0),
+                last_successful_gas_used: Some(0),
                 errors: Vec::new(),
                 timed_out: false,
             }))
@@ -5513,7 +6233,7 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             fixture.pair_tokens(),
-            Box::new(SoftLimitSim {
+            Box::new(PositiveOutputSim {
                 max_in: BigUint::from(100u8),
                 calls: default_calls(),
             }),
@@ -5582,7 +6302,7 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             fixture.pair_tokens(),
-            Box::new(SoftLimitSim {
+            Box::new(PositiveOutputSim {
                 max_in: BigUint::from(100u8),
                 calls: default_calls(),
             }),
@@ -5595,7 +6315,7 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             fixture.pair_tokens(),
-            Box::new(SoftLimitSim {
+            Box::new(PositiveOutputSim {
                 max_in: BigUint::from(100u8),
                 calls: default_calls(),
             }),
@@ -5640,7 +6360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_concurrency_after_partial_ladder_sets_partial_kind_mixed() {
+    async fn skipped_concurrency_after_partial_amount_coverage_sets_partial_kind_mixed() {
         let fixture = BasicQuoteFixture::new();
 
         let mut states = HashMap::new();
@@ -5666,7 +6386,7 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             fixture.pair_tokens(),
-            Box::new(SoftLimitSim {
+            Box::new(PositiveOutputSim {
                 max_in: BigUint::from(100u8),
                 calls: default_calls(),
             }),
@@ -5691,7 +6411,7 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
 
         assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
@@ -5780,7 +6500,7 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             fixture.pair_tokens(),
-            Box::new(SoftLimitSim {
+            Box::new(PositiveOutputSim {
                 max_in: BigUint::from(100u8),
                 calls: default_calls(),
             }),
@@ -6050,6 +6770,100 @@ mod tests {
             runner.run.pool_results[0].outcome,
             PoolOutcomeKind::InternalError
         ));
+    }
+
+    #[tokio::test]
+    async fn finalize_responses_orders_by_pool_identity_even_when_first_amount_is_zero() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-finalize-order", &["1", "2"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        runner.run.responses = vec![
+            AmountOutResponse {
+                pool: "pool-z".to_string(),
+                pool_name: "Pool Z".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000010".to_string(),
+                amounts_out: vec!["9".to_string(), "10".to_string()],
+                gas_used: vec![1, 1],
+                gas_in_sell: "1".to_string(),
+                block_number: 1,
+            },
+            AmountOutResponse {
+                pool: "pool-a".to_string(),
+                pool_name: "Pool A".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["0".to_string(), "200".to_string()],
+                gas_used: vec![0, 2],
+                gas_in_sell: "2".to_string(),
+                block_number: 1,
+            },
+        ];
+
+        runner.finalize_responses();
+
+        assert_eq!(
+            runner
+                .run
+                .responses
+                .iter()
+                .map(|response| response.pool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool-a", "pool-z"]
+        );
+        assert_eq!(runner.run.responses[0].amounts_out[0], "0");
+    }
+
+    #[tokio::test]
+    async fn finalize_responses_uses_pool_address_as_identity_tiebreaker() {
+        let fixture = BasicQuoteFixture::new();
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-finalize-tiebreak", &["1"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        runner.run.responses = vec![
+            AmountOutResponse {
+                pool: "pool-shared".to_string(),
+                pool_name: "Pool Shared".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000002".to_string(),
+                amounts_out: vec!["7".to_string()],
+                gas_used: vec![1],
+                gas_in_sell: "1".to_string(),
+                block_number: 1,
+            },
+            AmountOutResponse {
+                pool: "pool-shared".to_string(),
+                pool_name: "Pool Shared".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["8".to_string()],
+                gas_used: vec![1],
+                gas_in_sell: "1".to_string(),
+                block_number: 1,
+            },
+        ];
+
+        runner.finalize_responses();
+
+        assert_eq!(
+            runner
+                .run
+                .responses
+                .iter()
+                .map(|response| response.pool_address.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+            ]
+        );
     }
 
     #[test]
