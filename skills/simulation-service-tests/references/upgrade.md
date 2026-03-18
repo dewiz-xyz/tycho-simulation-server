@@ -42,6 +42,8 @@ Run verification per target chain.
 
 These relaxed helper invocations still require usable `result_quality=complete|partial`; they do not treat `request_level_failure` or `no_results` as success.
 
+If you use `scripts/run_suite.sh --allow-no-liquidity` for operational variability, remember it only relaxes the coverage/latency phases. The smoke phases still require successful-path ready quotes.
+
 ## VM pools (Curve/Balancer/Maverick)
 - VM checks are meaningful only when `/status.vm_enabled=true`.
 - For Ethereum comparison runs, include one VM-disabled pass:

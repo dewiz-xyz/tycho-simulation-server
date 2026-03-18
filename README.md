@@ -35,7 +35,7 @@ Common optional inputs:
 
 ## API Surface
 
-- `POST /simulate` returns laddered pool quotes plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
+- `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
 - `GET /status` reports native readiness, VM readiness, block progress, and VM rebuild/restart context for pollers and deploy scripts.
 
@@ -72,22 +72,28 @@ Detailed integration docs:
 
 Summary matrix:
 
-| Situation | `meta.status` | `meta.result_quality` | Quoteable |
+| Situation | `meta.status` | `meta.result_quality` | Usable For Quoting |
 | --- | --- | --- | --- |
 | Usable quotes with full coverage | `ready` | `complete` | yes |
-| Usable quotes with incomplete ladders or pool coverage | `ready` | `partial` | yes |
+| Usable quotes with partial requested-amount coverage or incomplete pool coverage | `ready` | `partial` | yes |
 | No usable quote because liquidity is absent or exhausted | `no_liquidity` | `no_results` | no |
-| Request completed with a structurally valid degraded response | `ready` or `internal_error` | `request_level_failure` | no |
+| Request completed with a valid payload but request-level failure details | `ready` or `internal_error` | `request_level_failure` | no |
 | Warm-up, token coverage, or request validation problem | `warming_up`, `token_missing`, or `invalid_request` | `request_level_failure` | no |
 
-Quoteable `/simulate` results require:
+`/simulate` results are usable for quoting when:
 
 - `meta.status=ready`
 - `meta.result_quality=complete` or `meta.result_quality=partial`
 
-`meta.failures` is the request-level explanation layer. It captures timeouts, cancellations, token coverage problems, no-pools reasons, and request-relevant simulation failures.
+`meta.failures` is the request-level failure summary. It captures timeouts, cancellations, token coverage problems, no-pools reasons, and request-relevant simulation failures.
 
-`meta.pool_results` is the per-pool anomaly layer. It captures pool-local outcomes such as `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, and `internal_error`.
+`meta.pool_results` is the per-pool outcome summary. It captures pool-local outcomes such as `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, and `internal_error`.
+
+For partial results, emitted pool rows keep the original request order and request length in `amounts_out`. Requested amounts that fail are serialized in place as `"0"`, and the matching `gas_used` entries are `0`.
+
+Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable quote for that pool," not as a real quote. `data[]` only contains pools that produced at least one positive output across the requested amounts. Fully-zero rows are filtered out of `data[]` and stay visible only through `meta.failures` and `meta.pool_results`.
+
+`data[]` order is deterministic, but it is not a best-to-worst ranking. Clients should rely on requested-amount alignment within each row and evaluate returned pools explicitly instead of inferring meaning from `data[0]`.
 
 `meta.vm_unavailable=true` means VM pools were skipped because VM state was not ready. When usable native quotes still exist, that typically surfaces as a `ready + partial` response rather than a hard non-ready status.
 
@@ -139,7 +145,9 @@ Useful helpers:
 - `scripts/stop_server.sh` to stop a server started by the repo helper
 - `scripts/run_suite.sh` to run smoke, encode smoke, coverage, and latency checks
 
-The repo suite is intentionally strict: it keeps verification on quoteable healthy-path responses and fails on request-visible degradation even when `/simulate` still returns a contract-valid `200 OK` payload.
+The repo suite is intentionally strict: it keeps verification on successful responses with usable quotes and fails on request-visible degradation even when `/simulate` still returns a contract-valid `200 OK` payload.
+
+That strictness also applies to requested-amount semantics: smoke validation treats `amounts_out[i] = "0"` as "no usable quote for that requested amount," not as a valid quote, and encode smoke uses dedicated realistic amount presets that must stay usable across both tested hops.
 
 ## Docs Map
 

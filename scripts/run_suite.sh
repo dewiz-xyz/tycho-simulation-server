@@ -20,11 +20,11 @@ Options:
   --suite              Pair suite for coverage/latency (default: core)
   --disable-vm-pools   Start server with ENABLE_VM_POOLS=false
   --enable-vm-pools    Start server with ENABLE_VM_POOLS=true (default; waits for vm_status=ready on supported chains)
-  --allow-no-liquidity Allow no_liquidity responses with only no_pools failures
+  --allow-no-liquidity Relax coverage/latency stages to allow no_liquidity + no_pools; smoke stages stay strict
   --stop               Stop server when done (only if started by this script)
   -h, --help           Show this help
 
-Tip: For mainnet variability, use --allow-no-liquidity only when you intentionally want to tolerate no-pools/no-results responses.
+Tip: For mainnet variability, use --allow-no-liquidity only when you intentionally want to relax coverage/latency for no-pools/no-results responses.
 USAGE
 }
 

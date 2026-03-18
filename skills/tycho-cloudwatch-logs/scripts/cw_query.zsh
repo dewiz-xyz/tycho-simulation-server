@@ -100,7 +100,7 @@ QUERY
       cat <<QUERY
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Merged protocol streams/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
+| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit ${limit}
@@ -170,7 +170,7 @@ QUERY
       cat <<QUERY
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Unhandled service error/
+| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Encode request timed out at router boundary/ or msg like /Unhandled service error/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit ${limit}
