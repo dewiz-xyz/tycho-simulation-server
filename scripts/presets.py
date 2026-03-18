@@ -515,6 +515,25 @@ DEFAULT_ENCODE_ROUTE_BY_CHAIN: dict[int, tuple[str, str, str]] = {
     8453: ("USDC", "WETH", "USDC"),
 }
 
+DEFAULT_ENCODE_BASE_UNITS_BY_CHAIN: dict[int, dict[tuple[str, str, str], list[int]]] = {
+    1: {
+        ("DAI", "USDC", "USDT"): [
+            1_000_000_000_000_000_000,
+            5_000_000_000_000_000_000,
+            10_000_000_000_000_000_000,
+            50_000_000_000_000_000_000,
+        ],
+    },
+    8453: {
+        ("USDC", "WETH", "USDC"): [
+            1_000_000,
+            5_000_000,
+            10_000_000,
+            50_000_000,
+        ],
+    },
+}
+
 
 @dataclass(frozen=True)
 class ResolvedPair:
@@ -531,6 +550,16 @@ def default_encode_route(chain_id: int) -> tuple[str, str, str]:
     if route is None:
         raise ValueError(f"No default encode route configured for chain {chain_id}")
     return route
+
+
+def default_encode_amounts(chain_id: int) -> list[str]:
+    route = default_encode_route(chain_id)
+    route_units = DEFAULT_ENCODE_BASE_UNITS_BY_CHAIN.get(chain_id, {}).get(route)
+    if route_units is None:
+        raise ValueError(
+            f"No default encode amounts configured for chain {chain_id} route {route!r}"
+        )
+    return [str(value) for value in route_units]
 
 
 def resolve_token(token_or_symbol: str, chain_id: int) -> str:

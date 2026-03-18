@@ -14,8 +14,8 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 
 from presets import (
-    amounts_for_pair,
     chain_label,
+    default_encode_amounts,
     default_encode_route,
     resolve_chain_id,
     resolve_token,
@@ -104,18 +104,32 @@ def apply_slippage(amount: str | int, bps: int) -> str:
     return str((value * safe_bps) // 10_000)
 
 
-def select_pool(response: dict, label: str) -> dict:
+def select_pool(response: dict, label: str, *, require_all_amounts: bool = True) -> dict:
     data = response.get("data")
     if not isinstance(data, list) or not data:
         raise AssertionError(f"{label}: no pool data")
-    pool = data[0]
     required = ["pool", "amounts_out", "gas_used", "gas_in_sell", "block_number", "pool_name", "pool_address"]
-    for key in required:
-        if key not in pool:
-            raise AssertionError(f"{label}: missing {key}")
-    if not is_int_string(pool.get("gas_in_sell")):
-        raise AssertionError(f'{label}: gas_in_sell must be an integer string ("0" is valid)')
-    return pool
+    for pool in data:
+        for key in required:
+            if key not in pool:
+                raise AssertionError(f"{label}: missing {key}")
+        if not is_int_string(pool.get("gas_in_sell")):
+            raise AssertionError(f'{label}: gas_in_sell must be an integer string ("0" is valid)')
+
+        amounts_out = pool.get("amounts_out")
+        if not isinstance(amounts_out, list) or not amounts_out:
+            raise AssertionError(f"{label}: pool row missing the first requested amount output")
+        if not all(is_int_string(amount) for amount in amounts_out):
+            raise AssertionError(f"{label}: pool row contains non-integer amount outputs")
+        if require_all_amounts:
+            if all(int(amount) > 0 for amount in amounts_out):
+                return pool
+        elif int(amounts_out[0]) > 0:
+            return pool
+
+    if require_all_amounts:
+        raise AssertionError(f"{label}: no pool returned usable quotes for every requested amount")
+    raise AssertionError(f"{label}: no pool returned a usable quote for the first requested amount")
 
 
 def validate_simulate_meta(
@@ -245,7 +259,8 @@ def main() -> int:
     mid_token = resolve_token(mid_symbol, chain_id)
     token_out = resolve_token(token_out_symbol, chain_id)
 
-    amounts = amounts_for_pair(token_in, mid_token, chain_id)
+    # Encode smoke uses curated route-specific amounts so strict two-hop checks stay realistic.
+    amounts = default_encode_amounts(chain_id)
 
     simulate_payload = {
         "request_id": f"encode-smoke-{uuid.uuid4().hex[:8]}",

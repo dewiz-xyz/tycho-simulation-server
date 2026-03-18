@@ -48,18 +48,9 @@ def is_int_string(value) -> bool:
     return value.isdigit()
 
 
-def allows_partial_ladder_prefix(
-    result_quality: object,
-    partial_kind: object,
-) -> bool:
-    return result_quality == "partial" and partial_kind in {"amount_ladders", "mixed"}
-
-
 def validate_pool_entry(
     entry,
     expected_len: int,
-    *,
-    allow_partial_prefix: bool = False,
 ) -> tuple[bool, str]:
     if not isinstance(entry, dict):
         return False, "pool entry is not an object"
@@ -68,10 +59,7 @@ def validate_pool_entry(
     if not isinstance(amounts_out, list):
         return False, "amounts_out is not a list"
     amounts_len = len(amounts_out)
-    if allow_partial_prefix:
-        if amounts_len == 0 or amounts_len > expected_len:
-            return False, f"amounts_out length mismatch (expected 1..{expected_len})"
-    elif amounts_len != expected_len:
+    if amounts_len != expected_len:
         return False, f"amounts_out length mismatch (expected {expected_len})"
     if not all(is_int_string(v) for v in amounts_out):
         return False, "amounts_out contains non-integer strings"
@@ -92,12 +80,21 @@ def validate_pool_entry(
     if not isinstance(block_number, int) or block_number < 0:
         return False, "block_number is invalid"
 
+    usable_amount_seen = False
     prev = -1
-    for raw in amounts_out:
+    for idx, raw in enumerate(amounts_out):
         current = int(raw)
+        if current == 0:
+            if gas_used[idx] != 0:
+                return False, "gas_used must be 0 for failed requested amounts"
+            continue
+        usable_amount_seen = True
         if current < prev:
             return False, "amounts_out is not monotonic"
         prev = current
+
+    if not usable_amount_seen:
+        return False, "pool entry has no usable amount outputs"
 
     return True, ""
 
@@ -151,8 +148,8 @@ def main() -> int:
         "--validate-data",
         action="store_true",
         help=(
-            "Validate response pool entries (amounts_out/gas_used lengths, gas_in_sell integer-string, "
-            "block_number, monotonicity)"
+            "Validate response pool entries (amounts_out/gas_used lengths, zero-filled failed requested amounts, "
+            "gas_in_sell integer-string, block_number, monotonicity)"
         ),
     )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
@@ -283,12 +280,10 @@ def main() -> int:
             continue
 
         if args.validate_data and isinstance(data, list):
-            allow_partial_prefix = allows_partial_ladder_prefix(result_quality, partial_kind)
             for entry in data:
                 ok, error = validate_pool_entry(
                     entry,
                     expected_len=len(amounts),
-                    allow_partial_prefix=allow_partial_prefix,
                 )
                 if not ok:
                     print(f"[FAIL] {pair_label} invalid pool entry: {error}")
