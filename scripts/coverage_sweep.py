@@ -87,11 +87,60 @@ def resolve_allowed_statuses(
     allow_no_pools: bool,
 ) -> set[str]:
     allowed_statuses = {status.strip() for status in allow_status.split(",") if status.strip()}
-    if allow_failures:
-        allowed_statuses.add("partial_success")
     if allow_no_pools:
         allowed_statuses.add("no_liquidity")
     return allowed_statuses
+
+
+def validate_response_meta(
+    meta: object,
+    *,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+    allow_no_pools: bool,
+) -> tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, "meta is not an object"
+
+    status = meta.get("status")
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+    data = meta.get("_data", [])
+
+    if status not in allowed_statuses:
+        return False, f"meta_status:{status}"
+
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            return False, "partial_kind_invalid"
+    elif partial_kind is not None:
+        return False, "partial_kind_unexpected"
+
+    has_data = isinstance(data, list) and bool(data)
+    if status == "ready" and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_ready_result_quality:{result_quality}"
+    if has_data and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_data_result_quality:{result_quality}"
+    if status == "no_liquidity":
+        if result_quality != "no_results":
+            return False, f"unexpected_no_liquidity_quality:{result_quality}"
+        if has_data:
+            return False, "no_liquidity_with_data"
+        if not allow_no_pools:
+            return False, "meta_status:no_liquidity"
+
+    if failures and not allow_failures:
+        if allow_no_pools and status == "no_liquidity":
+            only_no_pools = all(
+                isinstance(item, dict) and item.get("kind") == "no_pools"
+                for item in failures
+            )
+            if only_no_pools:
+                return True, "allowed_no_pools"
+        return False, "meta_failures"
+
+    return True, ""
 
 
 def main() -> int:
@@ -225,6 +274,7 @@ def main() -> int:
 
         meta = response_json.get("meta", {})
         status = meta.get("status")
+        result_quality = meta.get("result_quality") if isinstance(meta, dict) else None
         meta_statuses[str(status)] += 1
 
         failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
@@ -234,49 +284,29 @@ def main() -> int:
                 if kind is not None:
                     failure_kinds[str(kind)] += 1
 
-        if status not in allowed_statuses:
+        meta_for_validation = dict(meta) if isinstance(meta, dict) else {}
+        meta_for_validation["_data"] = response_json.get("data", [])
+        meta_valid, meta_error = validate_response_meta(
+            meta_for_validation,
+            allowed_statuses=allowed_statuses,
+            allow_failures=args.allow_failures,
+            allow_no_pools=args.allow_no_pools,
+        )
+        if not meta_valid:
             failures += 1
             report["requests"].append(
                 {
                     "pair": asdict(pair),
                     "elapsed_s": elapsed,
                     "meta": meta,
-                    "error": f"meta_status:{status}",
+                    "error": meta_error,
                 }
             )
             continue
 
-        if failures_list and not args.allow_failures:
-            if args.allow_no_pools and status == "no_liquidity":
-                only_no_pools = all(
-                    isinstance(item, dict) and item.get("kind") == "no_pools"
-                    for item in failures_list
-                )
-                if only_no_pools:
-                    allowed_no_pools += 1
-                    failures_list = []
-                else:
-                    failures += 1
-                    report["requests"].append(
-                        {
-                            "pair": asdict(pair),
-                            "elapsed_s": elapsed,
-                            "meta": meta,
-                            "error": "meta_failures",
-                        }
-                    )
-                    continue
-            else:
-                failures += 1
-                report["requests"].append(
-                    {
-                        "pair": asdict(pair),
-                        "elapsed_s": elapsed,
-                        "meta": meta,
-                        "error": "meta_failures",
-                    }
-                )
-                continue
+        if meta_error == "allowed_no_pools":
+            allowed_no_pools += 1
+            failures_list = []
 
         data = response_json.get("data", [])
         pool_count = len(data) if isinstance(data, list) else 0
@@ -309,13 +339,14 @@ def main() -> int:
                 "meta": meta,
                 "pool_count": pool_count,
                 "amounts": amounts,
+                "result_quality": result_quality,
             }
         )
 
         if args.verbose:
             print(
                 f"[OK] {pair.token_in}->{pair.token_out} {elapsed:.3f}s "
-                f"status={status} pools={pool_count}"
+                f"status={status} result_quality={result_quality} pools={pool_count}"
             )
 
     observed_protocols = sorted(winner_protocols.keys())

@@ -31,7 +31,8 @@
     "amounts": ["1000000000000000000", "5000000000000000000"]
   }
   ```
-- HTTP status is always `200 OK`. Validate `meta.status` and `meta.failures` to determine readiness or partial failures.
+- HTTP status is always `200 OK`. Validate `meta.result_quality`, `meta.partial_kind`, and `meta.failures`; `meta.status` alone is not enough to decide whether a response is quoteable.
+- The live `/simulate` contract is summarized in [README.md](../../../README.md) and detailed for integrations in [docs/simulate_example.md](../../../docs/simulate_example.md).
 
 ## Repo verification suite (recommended)
 - One-shot suite (start → wait_ready → smoke → coverage → latency):
@@ -40,8 +41,11 @@
   - VM pools are enabled by default; add `--disable-vm-pools` to skip VM feeds.
   - On Ethereum, VM-enabled runs wait for `vm_status=ready` and `vm_pools>=1` before the VM protocol probes run.
   - On Base, the runner also executes a strict native Aerodrome presence probe after the broader coverage sweep.
+  - The repo suite is intentionally strict: it keeps verification on healthy quoteable paths and fails on request-visible degradation even when the API response is still contract-valid.
   - There is no repo-runner mode that leaves VM pools enabled while skipping that wait; use `--disable-vm-pools` for the native-only fast path.
-  - Use `--allow-partial` or `--allow-no-liquidity` if you expect partial/no-liquidity responses.
+  - Use `--allow-failures` on the individual Python helpers only when you want to tolerate request-visible failures on otherwise usable `complete`/`partial` results.
+  - Use `--allow-no-liquidity` only when you intentionally want to relax the coverage/latency phases for `no_liquidity + no_results` responses that report `no_pools`.
+  - That flag does not relax `/simulate` smoke or `/encode` smoke; those still require successful-path ready quotes.
   - Smoke validation checks non-empty `data` and pool fields including `gas_in_sell` (decimal string, `"0"` is valid when reporting is disabled/unavailable; pricing inputs are request-scoped).
   - On Ethereum, `--suite core` keeps the tuned defaults: `coverage_core_vm` + `latency_core_vm` when VM is enabled, `latency_core` when it is not.
 - Individual runners:
@@ -50,8 +54,9 @@
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`
-  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams`
   - `python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50`
+  - If you run `scripts/run_suite.sh --allow-no-liquidity`, remember its latency output is an operational mixed-path check, not a pure usable-quote latency benchmark.
 - See `STRESS_TEST_README.md` for suites, defaults, and latency knobs.
 
 ## Useful commands
@@ -62,4 +67,4 @@
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_allowlisted --expect-protocols erc4626`
   - `python3 scripts/coverage_sweep.py --chain-id 1 --suite erc4626_negative --allow-no-pools`
 - Base Aerodrome rollout checks:
-  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams`

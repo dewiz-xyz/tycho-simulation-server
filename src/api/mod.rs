@@ -54,7 +54,7 @@ fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
             scope = "router_timeout",
             timeout_ms, "Request-level timeout triggered at router boundary: {}", err
         );
-        emit_simulate_completion(QuoteStatus::PartialSuccess, true);
+        emit_simulate_completion(QuoteStatus::Ready, true);
         emit_simulate_result_quality(QuoteResultQuality::RequestLevelFailure);
         emit_simulate_timeout(TimeoutKind::RouterBoundary);
         return (StatusCode::OK, Json(router_timeout_result())).into_response();

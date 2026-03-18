@@ -36,7 +36,6 @@ pub enum QuoteStatus {
     WarmingUp,
     TokenMissing,
     NoLiquidity,
-    PartialSuccess,
     InvalidRequest,
     InternalError,
 }
@@ -52,12 +51,19 @@ pub enum QuoteResultQuality {
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum QuotePartialKind {
+    AmountLadders,
+    PoolCoverage,
+    Mixed,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PoolOutcomeKind {
     PartialOutput,
     ZeroOutput,
     SkippedConcurrency,
     SkippedDeadline,
-    SkippedPrecheck,
     TimedOut,
     SimulatorError,
     InternalError,
@@ -136,6 +142,8 @@ pub struct PoolSimulationOutcome {
 pub struct QuoteMeta {
     pub status: QuoteStatus,
     pub result_quality: QuoteResultQuality,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_kind: Option<QuotePartialKind>,
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
@@ -271,7 +279,10 @@ pub struct EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AmountOutResponse, PoolOutcomeKind, QuoteResultQuality};
+    use super::{
+        AmountOutResponse, PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality,
+        QuoteStatus,
+    };
     use anyhow::Result;
 
     #[test]
@@ -288,15 +299,59 @@ mod tests {
     }
 
     #[test]
-    fn pool_outcome_kind_serializes_as_snake_case() -> Result<()> {
+    fn quote_status_serializes_without_partial_success() -> Result<()> {
+        assert_eq!(serde_json::to_string(&QuoteStatus::Ready)?, "\"ready\"");
         assert_eq!(
-            serde_json::to_string(&PoolOutcomeKind::SkippedPrecheck)?,
-            "\"skipped_precheck\""
+            serde_json::to_string(&QuoteStatus::InternalError)?,
+            "\"internal_error\""
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quote_partial_kind_serializes_as_snake_case() -> Result<()> {
+        assert_eq!(
+            serde_json::to_string(&QuotePartialKind::AmountLadders)?,
+            "\"amount_ladders\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QuotePartialKind::PoolCoverage)?,
+            "\"pool_coverage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QuotePartialKind::Mixed)?,
+            "\"mixed\""
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pool_outcome_kind_serializes_as_snake_case() -> Result<()> {
         assert_eq!(
             serde_json::to_string(&PoolOutcomeKind::PartialOutput)?,
             "\"partial_output\""
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quote_meta_omits_partial_kind_when_absent() -> Result<()> {
+        let meta = QuoteMeta {
+            status: QuoteStatus::Ready,
+            result_quality: QuoteResultQuality::Complete,
+            partial_kind: None,
+            block_number: 1,
+            vm_block_number: None,
+            matching_pools: 0,
+            candidate_pools: 0,
+            total_pools: None,
+            auction_id: None,
+            pool_results: Vec::new(),
+            vm_unavailable: false,
+            failures: Vec::new(),
+        };
+        let value = serde_json::to_value(meta)?;
+        assert!(value.get("partial_kind").is_none());
         Ok(())
     }
 

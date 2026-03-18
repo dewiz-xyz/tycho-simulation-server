@@ -46,7 +46,8 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 
 - Always pass chain context to scripts (`--chain-id` or env `CHAIN_ID`).
 - Base protocol finalization should keep Aerodrome in the candidate path:
-  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-status ready,partial_success --allow-failures --expect-protocols aerodrome_slipstreams`
+  - `python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams`
+  This relaxed helper path still requires usable `result_quality=complete|partial`; it does not treat `request_level_failure` or `no_results` as success.
 - To test native-only behavior on Ethereum:
   - `scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop`
 - Or start with VM disabled:

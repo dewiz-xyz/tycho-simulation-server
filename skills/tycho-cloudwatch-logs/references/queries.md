@@ -22,25 +22,25 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | block-updates-count | Block update frequency | Counts block update logs; also reports first/last timestamp in window. |
 | readiness | Service readiness | Matches "Service ready: first pools ingested". |
 | resync | Resync lifecycle | Matches any "Resync" message. |
-| stream-health | Stream startup and errors | Stream start, merged stream status, and stream errors. |
+| stream-health | Stream startup and errors | Stream start/update plus stream errors and unexpected exits. |
 | stream-supervision | Stream supervision lifecycle | Restarts, stale streams, missing blocks, advanced state. |
 | vm-rebuild | VM rebuild lifecycle | VM rebuild start/success and cleanup failures. |
 | startup | App boot sequence | Init, token load, concurrency limits. |
 | server | HTTP server lifecycle | Start/listen/bind/server errors. |
 | timeouts | Request handler timeouts | Request-level and computation timeouts. |
-| router-timeouts | Router boundary timeouts | Timeout layer and router errors. |
+| router-timeouts | Router boundary timeouts | `/simulate` and `/encode` timeout-layer events plus router errors. |
 | simulate-requests | Incoming simulate calls | "Received simulate request". |
 | simulate-completions | Quote completions | Success and timeout completions. |
-| simulate-successes | Successful completions | `status=Ready` completions with top pool details. |
+| simulate-successes | Quoteable successful completions | `status=ready` plus `result_quality=complete|partial`, with top pool details. |
 | simulate-rpm | Requests per minute | Uses completion logs (more reliable than request-start logs). |
 | simulate-rpm-by-auction | Requests per minute per auction_id | Uses completion logs; can be large, bump `--limit`. |
 | simulate-requests-per-auction | Total request count per auction_id | Complements simulate-rpm-by-auction (not per-minute). |
-| simulate-runs | Per-request simulation runs detail | Shows simulation_runs (scheduled pools) alongside key metrics. |
+| simulate-runs | Per-request scheduled-pool detail | Shows scheduled pool counts alongside key metrics. |
 | simulate-runs-per-minute | Pool simulation runs per minute | Sum of scheduled pools per minute; distinguishes runs from requests. |
 | simulate-runs-per-auction | Pool simulation runs per auction_id | Sum of scheduled pools per auction; distinguishes runs from requests. |
 | simulate-workload-summary | Full-window workload aggregate | Computes requests, pool simulation runs, amounts simulated, and simulation run totals. |
 | token-metadata | Token metadata fetch errors | Timeout and failure messages. |
-| token-rpc-fetch | Single token RPC fetch | Rare fetch path and failures. |
+| token-rpc-fetch | Single token RPC fetch | Rare fetch path; success visibility requires `debug`. |
 | state-anomalies | State store warnings | Missing state, unknown protocol/pair. |
 | vm-pools | VM pool feed config | Enabled/disabled logs. |
 | tvl-thresholds | TVL filter config | "Using TVL thresholds". |
@@ -50,16 +50,19 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | delta-transition | Delta transition failures | DeltaTransitionError and failed update warnings. |
 | stream-update-stats | Stream update stats | Max new/removed/updated/total pairs by stream. |
 
+Quote-contract note:
+- These queries target the live runtime log contract.
+- Detailed semantics are documented in [docs/quote_service.md](../../../docs/quote_service.md).
+
 ## Tail/filter patterns (aws logs tail/filter-log-events)
 - Block updates: Block update:
 - Readiness: Service ready: first pools ingested
 - Resync lifecycle: Resync
 - Stream errors: Stream error OR Stream ended unexpectedly
 - Stream start: Starting stream processing OR Stream update processed
-- Merged stream startup: Starting merged protocol streams OR Merged protocol streams running
 - HTTP server: Starting HTTP server OR Server listening OR Failed to bind to address
 - Handler timeouts: Simulate request timed out OR Simulate computation completed with timeout
-- Router timeouts: Request-level timeout triggered at router boundary
+- Router timeouts: Request-level timeout triggered at router boundary OR Encode request timed out at router boundary
 - Simulate request: Received simulate request
 - Simulate completions: Simulate computation completed
 - Token metadata: Token metadata fetch timed out OR Token metadata fetch failed
@@ -89,10 +92,10 @@ Use the existing `/simulate` presets for ERC4626 rollout checks. They already ex
 - `top_pool_address`
 
 Most useful presets:
-- `simulate-requests`: confirm request traffic for an allowlisted pair
 - `simulate-completions`: inspect readiness, failures, and skipped counts for a pair
-- `simulate-successes`: inspect successful quotes and top pool selection for a pair
+- `simulate-successes`: inspect quoteable successful quotes and top pool selection for a pair
 - `simulate-runs`: inspect per-request scheduled pool counts for a pair
+- `simulate-requests`: confirm request traffic for a pair
 
 Supported ERC4626 directions on this server:
 - `USDS -> sUSDS`
@@ -106,11 +109,13 @@ Negative probe:
 - `sUSDe -> USDe`
 
 Current blind spots:
-- Unsupported ERC4626 directions filtered by the server will usually be invisible here because the ERC4626 gate logs are `debug`, not `info`.
-- `/encode` requests cannot be isolated reliably by ERC4626 pair from current CloudWatch logs.
+- Unsupported ERC4626 directions filtered out during candidate selection are still invisible here because the ERC4626 gate logs are `debug`, not `info`.
+- Unsupported ERC4626 `/encode` rejections are now visible in CloudWatch, but there is still no dedicated preset for them.
+- General `/encode` traffic still cannot be isolated reliably by ERC4626 pair from current CloudWatch logs.
 
 ### Copyable ERC4626 commands
 Use `--query` when you want a one-off pair filter without adding a new preset. Start from the matching preset query below and append a `token_in`/`token_out` filter.
+CloudWatch logs store canonical lowercase token addresses for address-like values, so the filters below use lowercase addresses even when the headings use symbols.
 
 #### simulate-successes for allowlisted directions
 `USDS -> sUSDS`
@@ -125,6 +130,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -132,10 +138,10 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "USDS" and token_out = "sUSDS"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0xdc035d45d973e3ec169d2276ddab16f1e407384f" and token_out = "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
@@ -152,6 +158,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -159,10 +166,10 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "sUSDS" and token_out = "USDS"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd" and token_out = "0xdc035d45d973e3ec169d2276ddab16f1e407384f"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
@@ -179,6 +186,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -186,10 +194,10 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "USDC" and token_out = "sUSDC"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" and token_out = "0xbc65ad17c5c0a2a4d159fa5a503f4992c7b545fe"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
@@ -206,6 +214,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -213,10 +222,10 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "sUSDC" and token_out = "USDC"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0xbc65ad17c5c0a2a4d159fa5a503f4992c7b545fe" and token_out = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
@@ -233,6 +242,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -240,10 +250,10 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "PYUSD" and token_out = "spPYUSD"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0x6c3ea9036406852006290770bedfcaba0e23a0e8" and token_out = "0x80128dbb9f07b93dde62a6daeadb69ed14a7d354"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
@@ -260,6 +270,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -267,16 +278,16 @@ fields @timestamp, @logStream
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
-| filter msg = "Simulate computation completed" and status = "Ready"
-| filter token_in = "spPYUSD" and token_out = "PYUSD"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
+| filter token_in = "0x80128dbb9f07b93dde62a6daeadb69ed14a7d354" and token_out = "0x6c3ea9036406852006290770bedfcaba0e23a0e8"
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
 QUERY
 )"```
 
 #### Negative probe for `sUSDe -> USDe`
-Use `simulate-requests` to confirm traffic and `simulate-completions` to confirm that the server is not advertising it as supported liquidity.
+Use `simulate-completions` to confirm that the server is not advertising it as supported liquidity. If request-start debug logs are enabled, you can also use `simulate-requests` to confirm traffic.
 
 Request visibility:
 ```bash
@@ -289,7 +300,7 @@ fields @timestamp, @logStream
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | filter msg like /Received simulate request/
-| filter token_in = "sUSDe" and token_out = "USDe"
+| filter token_in = "0x9d39a5de30e57443bff2a8307a4256c8797a3497" and token_out = "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"
 | sort @timestamp desc
 | display @timestamp, request_id, auction_id, token_in, token_out, amounts, msg, @logStream
 | limit 100
@@ -314,7 +325,7 @@ fields @timestamp, @logStream
 | parse @message /"top_pool_name":"(?<top_pool_name>[^"]+)"/
 | parse @message /"top_pool_address":"(?<top_pool_address>[^"]+)"/
 | filter msg = "Simulate computation completed"
-| filter token_in = "sUSDe" and token_out = "USDe"
+| filter token_in = "0x9d39a5de30e57443bff2a8307a4256c8797a3497" and token_out = "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"
 | sort @timestamp desc
 | display @timestamp, request_id, auction_id, status, result_quality, responses, failures, pool_results, latency_ms, token_in, token_out, top_pool_name, top_pool_address, msg, @logStream
 | limit 100
@@ -385,7 +396,7 @@ fields @timestamp, @logStream
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Merged protocol streams/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
+| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit 100
@@ -456,7 +467,7 @@ fields @timestamp, @logStream
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Unhandled service error/
+| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Encode request timed out at router boundary/ or msg like /Unhandled service error/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit 100
@@ -478,6 +489,7 @@ fields @timestamp, @logStream
 ```
 
 ### simulate-completions
+Live-contract query for the current `quote_status`, `quote_result_quality`, and `partial_kind` fields.
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
@@ -488,6 +500,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -495,8 +508,6 @@ fields @timestamp, @logStream
 | parse @message /"scheduled_native_pools":(?<scheduled_native_pools>[0-9]+)/
 | parse @message /"scheduled_vm_pools":(?<scheduled_vm_pools>[0-9]+)/
 | parse @message /"skipped_vm_unavailable":(?<skipped_vm_unavailable>true|false)/
-| parse @message /"skipped_native_limits":(?<skipped_native_limits>[0-9]+)/
-| parse @message /"skipped_vm_limits":(?<skipped_vm_limits>[0-9]+)/
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"vm_completed_pools":(?<vm_completed_pools>[0-9]+)/
 | parse @message /"vm_median_first_gas":(?<vm_median_first_gas>[0-9]+(?:\.[0-9]+)?)/
@@ -514,13 +525,14 @@ fields @timestamp, @logStream
 | parse @message /"top_gas_used":(?<top_gas_used>[0-9]+)/
 | filter msg like /Simulate computation completed/
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, scheduled_native_pools, scheduled_vm_pools, skipped_vm_unavailable, skipped_native_limits, skipped_vm_limits, skipped_native_concurrency, skipped_vm_concurrency, skipped_native_deadline, skipped_vm_deadline, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, scheduled_native_pools, scheduled_vm_pools, skipped_vm_unavailable, skipped_native_concurrency, skipped_vm_concurrency, skipped_native_deadline, skipped_vm_deadline, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
 | limit 100
 ```
 
 Note: failure summaries (`failure_kinds`, `failure_protocols`, `failure_pool_kinds`, `failure_samples`) are emitted with debug formatting, so they appear as JSON string fields in `@message`. The easiest way to inspect them is to include `@message` in the display or open the log event details in the CloudWatch console.
 
 ### simulate-successes
+Live-contract query. This preset intentionally filters quoteable successes: `status = "ready"` plus `result_quality in {complete, partial}`.
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
@@ -531,6 +543,7 @@ fields @timestamp, @logStream
 | parse @message /"amounts":(?<amounts>[0-9]+)/
 | parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
 | parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"latency_ms":(?<latency_ms>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
@@ -542,16 +555,14 @@ fields @timestamp, @logStream
 | parse @message /"top_amount_out":"(?<top_amount_out>[^"]+)"/
 | parse @message /"top_gas_used":(?<top_gas_used>[0-9]+)/
 | parse @message /"skipped_vm_unavailable":(?<skipped_vm_unavailable>true|false)/
-| parse @message /"skipped_native_limits":(?<skipped_native_limits>[0-9]+)/
-| parse @message /"skipped_vm_limits":(?<skipped_vm_limits>[0-9]+)/
 | parse @message /"vm_completed_pools":(?<vm_completed_pools>[0-9]+)/
 | parse @message /"vm_median_first_gas":(?<vm_median_first_gas>[0-9]+(?:\.[0-9]+)?)/
 | parse @message /"vm_low_first_gas_count":(?<vm_low_first_gas_count>[0-9]+)/
 | parse @message /"vm_low_first_gas_ratio":(?<vm_low_first_gas_ratio>[0-9]+(?:\.[0-9]+)?)/
 | parse @message /"vm_low_first_gas_samples":"?(?<vm_low_first_gas_samples>\[[^\]]*\])"?/
-| filter msg = "Simulate computation completed" and status = "Ready"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, skipped_vm_unavailable, skipped_native_limits, skipped_vm_limits, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, skipped_vm_unavailable, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
 | limit 100
 ```
 
@@ -589,6 +600,7 @@ fields @timestamp
 ```
 
 ### simulate-runs
+This preset reports scheduled pool counts per request. Use `simulate-workload-summary` when you need amount-expanded simulation-run totals.
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
@@ -672,6 +684,7 @@ fields @timestamp, @logStream
 ```
 
 ### token-rpc-fetch
+Under the default `info` log level, this preset is mostly failure-focused. `Token fetch succeeded` only appears when `RUST_LOG=debug`.
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg

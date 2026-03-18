@@ -1,6 +1,6 @@
 use num_bigint::BigUint;
 use num_traits::Zero;
-use tracing::debug;
+use tracing::info;
 use tycho_simulation::tycho_common::Bytes;
 
 use crate::models::erc4626::{
@@ -219,7 +219,7 @@ fn validate_erc4626_swap_supported(
         return Ok(());
     }
 
-    debug!(
+    info!(
         protocol = swap.pool.protocol.as_str(),
         component_id = swap.pool.component_id.as_str(),
         token_in = token_in.to_string(),

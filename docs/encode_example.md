@@ -1,6 +1,6 @@
 # /encode example (RouteEncodeRequest)
 
-This document describes the target `/encode` schema.
+This document describes the `/encode` request and response shape.
 
 ## Terminology
 
@@ -12,10 +12,12 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 
 ## Workflow
 
-- Call `/simulate` for candidate pools.
+- Call `/simulate` for candidate pools. Keep only results with usable quotes (`status = "ready"` with `result_quality = "complete"` or `"partial"`). Within those rows, treat `amounts_out[i] = "0"` as "no usable quote for that requested amount," and ignore fully-zero rows. See [simulate_example.md](simulate_example.md).
 - Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
+
+The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for the default 2-hop route on each supported chain, requires both simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on either hop.
 
 ## Request body (shape)
 
@@ -201,3 +203,7 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 - Native `tokenIn`/`tokenOut` is supported only for allowlisted protocols (currently `rocketpool`).
   - Native `tokenIn` routes emit a `CALL`-only interaction with `value=amountIn` (no ERC20 approvals).
   - Native usage on non-allowlisted protocols is rejected as an invalid request.
+
+### Smoke-test note
+
+When you compare against the repo harness, remember that `scripts/encode_smoke.py` is proving something stricter than "the first requested amount can encode." It uses dedicated route-specific amount presets, expects every tested amount to remain usable across both hops, and treats any `"0"` hop output as a missing quote for that amount rather than a valid dust quote.

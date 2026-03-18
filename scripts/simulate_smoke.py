@@ -48,19 +48,27 @@ def is_int_string(value) -> bool:
     return value.isdigit()
 
 
-def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
+def validate_pool_entry(
+    entry,
+    expected_len: int,
+) -> tuple[bool, str]:
     if not isinstance(entry, dict):
         return False, "pool entry is not an object"
 
     amounts_out = entry.get("amounts_out")
-    if not isinstance(amounts_out, list) or len(amounts_out) != expected_len:
+    if not isinstance(amounts_out, list):
+        return False, "amounts_out is not a list"
+    amounts_len = len(amounts_out)
+    if amounts_len != expected_len:
         return False, f"amounts_out length mismatch (expected {expected_len})"
     if not all(is_int_string(v) for v in amounts_out):
         return False, "amounts_out contains non-integer strings"
 
     gas_used = entry.get("gas_used")
-    if not isinstance(gas_used, list) or len(gas_used) != expected_len:
-        return False, f"gas_used length mismatch (expected {expected_len})"
+    if not isinstance(gas_used, list):
+        return False, "gas_used is not a list"
+    if len(gas_used) != amounts_len:
+        return False, "gas_used length mismatch (expected to match amounts_out)"
     if not all(isinstance(v, int) and v >= 0 for v in gas_used):
         return False, "gas_used contains non-integers"
 
@@ -72,12 +80,55 @@ def validate_pool_entry(entry, expected_len: int) -> tuple[bool, str]:
     if not isinstance(block_number, int) or block_number < 0:
         return False, "block_number is invalid"
 
+    usable_amount_seen = False
     prev = -1
-    for raw in amounts_out:
+    for idx, raw in enumerate(amounts_out):
         current = int(raw)
+        if current == 0:
+            if gas_used[idx] != 0:
+                return False, "gas_used must be 0 for failed requested amounts"
+            continue
+        usable_amount_seen = True
         if current < prev:
             return False, "amounts_out is not monotonic"
         prev = current
+
+    if not usable_amount_seen:
+        return False, "pool entry has no usable amount outputs"
+
+    return True, ""
+
+
+def validate_response_meta(
+    meta: object,
+    *,
+    label: str,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+    require_usable_results: bool,
+) -> tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, f"{label}: meta is not an object"
+
+    status = meta.get("status")
+    if status not in allowed_statuses:
+        return False, f"{label}: unexpected status {status!r}"
+
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            return False, f"{label}: partial result missing valid partial_kind"
+    elif partial_kind is not None:
+        return False, f"{label}: partial_kind must be omitted unless result_quality=partial"
+
+    if require_usable_results and result_quality not in {"complete", "partial"}:
+        return False, f"{label}: unusable result_quality {result_quality!r}"
+
+    if failures and not allow_failures:
+        return False, f"{label}: had {len(failures)} failures"
 
     return True, ""
 
@@ -97,8 +148,8 @@ def main() -> int:
         "--validate-data",
         action="store_true",
         help=(
-            "Validate response pool entries (amounts_out/gas_used lengths, gas_in_sell integer-string, "
-            "block_number, monotonicity)"
+            "Validate response pool entries (amounts_out/gas_used lengths, zero-filled failed requested amounts, "
+            "gas_in_sell integer-string, block_number, monotonicity)"
         ),
     )
     parser.add_argument("--list-suites", action="store_true", help="List available suites and exit")
@@ -202,16 +253,23 @@ def main() -> int:
 
         meta = response_json.get("meta", {})
         status = meta.get("status")
-        failure_list = meta.get("failures", [])
-        meta_summary = f"status={status} failures={len(failure_list)}"
+        failure_list = meta.get("failures", []) if isinstance(meta, dict) else []
+        result_quality = meta.get("result_quality") if isinstance(meta, dict) else None
+        partial_kind = meta.get("partial_kind") if isinstance(meta, dict) else None
+        meta_summary = (
+            f"status={status} result_quality={result_quality} partial_kind={partial_kind} "
+            f"failures={len(failure_list)}"
+        )
 
-        if status not in allowed_statuses:
-            print(f"[FAIL] {pair_label} {elapsed:.3f}s {meta_summary}")
-            failures += 1
-            continue
-
-        if failure_list and not args.allow_failures:
-            print(f"[FAIL] {pair_label} {elapsed:.3f}s {meta_summary}")
+        valid_meta, meta_error = validate_response_meta(
+            meta,
+            label=pair_label,
+            allowed_statuses=allowed_statuses,
+            allow_failures=args.allow_failures,
+            require_usable_results=True,
+        )
+        if not valid_meta:
+            print(f"[FAIL] {pair_label} {elapsed:.3f}s {meta_summary} {meta_error}")
             failures += 1
             continue
 
@@ -223,7 +281,10 @@ def main() -> int:
 
         if args.validate_data and isinstance(data, list):
             for entry in data:
-                ok, error = validate_pool_entry(entry, expected_len=len(amounts))
+                ok, error = validate_pool_entry(
+                    entry,
+                    expected_len=len(amounts),
+                )
                 if not ok:
                     print(f"[FAIL] {pair_label} invalid pool entry: {error}")
                     failures += 1
