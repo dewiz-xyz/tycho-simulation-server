@@ -63,14 +63,10 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.ecr_suffix }}:${{ github.sha }}
