@@ -10,8 +10,8 @@ on:
         required: true
         type: choice
         options:
-          - testnet
-          - mainnet
+          - staging
+          - production
 
 permissions:
   id-token: write
@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.env.outputs.environment }}
+      ecr_suffix: ${{ steps.env.outputs.ecr_suffix }}
     steps:
       - id: env
         env:
@@ -33,9 +34,15 @@ jobs:
           INPUT_ENV: ${{ inputs.environment }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "environment=$INPUT_ENV" >> "$GITHUB_OUTPUT"
+            ENV="$INPUT_ENV"
           else
-            echo "environment=testnet" >> "$GITHUB_OUTPUT"
+            ENV="staging"
+          fi
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+          if [ "$ENV" = "production" ]; then
+            echo "ecr_suffix=mainnet" >> "$GITHUB_OUTPUT"
+          else
+            echo "ecr_suffix=testnet" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -66,7 +73,7 @@ jobs:
           platforms: linux/arm64
           push: true
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.environment }}:${{ github.sha }}
-            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.environment }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.ecr_suffix }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.ecr_suffix }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
