@@ -26,7 +26,7 @@ Required runtime inputs:
 
 Common optional inputs:
 
-- `RPC_URL` for cached `eth_gasPrice` refreshes used by `gas_in_sell`
+- `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
 - `HOST` and `PORT` to change the bind address
 - timeout, concurrency, and stream-health knobs from `src/config/mod.rs`

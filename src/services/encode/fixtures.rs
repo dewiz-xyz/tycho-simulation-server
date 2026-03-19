@@ -129,8 +129,6 @@ pub(super) fn test_app_state(
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-        latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
-        native_gas_price_reporting_enabled: Arc::new(RwLock::new(false)),
         enable_vm_pools: config.enable_vm_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: config.quote_timeout,

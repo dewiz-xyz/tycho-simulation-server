@@ -21,7 +21,6 @@ The per-pool response shape is `AmountOutResponse`:
 - `pool_address`
 - `amounts_out`
 - `gas_used`
-- `gas_in_sell`
 - `block_number`
 
 The request-level metadata shape is `QuoteMeta`:
@@ -123,7 +122,6 @@ Candidate discovery:
 
 - native candidates come from the native state store
 - VM candidates come from the VM state store only when VM state is ready
-- spot-native helper candidates are loaded for request-scoped gas conversion when the sell token is not native or wrapped native
 
 Execution rules:
 

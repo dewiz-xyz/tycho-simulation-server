@@ -118,8 +118,6 @@ pub fn load_config() -> AppConfig {
         chain_profile,
         api_key: network.api_key,
         rpc_url: network.rpc_url,
-        gas_price_refresh_interval_ms: network.gas_price_refresh_interval_ms,
-        gas_price_failure_tolerance: network.gas_price_failure_tolerance,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
@@ -150,8 +148,6 @@ pub fn load_config() -> AppConfig {
 struct NetworkConfig {
     api_key: String,
     rpc_url: Option<String>,
-    gas_price_refresh_interval_ms: u64,
-    gas_price_failure_tolerance: u64,
     tvl_threshold: f64,
     tvl_keep_threshold: f64,
     port: u16,
@@ -194,10 +190,6 @@ pub fn hosted_tycho_url(chain: Chain) -> Result<String, String> {
 fn load_network_config() -> NetworkConfig {
     let api_key = require_env("TYCHO_API_KEY");
     let rpc_url = optional_trimmed_env("RPC_URL");
-    let gas_price_refresh_interval_ms: u64 =
-        parse_env_or_default("GAS_PRICE_REFRESH_INTERVAL_MS", "5000");
-    let gas_price_failure_tolerance: u64 =
-        parse_env_or_default("GAS_PRICE_FAILURE_TOLERANCE", "50");
     let tvl_threshold: f64 = parse_env_or_default("TVL_THRESHOLD", "100");
     let tvl_keep_ratio: f64 = parse_env_or_default("TVL_KEEP_RATIO", "0.2");
     let tvl_keep_threshold: f64 = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
@@ -212,16 +204,10 @@ fn load_network_config() -> NetworkConfig {
         tvl_keep_threshold > 0.0,
         "Derived TVL keep threshold must be > 0"
     );
-    assert!(
-        gas_price_refresh_interval_ms > 0,
-        "GAS_PRICE_REFRESH_INTERVAL_MS must be > 0"
-    );
 
     NetworkConfig {
         api_key,
         rpc_url,
-        gas_price_refresh_interval_ms,
-        gas_price_failure_tolerance,
         tvl_threshold,
         tvl_keep_threshold,
         port,
@@ -342,8 +328,6 @@ pub struct AppConfig {
     pub chain_profile: ChainProfile,
     pub api_key: String,
     pub rpc_url: Option<String>,
-    pub gas_price_refresh_interval_ms: u64,
-    pub gas_price_failure_tolerance: u64,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,
