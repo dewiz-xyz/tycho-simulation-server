@@ -29,17 +29,17 @@ impl MemoryConfig {
 
 fn parse_env_u64(key: &str, default: u64) -> u64 {
     match env::var(key) {
-        Ok(value) => value.parse().unwrap_or_else(|_| panic!("Invalid {key}")),
+        Ok(value) => parse_or_panic(key, &value),
         Err(env::VarError::NotPresent) => default,
-        Err(err) => panic!("Failed reading {key}: {err}"),
+        Err(err) => read_env_or_panic(key, err),
     }
 }
 
 fn parse_env_usize(key: &str, default: usize) -> usize {
     match env::var(key) {
-        Ok(value) => value.parse().unwrap_or_else(|_| panic!("Invalid {key}")),
+        Ok(value) => parse_or_panic(key, &value),
         Err(env::VarError::NotPresent) => default,
-        Err(err) => panic!("Failed reading {key}: {err}"),
+        Err(err) => read_env_or_panic(key, err),
     }
 }
 
@@ -47,7 +47,7 @@ fn parse_env_bool_strict(key: &str, default: bool) -> bool {
     let value = match env::var(key) {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => return default,
-        Err(err) => panic!("Failed reading {key}: {err}"),
+        Err(err) => read_env_or_panic(key, err),
     };
 
     match value.as_str() {
@@ -59,6 +59,36 @@ fn parse_env_bool_strict(key: &str, default: bool) -> bool {
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" => true,
         "false" | "no" => false,
-        _ => panic!("Invalid {key}: expected one of 1/0/true/false/yes/no, got {value}"),
+        _ => invalid_bool_value(key, &value),
     }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "invalid startup env should still fail fast during boot"
+)]
+fn parse_or_panic<T>(key: &str, value: &str) -> T
+where
+    T: std::str::FromStr,
+{
+    match value.parse() {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("Invalid {key}"),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "invalid startup env should still fail fast during boot"
+)]
+fn read_env_or_panic<T>(key: &str, err: env::VarError) -> T {
+    panic!("Failed reading {key}: {err}");
+}
+
+#[expect(
+    clippy::panic,
+    reason = "invalid startup env should still fail fast during boot"
+)]
+fn invalid_bool_value(key: &str, value: &str) -> ! {
+    panic!("Invalid {key}: expected one of 1/0/true/false/yes/no, got {value}");
 }

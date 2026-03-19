@@ -18,14 +18,16 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 
 from presets import (
-    TOKENS,
-    default_amounts_for_token,
+    amounts_for_pair,
+    chain_label,
     list_suites,
     list_tokens,
     parse_amounts,
     parse_pairs,
+    resolve_chain_id,
     resolve_token,
     suite_pairs,
+    tokens_for_chain,
 )
 
 
@@ -53,18 +55,65 @@ def request_simulate(url, payload, timeout):
         return response.status, body, elapsed
 
 
-def parse_tokens(tokens_csv: str | None) -> list[str]:
+def parse_tokens(tokens_csv: str | None, chain_id: int) -> list[str]:
     if not tokens_csv:
-        return list(TOKENS.values())
+        return list(tokens_for_chain(chain_id).values())
     tokens = [token.strip() for token in tokens_csv.split(",") if token.strip()]
     if len(tokens) < 2:
         raise ValueError("Provide at least two tokens")
-    return [resolve_token(token) for token in tokens]
+    return [resolve_token(token, chain_id) for token in tokens]
+
+
+def validate_response_meta(
+    meta: object,
+    *,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+    allow_no_pools: bool,
+) -> tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, "meta_not_object"
+
+    status = meta.get("status")
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+
+    if status not in allowed_statuses:
+        return False, f"meta_status:{status}"
+
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            return False, "partial_kind_invalid"
+    elif partial_kind is not None:
+        return False, "partial_kind_unexpected"
+
+    if status == "ready" and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_ready_result_quality:{result_quality}"
+
+    if status == "no_liquidity":
+        if result_quality != "no_results":
+            return False, f"unexpected_no_liquidity_quality:{result_quality}"
+        if not allow_no_pools:
+            return False, "meta_status:no_liquidity"
+
+    if failures and not allow_failures:
+        if allow_no_pools and status == "no_liquidity":
+            only_no_pools = all(
+                isinstance(item, dict) and item.get("kind") == "no_pools"
+                for item in failures
+            )
+            if only_no_pools:
+                return True, ""
+        return False, "meta_failures"
+
+    return True, ""
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Latency percentiles for POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--requests", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--suite", default="core", help="Named pair suite from presets (used unless --random)")
@@ -89,13 +138,19 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     if args.list_suites:
-        for name in list_suites():
+        for name in list_suites(chain_id):
             print(name)
         return 0
 
     if args.list_tokens:
-        for symbol, address in list_tokens():
+        for symbol, address in list_tokens(chain_id):
             print(f"{symbol} {address}")
         return 0
 
@@ -110,9 +165,9 @@ def main() -> int:
         random.seed(args.seed)
 
     try:
-        explicit_pairs = parse_pairs(args.pair, args.pairs)
+        explicit_pairs = parse_pairs(args.pair, args.pairs, chain_id)
         amounts_override = parse_amounts(args.amounts) if args.amounts else None
-        tokens = parse_tokens(args.tokens)
+        tokens = parse_tokens(args.tokens, chain_id)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -131,7 +186,7 @@ def main() -> int:
         pairs = explicit_pairs
     elif not args.random:
         try:
-            pairs = suite_pairs(args.suite)
+            pairs = suite_pairs(args.suite, chain_id)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
@@ -142,8 +197,8 @@ def main() -> int:
             return pair.token_in, pair.token_out
         return tuple(random.sample(tokens, 2))
 
-    def amounts_for_token(token_in: str) -> list[str]:
-        return amounts_override or default_amounts_for_token(token_in)
+    def amounts_for_request(token_in: str, token_out: str) -> list[str]:
+        return amounts_override or amounts_for_pair(token_in, token_out, chain_id)
 
     if args.dry_run:
         sample_pair = pick_pair()
@@ -151,12 +206,14 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-sample",
             "token_in": sample_pair[0],
             "token_out": sample_pair[1],
-            "amounts": amounts_for_token(sample_pair[0]),
+            "amounts": amounts_for_request(sample_pair[0], sample_pair[1]),
         }
         print("Dry run configuration:")
         print(
             json.dumps(
                 {
+                    "chain_id": chain_id,
+                    "chain": chain_label(chain_id),
                     "url": args.url,
                     "requests": args.requests,
                     "concurrency": args.concurrency,
@@ -181,7 +238,7 @@ def main() -> int:
             "request_id": f"{args.request_id_prefix}-{index}-{uuid.uuid4().hex[:8]}",
             "token_in": token_in,
             "token_out": token_out,
-            "amounts": amounts_for_token(token_in),
+            "amounts": amounts_for_request(token_in, token_out),
         }
         try:
             status_code, body, elapsed = request_simulate(args.url, payload, args.timeout)
@@ -195,25 +252,19 @@ def main() -> int:
             meta = response_json.get("meta", {})
             status = meta.get("status")
             failures_list = meta.get("failures", [])
+            result_quality = meta.get("result_quality")
 
             with status_lock:
                 status_counts[str(status)] += 1
 
-            if status not in allowed_statuses:
-                return None, f"meta_status:{status}"
-
-            if failures_list and not args.allow_failures:
-                if args.allow_no_pools and status == "no_liquidity":
-                    only_no_pools = all(
-                        isinstance(item, dict) and item.get("kind") == "no_pools"
-                        for item in failures_list
-                    )
-                    if only_no_pools:
-                        failures_list = []
-                    else:
-                        return None, "meta_failures"
-                else:
-                    return None, "meta_failures"
+            meta_valid, meta_error = validate_response_meta(
+                meta,
+                allowed_statuses=allowed_statuses,
+                allow_failures=args.allow_failures,
+                allow_no_pools=args.allow_no_pools,
+            )
+            if not meta_valid:
+                return None, meta_error
 
             return elapsed, None
         except HTTPError as exc:
@@ -237,7 +288,7 @@ def main() -> int:
     total_time = time.perf_counter() - start_time
 
     if not response_times:
-        print("No successful requests.")
+        print(f"No successful requests ({chain_label(chain_id)}:{chain_id}).")
         print(f"Failures: {failures}")
         return 1
 
@@ -247,7 +298,7 @@ def main() -> int:
     p90 = percentile(response_times, 0.90)
     p99 = percentile(response_times, 0.99)
 
-    print("Latency results (seconds)")
+    print(f"Latency results ({chain_label(chain_id)}:{chain_id})")
     print("========================")
     print(f"Requests: {args.requests}")
     print(f"Successes: {len(response_times)}")

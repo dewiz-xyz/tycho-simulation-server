@@ -267,15 +267,30 @@ fn function_selector(signature: &str) -> Result<[u8; 4], EncodeError> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "deterministic encode fixtures use hard-coded addresses and selectors"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic encode fixtures use hard-coded response assertions"
+)]
+#[expect(
+    clippy::panic,
+    reason = "negative test branches are expressed as explicit test invariants"
+)]
+#[expect(
+    clippy::manual_let_else,
+    reason = "negative test assertions read more clearly in match form here"
+)]
 mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::services::encode::fixtures::{dummy_component, pool_ref};
+    use crate::services::encode::mocks::{MockProtocolSim, MockTychoEncoder};
     use crate::services::encode::model::{
         ResimulatedHopInternal, ResimulatedSegmentInternal, ResimulatedSwapInternal,
-    };
-    use crate::services::encode::test_support::{
-        dummy_component, pool_ref, MockProtocolSim, MockTychoEncoder,
     };
 
     fn decode_transfer_from_allowed(calldata: &[u8]) -> bool {
@@ -696,6 +711,18 @@ mod tests {
         assert!(
             registry.get_encoder("ekubo_v3").is_some(),
             "expected ekubo_v3 encoder in default registry"
+        );
+    }
+
+    #[test]
+    fn default_registry_supports_aerodrome_slipstreams() {
+        let registry = SwapEncoderRegistry::new(Chain::Base)
+            .add_default_encoders(None)
+            .expect("default encoder registry should initialize");
+
+        assert!(
+            registry.get_encoder("aerodrome_slipstreams").is_some(),
+            "expected aerodrome_slipstreams encoder in default registry"
         );
     }
 }

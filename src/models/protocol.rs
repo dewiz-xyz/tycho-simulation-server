@@ -7,6 +7,7 @@ pub enum ProtocolKind {
     UniswapV2,
     UniswapV3,
     UniswapV4,
+    AerodromeSlipstreams,
     Curve,
     PancakeswapV2,
     PancakeswapV3,
@@ -17,13 +18,15 @@ pub enum ProtocolKind {
     FluidV1,
     Rocketpool,
     EkuboV3,
+    ERC4626,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 13] = [
+    pub const ALL: [ProtocolKind; 15] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
+        ProtocolKind::AerodromeSlipstreams,
         ProtocolKind::Curve,
         ProtocolKind::PancakeswapV2,
         ProtocolKind::PancakeswapV3,
@@ -34,6 +37,7 @@ impl ProtocolKind {
         ProtocolKind::FluidV1,
         ProtocolKind::Rocketpool,
         ProtocolKind::EkuboV3,
+        ProtocolKind::ERC4626,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -41,6 +45,7 @@ impl ProtocolKind {
             ProtocolKind::UniswapV2 => "uniswap_v2",
             ProtocolKind::UniswapV3 => "uniswap_v3",
             ProtocolKind::UniswapV4 => "uniswap_v4",
+            ProtocolKind::AerodromeSlipstreams => "aerodrome_slipstreams",
             ProtocolKind::Curve => "vm:curve",
             ProtocolKind::PancakeswapV2 => "pancakeswap_v2",
             ProtocolKind::PancakeswapV3 => "pancakeswap_v3",
@@ -51,6 +56,7 @@ impl ProtocolKind {
             ProtocolKind::FluidV1 => "fluid_v1",
             ProtocolKind::Rocketpool => "rocketpool",
             ProtocolKind::EkuboV3 => "ekubo_v3",
+            ProtocolKind::ERC4626 => "erc4626",
         }
     }
 
@@ -83,6 +89,7 @@ impl ProtocolKind {
             "curve_pool" => Some(ProtocolKind::Curve),
             "balancer_v2_pool" => Some(ProtocolKind::BalancerV2),
             "maverick_v2_pool" => Some(ProtocolKind::MaverickV2),
+            "erc4626_pool" => Some(ProtocolKind::ERC4626),
             _ => None,
         }
     }
@@ -95,6 +102,7 @@ impl ProtocolKind {
             "uniswap_v3" => Some(ProtocolKind::UniswapV3),
             "pancakeswap_v3" => Some(ProtocolKind::PancakeswapV3),
             "uniswap_v4" => Some(ProtocolKind::UniswapV4),
+            "aerodrome_slipstreams" => Some(ProtocolKind::AerodromeSlipstreams),
             "ekubo_v2" => Some(ProtocolKind::EkuboV2),
             "ekubo_v3" => Some(ProtocolKind::EkuboV3),
             "fluid_v1" => Some(ProtocolKind::FluidV1),
@@ -102,6 +110,7 @@ impl ProtocolKind {
             "vm:curve" => Some(ProtocolKind::Curve),
             "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "vm:maverick_v2" => Some(ProtocolKind::MaverickV2),
+            "erc4626" => Some(ProtocolKind::ERC4626),
             _ => None,
         }
     }
@@ -126,13 +135,14 @@ mod tests {
 
     use super::*;
 
-    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 13] = [
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 15] = [
         ("uniswap_v2", ProtocolKind::UniswapV2),
         ("sushiswap_v2", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
         ("uniswap_v3", ProtocolKind::UniswapV3),
         ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
         ("uniswap_v4", ProtocolKind::UniswapV4),
+        ("aerodrome_slipstreams", ProtocolKind::AerodromeSlipstreams),
         ("ekubo_v2", ProtocolKind::EkuboV2),
         ("ekubo_v3", ProtocolKind::EkuboV3),
         ("fluid_v1", ProtocolKind::FluidV1),
@@ -140,9 +150,10 @@ mod tests {
         ("vm:curve", ProtocolKind::Curve),
         ("vm:balancer_v2", ProtocolKind::BalancerV2),
         ("vm:maverick_v2", ProtocolKind::MaverickV2),
+        ("erc4626", ProtocolKind::ERC4626),
     ];
 
-    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 12] = [
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 13] = [
         ("uniswap_v2_pool", ProtocolKind::UniswapV2),
         ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
@@ -155,12 +166,14 @@ mod tests {
         ("curve_pool", ProtocolKind::Curve),
         ("balancer_v2_pool", ProtocolKind::BalancerV2),
         ("maverick_v2_pool", ProtocolKind::MaverickV2),
+        ("erc4626_pool", ProtocolKind::ERC4626),
     ];
 
-    const NON_CANONICAL_ALIASES: [&str; 11] = [
+    const NON_CANONICAL_ALIASES: [&str; 12] = [
         "uniswapv2",
         "uniswapv3",
         "uniswapv4",
+        "aerodromeslipstreams",
         "curve",
         "balancer_v2",
         "maverick_v2",
@@ -276,6 +289,7 @@ mod tests {
             "curve_pool",
             "balancer_v2_pool",
             "maverick_v2_pool",
+            "erc4626_pool",
         ];
 
         for type_name in type_names {

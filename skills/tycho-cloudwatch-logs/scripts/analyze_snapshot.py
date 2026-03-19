@@ -368,15 +368,28 @@ def build_report(input_dir: Path, period: str) -> str:
     latency_by_status: dict[str, list[int]] = defaultdict(list)
     latency_by_bucket: dict[str, list[int]] = defaultdict(list)
     failures_by_status: dict[str, int] = defaultdict(int)
+    failures_by_cohort: dict[tuple[str, str], int] = defaultdict(int)
+    cohort_counts: Counter[tuple[str, str]] = Counter()
+    degraded_cohort_counts: Counter[tuple[str, str]] = Counter()
     status_counts: Counter[str] = Counter()
+    result_quality_counts: Counter[str] = Counter()
+    degraded_request_count = 0
 
     for row in completions_rows:
         status = row.get("status") or "Unknown"
+        result_quality = row.get("result_quality") or "unknown"
         latency = to_int(row.get("latency_ms"))
         failures = to_int(row.get("failures"))
         scheduled = to_int(row.get("scheduled_native_pools")) + to_int(row.get("scheduled_vm_pools"))
+        cohort = (status, result_quality)
         status_counts[status] += 1
+        result_quality_counts[result_quality] += 1
         failures_by_status[status] += failures
+        cohort_counts[cohort] += 1
+        failures_by_cohort[cohort] += failures
+        if status != "ready" or result_quality != "complete" or failures > 0:
+            degraded_request_count += 1
+            degraded_cohort_counts[cohort] += 1
         if latency:
             latency_by_status[status].append(latency)
             if scheduled <= 5:
@@ -515,27 +528,38 @@ def build_report(input_dir: Path, period: str) -> str:
         )
 
     status_total = sum(status_counts.values())
-    ready_count = status_counts.get("Ready", 0)
-    partial_count = status_counts.get("PartialSuccess", 0)
-    other_count = max(0, status_total - ready_count - partial_count)
+    ready_count = status_counts.get("ready", 0)
+    non_ready_count = max(0, status_total - ready_count)
+    complete_count = result_quality_counts.get("complete", 0)
+    partial_count = result_quality_counts.get("partial", 0)
+    request_level_failure_count = result_quality_counts.get("request_level_failure", 0)
+    no_results_count = result_quality_counts.get("no_results", 0)
     status_bar_width = 48
     if status_total:
         ready_share = ready_count / status_total * 100
+        non_ready_share = non_ready_count / status_total * 100
+        complete_share = complete_count / status_total * 100
         partial_share = partial_count / status_total * 100
+        request_level_failure_share = request_level_failure_count / status_total * 100
+        no_results_share = no_results_count / status_total * 100
         ready_w = int(round(ready_share / 100 * status_bar_width))
-        partial_w = int(round(partial_share / 100 * status_bar_width))
-        if ready_w + partial_w > status_bar_width:
-            partial_w = max(0, status_bar_width - ready_w)
-        status_bar = ("█" * ready_w) + ("░" * partial_w) + (" " * (status_bar_width - ready_w - partial_w))
+        non_ready_w = int(round(non_ready_share / 100 * status_bar_width))
+        if ready_w + non_ready_w > status_bar_width:
+            non_ready_w = max(0, status_bar_width - ready_w)
+        status_bar = ("█" * ready_w) + ("░" * non_ready_w) + (" " * (status_bar_width - ready_w - non_ready_w))
     else:
         ready_share = 0.0
+        non_ready_share = 0.0
+        complete_share = 0.0
         partial_share = 0.0
+        request_level_failure_share = 0.0
+        no_results_share = 0.0
         status_bar = " " * status_bar_width
 
     other_status_parts = [
         f"{status}={fmt_int(count)}"
         for status, count in status_counts.most_common()
-        if status not in ("Ready", "PartialSuccess")
+        if status != "ready"
     ]
 
     coverage_notes = []
@@ -760,7 +784,14 @@ def build_report(input_dir: Path, period: str) -> str:
     report_lines.append("")
     reliability_lines = [
         f"  [{status_bar}]",
-        f"   Ready: {ready_share:5.1f}% ({fmt_int(ready_count)})          Partial: {partial_share:5.1f}% ({fmt_int(partial_count)})",
+        f"   Ready: {ready_share:5.1f}% ({fmt_int(ready_count)})       Non-ready: {non_ready_share:5.1f}% ({fmt_int(non_ready_count)})",
+        (
+            "   Qualities: "
+            f"complete {complete_share:5.1f}% ({fmt_int(complete_count)}), "
+            f"partial {partial_share:5.1f}% ({fmt_int(partial_count)}), "
+            f"request_level_failure {request_level_failure_share:5.1f}% ({fmt_int(request_level_failure_count)}), "
+            f"no_results {no_results_share:5.1f}% ({fmt_int(no_results_count)})"
+        ),
     ]
     if other_status_parts:
         reliability_lines.append(f"   Other: {', '.join(other_status_parts)}")
@@ -768,13 +799,20 @@ def build_report(input_dir: Path, period: str) -> str:
 
     failure_lines = [
         f"Total failures reported: {fmt_int(sum(failures_by_status.values()))}",
-        f"Non-ready requests in sample: {fmt_int(status_total - ready_count)} / {fmt_int(status_total)}",
+        f"Degraded or failure-bearing requests in sample: {fmt_int(degraded_request_count)} / {fmt_int(status_total)}",
     ]
-    for status, count in status_counts.most_common():
-        if status != "Ready":
+    if degraded_cohort_counts:
+        for (status, result_quality), count in sorted(
+            degraded_cohort_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        ):
             failure_lines.append(
-                f"{status}: {fmt_int(count)} requests, {fmt_int(failures_by_status.get(status, 0))} failures"
+                f"{status} + {result_quality}: {fmt_int(count)} requests, {fmt_int(failures_by_cohort[(status, result_quality)])} failures"
             )
+    else:
+        failure_lines.append("All sampled requests were ready + complete with zero reported failures.")
+    if other_status_parts:
+        failure_lines.append(f"Other statuses observed: {', '.join(other_status_parts)}")
     report_lines.append(fenced_text(summary_box(failure_lines)))
 
     report_lines.append("")
@@ -865,7 +903,12 @@ def build_report(input_dir: Path, period: str) -> str:
         f"Throughput was bursty, simulation-runs/min ranged from {fmt_int(scheduled_pool_runs_minute_stats['min'])} to {fmt_int(scheduled_pool_runs_minute_stats['max'])} with p50 {fmt_int(scheduled_pool_runs_minute_stats['p50'])}, and request/min p50 was {fmt_int(req_minute_stats['p50'])}."
     )
     report_lines.append(
-        f"Latency stayed tight with p50 {fmt_int(latency_stats['p50'])} ms and p99 {fmt_int(latency_stats['p99'])} ms (max {fmt_int(latency_stats['max'])} ms), while status mix was Ready {ready_share:.1f}% and PartialSuccess {partial_share:.1f}%."
+        "Latency stayed tight with "
+        f"p50 {fmt_int(latency_stats['p50'])} ms and p99 {fmt_int(latency_stats['p99'])} ms "
+        f"(max {fmt_int(latency_stats['max'])} ms), while status mix was ready {ready_share:.1f}% "
+        f"and non-ready {non_ready_share:.1f}%; result_quality mix was complete {complete_share:.1f}%, "
+        f"partial {partial_share:.1f}%, request_level_failure {request_level_failure_share:.1f}%, "
+        f"and no_results {no_results_share:.1f}%."
     )
     report_lines.append(
         f"Top quote wins were led by {top_protocol} at {top_protocol_share}, and the busiest token pair in the sample was {top_pair}."

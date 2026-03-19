@@ -14,7 +14,16 @@ from pathlib import Path
 from urllib import request
 from urllib.error import HTTPError, URLError
 
-from presets import default_amounts_for_token, list_suites, list_tokens, parse_amounts, parse_pairs, suite_pairs
+from presets import (
+    amounts_for_pair,
+    chain_label,
+    list_suites,
+    list_tokens,
+    parse_amounts,
+    parse_pairs,
+    resolve_chain_id,
+    suite_pairs,
+)
 
 
 def request_simulate(url: str, payload: dict, timeout: float) -> tuple[int, bytes, float]:
@@ -40,9 +49,104 @@ def protocol_from_pool_name(pool_name: str | None) -> str:
     return protocol
 
 
+def protocol_from_fields(protocol: str | None, pool_name: str | None) -> str:
+    if protocol:
+        if protocol.startswith("vm:"):
+            return protocol.split(":", 1)[1]
+        return protocol
+    return protocol_from_pool_name(pool_name)
+
+
+def collect_candidate_protocols(response_json: dict) -> Counter[str]:
+    candidate_protocols: Counter[str] = Counter()
+
+    data = response_json.get("data", [])
+    if isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            protocol = protocol_from_fields(entry.get("protocol"), entry.get("pool_name")).lower()
+            candidate_protocols[protocol] += 1
+
+    meta = response_json.get("meta", {})
+    pool_results = meta.get("pool_results", []) if isinstance(meta, dict) else []
+    if isinstance(pool_results, list):
+        for entry in pool_results:
+            if not isinstance(entry, dict):
+                continue
+            protocol = protocol_from_fields(entry.get("protocol"), entry.get("pool_name")).lower()
+            candidate_protocols[protocol] += 1
+
+    return candidate_protocols
+
+
+def resolve_allowed_statuses(
+    allow_status: str,
+    *,
+    allow_failures: bool,
+    allow_no_pools: bool,
+) -> set[str]:
+    allowed_statuses = {status.strip() for status in allow_status.split(",") if status.strip()}
+    if allow_no_pools:
+        allowed_statuses.add("no_liquidity")
+    return allowed_statuses
+
+
+def validate_response_meta(
+    meta: object,
+    *,
+    allowed_statuses: set[str],
+    allow_failures: bool,
+    allow_no_pools: bool,
+) -> tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, "meta is not an object"
+
+    status = meta.get("status")
+    result_quality = meta.get("result_quality")
+    partial_kind = meta.get("partial_kind")
+    failures = meta.get("failures", [])
+    data = meta.get("_data", [])
+
+    if status not in allowed_statuses:
+        return False, f"meta_status:{status}"
+
+    if result_quality == "partial":
+        if partial_kind not in {"amount_ladders", "pool_coverage", "mixed"}:
+            return False, "partial_kind_invalid"
+    elif partial_kind is not None:
+        return False, "partial_kind_unexpected"
+
+    has_data = isinstance(data, list) and bool(data)
+    if status == "ready" and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_ready_result_quality:{result_quality}"
+    if has_data and result_quality not in {"complete", "partial"}:
+        return False, f"unexpected_data_result_quality:{result_quality}"
+    if status == "no_liquidity":
+        if result_quality != "no_results":
+            return False, f"unexpected_no_liquidity_quality:{result_quality}"
+        if has_data:
+            return False, "no_liquidity_with_data"
+        if not allow_no_pools:
+            return False, "meta_status:no_liquidity"
+
+    if failures and not allow_failures:
+        if allow_no_pools and status == "no_liquidity":
+            only_no_pools = all(
+                isinstance(item, dict) and item.get("kind") == "no_pools"
+                for item in failures
+            )
+            if only_no_pools:
+                return True, "allowed_no_pools"
+        return False, "meta_failures"
+
+    return True, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Coverage sweep for POST /simulate")
     parser.add_argument("--url", default="http://localhost:3000/simulate")
+    parser.add_argument("--chain-id", help="Runtime chain id (1 or 8453); overrides CHAIN_ID env")
     parser.add_argument("--suite", default="core", help="Named pair suite from presets")
     parser.add_argument("--pair", action="append", help="token_in:token_out (symbol or address)")
     parser.add_argument("--pairs", help="Comma-separated token_in:token_out pairs")
@@ -64,26 +168,36 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    try:
+        chain_id = resolve_chain_id(args.chain_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     if args.list_suites:
-        for name in list_suites():
+        for name in list_suites(chain_id):
             print(name)
         return 0
 
     if args.list_tokens:
-        for symbol, address in list_tokens():
+        for symbol, address in list_tokens(chain_id):
             print(f"{symbol} {address}")
         return 0
 
     try:
-        pairs = parse_pairs(args.pair, args.pairs)
+        pairs = parse_pairs(args.pair, args.pairs, chain_id)
         if not pairs:
-            pairs = suite_pairs(args.suite)
+            pairs = suite_pairs(args.suite, chain_id)
         amounts_override = parse_amounts(args.amounts) if args.amounts else None
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    allowed_statuses = {s.strip() for s in args.allow_status.split(",") if s.strip()}
+    allowed_statuses = resolve_allowed_statuses(
+        args.allow_status,
+        allow_failures=args.allow_failures,
+        allow_no_pools=args.allow_no_pools,
+    )
     if not allowed_statuses:
         print("Error: --allow-status produced no values", file=sys.stderr)
         return 2
@@ -93,17 +207,20 @@ def main() -> int:
         expected_protocols = {p.strip().lower() for p in args.expect_protocols.split(",") if p.strip()}
 
     report = {
+        "chain_id": chain_id,
+        "chain": chain_label(chain_id),
         "url": args.url,
         "suite": args.suite,
         "pairs": [asdict(p) for p in pairs],
         "amounts": amounts_override,
-        "amounts_strategy": "explicit" if amounts_override else "per_token_decimals",
+        "amounts_strategy": "explicit" if amounts_override else "per_pair_or_token_defaults",
         "requests": [],
         "pools": [],
         "summary": {},
     }
 
-    pool_protocols: Counter[str] = Counter()
+    winner_protocols: Counter[str] = Counter()
+    candidate_protocols: Counter[str] = Counter()
     pools_seen: dict[str, dict] = {}
     meta_statuses: Counter[str] = Counter()
     failure_kinds: Counter[str] = Counter()
@@ -112,7 +229,7 @@ def main() -> int:
     allowed_no_pools = 0
 
     for idx, pair in enumerate(pairs, start=1):
-        amounts = amounts_override or default_amounts_for_token(pair.token_in)
+        amounts = amounts_override or amounts_for_pair(pair.token_in, pair.token_out, chain_id)
         payload = {
             "request_id": f"{args.request_id_prefix}-{idx}-{uuid.uuid4().hex[:8]}",
             "token_in": pair.token_in,
@@ -157,6 +274,7 @@ def main() -> int:
 
         meta = response_json.get("meta", {})
         status = meta.get("status")
+        result_quality = meta.get("result_quality") if isinstance(meta, dict) else None
         meta_statuses[str(status)] += 1
 
         failures_list = meta.get("failures", []) if isinstance(meta, dict) else []
@@ -166,52 +284,33 @@ def main() -> int:
                 if kind is not None:
                     failure_kinds[str(kind)] += 1
 
-        if status not in allowed_statuses:
+        meta_for_validation = dict(meta) if isinstance(meta, dict) else {}
+        meta_for_validation["_data"] = response_json.get("data", [])
+        meta_valid, meta_error = validate_response_meta(
+            meta_for_validation,
+            allowed_statuses=allowed_statuses,
+            allow_failures=args.allow_failures,
+            allow_no_pools=args.allow_no_pools,
+        )
+        if not meta_valid:
             failures += 1
             report["requests"].append(
                 {
                     "pair": asdict(pair),
                     "elapsed_s": elapsed,
                     "meta": meta,
-                    "error": f"meta_status:{status}",
+                    "error": meta_error,
                 }
             )
             continue
 
-        if failures_list and not args.allow_failures:
-            if args.allow_no_pools and status == "no_liquidity":
-                only_no_pools = all(
-                    isinstance(item, dict) and item.get("kind") == "no_pools"
-                    for item in failures_list
-                )
-                if only_no_pools:
-                    allowed_no_pools += 1
-                    failures_list = []
-                else:
-                    failures += 1
-                    report["requests"].append(
-                        {
-                            "pair": asdict(pair),
-                            "elapsed_s": elapsed,
-                            "meta": meta,
-                            "error": "meta_failures",
-                        }
-                    )
-                    continue
-            else:
-                failures += 1
-                report["requests"].append(
-                    {
-                        "pair": asdict(pair),
-                        "elapsed_s": elapsed,
-                        "meta": meta,
-                        "error": "meta_failures",
-                    }
-                )
-                continue
+        if meta_error == "allowed_no_pools":
+            allowed_no_pools += 1
+            failures_list = []
 
         data = response_json.get("data", [])
         pool_count = len(data) if isinstance(data, list) else 0
+        candidate_protocols.update(collect_candidate_protocols(response_json))
 
         if isinstance(data, list):
             for entry in data:
@@ -220,8 +319,8 @@ def main() -> int:
                 pool_address = entry.get("pool_address")
                 pool_name = entry.get("pool_name")
                 pool_id = entry.get("pool")
-                protocol = protocol_from_pool_name(pool_name).lower()
-                pool_protocols[protocol] += 1
+                protocol = protocol_from_fields(entry.get("protocol"), pool_name).lower()
+                winner_protocols[protocol] += 1
                 if isinstance(pool_address, str):
                     pools_seen.setdefault(
                         pool_address.lower(),
@@ -234,17 +333,25 @@ def main() -> int:
                     )
 
         report["requests"].append(
-            {"pair": asdict(pair), "elapsed_s": elapsed, "meta": meta, "pool_count": pool_count, "amounts": amounts}
+            {
+                "pair": asdict(pair),
+                "elapsed_s": elapsed,
+                "meta": meta,
+                "pool_count": pool_count,
+                "amounts": amounts,
+                "result_quality": result_quality,
+            }
         )
 
         if args.verbose:
             print(
                 f"[OK] {pair.token_in}->{pair.token_out} {elapsed:.3f}s "
-                f"status={status} pools={pool_count}"
+                f"status={status} result_quality={result_quality} pools={pool_count}"
             )
 
-    observed_protocols = sorted(pool_protocols.keys())
-    missing_expected = sorted([p for p in expected_protocols if p not in set(observed_protocols)])
+    observed_protocols = sorted(winner_protocols.keys())
+    candidate_protocol_list = sorted(candidate_protocols.keys())
+    missing_expected = sorted([p for p in expected_protocols if p not in set(candidate_protocol_list)])
 
     report["summary"] = {
         "pairs": len(pairs),
@@ -254,28 +361,44 @@ def main() -> int:
         "allowed_no_pools": allowed_no_pools,
         "unique_pools": len(pools_seen),
         "observed_protocols": observed_protocols,
-        "protocol_counts": dict(pool_protocols),
+        "protocol_counts": dict(winner_protocols),
+        "winner_protocols": observed_protocols,
+        "winner_protocol_counts": dict(winner_protocols),
+        "candidate_protocols": candidate_protocol_list,
+        "candidate_protocol_counts": dict(candidate_protocols),
         "missing_expected_protocols": missing_expected,
     }
+    report["winner_protocols"] = observed_protocols
+    report["winner_protocol_counts"] = dict(winner_protocols)
+    report["candidate_protocols"] = candidate_protocol_list
+    report["candidate_protocol_counts"] = dict(candidate_protocols)
     report["pools"] = sorted(
         pools_seen.values(), key=lambda item: (item.get("protocol", ""), item.get("pool_name", ""))
     )
 
-    print("Coverage sweep summary")
+    print(f"Coverage sweep summary ({chain_label(chain_id)}:{chain_id})")
     print("=====================")
     print(f"Pairs: {len(pairs)}")
     print(f"Failures: {failures}")
     if allowed_no_pools:
         print(f"Allowed no_pools: {allowed_no_pools}")
     print(f"Unique pools observed: {len(pools_seen)}")
-    print(f"Protocols observed: {', '.join(observed_protocols) if observed_protocols else '(none)'}")
+    print(f"Winner protocols: {', '.join(observed_protocols) if observed_protocols else '(none)'}")
+    print(
+        f"Candidate protocols: {', '.join(candidate_protocol_list) if candidate_protocol_list else '(none)'}"
+    )
     if meta_statuses:
         status_summary = ", ".join(f"{status}={count}" for status, count in meta_statuses.items())
         print(f"Meta statuses: {status_summary}")
 
-    if pool_protocols:
-        print("\nTop protocols by pool appearances (top 10):")
-        for protocol, count in pool_protocols.most_common(10):
+    if winner_protocols:
+        print("\nTop winner protocols by pool appearances (top 10):")
+        for protocol, count in winner_protocols.most_common(10):
+            print(f"- {protocol}: {count}")
+
+    if candidate_protocols:
+        print("\nTop candidate protocols by pool appearances (top 10):")
+        for protocol, count in candidate_protocols.most_common(10):
             print(f"- {protocol}: {count}")
 
     if missing_expected:

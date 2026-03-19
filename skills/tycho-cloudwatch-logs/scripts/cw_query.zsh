@@ -1,6 +1,9 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
+# Query helper for the live quote-service log contract.
+# Detailed semantics are documented in docs/quote_service.md.
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 source "$script_dir/cw_env.zsh"
 
@@ -32,6 +35,7 @@ Presets: block-updates, block-updates-window, block-updates-count,
 Privacy: prefer aggregate presets for shared outputs (simulate-rpm,
          simulate-runs-per-minute, simulate-workload-summary, block-updates-count).
          Presets exposing request_id/auction_id/token or pool addresses are for internal triage.
+Note: presets reflect the live quote-service log contract from docs/quote_service.md.
 USAGE
 }
 
@@ -96,7 +100,7 @@ QUERY
       cat <<QUERY
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Merged protocol streams/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
+| filter msg like /Starting stream processing/ or msg like /Stream update processed/ or msg like /Stream error/ or msg like /Stream ended unexpectedly/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit ${limit}
@@ -166,7 +170,7 @@ QUERY
       cat <<QUERY
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
-| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Unhandled service error/
+| filter msg like /Request-level timeout triggered at router boundary/ or msg like /Encode request timed out at router boundary/ or msg like /Unhandled service error/
 | sort @timestamp desc
 | display @timestamp, msg, @logStream
 | limit ${limit}
@@ -196,8 +200,9 @@ fields @timestamp, @logStream
 | parse @message /"token_in":"(?<token_in>[^"]+)"/
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
 | parse @message /"amounts":(?<amounts>[0-9]+)/
-| parse @message /"result_quality":"(?<result_quality>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -209,8 +214,6 @@ fields @timestamp, @logStream
 | parse @message /"skipped_vm_concurrency":(?<skipped_vm_concurrency>[0-9]+)/
 | parse @message /"skipped_native_deadline":(?<skipped_native_deadline>[0-9]+)/
 | parse @message /"skipped_vm_deadline":(?<skipped_vm_deadline>[0-9]+)/
-| parse @message /"skipped_native_limits":(?<skipped_native_limits>[0-9]+)/
-| parse @message /"skipped_vm_limits":(?<skipped_vm_limits>[0-9]+)/
 | parse @message /"vm_unavailable":(?<vm_unavailable>true|false)/
 | parse @message /"vm_completed_pools":(?<vm_completed_pools>[0-9]+)/
 | parse @message /"vm_median_first_gas":(?<vm_median_first_gas>[0-9]+(?:\.[0-9]+)?)/
@@ -224,7 +227,7 @@ fields @timestamp, @logStream
 | parse @message /"top_gas_used":(?<top_gas_used>[0-9]+)/
 | filter msg like /Simulate computation completed/
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, scheduled_native_pools, scheduled_vm_pools, skipped_vm_unavailable, skipped_native_limits, skipped_vm_limits, skipped_native_concurrency, skipped_vm_concurrency, skipped_native_deadline, skipped_vm_deadline, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, scheduled_native_pools, scheduled_vm_pools, skipped_vm_unavailable, skipped_native_concurrency, skipped_vm_concurrency, skipped_native_deadline, skipped_vm_deadline, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
 | limit ${limit}
 QUERY
       ;;
@@ -237,8 +240,9 @@ fields @timestamp, @logStream
 | parse @message /"token_in":"(?<token_in>[^"]+)"/
 | parse @message /"token_out":"(?<token_out>[^"]+)"/
 | parse @message /"amounts":(?<amounts>[0-9]+)/
-| parse @message /"result_quality":"(?<result_quality>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_result_quality":"(?<result_quality>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
+| parse @message /"partial_kind":"(?<partial_kind>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"pool_results":(?<pool_results>[0-9]+)/
@@ -250,16 +254,14 @@ fields @timestamp, @logStream
 | parse @message /"top_amount_out":"(?<top_amount_out>[^"]+)"/
 | parse @message /"top_gas_used":(?<top_gas_used>[0-9]+)/
 | parse @message /"skipped_vm_unavailable":(?<skipped_vm_unavailable>true|false)/
-| parse @message /"skipped_native_limits":(?<skipped_native_limits>[0-9]+)/
-| parse @message /"skipped_vm_limits":(?<skipped_vm_limits>[0-9]+)/
 | parse @message /"vm_completed_pools":(?<vm_completed_pools>[0-9]+)/
 | parse @message /"vm_median_first_gas":(?<vm_median_first_gas>[0-9]+(?:\.[0-9]+)?)/
 | parse @message /"vm_low_first_gas_count":(?<vm_low_first_gas_count>[0-9]+)/
 | parse @message /"vm_low_first_gas_ratio":(?<vm_low_first_gas_ratio>[0-9]+(?:\.[0-9]+)?)/
 | parse @message /"vm_low_first_gas_samples":"?(?<vm_low_first_gas_samples>\[[^\]]*\])"?/
-| filter msg = "Simulate computation completed" and status = "Ready"
+| filter msg = "Simulate computation completed" and status = "ready" and (result_quality = "complete" or result_quality = "partial")
 | sort @timestamp desc
-| display @timestamp, request_id, auction_id, status, result_quality, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, skipped_vm_unavailable, skipped_native_limits, skipped_vm_limits, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
+| display @timestamp, request_id, auction_id, status, result_quality, partial_kind, vm_unavailable, responses, failures, pool_results, latency_ms, token_in, token_out, amounts, top_pool_name, top_pool_address, top_amount_out, top_gas_used, skipped_vm_unavailable, vm_completed_pools, vm_median_first_gas, vm_low_first_gas_count, vm_low_first_gas_ratio, msg, @logStream
 | limit ${limit}
 QUERY
       ;;
@@ -442,7 +444,7 @@ fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
 | parse @message /"request_id":"(?<request_id>[^"]+)"/
 | parse @message /"auction_id":"(?<auction_id>[^"]+)"/
-| parse @message /"status":"(?<status>[^"]+)"/
+| parse @message /"quote_status":"(?<status>[^"]+)"/
 | parse @message /"responses":(?<responses>[0-9]+)/
 | parse @message /"failures":(?<failures>[0-9]+)/
 | parse @message /"latency_ms":(?<latency_ms>[0-9]+)/

@@ -7,7 +7,11 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
-    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
+    tycho_common::{
+        models::{token::Token, Chain},
+        simulation::protocol_sim::ProtocolSim,
+        Bytes,
+    },
 };
 
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
@@ -21,6 +25,8 @@ fn native_token_address() -> Bytes {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub chain: Chain,
+    pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
@@ -37,6 +43,7 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub erc4626_deposits_enabled: bool,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
@@ -162,10 +169,11 @@ pub struct VmStreamStatus {
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-#[allow(clippy::type_complexity)]
+type SharedPoolStates = Arc<RwLock<HashMap<String, PoolEntry>>>;
+
 #[derive(Clone, Default)]
 struct ProtocolShard {
-    states: Arc<RwLock<HashMap<String, PoolEntry>>>,
+    states: SharedPoolStates,
 }
 
 impl ProtocolShard {
@@ -226,6 +234,32 @@ impl UpdateMetrics {
             || self.updates_for_unknown_pair > 0
             || self.states_missing_in_shard > 0
             || self.removed_unknown_pair > 0
+    }
+}
+
+#[derive(Default)]
+struct TokenIndexChanges {
+    additions: Vec<(Bytes, String)>,
+    removals: Vec<(Bytes, String)>,
+}
+
+#[derive(Default)]
+struct UpdateAccumulator {
+    new_pairs_count: usize,
+    new_pairs_missing_state: usize,
+    unknown_protocol_new_pairs: usize,
+    updated_states: usize,
+    updates_for_unknown_pair: usize,
+    states_missing_in_shard: usize,
+    removed_pairs_count: usize,
+    removed_unknown_pair: usize,
+    anomaly_samples: Vec<String>,
+    tokens_to_cache: Vec<Token>,
+}
+
+impl UpdateAccumulator {
+    fn record_anomaly(&mut self, kind: &str, value: &str) {
+        add_anomaly_sample(&mut self.anomaly_samples, kind, value);
     }
 }
 
@@ -332,88 +366,145 @@ impl StateStore {
             *guard = block_number;
         }
 
-        let mut index_additions: Vec<(Bytes, String)> = Vec::new();
-        let mut index_removals: Vec<(Bytes, String)> = Vec::new();
-        let mut anomaly_samples = Vec::new();
+        let mut index_changes = TokenIndexChanges::default();
+        let mut stats = UpdateAccumulator::default();
 
-        let mut new_pairs_count = 0;
-        let mut new_pairs_missing_state = 0;
-        let mut unknown_protocol_new_pairs = 0;
-        let mut tokens_to_cache: Vec<Token> = Vec::new();
-        for (id, component) in update.new_pairs.into_iter() {
+        self.apply_new_pairs(
+            update.new_pairs,
+            &mut update.states,
+            &mut index_changes,
+            &mut stats,
+        )
+        .await;
+        self.cache_new_tokens(&mut stats).await;
+        self.apply_state_updates(update.states, &mut stats).await;
+        self.apply_removed_pairs(update.removed_pairs, &mut index_changes, &mut stats)
+            .await;
+
+        if !index_changes.additions.is_empty() || !index_changes.removals.is_empty() {
+            let mut index = self.token_index.write().await;
+            apply_token_index_changes(&mut index, index_changes.additions, index_changes.removals);
+        }
+
+        let total_pairs = self.total_states().await;
+        self.update_ready_state(total_pairs);
+
+        UpdateMetrics {
+            block_number,
+            updated_states: stats.updated_states,
+            new_pairs: stats.new_pairs_count,
+            removed_pairs: stats.removed_pairs_count,
+            total_pairs,
+            new_pairs_missing_state: stats.new_pairs_missing_state,
+            unknown_protocol_new_pairs: stats.unknown_protocol_new_pairs,
+            updates_for_unknown_pair: stats.updates_for_unknown_pair,
+            states_missing_in_shard: stats.states_missing_in_shard,
+            removed_unknown_pair: stats.removed_unknown_pair,
+            anomaly_samples: stats.anomaly_samples,
+        }
+    }
+
+    async fn apply_new_pairs(
+        &self,
+        new_pairs: HashMap<String, ProtocolComponent>,
+        states: &mut HashMap<String, Box<dyn ProtocolSim>>,
+        index_changes: &mut TokenIndexChanges,
+        stats: &mut UpdateAccumulator,
+    ) {
+        for (id, component) in new_pairs {
             match ProtocolKind::from_component(&component) {
                 Some(kind) => {
-                    let state = update.states.remove(&id);
-                    if let Some(state) = state {
-                        let component = Arc::new(component);
-                        self.id_to_kind.write().await.insert(id.clone(), kind);
-                        if let Some(shard) = self.shards.get(&kind) {
-                            tokens_to_cache.extend(component.tokens.iter().cloned());
-                            for token in component.tokens.iter() {
-                                index_additions.push((token.address.clone(), id.clone()));
-                            }
-                            shard
-                                .insert_new(id.clone(), Arc::from(state), Arc::clone(&component))
-                                .await;
-                            new_pairs_count += 1;
-                        }
-                    } else {
-                        new_pairs_missing_state += 1;
-                        add_anomaly_sample(
-                            &mut anomaly_samples,
-                            "new_pairs_missing_state",
-                            id.as_str(),
-                        );
-                    }
+                    self.insert_new_pair(id, kind, component, states, index_changes, stats)
+                        .await;
                 }
                 None => {
-                    unknown_protocol_new_pairs += 1;
-                    add_anomaly_sample(
-                        &mut anomaly_samples,
-                        "unknown_protocol_new_pairs",
-                        id.as_str(),
-                    );
+                    stats.unknown_protocol_new_pairs += 1;
+                    stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
                 }
             }
         }
+    }
 
-        if !tokens_to_cache.is_empty() {
-            self.tokens.insert_batch(tokens_to_cache.into_iter()).await;
+    async fn insert_new_pair(
+        &self,
+        id: String,
+        kind: ProtocolKind,
+        component: ProtocolComponent,
+        states: &mut HashMap<String, Box<dyn ProtocolSim>>,
+        index_changes: &mut TokenIndexChanges,
+        stats: &mut UpdateAccumulator,
+    ) {
+        let Some(state) = states.remove(&id) else {
+            stats.new_pairs_missing_state += 1;
+            stats.record_anomaly("new_pairs_missing_state", id.as_str());
+            return;
+        };
+        let Some(shard) = self.shards.get(&kind) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            return;
+        };
+
+        let component = Arc::new(component);
+        self.id_to_kind.write().await.insert(id.clone(), kind);
+        stats
+            .tokens_to_cache
+            .extend(component.tokens.iter().cloned());
+        for token in &component.tokens {
+            index_changes
+                .additions
+                .push((token.address.clone(), id.clone()));
+        }
+        shard
+            .insert_new(id, Arc::from(state), Arc::clone(&component))
+            .await;
+        stats.new_pairs_count += 1;
+    }
+
+    async fn cache_new_tokens(&self, stats: &mut UpdateAccumulator) {
+        if stats.tokens_to_cache.is_empty() {
+            return;
         }
 
-        let mut updated_states = 0;
-        let mut updates_for_unknown_pair = 0;
-        let mut states_missing_in_shard = 0;
-        for (id, state) in update.states.into_iter() {
+        self.tokens
+            .insert_batch(stats.tokens_to_cache.drain(..))
+            .await;
+    }
+
+    async fn apply_state_updates(
+        &self,
+        states: HashMap<String, Box<dyn ProtocolSim>>,
+        stats: &mut UpdateAccumulator,
+    ) {
+        for (id, state) in states {
             let kind_opt = { self.id_to_kind.read().await.get(&id).copied() };
             if let Some(kind) = kind_opt {
                 if let Some(shard) = self.shards.get(&kind) {
                     if shard.update_state(&id, Arc::from(state)).await {
-                        updated_states += 1;
+                        stats.updated_states += 1;
                     } else {
-                        states_missing_in_shard += 1;
-                        add_anomaly_sample(
-                            &mut anomaly_samples,
-                            "states_missing_in_shard",
-                            id.as_str(),
-                        );
+                        stats.states_missing_in_shard += 1;
+                        stats.record_anomaly("states_missing_in_shard", id.as_str());
                     }
                 }
             } else {
-                updates_for_unknown_pair += 1;
-                add_anomaly_sample(
-                    &mut anomaly_samples,
-                    "updates_for_unknown_pair",
-                    id.as_str(),
-                );
+                stats.updates_for_unknown_pair += 1;
+                stats.record_anomaly("updates_for_unknown_pair", id.as_str());
             }
         }
+    }
 
-        let mut removed_pairs_count = 0;
-        let mut removed_unknown_pair = 0;
-        for (id, component) in update.removed_pairs.into_iter() {
-            for token in component.tokens.iter() {
-                index_removals.push((token.address.clone(), id.clone()));
+    async fn apply_removed_pairs(
+        &self,
+        removed_pairs: HashMap<String, ProtocolComponent>,
+        index_changes: &mut TokenIndexChanges,
+        stats: &mut UpdateAccumulator,
+    ) {
+        for (id, component) in removed_pairs {
+            for token in &component.tokens {
+                index_changes
+                    .removals
+                    .push((token.address.clone(), id.clone()));
             }
 
             let removed_kind = {
@@ -424,21 +515,16 @@ impl StateStore {
             if let Some(kind) = removed_kind {
                 if let Some(shard) = self.shards.get(&kind) {
                     shard.remove(&id).await;
-                    removed_pairs_count += 1;
+                    stats.removed_pairs_count += 1;
                 }
             } else {
-                removed_unknown_pair += 1;
-                add_anomaly_sample(&mut anomaly_samples, "removed_unknown_pair", id.as_str());
+                stats.removed_unknown_pair += 1;
+                stats.record_anomaly("removed_unknown_pair", id.as_str());
             }
         }
+    }
 
-        if !index_additions.is_empty() || !index_removals.is_empty() {
-            let mut index = self.token_index.write().await;
-            apply_token_index_changes(&mut index, index_additions, index_removals);
-        }
-
-        let total_pairs = self.total_states().await;
-
+    fn update_ready_state(&self, total_pairs: usize) {
         let mut broadcast_value = None;
         if total_pairs > 0 && !self.ready.load(Ordering::Acquire) {
             self.ready.store(true, Ordering::Release);
@@ -450,20 +536,6 @@ impl StateStore {
 
         if let Some(value) = broadcast_value {
             let _ = self.ready_tx.send(value);
-        }
-
-        UpdateMetrics {
-            block_number,
-            updated_states,
-            new_pairs: new_pairs_count,
-            removed_pairs: removed_pairs_count,
-            total_pairs,
-            new_pairs_missing_state,
-            unknown_protocol_new_pairs,
-            updates_for_unknown_pair,
-            states_missing_in_shard,
-            removed_unknown_pair,
-            anomaly_samples,
         }
     }
 
@@ -742,7 +814,7 @@ mod tests {
             _delta: ProtocolStateDelta,
             _tokens: &HashMap<Bytes, Token>,
             _balances: &Balances,
-        ) -> Result<(), TransitionError<String>> {
+        ) -> Result<(), TransitionError> {
             Ok(())
         }
 
@@ -764,7 +836,8 @@ mod tests {
     }
 
     fn token(address: &str) -> Bytes {
-        Bytes::from_str(address.trim_start_matches("0x")).expect("valid token address")
+        Bytes::from_str(address.trim_start_matches("0x"))
+            .unwrap_or_else(|err| unreachable!("valid token address: {err}"))
     }
 
     fn address(seed: u8) -> Bytes {
@@ -791,7 +864,7 @@ mod tests {
             HashMap::new(),
             Bytes::new(),
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                .expect("valid timestamp")
+                .unwrap_or_else(|| unreachable!("valid timestamp"))
                 .naive_utc(),
         )
     }
@@ -804,6 +877,58 @@ mod tests {
             new_pairs.insert(id, component);
         }
         Update::new(1, states, new_pairs)
+    }
+
+    fn empty_token_store() -> Arc<TokenStore> {
+        Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper keeps AppState setup explicit while removing repeated literals"
+    )]
+    fn build_test_app_state(
+        token_store: Arc<TokenStore>,
+        native_state_store: Arc<StateStore>,
+        vm_state_store: Arc<StateStore>,
+        latest_native_gas_price_wei: Option<u128>,
+        native_gas_price_reporting_enabled: bool,
+        enable_vm_pools: bool,
+        native_sim_concurrency: usize,
+        vm_sim_concurrency: usize,
+    ) -> AppState {
+        AppState {
+            chain: Chain::Ethereum,
+            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            tokens: token_store,
+            native_state_store,
+            vm_state_store,
+            native_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream_health: Arc::new(StreamHealth::new()),
+            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            latest_native_gas_price_wei: Arc::new(RwLock::new(latest_native_gas_price_wei)),
+            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(
+                native_gas_price_reporting_enabled,
+            )),
+            enable_vm_pools,
+            readiness_stale: Duration::from_secs(120),
+            quote_timeout: Duration::from_millis(100),
+            pool_timeout_native: Duration::from_millis(50),
+            pool_timeout_vm: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(1000),
+            native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+            erc4626_deposits_enabled: false,
+            reset_allowance_tokens: Arc::new(HashMap::new()),
+            native_sim_concurrency,
+            vm_sim_concurrency,
+        }
     }
 
     #[test]
@@ -824,11 +949,15 @@ mod tests {
         );
 
         assert_eq!(
-            index.get(&token_a).unwrap(),
+            index
+                .get(&token_a)
+                .unwrap_or_else(|| unreachable!("token_a must be indexed")),
             &HashSet::from(["pool1".to_string(), "pool2".to_string()])
         );
         assert_eq!(
-            index.get(&token_b).unwrap(),
+            index
+                .get(&token_b)
+                .unwrap_or_else(|| unreachable!("token_b must be indexed")),
             &HashSet::from(["pool1".to_string()])
         );
 
@@ -842,7 +971,9 @@ mod tests {
         );
 
         assert_eq!(
-            index.get(&token_a).unwrap(),
+            index
+                .get(&token_a)
+                .unwrap_or_else(|| unreachable!("token_a must remain indexed")),
             &HashSet::from(["pool2".to_string()])
         );
         assert!(!index.contains_key(&token_b));
@@ -1145,148 +1276,144 @@ mod tests {
             )]))
             .await;
 
-        let app_state = AppState {
-            tokens: Arc::clone(&token_store),
-            native_state_store: Arc::clone(&native_store),
-            vm_state_store: Arc::clone(&vm_store),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: true,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = build_test_app_state(
+            Arc::clone(&token_store),
+            Arc::clone(&native_store),
+            Arc::clone(&vm_store),
+            None,
+            false,
+            true,
+            1,
+            1,
+        );
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
     }
-    #[tokio::test]
-    async fn matching_pools_native_wrapped_aliasing_cases() {
-        enum RequestTokenIn {
-            Wrapped,
-            Native,
-            Other,
-        }
 
-        struct Case {
-            name: &'static str,
-            request_token_in: RequestTokenIn,
-            include_wrapped_pool: bool,
-            include_native_pool: bool,
-            expected_pool_ids: &'static [&'static str],
-        }
+    enum RequestTokenIn {
+        Wrapped,
+        Native,
+        Other,
+    }
 
-        let wrapped_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+    struct MatchingPoolsCase {
+        name: &'static str,
+        request_token_in: RequestTokenIn,
+        include_wrapped_pool: bool,
+        include_native_pool: bool,
+        expected_pool_ids: &'static [&'static str],
+    }
+
+    fn known_address(value: &str) -> Bytes {
+        Bytes::from_str(value).unwrap_or_else(|err| unreachable!("valid address: {err}"))
+    }
+
+    async fn run_matching_pools_case(case: MatchingPoolsCase, wrapped_address: &Bytes) {
         let native_address = native_token_address();
         let token_x = mk_token(9, "TKNX");
         let token_y = mk_token(10, "TKNY");
-        let wrapped_token = Token::new(&wrapped_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
+        let wrapped_token = Token::new(wrapped_address, "WETH", 18, 0, &[], Chain::Ethereum, 100);
         let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
 
-        let cases = [
-            Case {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+        let mut update_pairs = Vec::new();
+
+        if case.include_wrapped_pool {
+            update_pairs.push((
+                "pool-weth".to_string(),
+                mk_component(
+                    20,
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    vec![wrapped_token.clone(), token_x.clone()],
+                ),
+                Box::new(DummySim) as Box<dyn ProtocolSim>,
+            ));
+        }
+
+        if case.include_native_pool {
+            update_pairs.push((
+                "pool-native".to_string(),
+                mk_component(
+                    21,
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    vec![native_token.clone(), token_x.clone()],
+                ),
+                Box::new(DummySim) as Box<dyn ProtocolSim>,
+            ));
+        }
+
+        store.apply_update(mk_update(update_pairs)).await;
+
+        let request_token_in = match case.request_token_in {
+            RequestTokenIn::Wrapped => wrapped_address,
+            RequestTokenIn::Native => &native_address,
+            RequestTokenIn::Other => &token_y.address,
+        };
+        let matches = store
+            .matching_pools_by_addresses(request_token_in, &token_x.address)
+            .await;
+        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
+        let expected: HashSet<String> = case
+            .expected_pool_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(ids, expected, "case {}", case.name);
+    }
+
+    #[tokio::test]
+    async fn matching_pools_native_wrapped_aliasing_cases() {
+        let wrapped_address = known_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+
+        for case in [
+            MatchingPoolsCase {
                 name: "wrapped request prefers exact wrapped pools",
                 request_token_in: RequestTokenIn::Wrapped,
                 include_wrapped_pool: true,
                 include_native_pool: true,
                 expected_pool_ids: &["pool-weth"],
             },
-            Case {
+            MatchingPoolsCase {
                 name: "wrapped request falls back to native-only pool",
                 request_token_in: RequestTokenIn::Wrapped,
                 include_wrapped_pool: false,
                 include_native_pool: true,
                 expected_pool_ids: &["pool-native"],
             },
-            Case {
+            MatchingPoolsCase {
                 name: "native request prefers exact native pools",
                 request_token_in: RequestTokenIn::Native,
                 include_wrapped_pool: true,
                 include_native_pool: true,
                 expected_pool_ids: &["pool-native"],
             },
-            Case {
+            MatchingPoolsCase {
                 name: "native request falls back to wrapped-only pool",
                 request_token_in: RequestTokenIn::Native,
                 include_wrapped_pool: true,
                 include_native_pool: false,
                 expected_pool_ids: &["pool-weth"],
             },
-            Case {
+            MatchingPoolsCase {
                 name: "non wrapped request does not include native pool",
                 request_token_in: RequestTokenIn::Other,
                 include_wrapped_pool: false,
                 include_native_pool: true,
                 expected_pool_ids: &[],
             },
-        ];
-
-        for case in cases {
-            let token_store = Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_secs(1),
-            ));
-            let store = StateStore::new(token_store);
-            let mut update_pairs = Vec::new();
-
-            if case.include_wrapped_pool {
-                update_pairs.push((
-                    "pool-weth".to_string(),
-                    mk_component(
-                        20,
-                        "uniswap_v2",
-                        "uniswap_v2_pool",
-                        vec![wrapped_token.clone(), token_x.clone()],
-                    ),
-                    Box::new(DummySim) as Box<dyn ProtocolSim>,
-                ));
-            }
-
-            if case.include_native_pool {
-                update_pairs.push((
-                    "pool-native".to_string(),
-                    mk_component(
-                        21,
-                        "uniswap_v2",
-                        "uniswap_v2_pool",
-                        vec![native_token.clone(), token_x.clone()],
-                    ),
-                    Box::new(DummySim) as Box<dyn ProtocolSim>,
-                ));
-            }
-
-            store.apply_update(mk_update(update_pairs)).await;
-
-            let request_token_in = match case.request_token_in {
-                RequestTokenIn::Wrapped => &wrapped_address,
-                RequestTokenIn::Native => &native_address,
-                RequestTokenIn::Other => &token_y.address,
-            };
-            let matches = store
-                .matching_pools_by_addresses(request_token_in, &token_x.address)
-                .await;
-            let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-            let expected: HashSet<String> = case
-                .expected_pool_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect();
-
-            assert_eq!(ids, expected, "case {}", case.name);
+        ] {
+            run_matching_pools_case(case, &wrapped_address).await;
         }
     }
 
@@ -1301,8 +1428,7 @@ mod tests {
         ));
         let store = StateStore::new(token_store);
 
-        let wrapped_address =
-            Bytes::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").expect("valid address");
+        let wrapped_address = known_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
         let native_address = native_token_address();
         let token_x = mk_token(12, "TKNX");
         let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
@@ -1422,8 +1548,12 @@ mod tests {
 
         drop(index_guard);
 
-        writer_task.await.expect("writer task should succeed");
-        let matches = query_task.await.expect("query task should succeed");
+        writer_task
+            .await
+            .unwrap_or_else(|err| unreachable!("writer task should succeed: {err}"));
+        let matches = query_task
+            .await
+            .unwrap_or_else(|err| unreachable!("query task should succeed: {err}"));
         let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
 
         assert_eq!(ids, HashSet::from(["pool-v1".to_string()]));
@@ -1431,90 +1561,14 @@ mod tests {
 
     #[tokio::test]
     async fn app_state_native_gas_price_defaults_to_none() {
-        let app_state = AppState {
-            tokens: Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )),
-            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: true,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = gas_price_test_app_state(None, false);
 
         assert_eq!(app_state.latest_native_gas_price_wei().await, None);
     }
 
     #[tokio::test]
     async fn app_state_native_gas_price_updates() {
-        let app_state = AppState {
-            tokens: Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )),
-            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(RwLock::new(None)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
-            enable_vm_pools: true,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = gas_price_test_app_state(None, false);
 
         app_state.set_latest_native_gas_price_wei(Some(42)).await;
         assert_eq!(app_state.latest_native_gas_price_wei().await, Some(42));
@@ -1522,45 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_state_effective_native_gas_price_for_quotes_serializes_with_disable_transition() {
-        let app_state = AppState {
-            tokens: Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )),
-            native_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            vm_state_store: Arc::new(StateStore::new(Arc::new(TokenStore::new(
-                HashMap::new(),
-                "http://localhost".to_string(),
-                "test".to_string(),
-                Chain::Ethereum,
-                Duration::from_millis(10),
-            )))),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(RwLock::new(Some(42))),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(true)),
-            enable_vm_pools: true,
-            readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-        };
+        let app_state = gas_price_test_app_state(Some(42), true);
 
         assert_eq!(
             app_state.effective_native_gas_price_wei_for_quotes().await,
@@ -1578,11 +1594,32 @@ mod tests {
         assert!(!disable_task.is_finished());
 
         drop(reporting_read_guard);
-        disable_task.await.expect("disable task should complete");
+        disable_task
+            .await
+            .unwrap_or_else(|err| unreachable!("disable task should complete: {err}"));
 
         assert_eq!(
             app_state.effective_native_gas_price_wei_for_quotes().await,
             None
         );
+    }
+
+    fn gas_price_test_app_state(
+        gas_price_wei: Option<u128>,
+        gas_reporting_enabled: bool,
+    ) -> AppState {
+        let token_store = empty_token_store();
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        build_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            gas_price_wei,
+            gas_reporting_enabled,
+            true,
+            1,
+            1,
+        )
     }
 }

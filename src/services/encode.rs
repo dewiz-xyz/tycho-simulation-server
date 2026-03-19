@@ -10,7 +10,9 @@ mod tycho_swaps;
 mod wire;
 
 #[cfg(test)]
-mod test_support;
+mod fixtures;
+#[cfg(test)]
+mod mocks;
 
 pub use error::{EncodeError, EncodeErrorKind};
 
@@ -21,7 +23,7 @@ pub async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
 ) -> Result<RouteEncodeResponse, EncodeError> {
-    let chain = request::validate_chain(request.chain_id)?;
+    let chain = request::validate_chain(request.chain_id, state.chain)?;
     request::validate_swap_kinds(&request)?;
 
     let token_in = wire::parse_address(&request.token_in)?;
@@ -35,10 +37,19 @@ pub async fn encode_route(
 
     let native_address = chain.native_token().address;
     let is_native_input = token_in == native_address;
-    let normalized =
-        normalize::normalize_route(&request, &token_in, &token_out, &amount_in, &native_address)?;
+    let allowlist = &state.native_token_protocol_allowlist;
+    let normalized = normalize::normalize_route(
+        &request,
+        &token_in,
+        &token_out,
+        &amount_in,
+        &native_address,
+        state.erc4626_deposits_enabled,
+        allowlist,
+    )?;
     let resimulated =
-        resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out).await?;
+        resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out, allowlist)
+            .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
     let encoder = calldata::build_encoder(chain, router_address.clone())?;
     let expected_total = response::compute_expected_total(&resimulated);

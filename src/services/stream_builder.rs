@@ -1,18 +1,20 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use futures::StreamExt;
 use tracing::info;
 use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
+            aerodrome_slipstreams::state::AerodromeSlipstreamsState,
             ekubo::state::EkuboState,
             ekubo_v3::state::EkuboV3State,
-            filters::{balancer_v2_pool_filter, curve_pool_filter, fluid_v1_paused_pools_filter},
+            erc4626::state::ERC4626State,
+            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
-            // rocketpool::state::RocketpoolState,
+            rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::state::UniswapV4State,
@@ -38,6 +40,8 @@ pub async fn build_native_stream(
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
     tokens: Arc<TokenStore>,
+    chain: Chain,
+    protocols: &[String],
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -53,29 +57,55 @@ pub async fn build_native_stream(
         tvl_add_threshold,
         tvl_keep_threshold,
         decode_skip_state_failures(StreamDecodePolicy::Native),
+        chain,
     );
 
-    builder = builder.exchange::<UniswapV2State>("uniswap_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV2State>("sushiswap_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<PancakeswapV2State>("pancakeswap_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None);
-    builder = builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None);
-    builder = builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None);
-    builder = builder.exchange::<FluidV1>(
-        "fluid_v1",
-        tvl_filter.clone(),
-        Some(fluid_v1_paused_pools_filter),
-    );
-    // builder = builder.exchange::<RocketpoolState>("rocketpool", tvl_filter.clone(), None);
-    builder = builder.exchange::<EkuboV3State>("ekubo_v3", tvl_filter.clone(), None);
+    for protocol in protocols {
+        builder = register_native_protocol(builder, protocol, &tvl_filter)?;
+    }
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
     }))
+}
+
+fn register_native_protocol(
+    builder: ProtocolStreamBuilder,
+    protocol: &str,
+    tvl_filter: &ComponentFilter,
+) -> Result<ProtocolStreamBuilder> {
+    match protocol {
+        "uniswap_v2" | "sushiswap_v2" => {
+            Ok(builder.exchange::<UniswapV2State>(protocol, tvl_filter.clone(), None))
+        }
+        "pancakeswap_v2" => {
+            Ok(builder.exchange::<PancakeswapV2State>(protocol, tvl_filter.clone(), None))
+        }
+        "uniswap_v3" | "pancakeswap_v3" => {
+            Ok(builder.exchange::<UniswapV3State>(protocol, tvl_filter.clone(), None))
+        }
+        "uniswap_v4" => Ok(builder.exchange::<UniswapV4State>(protocol, tvl_filter.clone(), None)),
+        "ekubo_v2" => Ok(builder.exchange::<EkuboState>(protocol, tvl_filter.clone(), None)),
+        "fluid_v1" => Ok(builder.exchange::<FluidV1>(
+            protocol,
+            tvl_filter.clone(),
+            Some(fluid_v1_paused_pools_filter),
+        )),
+        "rocketpool" => Ok(builder.exchange::<RocketpoolState>(protocol, tvl_filter.clone(), None)),
+        "ekubo_v3" => Ok(builder.exchange::<EkuboV3State>(protocol, tvl_filter.clone(), None)),
+        "aerodrome_slipstreams" => {
+            Ok(builder.exchange::<AerodromeSlipstreamsState>(protocol, tvl_filter.clone(), None))
+        }
+        "erc4626" => Ok(builder.exchange::<ERC4626State>(
+            protocol,
+            tvl_filter.clone(),
+            Some(erc4626_filter),
+        )),
+        other => bail!("Unknown native protocol in chain profile: {}", other),
+    }
 }
 
 pub async fn build_vm_stream(
@@ -84,6 +114,8 @@ pub async fn build_vm_stream(
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
     tokens: Arc<TokenStore>,
+    chain: Chain,
+    protocols: &[String],
 ) -> Result<
     impl futures::Stream<
             Item = Result<
@@ -99,27 +131,37 @@ pub async fn build_vm_stream(
         tvl_add_threshold,
         tvl_keep_threshold,
         decode_skip_state_failures(StreamDecodePolicy::Vm),
+        chain,
     );
 
-    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-        "vm:curve",
-        tvl_filter.clone(),
-        Some(curve_pool_filter),
-    );
-    builder = builder.exchange::<EVMPoolState<PreCachedDB>>(
-        "vm:balancer_v2",
-        tvl_filter.clone(),
-        Some(balancer_v2_pool_filter),
-    );
-    builder =
-        builder.exchange::<EVMPoolState<PreCachedDB>>("vm:maverick_v2", tvl_filter.clone(), None);
+    for protocol in protocols {
+        builder = register_vm_protocol(builder, protocol, &tvl_filter)?;
+    }
 
     let snapshot = tokens.snapshot().await;
     let stream = builder.set_tokens(snapshot).await.build().await?;
 
     Ok(stream.map(|item| {
-        item.map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync + 'static>)
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
     }))
+}
+
+fn register_vm_protocol(
+    builder: ProtocolStreamBuilder,
+    protocol: &str,
+    tvl_filter: &ComponentFilter,
+) -> Result<ProtocolStreamBuilder> {
+    match protocol {
+        "vm:balancer_v2" => Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(
+            protocol,
+            tvl_filter.clone(),
+            Some(balancer_v2_pool_filter),
+        )),
+        "vm:curve" | "vm:maverick_v2" => {
+            Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(protocol, tvl_filter.clone(), None))
+        }
+        other => bail!("Unknown VM protocol in chain profile: {}", other),
+    }
 }
 
 fn base_builder(
@@ -128,6 +170,7 @@ fn base_builder(
     tvl_add_threshold: f64,
     tvl_keep_threshold: f64,
     skip_state_decode_failures: bool,
+    chain: Chain,
 ) -> (ProtocolStreamBuilder, ComponentFilter) {
     let add_tvl = tvl_add_threshold;
     let keep_tvl = tvl_keep_threshold.min(add_tvl);
@@ -137,7 +180,7 @@ fn base_builder(
     );
     let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
 
-    let builder = ProtocolStreamBuilder::new(tycho_url, Chain::Ethereum)
+    let builder = ProtocolStreamBuilder::new(tycho_url, chain)
         .latency_buffer(15)
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(skip_state_decode_failures);
@@ -146,15 +189,38 @@ fn base_builder(
 }
 
 fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    match policy {
-        StreamDecodePolicy::Native => true,
-        StreamDecodePolicy::Vm => true,
-    }
+    matches!(policy, StreamDecodePolicy::Native | StreamDecodePolicy::Vm)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_skip_state_failures, StreamDecodePolicy};
+    use std::collections::BTreeSet;
+
+    use super::{
+        decode_skip_state_failures, register_native_protocol, register_vm_protocol,
+        StreamDecodePolicy,
+    };
+    use crate::config::{
+        BASE_NATIVE_PROTOCOLS, BASE_VM_PROTOCOLS, ETHEREUM_NATIVE_PROTOCOLS, ETHEREUM_VM_PROTOCOLS,
+    };
+    use tycho_simulation::{
+        evm::stream::ProtocolStreamBuilder, tycho_client::feed::component_tracker::ComponentFilter,
+    };
+
+    fn test_builder() -> ProtocolStreamBuilder {
+        ProtocolStreamBuilder::new(
+            "localhost",
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        )
+    }
+
+    fn test_filter() -> ComponentFilter {
+        ComponentFilter::with_tvl_range(0.0, 1.0)
+    }
+
+    fn unique_protocols<'a>(left: &'a [&'a str], right: &'a [&'a str]) -> BTreeSet<&'a str> {
+        left.iter().chain(right.iter()).copied().collect()
+    }
 
     #[test]
     fn native_stream_keeps_decode_skip_enabled() {
@@ -164,5 +230,55 @@ mod tests {
     #[test]
     fn vm_stream_keeps_decode_skip_enabled() {
         assert!(decode_skip_state_failures(StreamDecodePolicy::Vm));
+    }
+
+    #[test]
+    fn unknown_native_protocol_returns_error() {
+        let builder = test_builder();
+        let filter = test_filter();
+        let result = register_native_protocol(builder, "unknown_protocol", &filter);
+        assert!(result.is_err());
+        let Err(err) = result else {
+            unreachable!("expected error for unknown native protocol");
+        };
+        assert!(err.to_string().contains("Unknown native protocol"));
+    }
+
+    #[test]
+    fn unknown_vm_protocol_returns_error() {
+        let builder = test_builder();
+        let filter = test_filter();
+        let result = register_vm_protocol(builder, "vm:unknown", &filter);
+        assert!(result.is_err());
+        let Err(err) = result else {
+            unreachable!("expected error for unknown VM protocol");
+        };
+        assert!(err.to_string().contains("Unknown VM protocol"));
+    }
+
+    #[test]
+    fn chain_profile_native_protocols_all_register_successfully() {
+        let filter = test_filter();
+
+        for protocol in unique_protocols(ETHEREUM_NATIVE_PROTOCOLS, BASE_NATIVE_PROTOCOLS) {
+            let result = register_native_protocol(test_builder(), protocol, &filter);
+            assert!(
+                result.is_ok(),
+                "expected native protocol {protocol} to register"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_profile_vm_protocols_all_register_successfully() {
+        let filter = test_filter();
+
+        for protocol in unique_protocols(ETHEREUM_VM_PROTOCOLS, BASE_VM_PROTOCOLS) {
+            let result = register_vm_protocol(test_builder(), protocol, &filter);
+            assert!(
+                result.is_ok(),
+                "expected VM protocol {protocol} to register"
+            );
+        }
     }
 }

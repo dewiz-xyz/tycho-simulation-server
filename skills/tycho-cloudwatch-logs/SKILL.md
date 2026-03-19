@@ -11,6 +11,8 @@ Use AWS CLI to inspect Tycho simulation logs in CloudWatch. Default log group is
 If you hit `ExpiredTokenException`, refresh the `AWS_SESSION_TOKEN` in `.env` and retry.
 
 Simulate completion logs are now emitted at `info` level for successful requests and include extra context (tokens, latency, top pool details, and failure summaries). For detailed failure summaries, inspect the raw `@message` JSON.
+The raw completion logs emit wire-aligned `quote_status`, `quote_result_quality`, and `partial_kind`; the bundled query presets map those back to concise columns for triage.
+`token-rpc-fetch` is most useful for failures under the default log level; the success path only appears when `RUST_LOG=debug`.
 `uniswap-v4-filter` logs include `filter_rule`, `considered_pools`, `accepted_pools`, `filtered_pools`, `pools_with_hook_identifier`, and `pools_missing_hook_identifier` to explain hook-pool coverage.
 
 ## Quick start
@@ -19,6 +21,31 @@ Simulate completion logs are now emitted at `info` level for successful requests
 2. Tail (JSON pretty print): `zsh skills/tycho-cloudwatch-logs/scripts/cw_tail.zsh --since 15m --follow`
 3. Filter: `zsh skills/tycho-cloudwatch-logs/scripts/cw_filter.zsh --since 2h --filter-pattern "Block update:"`
 4. Query: `zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh --preset resync --since 24h`
+
+## ERC4626 rollout checks
+For ERC4626 `/simulate` rollout triage, use the existing presets instead of adding a new one:
+`simulate-requests`, `simulate-completions`, `simulate-successes`, and `simulate-runs`.
+
+Use `simulate-completions` when you need to inspect degraded `ready` outcomes. `simulate-successes` is intentionally narrower and only shows quoteable `ready` completions (`result_quality=complete|partial`).
+
+Supported ERC4626 directions on this server today:
+- `USDS -> sUSDS`
+- `sUSDS -> USDS`
+- `USDC -> sUSDC`
+- `sUSDC -> USDC`
+- `PYUSD -> spPYUSD`
+- `spPYUSD -> PYUSD`
+
+Negative probe to keep handy:
+- `sUSDe -> USDe`
+
+Current observability limits:
+- ERC4626 candidate drops are still logged at `debug`, so those per-candidate skip reasons remain invisible in CloudWatch under the default `info` log level.
+- Unsupported ERC4626 `/encode` rejections are now visible in CloudWatch, but there is still no dedicated preset for them.
+- General `/encode` traffic still does not include enough pair or protocol detail to isolate all ERC4626 activity reliably in CloudWatch.
+- `router-timeouts` covers both `/simulate` and `/encode` router-boundary timeout logs, but it is not pair-aware.
+
+Start with `references/queries.md` for copyable ERC4626 pair filters built on top of the existing presets.
 
 ## Preset catalog
 | Preset | Purpose |
@@ -34,19 +61,19 @@ Simulate completion logs are now emitted at `info` level for successful requests
 | startup | App boot sequence. |
 | server | HTTP server lifecycle. |
 | timeouts | Handler timeouts. |
-| router-timeouts | Router boundary timeouts. |
+| router-timeouts | Router boundary timeouts for both `/simulate` and `/encode`. |
 | simulate-requests | Incoming simulate requests. |
 | simulate-completions | Completion logs for simulate calls. |
-| simulate-successes | Successful completion logs (`status=Ready`). |
+| simulate-successes | Quoteable successful completion logs (`status=ready` with `result_quality=complete|partial`). |
 | simulate-rpm | Requests per minute (completion-based). |
 | simulate-rpm-by-auction | Requests per minute per auction_id. |
 | simulate-requests-per-auction | Total request count per auction_id. |
-| simulate-runs | Per-request detail with simulation_runs count. |
+| simulate-runs | Per-request detail with scheduled pool counts. |
 | simulate-runs-per-minute | Total pool simulation runs per minute. |
 | simulate-runs-per-auction | Total pool simulation runs per auction_id. |
 | simulate-workload-summary | Full-window amount and pool workload aggregate (requests, pool simulation runs, amounts simulated, simulation runs). |
 | token-metadata | Token metadata fetch errors. |
-| token-rpc-fetch | Single-token RPC fetch path. |
+| token-rpc-fetch | Single-token RPC fetch path (success logs require `debug`). |
 | state-anomalies | Missing/unknown state warnings. |
 | vm-pools | VM pool feed config. |
 | tvl-thresholds | TVL filter thresholds. |
@@ -96,3 +123,4 @@ Quick checks for memory and CPU utilization using ECS ContainerInsights.
 
 ## References
 Use `references/queries.md` for the full preset index and filter/query snippets.
+Use [docs/quote_service.md](../../docs/quote_service.md) for the `/simulate` quote-status, result-quality, and partial-kind contract.

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize, Serializer};
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive borrowed values"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -78,7 +82,6 @@ pub enum QuoteStatus {
     WarmingUp,
     TokenMissing,
     NoLiquidity,
-    PartialSuccess,
     InvalidRequest,
     InternalError,
 }
@@ -90,6 +93,14 @@ pub enum QuoteResultQuality {
     Partial,
     NoResults,
     RequestLevelFailure,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotePartialKind {
+    AmountLadders,
+    PoolCoverage,
+    Mixed,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +189,8 @@ pub struct PoolSimulationOutcome {
 pub struct QuoteMeta {
     pub status: QuoteStatus,
     pub result_quality: QuoteResultQuality,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_kind: Option<QuotePartialKind>,
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
@@ -238,7 +251,6 @@ pub struct SegmentDraft {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
-#[allow(clippy::enum_variant_names)]
 pub enum SwapKind {
     SimpleSwap,
     MultiSwap,
@@ -314,34 +326,84 @@ pub struct EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AmountOutResponse, ExecutionRisk, PoolOutcomeKind, QuoteResultQuality, RiskLevel};
+    use super::{
+        AmountOutResponse, ExecutionRisk, PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, RiskLevel,
+        QuoteStatus,
+    };
+    use anyhow::Result;
 
     #[test]
-    fn quote_result_quality_serializes_as_snake_case() {
+    fn quote_result_quality_serializes_as_snake_case() -> Result<()> {
         assert_eq!(
-            serde_json::to_string(&QuoteResultQuality::RequestLevelFailure).unwrap(),
+            serde_json::to_string(&QuoteResultQuality::RequestLevelFailure)?,
             "\"request_level_failure\""
         );
         assert_eq!(
-            serde_json::to_string(&QuoteResultQuality::NoResults).unwrap(),
+            serde_json::to_string(&QuoteResultQuality::NoResults)?,
             "\"no_results\""
         );
+        Ok(())
     }
 
     #[test]
-    fn pool_outcome_kind_serializes_as_snake_case() {
+    fn quote_status_serializes_without_partial_success() -> Result<()> {
+        assert_eq!(serde_json::to_string(&QuoteStatus::Ready)?, "\"ready\"");
         assert_eq!(
-            serde_json::to_string(&PoolOutcomeKind::SkippedPrecheck).unwrap(),
-            "\"skipped_precheck\""
+            serde_json::to_string(&QuoteStatus::InternalError)?,
+            "\"internal_error\""
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quote_partial_kind_serializes_as_snake_case() -> Result<()> {
+        assert_eq!(
+            serde_json::to_string(&QuotePartialKind::AmountLadders)?,
+            "\"amount_ladders\""
         );
         assert_eq!(
-            serde_json::to_string(&PoolOutcomeKind::PartialOutput).unwrap(),
+            serde_json::to_string(&QuotePartialKind::PoolCoverage)?,
+            "\"pool_coverage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QuotePartialKind::Mixed)?,
+            "\"mixed\""
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pool_outcome_kind_serializes_as_snake_case() -> Result<()> {
+        assert_eq!(
+            serde_json::to_string(&PoolOutcomeKind::PartialOutput)?,
             "\"partial_output\""
         );
+        Ok(())
     }
 
     #[test]
-    fn amount_out_response_serializes_gas_in_sell_snake_case() {
+    fn quote_meta_omits_partial_kind_when_absent() -> Result<()> {
+        let meta = QuoteMeta {
+            status: QuoteStatus::Ready,
+            result_quality: QuoteResultQuality::Complete,
+            partial_kind: None,
+            block_number: 1,
+            vm_block_number: None,
+            matching_pools: 0,
+            candidate_pools: 0,
+            total_pools: None,
+            auction_id: None,
+            pool_results: Vec::new(),
+            vm_unavailable: false,
+            failures: Vec::new(),
+        };
+        let value = serde_json::to_value(meta)?;
+        assert!(value.get("partial_kind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn amount_out_response_serializes_gas_in_sell_snake_case() -> Result<()> {
         let response = AmountOutResponse {
             pool: "pool-1".to_string(),
             pool_name: "name".to_string(),
@@ -355,9 +417,10 @@ mod tests {
             execution_risk: None,
         };
 
-        let value = serde_json::to_value(response).expect("serialize response");
+        let value = serde_json::to_value(response)?;
         assert_eq!(value["gas_in_sell"], "3000000");
         assert!(value.get("gasInSellToken").is_none());
+        Ok(())
     }
 
     #[test]

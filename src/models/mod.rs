@@ -1,3 +1,4 @@
+pub mod erc4626;
 pub mod factories;
 pub mod messages;
 pub mod protocol;

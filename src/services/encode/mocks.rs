@@ -1,57 +1,14 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tycho_execution::encoding::errors::EncodingError;
 use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
-use tycho_simulation::protocol::models::ProtocolComponent;
 use tycho_simulation::tycho_common::models::token::Token;
-use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
 use tycho_simulation::tycho_common::Bytes;
-
-use crate::models::messages::PoolRef;
-
-pub(super) fn pool_ref(id: &str) -> PoolRef {
-    PoolRef {
-        protocol: "uniswap_v2".to_string(),
-        component_id: id.to_string(),
-        pool_address: None,
-    }
-}
-
-pub(super) fn dummy_component() -> ProtocolComponent {
-    component_with_tokens(
-        "0x0000000000000000000000000000000000000009",
-        vec![
-            dummy_token("0x0000000000000000000000000000000000000001"),
-            dummy_token("0x0000000000000000000000000000000000000002"),
-        ],
-    )
-}
-
-pub(super) fn component_with_tokens(id: &str, tokens: Vec<Token>) -> ProtocolComponent {
-    ProtocolComponent::new(
-        Bytes::from_str(id).unwrap(),
-        "uniswap_v2".to_string(),
-        "uniswap_v2".to_string(),
-        Chain::Ethereum,
-        tokens,
-        Vec::new(),
-        HashMap::new(),
-        Bytes::default(),
-        NaiveDateTime::default(),
-    )
-}
-
-pub(super) fn dummy_token(address: &str) -> Token {
-    let bytes = Bytes::from_str(address).unwrap();
-    Token::new(&bytes, "TKN", 18, 0, &[], Chain::Ethereum, 100)
-}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct MockProtocolSim;
@@ -104,8 +61,7 @@ impl ProtocolSim for MockProtocolSim {
         _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
-    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
-    {
+    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError> {
         Ok(())
     }
 
@@ -183,8 +139,7 @@ impl ProtocolSim for StepProtocolSim {
         _delta: tycho_simulation::tycho_common::dto::ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
         _balances: &tycho_simulation::tycho_common::simulation::protocol_sim::Balances,
-    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError<String>>
-    {
+    ) -> Result<(), tycho_simulation::tycho_common::simulation::errors::TransitionError> {
         Ok(())
     }
 
@@ -210,6 +165,10 @@ impl ProtocolSim for StepProtocolSim {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Tests only call this helper with StepProtocolSim states."
+)]
 pub(super) fn step_multiplier(state: &Arc<dyn ProtocolSim>) -> u32 {
     state
         .as_any()
