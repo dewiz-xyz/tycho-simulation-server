@@ -3,7 +3,7 @@ name = "tycho-simulation-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.0"
-description = "Tycho simulation HTTP quote service"
+description = "Fast simulation API for DeFi swaps and routing, built on Tycho state."
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 

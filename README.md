@@ -1,6 +1,8 @@
 # Tycho Simulation Server
 
-An HTTP service that ingests Tycho protocol streams, keeps an in-memory view of pool state, and serves swap quote simulation, route encoding, and readiness APIs.
+Fast simulation API for DeFi swaps and routing, built on Tycho state.
+
+It ingests Tycho protocol streams, keeps an in-memory view of pool state, and serves quote simulation, route encoding, and readiness APIs.
 
 ## Service Role
 

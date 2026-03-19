@@ -1,6 +1,7 @@
 # Tycho Simulation Server (repo context)
 
 ## What this service does
+- Fast simulation API for DeFi swaps and routing, built on Tycho state.
 - Rust Axum service that ingests Tycho protocol streams, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation.
 - Main binary: `tycho-price-service` (see `src/main.rs`).
 
