@@ -16,7 +16,6 @@ use tycho_simulation_server::memory::maybe_log_memory_snapshot;
 use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
 use tycho_simulation_server::models::stream_health::StreamHealth;
 use tycho_simulation_server::models::tokens::TokenStore;
-use tycho_simulation_server::services::gas_price::spawn_gas_price_startup_task;
 use tycho_simulation_server::services::stream_builder::{build_native_stream, build_vm_stream};
 
 #[global_allocator]
@@ -39,7 +38,6 @@ async fn main() -> anyhow::Result<()> {
     let supervisor_cfg = build_supervisor_config(&config);
 
     log_concurrency_config(&config);
-    spawn_gas_price_refresh(&config, &app_state);
     spawn_native_stream_task(
         &config,
         &tycho_url,
@@ -171,8 +169,6 @@ fn build_app_state(
         native_stream_health: Arc::clone(&resources.native_stream_health),
         vm_stream_health: Arc::clone(&resources.vm_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
-        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: effective_vm_enabled,
         readiness_stale,
         quote_timeout,
@@ -221,30 +217,6 @@ fn log_concurrency_config(config: &tycho_simulation_server::config::AppConfig) {
         enable_vm_pools = effective_vm_enabled,
         requested_vm_pools = config.enable_vm_pools,
         "Initialized simulation concurrency limits"
-    );
-}
-
-fn spawn_gas_price_refresh(
-    config: &tycho_simulation_server::config::AppConfig,
-    app_state: &AppState,
-) {
-    let Some(rpc_url) = config.rpc_url.clone() else {
-        info!("RPC_URL is not configured; gas-in-sell reporting remains disabled");
-        return;
-    };
-    let chain = config.chain_profile.chain;
-    let refresh_interval = Duration::from_millis(config.gas_price_refresh_interval_ms);
-    let failure_tolerance = config.gas_price_failure_tolerance;
-    // TODO: On Base, total tx cost also includes the L1 data fee, so `eth_gasPrice` on its own
-    // doesn't tell the whole story. Keeping the shared refresh loop for now and fixing the Base
-    // side properly in a follow-up PR.
-    let _startup_task = spawn_gas_price_startup_task(
-        app_state.clone(),
-        chain,
-        rpc_url,
-        refresh_interval,
-        failure_tolerance,
-        reqwest::Client::new(),
     );
 }
 
@@ -425,8 +397,6 @@ mod tests {
             chain_profile,
             api_key: "test-api-key".to_string(),
             rpc_url: rpc_url.map(str::to_string),
-            gas_price_refresh_interval_ms: 5_000,
-            gas_price_failure_tolerance: 5,
             tvl_threshold: 100.0,
             tvl_keep_threshold: 20.0,
             port: 3000,

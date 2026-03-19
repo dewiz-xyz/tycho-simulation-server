@@ -41,7 +41,6 @@ This document describes the `/simulate` request and response shape.
       "pool_address": "0x1111111111111111111111111111111111111111",
       "amounts_out": ["999000000", "4985000000"],
       "gas_used": [210000, 210000],
-      "gas_in_sell": "630000000000000",
       "block_number": 19876543
     }
   ],
@@ -70,7 +69,6 @@ This document describes the `/simulate` request and response shape.
       "pool_address": "0x2222222222222222222222222222222222222222",
       "amounts_out": ["0", "215000000", "980000000"],
       "gas_used": [0, 210000, 220000],
-      "gas_in_sell": "660000000000000",
       "block_number": 19876543
     }
   ],
@@ -93,7 +91,6 @@ In this example, the smallest requested amount failed for that pool, so `amounts
 - `amounts_out[i] = "0"` means that requested amount did not produce a usable quote for that pool. It is not a real output amount.
 - `data[]` contains only pools with at least one positive output across the requested amounts. Pools whose entire `amounts_out` row is `"0"` stay out of `data[]` and remain visible through `meta.failures` and `meta.pool_results`.
 - `data[]` row order is deterministic, but it is not a best-to-worst ranking. Consumers should rely on requested-amount alignment within each row and choose pools explicitly rather than inferring semantics from `data[0]`.
-- `gas_in_sell` is a sell-token decimal string derived from the latest cached gas price, request-scoped ETH-to-sell pricing, and the pool's last successful `gas_used` entry. It can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
 - `block_number` is the native stream block. `vm_block_number` is present when VM pool support is enabled and VM state has a current block.
 
 ### How to consume `data[]`
