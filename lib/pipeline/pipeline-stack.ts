@@ -34,7 +34,7 @@ export class PipelineStack extends cdk.Stack {
 
     const synth = new pipelines.CodeBuildStep("Synth", {
       input: pipelines.CodePipelineSource.connection(
-        "dewiz-xyz/tycho-simulation-server",
+        "dewiz-xyz/dsolver-simulator",
         "master",
         {
           connectionArn: githubConnectionArn,
