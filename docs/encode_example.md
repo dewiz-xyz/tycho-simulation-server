@@ -206,6 +206,6 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
   - Native usage on non-allowlisted protocols is rejected as an invalid request.
 - The API shape stays success/error oriented. If you need richer server-side failure breakdowns, use logs keyed by `requestId`, `encode_error_kind`, and `failure_stage`.
 
-### Smoke-test note
+### Local analysis note
 
-When you compare against the repo harness, remember that `scripts/encode_smoke.py` is proving something stricter than "the first requested amount can encode." It uses dedicated route-specific amount presets, expects every tested amount to remain usable across both hops, and treats any `"0"` hop output as a missing quote for that amount rather than a valid dust quote.
+The repo-local analyzer uses a narrow 2-hop route probe built from `/simulate` results and records how `/encode` behaves for that route. It is meant to surface behavior, latency, and oddities in a standardized report, not to act like a strict pass/fail encode contract test.

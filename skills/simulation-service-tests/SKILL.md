@@ -1,186 +1,87 @@
 ---
 name: simulation-service-tests
-description: Run, test, benchmark, upgrade, and deploy the Tycho simulation server in this repo (tycho-simulation-server). Use when starting/stopping the service, waiting for /status readiness, validating /simulate across many token pairs/pools/protocols (including VM pools like curve/balancer/maverick), computing p50/p90/p99 latencies, running load/stress tests, or verifying upgrades and deployments (cargo fmt/clippy/nextest/build, docker build, CDK synth/diff/deploy).
+description: Analyze the local Tycho simulation server in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
-  short-description: Tycho simulation service tests
+  short-description: Tycho simulation local analysis
 ---
 
-# Simulation Service Tests
+# Simulation Service Analysis
 
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `src/`).
-2. Ensure `.env` exists and contains `TYCHO_API_KEY` (avoid logging it). For manual health checks, use `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
-3. Pick a chain context for this run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base). Scripts fail fast if neither `--chain-id` nor `CHAIN_ID` is set.
-4. Start the server (keeps a PID file in the repo root):
+2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
+3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
+4. Run the analyzer:
    ```bash
-   cd /path/to/tycho-simulation-server
-   scripts/start_server.sh --repo . --chain-id 1
+   cargo run --bin sim-analysis -- --chain-id 1 --stop
    ```
-5. Wait for readiness and verify chain:
-   ```bash
-   scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1
-   ```
-   - If it stays `warming_up`, wait longer (3–5+ minutes on a cold start, longer with VM pools) or re-run with a higher `--timeout`.
+5. Read:
+   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/summary.md`
+   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/report.json`
 
-## One-shot end-to-end suite
+## What the analyzer does
 
-Run start → wait_ready → smoke → coverage → latency:
+- Reuses the existing local server if it is already responding, otherwise starts it with the repo lifecycle scripts.
+- Waits for `/status`, including VM readiness when VM pools are enabled.
+- Fresh VM-pool warmups can take much longer than native readiness. Budget up to 10 minutes before treating VM readiness as stuck.
+- Runs a balanced `/simulate` sweep across representative pairs.
+- Builds a narrow 2-hop `/encode` probe from live `/simulate` results.
+- Runs latency and light stress sweeps.
+- Saves sampled request/response artifacts plus log excerpts.
+- Optionally compares the current run against the latest compatible saved report.
+
+## Behavior model
+
+- Non-zero exit codes are reserved for harness/runtime failures such as startup failures, readiness timeouts, transport failures that prevent analysis, or report-writing failures.
+- Degraded protocol behavior, request-level failures, odd pool visibility, and latency regressions are reported as findings, not hard failures.
+- The analyzer is meant to help the agent investigate local behavior, not to decide prod-readiness by itself.
+
+## Useful commands
+
+Base run:
 ```bash
-cd /path/to/tycho-simulation-server
-scripts/run_suite.sh --repo . --chain-id 1 --suite core --stop
+cargo run --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
-`run_suite.sh` is the stable, VM-aware repo verification path. With VM pools enabled (the default), it waits for `vm_status=ready` and at least one VM pool before running VM protocol presence checks, so cold starts can take longer than native-only runs.
-
-`run_suite.sh` is intentionally a strict successful-path check. It fails on request-visible degradation even when `/simulate` returns `200 OK` with a contract-valid degraded payload. Use the individual Python helpers when you want relaxed contract exploration.
-
-`run_suite.sh` smoke checks require non-empty `data` and validate pool entry schema (`amounts_out`, `gas_used`, `gas_in_sell`, monotonicity, and `block_number`). `amounts_out[i] = "0"` means that requested amount did not produce a usable quote for that pool, so fully-zero rows are not valid smoke-test data. `gas_in_sell` is different: it is a decimal-string sell-token amount computed from request-scoped pricing inputs and can legitimately be `"0"` when gas reporting or pricing inputs are unavailable.
-
-VM pools (Curve/Balancer/Maverick feeds) are enabled by default. The supported fast path is to exclude them entirely:
+Keep the server running:
 ```bash
-scripts/run_suite.sh --repo . --chain-id 1 --suite core --disable-vm-pools --stop
+cargo run --bin sim-analysis -- --chain-id 1
 ```
 
-There is no repo-runner mode that keeps VM pools enabled while skipping VM readiness waiting.
-
-Relax the coverage and latency phases for explicit no-liquidity/no-pools responses while keeping both smoke stages strict:
+Disable baseline comparison:
 ```bash
-scripts/run_suite.sh --repo . --chain-id 8453 --suite core --allow-no-liquidity --stop
+cargo run --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ```
 
-`--allow-no-liquidity` does not relax `/simulate` smoke or `/encode` smoke. Those successful-path gates still require `status=ready` with usable `complete`/`partial` quote results.
-
-## Smoke test /simulate
-
-- Use curated chain-aware presets (token/suite sets differ by chain).
-- Remember: `/simulate` returns `200 OK` for complete, partial, no-result, and selected request-level degraded outcomes; use `meta.result_quality`, `meta.partial_kind`, and `meta.failures` to judge whether the response is usable for quoting.
-- `/simulate` semantics are summarized in [README.md](../../README.md) and detailed for integrations in [docs/simulate_example.md](../../docs/simulate_example.md).
-
-Examples:
+Manual VM-ready wait when you want to confirm the service itself before rerunning the analyzer:
 ```bash
-python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke
-python3 scripts/simulate_smoke.py --chain-id 8453 --pair USDC:WETH --pair WETH:USDC
-python3 scripts/simulate_smoke.py --chain-id 1 --list-tokens
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
 
-For stricter checks (fail on empty data and validate pool entries, including `gas_in_sell`):
+Write to a custom directory:
 ```bash
-python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke --require-data --validate-data
+cargo run --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
 ```
 
-Under `--validate-data`, only positive `amounts_out` values count as usable quotes. `"0"` means that requested amount failed for that pool, requires matching `gas_used = 0`, and a row whose full `amounts_out` array is `"0"` should fail validation.
-
-Allow partial ready responses with request-visible failures:
+Target a different local base URL:
 ```bash
-python3 scripts/simulate_smoke.py --chain-id 8453 --suite smoke --allow-failures
+cargo run --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --stop
 ```
 
-`--allow-failures` only relaxes request-visible failures on otherwise usable `complete`/`partial` results. It does not turn `request_level_failure` or `no_results` into smoke-test success.
+## Investigation flow
 
-## Smoke test /encode
+After the analyzer runs:
 
-- `/encode` follows the live route schema. The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` depending on route shape and splits.
-- The repo smoke helper is a narrow strict sanity check for the default 2-hop route, not a broad `/encode` contract sweep.
-- The smoke test performs two `/simulate` calls to pick pools, then posts a 2-hop route.
-- Route tokens are chain-aware (`scripts/presets.py` `default_encode_route`).
-- Encode amounts are also chain-aware and come from dedicated realistic presets in `scripts/presets.py`; encode smoke does not reuse the generic `/simulate` amount presets.
-- Default addresses can be overridden via `.env` (`COW_SETTLEMENT_CONTRACT`, `TYCHO_ROUTER_ADDRESS`).
-- `/encode` keeps its current success/error response contract, but its pool-picking guidance follows the live `/simulate` contract.
-- Pool selection remains strict: encode smoke requires `status=ready` plus `result_quality=complete|partial`; `request_level_failure` and `no_results` are not usable quote sources.
-- Strict means every requested amount must stay usable on both hops. Any tested amount that comes back as `"0"` on either hop should fail the encode smoke run.
-
-Examples:
-```bash
-python3 scripts/encode_smoke.py --chain-id 1 --encode-url http://localhost:3000/encode --simulate-url http://localhost:3000/simulate --repo .
-python3 scripts/encode_smoke.py --chain-id 8453 --allow-failures --verbose
-```
-
-## Pool/protocol coverage sweeps
-
-`coverage_sweep.py` runs a suite of pairs and reports which protocols/pools appear in responses:
-```bash
-python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json
-python3 scripts/coverage_sweep.py --chain-id 1 --suite v4_candidates
-python3 scripts/coverage_sweep.py --chain-id 1 --suite exploratory_protocols --allow-failures --allow-no-pools
-python3 scripts/coverage_sweep.py --chain-id 8453 --suite aerodrome_presence --allow-failures --expect-protocols aerodrome_slipstreams
-```
-
-`coverage_sweep.py` validates `result_quality` and `partial_kind`, not just `status`. `--allow-failures` only relaxes request-visible failures on otherwise usable `complete`/`partial` results. Use `--allow-no-pools` when you intentionally want to tolerate `no_liquidity + no_pools`.
-
-VM pool feeds are controlled by `ENABLE_VM_POOLS` (default: `true`). Use `ENABLE_VM_POOLS=false` (or `scripts/run_suite.sh --chain-id 1 --disable-vm-pools ...`) to turn them off. See `references/protocols.md`.
-
-`coverage_sweep.py` now reports both winner-path protocols (from successful `data` entries) and candidate-path protocols (from `data` plus `meta.pool_results`). `--expect-protocols` validates against candidate-path presence so prechecked/skipped pools still count toward coverage expectations.
-
-Protocol assertions should be chain-aware. Example (Ethereum VM probe):
-```bash
-python3 scripts/coverage_sweep.py --chain-id 1 --pair USDC:USDT --pair USDT:USDC --pair ETH:RETH --expect-protocols maverick_v2
-```
-
-Allow `no_liquidity` responses with only `no_pools` failures:
-```bash
-python3 scripts/coverage_sweep.py --chain-id 8453 --suite core --allow-no-pools
-```
-
-## Latency percentiles (p50/p90/p99)
-
-`latency_percentiles.py` measures only `ready` responses with usable quotes by default (`result_quality=complete|partial`, no `meta.failures`). `scripts/run_suite.sh --suite core` uses the narrower `latency_core` pair set for this phase so the percentile pass stays on consistently ready paths:
-```bash
-python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 300 --concurrency 50
-python3 scripts/latency_percentiles.py --chain-id 8453 --suite core --requests 300 --concurrency 50
-```
-
-Even with `--allow-failures`, the percentile runner still excludes unusable `request_level_failure` and `no_results` outcomes.
-
-When `scripts/run_suite.sh --allow-no-liquidity` is set, the coverage and latency phases accept `no_liquidity + no_pools` responses for operational variability. Treat that run as mixed request latency, not a pure usable-quote latency benchmark.
-
-## Load / stress testing
-
-- Prefer the repo suite + percentile runner:
-  - `scripts/run_suite.sh --repo . --chain-id 1 --suite core`
-  - `python3 scripts/latency_percentiles.py --chain-id 1 --requests 2000 --concurrency 50 --suite core`
-- See `STRESS_TEST_README.md` for defaults and knobs (`LATENCY_REQUESTS`, `LATENCY_CONCURRENCY`, `LATENCY_CONCURRENCY_VM`).
-
-## Maintenance checks
-
-Run a CI-like pass:
-```bash
-bash skills/simulation-service-tests/scripts/run_checks.sh --repo /path/to/tycho-simulation-server
-```
-
-## Memory tracking (jemalloc)
-
-1. Run the ignored harnesses and record output lines in `.codex/memory-task/service-memory-tracking.md`:
-   ```bash
-   cargo test --test integration protocol_reset_memory::memory_spike_breakdown_harness -- --ignored --nocapture
-   cargo test --test integration protocol_reset_memory::shared_db_rebuild_stress_harness -- --ignored --nocapture
-   ```
-2. Append a diff table based on the latest `memory_breakdown` line:
-   ```bash
-   python3 skills/simulation-service-tests/scripts/memory_diff.py --repo /path/to/tycho-simulation-server
-   ```
-
-## Upgrade workflow (typical)
-
-1. Bump `tycho-simulation` tag/version (or other deps).
-2. Run: `cargo fmt`, `cargo clippy ...`, `cargo nextest run`, `cargo build --release`.
-3. Run the end-to-end suite (`scripts/run_suite.sh`) on both chains (typically one run with `--chain-id 1`, one with `--chain-id 8453`; with/without VM pools as needed).
-4. If infra changes are involved: `npm ci`, `npx cdk synth`, `npx cdk diff`.
-
-## Deploy workflow (CDK + Docker)
-
-See `references/deploy.md`.
-
-## Included scripts
-
-- Repo (source of truth): `scripts/start_server.sh`, `scripts/stop_server.sh`, `scripts/wait_ready.sh`, `scripts/run_suite.sh`, plus the Python runners in `scripts/`.
-- Skill utilities: `skills/simulation-service-tests/scripts/run_checks.sh` (CI-like `cargo fmt/clippy/nextest/build` + optional `cdk synth`/`docker build`), `skills/simulation-service-tests/scripts/memory_diff.py`, and the fallback `skills/simulation-service-tests/scripts/presets.py` used by the harness tests.
+1. Read `summary.md` first for the high-level picture.
+2. Use `report.json` for exact counts, latencies, status/result-quality splits, and protocol visibility.
+3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and log excerpts.
+4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
+5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.
 
 ## References
 
-- `references/project.md` – repo commands, endpoints, and stress-test details.
-- `references/encode.md` – `/encode` schema and smoke-testing notes.
-- `references/protocols.md` – exchange/protocol feeds per chain and test implications.
+- `references/project.md` – repo commands, outputs, and analysis flow.
+- `references/encode.md` – `/encode` schema and route-probe notes.
+- `references/protocols.md` – chain protocol context and VM notes that help interpret findings.
 - `references/tycho-deps.md` – Tycho/Propeller Heads context and docs.
-- `references/upgrade.md` – checklist for dependency upgrades.
-- `references/deploy.md` – CDK + Docker deployment notes.

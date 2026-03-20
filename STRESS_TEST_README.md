@@ -1,91 +1,70 @@
-# Simulation Test Suite for Tycho Simulation Server
+# Local Simulation Analysis
 
-This repo ships a lightweight test suite for the `/simulate` endpoint. It covers smoke checks, protocol/pool coverage, and latency percentiles.
+This repo ships a reporting-first Rust CLI for local simulation-service analysis. It starts or reuses the server, waits for readiness, exercises representative `/simulate` and `/encode` flows, runs latency and light stress probes, captures sampled evidence, and writes a structured report instead of enforcing a strict pass/fail gate.
 
-## Overview
+## Quick start
 
-The suite (`scripts/run_suite.sh`) performs:
-
-- **Server lifecycle**: start (if needed), wait for `/status`, optional stop
-- **Smoke checks**: quick sanity pairs for `/simulate`
-- **Coverage sweep**: summarizes pools and protocols seen
-- **Latency percentiles**: p50/p90/p99 with configurable concurrency
-
-## Prerequisites
-
-1. **Python 3** (stdlib only)
-2. **Rust toolchain** for `cargo run --release`
-3. **Tycho API key** in `.env` (`TYCHO_API_KEY=...`)
-4. **Chain context** via `--chain-id` or `CHAIN_ID` (`1` Ethereum, `8453` Base)
-
-## Quick Start
-
-Run the full suite on Ethereum (start → wait → smoke → coverage → latency):
+Ethereum:
 
 ```bash
-scripts/run_suite.sh --repo . --chain-id 1 --stop
+cargo run --bin sim-analysis -- --chain-id 1 --stop
 ```
 
-Run the full suite on Base:
+Base:
 
 ```bash
-scripts/run_suite.sh --repo . --chain-id 8453 --stop
+cargo run --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
-Run a native-only Ethereum suite without VM pools:
+Keep the server running after the analysis:
 
 ```bash
-scripts/run_suite.sh --repo . --chain-id 1 --disable-vm-pools --stop
+cargo run --bin sim-analysis -- --chain-id 1
 ```
 
-`scripts/run_suite.sh` is intentionally a strict healthy-path gate. It keeps smoke, encode, coverage, and latency on quoteable success paths and fails on request-visible degradation even when the API contract still returns `200 OK`.
+Disable baseline comparison for a one-off run:
 
-## Suite Configuration
-
-- **Suites** (see `scripts/presets.py`, chain-aware):
-  - Ethereum: `smoke`, `core`, `latency_core`, `coverage_core_vm`, `latency_core_vm`, `extended`, `stables`, `lst`, `governance`, `v4_candidates`, `exploratory_protocols`, `erc4626_allowlisted`, `erc4626_negative`
-  - Base: `smoke`, `core`, `aerodrome_presence`, `extended`, `stables`, `governance`, `v4_candidates`
-  - `scripts/run_suite.sh --suite core` keeps the tuned Ethereum defaults: `coverage_core_vm` + `latency_core_vm` when VM is enabled, `latency_core` when it is not.
-- **Latency defaults** (override via env):
-  - `LATENCY_REQUESTS` (default: 200)
-  - `LATENCY_CONCURRENCY` (default: 8)
-  - `LATENCY_CONCURRENCY_VM` (default: 4)
-- **Amounts**: pair-specific ladders when configured, otherwise token-based decimal defaults. Override with `--amounts` on each script.
-
-## Running Individual Steps
-
-Smoke test:
 ```bash
-python3 scripts/simulate_smoke.py --chain-id 1 --suite smoke
+cargo run --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ```
 
-Coverage sweep (writes JSON report):
-```bash
-python3 scripts/coverage_sweep.py --chain-id 1 --suite core --out logs/coverage_sweep.json
-```
+## What the analyzer does
 
-Latency percentiles:
-```bash
-python3 scripts/latency_percentiles.py --chain-id 1 --suite core --requests 200 --concurrency 8
-```
+- reuses the existing local server if it is already responding, otherwise starts it
+- waits for `/status`, including VM readiness when VM pools are enabled
+- allows longer VM warmups on fresh starts; budget up to about 10 minutes before assuming VM pools are stuck
+- runs a balanced `/simulate` sweep across representative pairs
+- builds a narrow 2-hop `/encode` probe from live `/simulate` results
+- runs latency and light stress sweeps
+- saves a JSON report, markdown summary, sampled request/response artifacts, and log excerpts
+- optionally compares the current run with the most recent compatible saved report
 
 ## Output
 
-- Coverage report: `logs/coverage_sweep.json`
-- Server log: `logs/tycho-sim-server.log`
+Default output root:
 
-## Troubleshooting
+```text
+logs/simulation-reports/<chain-id>/balanced/<timestamp>/
+```
 
-- **Server not running**: `scripts/run_suite.sh` starts it for you. For manual control:
-  - `scripts/start_server.sh --repo . --chain-id 1`
-  - `scripts/stop_server.sh --repo .`
-- **Readiness timeouts**: on Ethereum with VM pools enabled, `scripts/run_suite.sh` waits for VM readiness automatically. Check `logs/tycho-sim-server.log` for startup errors.
-- **Wrong chain target**: use `scripts/wait_ready.sh --expect-chain-id <id>` to assert the running deployment.
-- **Degraded responses**: `/simulate` still returns `200 OK` for contract-valid degraded outcomes. The repo suite remains strict and only treats quoteable healthy-path results as success.
+Main artifacts:
 
-## Customization Notes
+- `report.json`: machine-readable run summary
+- `summary.md`: human-readable findings and investigation hints
+- `evidence/`: readiness snapshots, sampled request/response bodies, and log excerpts
 
-- Use `--allow-failures` on the individual Python helpers if you want to tolerate request-visible failures on otherwise usable `complete`/`partial` results.
-- `--allow-failures` does not turn `request_level_failure` or `no_results` into smoke, coverage, latency, or encode-selection success.
-- Use `--allow-no-pools` or `--allow-no-liquidity` when you intentionally want to tolerate `no_liquidity + no_pools` outcomes.
-- Change suites or token lists in `scripts/presets.py` per chain.
+## Behavior model
+
+- Non-zero exit codes are reserved for harness/runtime failures such as startup failures, readiness timeouts, transport failures that prevent analysis, or report-writing issues.
+- Degraded protocol behavior, request-level failures, odd pool visibility, and latency regressions are reported as findings, not hard failures.
+- The analyzer is meant to help agents investigate, not to decide prod-readiness by itself.
+
+## Investigation flow
+
+After a run:
+
+1. Read `summary.md` for the high-level picture.
+2. Inspect `report.json` for exact counts, latencies, and protocol visibility.
+3. Open any sampled artifacts in `evidence/` that look suspicious.
+4. Compare against the saved baseline when the current behavior looks off.
+5. Follow up with targeted manual requests or deeper log analysis when a protocol-specific anomaly needs explanation.
