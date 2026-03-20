@@ -191,7 +191,7 @@ Router-level timeout behavior:
 `/encode` is intentionally different:
 
 - router timeouts return `408 Request Timeout`
-- the payload shape is `{ error, requestId }`
+- the payload shape is `{ error }`, with `requestId` included when available
 
 ## Observability contract
 
@@ -218,6 +218,15 @@ Operational guidance:
 - group by `quote_result_quality` for completeness and degradation monitoring
 - use `partial_kind` to split partial requested-amount coverage from incomplete pool coverage
 - treat `simulate-successes` style queries as `ready + (complete|partial)` only
+
+`/encode` observability:
+
+- `/encode` still does not expose `QuoteMeta`; its API contract stays success/error oriented
+- the handler emits one structured completion event per request instead of relying on per-hop `info` logs
+- summary logs include route shape fields such as `segments`, `hops`, `swaps`, `route_protocols`, `swap_kind`, request amounts, and whether the route uses VM pools
+- failure logs also include stable `encode_error_kind` and `failure_stage` fields
+- current `failure_stage` values are `validation`, `readiness`, `normalization`, `resimulation`, `min_amount_out_guard`, `encoding`, `interaction_build`, `internal`, `handler_timeout`, and `router_timeout`
+- per-segment, per-hop, and per-swap resimulation traces are emitted at `debug`, not `info`
 
 ## Integrations
 

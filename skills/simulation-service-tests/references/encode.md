@@ -30,7 +30,7 @@ python3 scripts/encode_smoke.py --chain-id 8453 --encode-url http://localhost:30
   - `COW_SETTLEMENT_CONTRACT`
   - `TYCHO_ROUTER_ADDRESS`
 - `/encode` fails if the resimulated route `expectedAmountOut < minAmountOut`.
-- Timeout behavior differs from `/simulate`: `/encode` returns `408` with `{ error, requestId }`.
+- Timeout behavior differs from `/simulate`: `/encode` returns `408` with `{ error }`, plus `requestId` when it is available.
 - Chain mismatch between request `chainId` and server runtime chain fails validation.
 - `/simulate` rows with fully-zero `amounts_out` are not usable encode candidates. More generally, `"0"` means that requested amount did not produce a usable quote, not a valid quote.
 
