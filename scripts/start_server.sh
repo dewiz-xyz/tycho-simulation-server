@@ -123,7 +123,7 @@ fi
 
 (
   cd "$repo"
-  nohup cargo run --release > "$log_file" 2>&1 &
+  RUSTFLAGS="-C target-cpu=native -C link-arg=-s" nohup cargo run --release > "$log_file" 2>&1 &
   echo $! > "$pid_file"
 )
 
