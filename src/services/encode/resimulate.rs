@@ -1114,4 +1114,35 @@ mod tests {
 
         assert_timeout_error(err, "pool-vm-slow");
     }
+
+    #[tokio::test]
+    async fn token_cache_surfaces_lookup_request_failures() {
+        let missing_token = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = Arc::new(crate::models::tokens::TokenStore::new(
+            HashMap::new(),
+            "http://127.0.0.1:9".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            TestAppStateConfig::default(),
+        );
+        let mut cache = TokenCache::new(&app_state);
+
+        let err = match cache.get(&missing_token.address).await {
+            Ok(_) => panic!("Expected token cache miss to fail when RPC fetch is unavailable"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::Simulation
+        );
+        assert!(err.message().contains("Token lookup failed"));
+    }
 }

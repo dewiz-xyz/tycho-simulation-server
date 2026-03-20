@@ -82,6 +82,15 @@ pub(super) fn normalize_route(
     })
 }
 
+pub(super) fn route_uses_vm(normalized: &NormalizedRouteInternal) -> bool {
+    normalized
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .any(|swap| swap.pool.protocol.starts_with("vm:"))
+}
+
 fn validate_segment_shape(segment: &SegmentDraft, segment_index: usize) -> Result<(), EncodeError> {
     if segment.hops.is_empty() {
         return Err(EncodeError::invalid(format!(
@@ -263,6 +272,68 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         vec!["rocketpool".to_string()]
+    }
+
+    #[test]
+    fn route_uses_vm_detects_vm_swaps() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000003".to_string(),
+            amount_in: "100".to_string(),
+            min_amount_out: "90".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000004".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000005".to_string(),
+            swap_kind: SwapKind::MultiSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::MultiSwap,
+                share_bps: 0,
+                hops: vec![
+                    HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: PoolRef {
+                                protocol: "uniswap_v2".to_string(),
+                                component_id: "pool-native".to_string(),
+                                pool_address: None,
+                            },
+                            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                            split_bps: 0,
+                        }],
+                    },
+                    HopDraft {
+                        token_in: "0x0000000000000000000000000000000000000002".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000003".to_string(),
+                        swaps: vec![PoolSwapDraft {
+                            pool: PoolRef {
+                                protocol: "vm:maverick_v2".to_string(),
+                                component_id: "pool-vm".to_string(),
+                                pool_address: None,
+                            },
+                            token_in: "0x0000000000000000000000000000000000000002".to_string(),
+                            token_out: "0x0000000000000000000000000000000000000003".to_string(),
+                            split_bps: 0,
+                        }],
+                    },
+                ],
+            }],
+            request_id: None,
+        };
+
+        let normalized = normalize_route(
+            &request,
+            &parse_address(&request.token_in).unwrap(),
+            &parse_address(&request.token_out).unwrap(),
+            &BigUint::from(100u32),
+            &Chain::Ethereum.native_token().address,
+            false,
+            &allowlist(),
+        )
+        .unwrap();
+
+        assert!(route_uses_vm(&normalized));
     }
 
     #[test]

@@ -5,7 +5,7 @@ mod model;
 mod normalize;
 mod request;
 mod resimulate;
-mod response;
+pub(crate) mod response;
 mod tycho_swaps;
 mod wire;
 
@@ -15,14 +15,22 @@ mod fixtures;
 mod mocks;
 
 pub use error::{EncodeError, EncodeErrorKind};
+pub(crate) use response::{log_failure, log_handler_timeout, log_received, log_success};
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;
 
+pub struct EncodeComputation {
+    pub response: RouteEncodeResponse,
+    pub expected_amount_out: String,
+    pub amount_out_delta: String,
+    pub reset_approval: bool,
+}
+
 pub async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
-) -> Result<RouteEncodeResponse, EncodeError> {
+) -> Result<EncodeComputation, EncodeError> {
     let chain = request::validate_chain(request.chain_id, state.chain)?;
     request::validate_swap_kinds(&request)?;
 
@@ -47,17 +55,23 @@ pub async fn encode_route(
         state.erc4626_deposits_enabled,
         allowlist,
     )?;
+    let route_uses_vm = normalize::route_uses_vm(&normalized);
+    let availability = state.encode_availability(route_uses_vm).await;
+    if let Some(message) = availability.availability_message() {
+        return Err(EncodeError::unavailable(message));
+    }
     let resimulated =
         resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out, allowlist)
             .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
-    let encoder = calldata::build_encoder(chain, router_address.clone())?;
     let expected_total = response::compute_expected_total(&resimulated);
     if expected_total < min_amount_out {
         return Err(EncodeError::simulation(
             "Route expectedAmountOut below minAmountOut",
         ));
     }
+    let amount_out_delta = (&expected_total - &min_amount_out).to_string();
+    let encoder = calldata::build_encoder(chain, router_address.clone())?;
     let route_context = calldata::RouteContext {
         request: &request,
         token_in: &token_in,
@@ -84,8 +98,13 @@ pub async fn encode_route(
 
     let debug = response::build_debug(&state, &request).await;
 
-    Ok(RouteEncodeResponse {
-        interactions,
-        debug,
+    Ok(EncodeComputation {
+        response: RouteEncodeResponse {
+            interactions,
+            debug,
+        },
+        expected_amount_out: expected_total.to_string(),
+        amount_out_delta,
+        reset_approval,
     })
 }
