@@ -45,7 +45,7 @@ jobs:
           fi
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
           if [ "$ENV" = "production" ]; then
-            echo "ecr_suffix=mainnet" >> "$GITHUB_OUTPUT"
+            echo "ecr_suffix=quote-base" >> "$GITHUB_OUTPUT"
           else
             echo "ecr_suffix=testnet" >> "$GITHUB_OUTPUT"
           fi
