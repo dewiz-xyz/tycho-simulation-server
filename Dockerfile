@@ -15,9 +15,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ca-certificates openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/tycho-price-service /usr/local/bin/tycho-price-service
+COPY --from=builder /app/target/release/dsolver-simulator-service /usr/local/bin/dsolver-simulator-service
 
 RUN useradd -m appuser
 USER appuser
 
-ENTRYPOINT ["tycho-price-service"]
+ENTRYPOINT ["dsolver-simulator-service"]
