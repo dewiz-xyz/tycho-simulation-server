@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tycho_simulation_server::sim_analysis::run().await
+    dsolver_simulator::sim_analysis::run().await
 }

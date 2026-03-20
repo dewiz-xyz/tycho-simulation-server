@@ -160,7 +160,13 @@ struct BaselineLoad {
 
 struct EncodePrepOutcome {
     report: ScenarioReport,
-    selected_pool: Option<AmountOutResponse>,
+    selected_pool: Option<SelectedPool>,
+}
+
+#[derive(Clone)]
+struct SelectedPool {
+    quote: AmountOutResponse,
+    protocol: String,
 }
 
 impl CliArgs {
@@ -494,10 +500,11 @@ async fn run_encode_scenarios(
     reports.push(first_hop.report);
 
     *protocols
-        .entry(protocol_from_pool_name(&first_pool.pool_name))
+        .entry(first_pool.protocol.clone())
         .or_insert(0usize) += 1;
 
     let hop_amounts = first_pool
+        .quote
         .amounts_out
         .iter()
         .map(|amount| apply_slippage(amount, DEFAULT_SLIPPAGE_BPS))
@@ -532,11 +539,12 @@ async fn run_encode_scenarios(
     reports.push(second_hop.report);
 
     *protocols
-        .entry(protocol_from_pool_name(&second_pool.pool_name))
+        .entry(second_pool.protocol.clone())
         .or_insert(0usize) += 1;
 
     let min_amount_out = apply_slippage(
         second_pool
+            .quote
             .amounts_out
             .first()
             .map(String::as_str)
@@ -605,19 +613,20 @@ async fn run_encode_prep_hop(
         std::slice::from_ref(&artifact),
     );
     let selected_pool = match deserialize_quote_result(&observation) {
-        Ok(quote) => {
-            let selected_pool = select_best_pool(&quote).cloned();
-            if let Some(pool) = &selected_pool {
+        Ok(quote) => match select_best_pool(&quote) {
+            Some(pool) => {
                 report
                     .notes
-                    .push(format!("selected pool candidate: {}", pool.pool_name));
-            } else {
+                    .push(format!("selected pool candidate: {}", pool.quote.pool_name));
+                Some(pool)
+            }
+            None => {
                 report
                     .notes
                     .push("no usable pool row was available for route assembly".to_string());
+                None
             }
-            selected_pool
-        }
+        },
         Err(error) => {
             report.notes.push(format!(
                 "unable to decode hop response for route assembly: {error:#}"
@@ -662,8 +671,8 @@ fn build_encode_route_request(
     token_in: &str,
     mid_token: &str,
     token_out: &str,
-    first_pool: &crate::models::messages::AmountOutResponse,
-    second_pool: &crate::models::messages::AmountOutResponse,
+    first_pool: &SelectedPool,
+    second_pool: &SelectedPool,
     min_amount_out: &str,
 ) -> Result<RouteEncodeRequest> {
     Ok(RouteEncodeRequest {
@@ -703,16 +712,14 @@ fn build_encode_route_request(
     })
 }
 
-fn encode_pool_swap(
-    pool: &crate::models::messages::AmountOutResponse,
-    token_in: &str,
-    token_out: &str,
-) -> PoolSwapDraft {
+fn encode_pool_swap(pool: &SelectedPool, token_in: &str, token_out: &str) -> PoolSwapDraft {
     PoolSwapDraft {
         pool: PoolRef {
-            protocol: protocol_from_pool_name(&pool.pool_name),
-            component_id: pool.pool.clone(),
-            pool_address: Some(pool.pool_address.clone()),
+            // Prefer quote metadata for canonical ids; the analyzer only falls back to known
+            // pool_name prefixes when metadata is absent on an otherwise usable row.
+            protocol: pool.protocol.clone(),
+            component_id: pool.quote.pool.clone(),
+            pool_address: Some(pool.quote.pool_address.clone()),
         },
         token_in: token_in.to_string(),
         token_out: token_out.to_string(),
@@ -1123,8 +1130,8 @@ fn deserialize_quote_result(observation: &RequestObservation) -> Result<QuoteRes
     serde_json::from_value(response.clone()).context("failed to deserialize quote result")
 }
 
-fn select_best_pool(quote: &QuoteResult) -> Option<&crate::models::messages::AmountOutResponse> {
-    quote
+fn select_best_pool(quote: &QuoteResult) -> Option<SelectedPool> {
+    let entry = quote
         .data
         .iter()
         .filter(|entry| {
@@ -1134,7 +1141,22 @@ fn select_best_pool(quote: &QuoteResult) -> Option<&crate::models::messages::Amo
                 .is_some_and(|amount| amount != "0")
                 && entry.amounts_out.iter().any(|amount| amount != "0")
         })
-        .max_by(|left, right| compare_amount_strings(&left.amounts_out[0], &right.amounts_out[0]))
+        .max_by(|left, right| {
+            compare_amount_strings(&left.amounts_out[0], &right.amounts_out[0])
+        })?;
+
+    let protocol = quote
+        .meta
+        .pool_results
+        .iter()
+        .find(|pool| pool.pool == entry.pool)
+        .map(|pool| pool.protocol.clone())
+        .unwrap_or_else(|| protocol_from_pool_name(&entry.pool_name));
+
+    Some(SelectedPool {
+        quote: entry.clone(),
+        protocol,
+    })
 }
 
 fn compare_amount_strings(left: &str, right: &str) -> std::cmp::Ordering {
@@ -1154,11 +1176,43 @@ fn protocols_from_quote(quote: &QuoteResult) -> Vec<String> {
     protocols.into_iter().collect()
 }
 
-fn protocol_from_pool_name(pool_name: &str) -> String {
-    pool_name
+fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
+    let protocol = pool_name
         .split_once("::")
-        .map(|(protocol, _)| protocol.to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map(|(protocol, _)| protocol)
+        .unwrap_or(pool_name);
+    match protocol {
+        "uniswap_v2" | "UniswapV2" => Some("uniswap_v2"),
+        "uniswap_v3" | "UniswapV3" => Some("uniswap_v3"),
+        "uniswap_v4" | "UniswapV4" => Some("uniswap_v4"),
+        "aerodrome_slipstreams" | "AerodromeSlipstreams" => Some("aerodrome_slipstreams"),
+        "ekubo_v2" | "EkuboV2" => Some("ekubo_v2"),
+        "ekubo_v3" | "EkuboV3" => Some("ekubo_v3"),
+        "sushiswap_v2" | "SushiswapV2" => Some("sushiswap_v2"),
+        "pancakeswap_v2" | "PancakeswapV2" | "PancakeSwapV2" => Some("pancakeswap_v2"),
+        "pancakeswap_v3" | "PancakeswapV3" | "PancakeSwapV3" => Some("pancakeswap_v3"),
+        "fluid_v1" | "FluidV1" => Some("fluid_v1"),
+        "rocketpool" | "RocketPool" => Some("rocketpool"),
+        "erc4626" | "ERC4626" => Some("erc4626"),
+        "vm:curve" | "Curve" => Some("vm:curve"),
+        "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
+        "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
+        _ => None,
+    }
+}
+
+fn protocol_from_pool_name(pool_name: &str) -> String {
+    canonical_protocol_from_pool_name(pool_name)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            pool_name
+                .split_once("::")
+                .map(|(protocol, _)| protocol)
+                .unwrap_or(pool_name)
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['-', ' '], "_")
+        })
 }
 
 fn simulate_request(
@@ -1690,7 +1744,11 @@ fn fmt_rate(rate: f64) -> String {
 mod tests {
     use super::{
         capture_log_boundary, collect_logs, discover_latest_baseline, maybe_load_baseline,
-        percentile, sanitize_filename, BaselineMode,
+        percentile, sanitize_filename, select_best_pool, BaselineMode,
+    };
+    use crate::models::messages::{
+        AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
+        QuoteResultQuality, QuoteStatus,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1793,5 +1851,207 @@ mod tests {
         assert!(summary.highlights[0].contains("new error"));
 
         assert!(fs::remove_dir_all(&root).is_ok());
+    }
+
+    #[test]
+    fn select_best_pool_uses_canonical_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "UniswapV3::DAI/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "UniswapV3::DAI/USDC".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "uniswap_v3".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("uniswap_v3")
+        );
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+            Some("pool-1")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_falls_back_to_known_pool_name_prefixes() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "UniswapV3::DAI/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("uniswap_v3")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_preserves_vm_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Curve::USDC/USDT".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "Curve::USDC/USDT".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "vm:curve".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("vm:curve")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_falls_back_to_vm_protocol_from_pool_name() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Curve::USDC/USDT".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("vm:curve")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_falls_back_to_normalized_pool_name_prefix() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "UnknownProtocol::DAI/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("unknownprotocol")
+        );
     }
 }

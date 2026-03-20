@@ -9,6 +9,14 @@ use anyhow::{anyhow, Result};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::NaiveDateTime;
+use dsolver_simulator::api::create_router;
+use dsolver_simulator::models::messages::{
+    EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
+    RouteEncodeResponse, SegmentDraft, SwapKind,
+};
+use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::stream_health::StreamHealth;
+use dsolver_simulator::models::tokens::TokenStore;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tokio::sync::Semaphore;
@@ -21,14 +29,6 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
     Balances, GetAmountOutResult, ProtocolSim,
 };
 use tycho_simulation::tycho_common::Bytes;
-use tycho_simulation_server::api::create_router;
-use tycho_simulation_server::models::messages::{
-    EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
-    RouteEncodeResponse, SegmentDraft, SwapKind,
-};
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
-use tycho_simulation_server::models::stream_health::StreamHealth;
-use tycho_simulation_server::models::tokens::TokenStore;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
