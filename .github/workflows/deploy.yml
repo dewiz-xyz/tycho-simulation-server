@@ -2,7 +2,9 @@ name: Build & Push Docker Image
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
+      - staging
   workflow_dispatch:
     inputs:
       environment:
@@ -32,11 +34,14 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_ENV: ${{ inputs.environment }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             ENV="$INPUT_ENV"
-          else
+          elif [ "$REF_NAME" = "staging" ]; then
             ENV="staging"
+          else
+            ENV="production"
           fi
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
           if [ "$ENV" = "production" ]; then
