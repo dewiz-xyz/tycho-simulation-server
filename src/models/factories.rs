@@ -63,7 +63,7 @@ pub fn encode_router_timeout_result() -> EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{router_timeout_result, simulate_timeout_meta};
+    use super::{encode_router_timeout_result, router_timeout_result, simulate_timeout_meta};
     use crate::models::messages::{QuoteResultQuality, QuoteStatus};
 
     #[test]
@@ -99,5 +99,12 @@ mod tests {
         assert_eq!(meta.total_pools, Some(12));
         assert_eq!(meta.auction_id.as_deref(), Some("auction-1"));
         assert_eq!(meta.failures.len(), 1);
+    }
+
+    #[test]
+    fn encode_router_timeout_result_uses_sentinel_values() {
+        let result = encode_router_timeout_result();
+        assert_eq!(result.error, "Encode request timed out");
+        assert!(result.request_id.is_none());
     }
 }

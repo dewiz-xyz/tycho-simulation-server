@@ -41,6 +41,8 @@ Common optional inputs:
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
 - `GET /status` reports native readiness, VM readiness, block progress, and VM rebuild/restart context for pollers and deploy scripts.
 
+`/encode` keeps its current HTTP control flow, but the server now emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
+
 Detailed integration docs:
 
 - [docs/simulate_example.md](docs/simulate_example.md) for `/simulate` request and response shape
@@ -117,8 +119,10 @@ Timeout behavior differs by endpoint:
 
 - `/simulate` request-guard timeouts return `200 OK` with a contract-valid payload whose `meta.status=ready`, `meta.result_quality=request_level_failure`, and `meta.failures` includes a `timeout`
 - `/simulate` router-boundary timeouts also return `200 OK` with `result_quality=request_level_failure`
-- `/encode` timeouts return `408 Request Timeout` with `{ "error": "...", "requestId": ... }`
+- `/encode` router-boundary timeouts return `408 Request Timeout` with `{ "error": "..." }`, plus `requestId` when it is available
 - `/status` is not wrapped in the router timeout layer
+
+For ops, `/encode` timeout and failure logs include stable `encode_error_kind` and `failure_stage` fields so CloudWatch queries can separate validation, readiness, normalization, resimulation, encoding, `handler_timeout`, and `router_timeout` paths.
 
 If you are integrating against `/simulate`, inspect `meta` on every successful HTTP response. If you are integrating against `/encode`, normal HTTP success and error handling is still the right control flow.
 

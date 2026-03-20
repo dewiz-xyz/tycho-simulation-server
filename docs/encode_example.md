@@ -16,6 +16,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
+- For server-side reporting, rely on the structured summary log emitted for each `/encode` request. Detailed resimulation traces are available at `debug`.
 
 The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for the default 2-hop route on each supported chain, requires both simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on either hop.
 
@@ -203,6 +204,7 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 - Native `tokenIn`/`tokenOut` is supported only for allowlisted protocols (currently `rocketpool`).
   - Native `tokenIn` routes emit a `CALL`-only interaction with `value=amountIn` (no ERC20 approvals).
   - Native usage on non-allowlisted protocols is rejected as an invalid request.
+- The API shape stays success/error oriented. If you need richer server-side failure breakdowns, use logs keyed by `requestId`, `encode_error_kind`, and `failure_stage`.
 
 ### Smoke-test note
 

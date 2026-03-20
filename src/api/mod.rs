@@ -68,7 +68,12 @@ fn handle_encode_timeout_error(err: BoxError, timeout_ms: u64) -> Response {
     if err.is::<Elapsed>() {
         warn!(
             scope = "router_timeout",
-            timeout_ms, "Encode request timed out at router boundary: {}", err
+            timeout_ms,
+            status_code = StatusCode::REQUEST_TIMEOUT.as_u16(),
+            encode_error_kind = "timeout",
+            failure_stage = "router_timeout",
+            error = %err,
+            "Encode request timed out at router boundary"
         );
         return (
             StatusCode::REQUEST_TIMEOUT,

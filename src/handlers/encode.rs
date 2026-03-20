@@ -6,24 +6,19 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use tracing::{info, warn};
 
 use crate::models::messages::{EncodeErrorResponse, RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;
-use crate::services::encode::{encode_route, EncodeErrorKind};
+use crate::services::encode::{
+    encode_route, log_failure, log_handler_timeout, log_received, log_success,
+};
 
 pub async fn encode(
     State(state): State<AppState>,
     Json(request): Json<RouteEncodeRequest>,
 ) -> Response {
     let started_at = Instant::now();
-    let request_id = request.request_id.as_deref();
-
-    info!(
-        request_id,
-        segments = request.segments.len(),
-        "Received encode request"
-    );
+    log_received(&request);
 
     let request_timeout = state.request_timeout();
     let state_for_computation = state.clone();
@@ -33,12 +28,10 @@ pub async fn encode(
 
     let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await else {
         let timeout_ms = request_timeout.as_millis() as u64;
-        warn!(
-            scope = "handler_timeout",
-            request_id,
+        log_handler_timeout(
+            &request,
             timeout_ms,
-            latency_ms = started_at.elapsed().as_millis() as u64,
-            "Encode request timed out at request-level guard"
+            started_at.elapsed().as_millis() as u64,
         );
 
         let body = Json(EncodeErrorResponse {
@@ -50,14 +43,9 @@ pub async fn encode(
 
     let latency_ms = started_at.elapsed().as_millis() as u64;
     match computation {
-        Ok(response) => {
-            info!(
-                request_id,
-                latency_ms,
-                interactions = response.interactions.len(),
-                "Encode request completed"
-            );
-            Json::<RouteEncodeResponse>(response).into_response()
+        Ok(computation) => {
+            log_success(&request, &computation, latency_ms);
+            Json::<RouteEncodeResponse>(computation.response).into_response()
         }
         Err(err) => {
             let status = err.status_code();
@@ -65,32 +53,7 @@ pub async fn encode(
                 error: err.message().to_string(),
                 request_id: request.request_id.clone(),
             });
-            match err.kind() {
-                EncodeErrorKind::InvalidRequest => {
-                    warn!(
-                        request_id,
-                        latency_ms,
-                        error = err.message(),
-                        "Invalid encode request"
-                    );
-                }
-                EncodeErrorKind::Simulation | EncodeErrorKind::Encoding => {
-                    warn!(
-                        request_id,
-                        latency_ms,
-                        error = err.message(),
-                        "Encode failed"
-                    );
-                }
-                EncodeErrorKind::Internal | EncodeErrorKind::NotFound => {
-                    warn!(
-                        request_id,
-                        latency_ms,
-                        error = err.message(),
-                        "Encode failed with internal error"
-                    );
-                }
-            }
+            log_failure(&request, status, err.kind(), err.message(), latency_ms);
             (status, body).into_response()
         }
     }
