@@ -5,15 +5,18 @@ on:
     branches:
       - master
       - staging
+      - shadow
   workflow_dispatch:
     inputs:
-      environment:
-        description: Target environment
+      target:
+        description: Target stack
         required: true
         type: choice
         options:
-          - staging
-          - production
+          - quote-base
+          - solve-base
+          - shadow
+          - staging-solve-base
 
 permissions:
   id-token: write
@@ -23,38 +26,47 @@ env:
   AWS_REGION: eu-central-1
 
 jobs:
-  determine-env:
-    name: Determine Environment
+  determine-targets:
+    name: Determine Targets
     runs-on: ubuntu-latest
     outputs:
-      environment: ${{ steps.env.outputs.environment }}
-      ecr_suffix: ${{ steps.env.outputs.ecr_suffix }}
+      targets: ${{ steps.targets.outputs.targets }}
+      environment: ${{ steps.targets.outputs.environment }}
     steps:
-      - id: env
+      - id: targets
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_ENV: ${{ inputs.environment }}
+          INPUT_TARGET: ${{ inputs.target }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            ENV="$INPUT_ENV"
+            TARGETS="[\"$INPUT_TARGET\"]"
+            case "$INPUT_TARGET" in
+              quote-base|solve-base) ENV="production" ;;
+              shadow|staging-solve-base) ENV="staging" ;;
+            esac
+          elif [ "$REF_NAME" = "shadow" ]; then
+            TARGETS='["shadow"]'
+            ENV="staging"
           elif [ "$REF_NAME" = "staging" ]; then
+            TARGETS='["staging-solve-base"]'
             ENV="staging"
           else
+            TARGETS='["quote-base","solve-base"]'
             ENV="production"
           fi
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
-          if [ "$ENV" = "production" ]; then
-            echo "ecr_suffix=quote-base" >> "$GITHUB_OUTPUT"
-          else
-            echo "ecr_suffix=testnet" >> "$GITHUB_OUTPUT"
-          fi
 
   build:
-    name: Build & Push
-    needs: determine-env
+    name: Build & Push (${{ matrix.target }})
+    needs: determine-targets
     runs-on: ubuntu-latest
-    environment: ${{ needs.determine-env.outputs.environment }}
+    environment: ${{ needs.determine-targets.outputs.environment }}
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.determine-targets.outputs.targets) }}
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -74,7 +86,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.ecr_suffix }}:${{ github.sha }}
-            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ needs.determine-env.outputs.ecr_suffix }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
