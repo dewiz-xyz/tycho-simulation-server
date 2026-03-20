@@ -4,6 +4,7 @@ mod report;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::BigUint;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
@@ -109,6 +110,11 @@ struct ScriptPaths {
 struct LifecycleState {
     started_server: bool,
     initial_readiness: ReadinessSnapshot,
+}
+
+struct StartupBindConfig {
+    host: String,
+    port: u16,
 }
 
 struct LogBoundary {
@@ -388,27 +394,73 @@ async fn ensure_server_ready(
             }
         }
         Err(_) => {
-            start_server(scripts, repo, args.chain_id)?;
+            start_server(scripts, repo, args.chain_id, &args.base_url)?;
             started_server = true;
         }
     }
 
-    wait_for_readiness(scripts, &status_url, args.chain_id, false)?;
-    let mut snapshot = fetch_readiness_snapshot(client, &status_url)
-        .await
-        .context("failed to fetch readiness after wait_ready")?;
-
-    if snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready") {
-        wait_for_readiness(scripts, &status_url, args.chain_id, true)?;
-        snapshot = fetch_readiness_snapshot(client, &status_url)
+    let readiness_result = async {
+        wait_for_readiness(scripts, &status_url, args.chain_id, false)?;
+        let mut snapshot = fetch_readiness_snapshot(client, &status_url)
             .await
-            .context("failed to fetch readiness after VM wait")?;
+            .context("failed to fetch readiness after wait_ready")?;
+
+        if snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready") {
+            wait_for_readiness(scripts, &status_url, args.chain_id, true)?;
+            snapshot = fetch_readiness_snapshot(client, &status_url)
+                .await
+                .context("failed to fetch readiness after VM wait")?;
+        }
+
+        Ok(snapshot)
     }
+    .await;
+
+    let snapshot = match readiness_result {
+        Ok(snapshot) => snapshot,
+        Err(err) if started_server && args.stop => {
+            return match stop_server(scripts, repo) {
+                Ok(()) => Err(err),
+                Err(stop_err) => Err(anyhow!(
+                    "{err}; failed to stop server after readiness failure: {stop_err}"
+                )),
+            };
+        }
+        Err(err) => return Err(err),
+    };
 
     Ok(LifecycleState {
         started_server,
         initial_readiness: snapshot,
     })
+}
+
+fn startup_bind_config(base_url: &str) -> Result<StartupBindConfig> {
+    let url = Url::parse(base_url)
+        .with_context(|| format!("failed to parse --base-url {base_url} for auto-start"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("--base-url must include a host for auto-start: {base_url}"))?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        anyhow!("--base-url must include a port or use http/https for auto-start: {base_url}")
+    })?;
+
+    Ok(StartupBindConfig {
+        host: normalize_startup_host(host)?,
+        port,
+    })
+}
+
+fn normalize_startup_host(host: &str) -> Result<String> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+
+    host.parse::<IpAddr>()
+        .with_context(|| {
+            format!("--base-url host must be an IP address or localhost for auto-start: {host}")
+        })
+        .map(|_| host.to_string())
 }
 
 async fn run_simulate_scenario(
@@ -1289,17 +1341,19 @@ async fn fetch_readiness_snapshot(client: &Client, url: &str) -> Result<Readines
     serde_json::from_value(value).context("failed to deserialize readiness snapshot")
 }
 
-fn start_server(scripts: &ScriptPaths, repo: &Path, chain_id: u64) -> Result<()> {
-    run_script(
-        &scripts.start_server,
-        &[
-            "--repo".to_string(),
-            repo.display().to_string(),
-            "--chain-id".to_string(),
-            chain_id.to_string(),
-        ],
-    )
-    .map(|_| ())
+fn start_server(scripts: &ScriptPaths, repo: &Path, chain_id: u64, base_url: &str) -> Result<()> {
+    let bind = startup_bind_config(base_url)?;
+    let args = vec![
+        "--repo".to_string(),
+        repo.display().to_string(),
+        "--chain-id".to_string(),
+        chain_id.to_string(),
+        "--env".to_string(),
+        format!("HOST={}", bind.host),
+        "--env".to_string(),
+        format!("PORT={}", bind.port),
+    ];
+    run_script(&scripts.start_server, &args).map(|_| ())
 }
 
 fn stop_server(scripts: &ScriptPaths, repo: &Path) -> Result<()> {
@@ -1743,15 +1797,19 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_log_boundary, collect_logs, discover_latest_baseline, maybe_load_baseline,
-        percentile, sanitize_filename, select_best_pool, BaselineMode,
+        capture_log_boundary, collect_logs, discover_latest_baseline, ensure_server_ready,
+        maybe_load_baseline, percentile, sanitize_filename, select_best_pool, startup_bind_config,
+        BaselineMode, CliArgs, ScriptPaths,
     };
     use crate::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
         QuoteResultQuality, QuoteStatus,
     };
+    use reqwest::Client;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_test_dir(name: &str) -> PathBuf {
@@ -1765,6 +1823,18 @@ mod tests {
         ))
     }
 
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        assert!(fs::write(path, contents).is_ok());
+        let metadata_result = fs::metadata(path);
+        assert!(metadata_result.is_ok());
+        let Some(metadata) = metadata_result.ok() else {
+            return;
+        };
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        assert!(fs::set_permissions(path, permissions).is_ok());
+    }
+
     #[test]
     fn percentile_interpolates_between_points() {
         let values = [10.0, 20.0, 30.0, 40.0];
@@ -1774,6 +1844,147 @@ mod tests {
     #[test]
     fn sanitize_filename_replaces_spaces() {
         assert_eq!(sanitize_filename("hello world"), "hello-world");
+    }
+
+    #[test]
+    fn startup_bind_config_normalizes_localhost_and_preserves_explicit_port() {
+        let bind_result = startup_bind_config("http://localhost:4100");
+        assert!(bind_result.is_ok());
+        let Some(bind) = bind_result.ok() else {
+            return;
+        };
+
+        assert_eq!(bind.host, "127.0.0.1");
+        assert_eq!(bind.port, 4100);
+    }
+
+    #[test]
+    fn startup_bind_config_uses_scheme_default_port() {
+        let bind_result = startup_bind_config("https://127.0.0.1");
+        assert!(bind_result.is_ok());
+        let Some(bind) = bind_result.ok() else {
+            return;
+        };
+
+        assert_eq!(bind.host, "127.0.0.1");
+        assert_eq!(bind.port, 443);
+    }
+
+    #[tokio::test]
+    async fn ensure_server_ready_stops_started_server_when_wait_ready_fails_and_stop_is_set() {
+        let root = temp_test_dir("ensure-ready-stop");
+        let scripts_dir = root.join("scripts");
+        assert!(fs::create_dir_all(&scripts_dir).is_ok());
+
+        let start_marker = root.join("start-called");
+        let stop_marker = root.join("stop-called");
+        write_executable(
+            &scripts_dir.join("start_server.sh"),
+            &format!("#!/bin/sh\ntouch {}\n", start_marker.display()),
+        );
+        write_executable(
+            &scripts_dir.join("stop_server.sh"),
+            &format!("#!/bin/sh\ntouch {}\n", stop_marker.display()),
+        );
+        write_executable(
+            &scripts_dir.join("wait_ready.sh"),
+            "#!/bin/sh\necho wait-ready failed >&2\nexit 1\n",
+        );
+
+        let client_result = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build();
+        assert!(client_result.is_ok());
+        let Some(client) = client_result.ok() else {
+            return;
+        };
+
+        let result = ensure_server_ready(
+            &client,
+            &ScriptPaths::new(&root),
+            &root,
+            &CliArgs {
+                repo: root.clone(),
+                chain_id: 1,
+                profile: "balanced".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                report_dir: None,
+                baseline: BaselineMode::Latest,
+                stop: true,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let Some(error) = result.err() else {
+            return;
+        };
+        let message = error.to_string();
+        assert!(message.contains("wait_ready.sh failed: wait-ready failed"));
+        assert!(start_marker.exists());
+        assert!(stop_marker.exists());
+        assert!(fs::remove_dir_all(&root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ensure_server_ready_keeps_readiness_error_when_cleanup_also_fails() {
+        let root = temp_test_dir("ensure-ready-stop-fail");
+        let scripts_dir = root.join("scripts");
+        assert!(fs::create_dir_all(&scripts_dir).is_ok());
+
+        let start_marker = root.join("start-called");
+        let stop_marker = root.join("stop-called");
+        write_executable(
+            &scripts_dir.join("start_server.sh"),
+            &format!("#!/bin/sh\ntouch {}\n", start_marker.display()),
+        );
+        write_executable(
+            &scripts_dir.join("stop_server.sh"),
+            &format!(
+                "#!/bin/sh\ntouch {}\necho stop failed >&2\nexit 1\n",
+                stop_marker.display()
+            ),
+        );
+        write_executable(
+            &scripts_dir.join("wait_ready.sh"),
+            "#!/bin/sh\necho wait-ready failed >&2\nexit 1\n",
+        );
+
+        let client_result = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build();
+        assert!(client_result.is_ok());
+        let Some(client) = client_result.ok() else {
+            return;
+        };
+
+        let result = ensure_server_ready(
+            &client,
+            &ScriptPaths::new(&root),
+            &root,
+            &CliArgs {
+                repo: root.clone(),
+                chain_id: 1,
+                profile: "balanced".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                report_dir: None,
+                baseline: BaselineMode::Latest,
+                stop: true,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let Some(error) = result.err() else {
+            return;
+        };
+        let message = error.to_string();
+        assert!(message.contains("wait_ready.sh failed: wait-ready failed"));
+        assert!(message.contains("failed to stop server after readiness failure"));
+        assert!(message.contains("stop_server.sh failed: stop failed"));
+        assert!(start_marker.exists());
+        assert!(stop_marker.exists());
+        assert!(fs::remove_dir_all(&root).is_ok());
     }
 
     #[test]

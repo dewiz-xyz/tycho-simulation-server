@@ -161,7 +161,7 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
-- `skills/simulation-service-tests/SKILL.md`: repo-local analysis skill
+- `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
 
 ## License
