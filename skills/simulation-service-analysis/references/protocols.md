@@ -1,0 +1,52 @@
+# Protocol feeds (what this server subscribes to)
+
+The service subscribes to chain-specific Tycho exchanges at startup (see `src/config/mod.rs` and `src/services/stream_builder.rs`).
+
+## Native feeds by chain
+
+### Ethereum (`CHAIN_ID=1`)
+- `uniswap_v2`
+- `sushiswap_v2`
+- `pancakeswap_v2`
+- `uniswap_v3`
+- `pancakeswap_v3`
+- `uniswap_v4`
+- `ekubo_v2`
+- `fluid_v1`
+- `rocketpool`
+- `erc4626`
+- `ekubo_v3`
+
+### Base (`CHAIN_ID=8453`)
+- `uniswap_v2`
+- `uniswap_v3`
+- `uniswap_v4`
+- `pancakeswap_v3`
+- `aerodrome_slipstreams`
+
+## VM feeds by chain
+
+### Ethereum (`CHAIN_ID=1`)
+- `vm:curve`
+- `vm:balancer_v2`
+- `vm:maverick_v2`
+
+### Base (`CHAIN_ID=8453`)
+- No VM protocols configured in this iteration.
+
+## Effective VM enablement
+
+- Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
+- This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
+- The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
+
+## Notes that affect local analysis
+
+- Always pass chain context to the analyzer (`--chain-id` or env `CHAIN_ID`).
+- The analyzer uses representative pairs for native, stable, governance, and VM-sensitive paths. Treat protocol visibility as evidence, not as a hard assertion that every protocol must surface on every run.
+- Ethereum runs can take longer when VM pools are enabled. If the analyzer waits on VM readiness, that is expected on cold starts.
+- Base should keep Aerodrome visible somewhere in the balanced report, but absence is a finding to investigate rather than an automatic failure.
+- ERC4626 and other edge features are still highly state-sensitive. Use the analyzer report to decide whether you need deeper focused requests rather than baking every edge path into the default run.
+- TVL filtering matters: pools are included or removed based on `TVL_THRESHOLD` and `TVL_KEEP_RATIO`.
+  If a protocol disappears unexpectedly, lowering `TVL_THRESHOLD` may be worth testing in a follow-up run.
+- Protocol labels in the analyzer are inferred from returned pool data and `meta.pool_results`. They are useful for comparison and triage, but they are still downstream observations of live state.

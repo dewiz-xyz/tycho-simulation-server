@@ -5,6 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
+use dsolver_simulator::config::MemoryConfig;
+use dsolver_simulator::handlers::stream::{
+    process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
+};
+use dsolver_simulator::models::messages::AmountOutRequest;
+use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::stream_health::StreamHealth;
+use dsolver_simulator::models::tokens::TokenStore;
+use dsolver_simulator::services::quotes::get_amounts_out;
 use futures::stream;
 use jemalloc_ctl as jemalloc;
 use jemallocator::Jemalloc;
@@ -25,15 +34,6 @@ use tycho_simulation::tycho_common::{
     },
     Bytes,
 };
-use tycho_simulation_server::config::MemoryConfig;
-use tycho_simulation_server::handlers::stream::{
-    process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
-};
-use tycho_simulation_server::models::messages::AmountOutRequest;
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
-use tycho_simulation_server::models::stream_health::StreamHealth;
-use tycho_simulation_server::models::tokens::TokenStore;
-use tycho_simulation_server::services::quotes::get_amounts_out;
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;

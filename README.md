@@ -21,6 +21,8 @@ cp .env.example .env
 cargo run --release
 ```
 
+`cargo run --release` starts `dsolver-simulator-service` via the repo's Cargo `default-run`.
+
 Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
@@ -137,11 +139,11 @@ cargo nextest run
 cargo build --release
 ```
 
-Repo harness:
+Local analysis harness:
 
 ```bash
-scripts/run_suite.sh --repo . --chain-id 1 --stop
-scripts/run_suite.sh --repo . --chain-id 8453 --stop
+cargo run --bin sim-analysis -- --chain-id 1 --stop
+cargo run --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 Useful helpers:
@@ -149,19 +151,17 @@ Useful helpers:
 - `scripts/start_server.sh` to start the server with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain and VM readiness expectations
 - `scripts/stop_server.sh` to stop a server started by the repo helper
-- `scripts/run_suite.sh` to run smoke, encode smoke, coverage, and latency checks
+- `cargo run --bin sim-analysis -- ...` to generate a JSON + markdown local behavior report
 
-The repo suite is intentionally strict: it keeps verification on successful responses with usable quotes and fails on request-visible degradation even when `/simulate` still returns a contract-valid `200 OK` payload.
-
-That strictness also applies to requested-amount semantics: smoke validation treats `amounts_out[i] = "0"` as "no usable quote for that requested amount," not as a valid quote, and encode smoke uses dedicated realistic amount presets that must stay usable across both tested hops.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass/fail harness.
 
 ## Docs Map
 
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
-- [STRESS_TEST_README.md](STRESS_TEST_README.md): coverage, latency, and stress-test workflows
-- `skills/simulation-service-tests/SKILL.md`: repo-local validation workflow
+- [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
+- `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
 
 ## License
