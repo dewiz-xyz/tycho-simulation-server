@@ -772,9 +772,13 @@ async fn encode_route_rejects_when_request_chain_does_not_match_runtime_chain() 
 }
 
 #[tokio::test]
-async fn encode_route_rejects_when_native_state_is_not_ready() -> Result<()> {
+async fn encode_route_vm_only_succeeds_when_native_state_is_not_ready() -> Result<()> {
     let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
         vm_pool: true,
+        enable_vm_pools: true,
         ensure_native_ready_store: false,
         mark_native_healthy: false,
         request_id: "req-native-not-ready",
@@ -783,13 +787,13 @@ async fn encode_route_rejects_when_native_state_is_not_ready() -> Result<()> {
     let (app, request) = setup_app_state_and_request(config).await?;
 
     let (status, body) = post_encode(app, &request).await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert_eq!(
-        response.error,
-        "Encode unavailable: native state warming up"
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
     );
-    assert_eq!(response.request_id.as_deref(), Some("req-native-not-ready"));
     Ok(())
 }
 

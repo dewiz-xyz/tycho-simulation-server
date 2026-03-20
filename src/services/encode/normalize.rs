@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn route_uses_vm_detects_vm_swaps() {
+    fn route_backend_usage_detects_mixed_routes() {
         let request = RouteEncodeRequest {
             chain_id: 1,
             token_in: "0x0000000000000000000000000000000000000001".to_string(),
@@ -348,7 +348,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(route_uses_vm(&normalized));
+        assert_eq!(route_backend_usage(&normalized), (true, true));
     }
 
     #[test]

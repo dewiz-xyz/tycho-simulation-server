@@ -1124,17 +1124,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encode_availability_requires_vm_only_for_vm_routes() {
-        let state = build_readiness_test_state(false).await;
-        state.native_stream_health.record_update(1).await;
+    async fn encode_availability_gates_backends_by_route_shape() {
+        let native_ready_vm_disabled = build_readiness_test_state(false).await;
+        native_ready_vm_disabled
+            .native_stream_health
+            .record_update(1)
+            .await;
 
         assert_eq!(
-            state.encode_availability(false).await,
+            native_ready_vm_disabled
+                .encode_availability(true, false)
+                .await,
             EncodeAvailability::Ready
         );
         assert_eq!(
-            state.encode_availability(true).await,
+            native_ready_vm_disabled
+                .encode_availability(false, true)
+                .await,
             EncodeAvailability::VmDisabled
+        );
+        assert_eq!(
+            native_ready_vm_disabled
+                .encode_availability(true, true)
+                .await,
+            EncodeAvailability::VmDisabled
+        );
+
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_warming_vm_ready = build_test_app_state(
+            token_store,
+            native_state_store,
+            Arc::clone(&vm_state_store),
+            true,
+            1,
+            1,
+        );
+        vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    31,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        native_warming_vm_ready
+            .vm_stream_health
+            .record_update(1)
+            .await;
+
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(true, false)
+                .await,
+            EncodeAvailability::NativeWarmingUp
+        );
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(false, true)
+                .await,
+            EncodeAvailability::Ready
+        );
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(true, true)
+                .await,
+            EncodeAvailability::NativeWarmingUp
         );
     }
 
@@ -1543,7 +1609,7 @@ mod tests {
 
         assert_eq!(app_state.vm_readiness().await, VmReadiness::Rebuilding);
         assert_eq!(
-            app_state.encode_availability(true).await,
+            app_state.encode_availability(false, true).await,
             EncodeAvailability::VmRebuilding
         );
     }
