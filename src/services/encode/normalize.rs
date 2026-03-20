@@ -82,13 +82,28 @@ pub(super) fn normalize_route(
     })
 }
 
-pub(super) fn route_uses_vm(normalized: &NormalizedRouteInternal) -> bool {
-    normalized
+pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool, bool) {
+    let mut uses_native = false;
+    let mut uses_vm = false;
+
+    for swap in normalized
         .segments
         .iter()
         .flat_map(|segment| segment.hops.iter())
         .flat_map(|hop| hop.swaps.iter())
-        .any(|swap| swap.pool.protocol.starts_with("vm:"))
+    {
+        if swap.pool.protocol.starts_with("vm:") {
+            uses_vm = true;
+        } else {
+            uses_native = true;
+        }
+
+        if uses_native && uses_vm {
+            break;
+        }
+    }
+
+    (uses_native, uses_vm)
 }
 
 fn validate_segment_shape(segment: &SegmentDraft, segment_index: usize) -> Result<(), EncodeError> {

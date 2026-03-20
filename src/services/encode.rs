@@ -55,8 +55,8 @@ pub async fn encode_route(
         state.erc4626_deposits_enabled,
         allowlist,
     )?;
-    let route_uses_vm = normalize::route_uses_vm(&normalized);
-    let availability = state.encode_availability(route_uses_vm).await;
+    let (uses_native, uses_vm) = normalize::route_backend_usage(&normalized);
+    let availability = state.encode_availability(uses_native, uses_vm).await;
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }

@@ -178,14 +178,20 @@ impl AppState {
         }
     }
 
-    pub async fn encode_availability(&self, route_uses_vm: bool) -> EncodeAvailability {
-        match self.native_readiness().await {
-            NativeReadiness::Ready => {}
-            NativeReadiness::WarmingUp => return EncodeAvailability::NativeWarmingUp,
-            NativeReadiness::Stale => return EncodeAvailability::NativeStale,
+    pub(crate) async fn encode_availability(
+        &self,
+        uses_native: bool,
+        uses_vm: bool,
+    ) -> EncodeAvailability {
+        if uses_native {
+            match self.native_readiness().await {
+                NativeReadiness::Ready => {}
+                NativeReadiness::WarmingUp => return EncodeAvailability::NativeWarmingUp,
+                NativeReadiness::Stale => return EncodeAvailability::NativeStale,
+            }
         }
 
-        if !route_uses_vm {
+        if !uses_vm {
             return EncodeAvailability::Ready;
         }
 
