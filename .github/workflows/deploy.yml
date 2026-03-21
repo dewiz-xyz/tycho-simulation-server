@@ -90,3 +90,9 @@ jobs:
             ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Force deploy ECS service
+        env:
+          CLUSTER: ${{ matrix.target }}
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service tycho-simulator --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
