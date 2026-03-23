@@ -5,6 +5,7 @@ use tycho_execution::encoding::errors::EncodingError;
 pub enum EncodeErrorKind {
     InvalidRequest,
     NotFound,
+    Unavailable,
     Simulation,
     Encoding,
     Internal,
@@ -38,6 +39,13 @@ impl EncodeError {
         }
     }
 
+    pub fn unavailable<T: Into<String>>(message: T) -> Self {
+        Self {
+            kind: EncodeErrorKind::Unavailable,
+            message: message.into(),
+        }
+    }
+
     pub fn encoding<T: Into<String>>(message: T) -> Self {
         Self {
             kind: EncodeErrorKind::Encoding,
@@ -56,6 +64,7 @@ impl EncodeError {
         match self.kind {
             EncodeErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
             EncodeErrorKind::NotFound => StatusCode::NOT_FOUND,
+            EncodeErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             EncodeErrorKind::Simulation => StatusCode::UNPROCESSABLE_ENTITY,
             EncodeErrorKind::Encoding | EncodeErrorKind::Internal => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -78,5 +87,19 @@ pub(super) fn map_encoding_error(err: EncodingError) -> EncodeError {
             EncodeError::invalid(format!("Tycho encoding error: {err}"))
         }
         _ => EncodeError::encoding(format!("Tycho encoding error: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncodeError, EncodeErrorKind};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn unavailable_errors_map_to_service_unavailable() {
+        let error = EncodeError::unavailable("Encode unavailable: native state warming up");
+
+        assert_eq!(error.kind(), EncodeErrorKind::Unavailable);
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

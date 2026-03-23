@@ -2426,6 +2426,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
+name = "dsolver-simulator"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 1.5.4",
+ "alloy-sol-types",
+ "anyhow",
+ "axum 0.7.9",
+ "chrono",
+ "dotenv",
+ "futures 0.3.31",
+ "jemalloc-ctl",
+ "jemallocator",
+ "num-bigint",
+ "num-traits",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "tycho-execution",
+ "tycho-simulation",
+ "typetag",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6544,35 +6573,6 @@ dependencies = [
  "tycho-ethereum",
  "typetag",
  "uuid",
-]
-
-[[package]]
-name = "tycho-simulation-server"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives 1.5.4",
- "alloy-sol-types",
- "anyhow",
- "axum 0.7.9",
- "chrono",
- "dotenv",
- "futures 0.3.31",
- "jemalloc-ctl",
- "jemallocator",
- "num-bigint",
- "num-traits",
- "rand 0.8.5",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-subscriber 0.3.22",
- "tycho-execution",
- "tycho-simulation",
- "typetag",
 ]
 
 [[package]]

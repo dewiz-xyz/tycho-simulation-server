@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 
 #[expect(
     clippy::trivially_copy_pass_by_ref,
@@ -18,14 +18,13 @@ pub struct AmountOutRequest {
     pub amounts: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AmountOutResponse {
     pub pool: String,
     pub pool_name: String,
     pub pool_address: String,
     pub amounts_out: Vec<String>,
     pub gas_used: Vec<u64>,
-    pub gas_in_sell: String,
     pub block_number: u64,
     /// Per-ladder-step slippage in basis points (1 bps = 0.01%).
     /// Positive = price impact against the trader; negative = favourable fill.
@@ -45,7 +44,7 @@ pub struct AmountOutResponse {
 }
 
 /// Qualitative risk level derived from the composite `risk_score`.
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     /// `risk_score < 200` — deep pool, minimal sensitivity to concurrent activity.
@@ -66,7 +65,7 @@ pub enum RiskLevel {
 /// slippage (price sensitivity), utilization (capacity pressure), curve convexity,
 /// and partial-ladder detection.  Block-lag staleness is **not** included here —
 /// clients should add that penalty using `block_number` vs. current chain head.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExecutionRisk {
     /// Weighted composite score.  Lower is safer.
     /// `< 200` → low; `200–499` → medium; `500–999` → high; `>= 1000` → very high.
@@ -75,7 +74,7 @@ pub struct ExecutionRisk {
     pub risk_level: RiskLevel,
 }
 
-#[derive(Debug, Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStatus {
     Ready,
@@ -86,7 +85,7 @@ pub enum QuoteStatus {
     InternalError,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteResultQuality {
     Complete,
@@ -95,7 +94,7 @@ pub enum QuoteResultQuality {
     RequestLevelFailure,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotePartialKind {
     AmountLadders,
@@ -103,7 +102,7 @@ pub enum QuotePartialKind {
     Mixed,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolOutcomeKind {
     PartialOutput,
@@ -158,7 +157,32 @@ impl Serialize for QuoteFailureKind {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+impl<'de> Deserialize<'de> for QuoteFailureKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "warm_up" => Ok(Self::WarmUp),
+            "token_validation" => Ok(Self::TokenValidation),
+            "token_coverage" => Ok(Self::TokenCoverage),
+            "timeout" => Ok(Self::Timeout),
+            "concurrency_limit" => Ok(Self::ConcurrencyLimit),
+            "overflow" => Ok(Self::Overflow),
+            "simulator" => Ok(Self::Simulator),
+            "no_pools" => Ok(Self::NoPools),
+            "inconsistent_result" => Ok(Self::InconsistentResult),
+            "internal" => Ok(Self::Internal),
+            "invalid_request" => Ok(Self::InvalidRequest),
+            _ => Err(D::Error::custom(format!(
+                "unknown quote failure kind: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuoteFailure {
     pub kind: QuoteFailureKind,
     pub message: String,
@@ -172,7 +196,7 @@ pub struct QuoteFailure {
     pub protocol: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PoolSimulationOutcome {
     pub pool: String,
     pub pool_name: String,
@@ -185,7 +209,7 @@ pub struct PoolSimulationOutcome {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuoteMeta {
     pub status: QuoteStatus,
     pub result_quality: QuoteResultQuality,
@@ -208,7 +232,7 @@ pub struct QuoteMeta {
     pub failures: Vec<QuoteFailure>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuoteResult {
     pub request_id: String,
     pub data: Vec<AmountOutResponse>,
@@ -410,7 +434,6 @@ mod tests {
             pool_address: "0x1".to_string(),
             amounts_out: vec!["1".to_string()],
             gas_used: vec![1],
-            gas_in_sell: "3000000".to_string(),
             block_number: 1,
             slippage_bps: Vec::new(),
             pool_utilization_bps: None,
@@ -418,7 +441,6 @@ mod tests {
         };
 
         let value = serde_json::to_value(response)?;
-        assert_eq!(value["gas_in_sell"], "3000000");
         assert!(value.get("gasInSellToken").is_none());
         Ok(())
     }
@@ -466,7 +488,6 @@ mod tests {
             pool_address: "0x1".to_string(),
             amounts_out: vec!["1".to_string()],
             gas_used: vec![1],
-            gas_in_sell: "0".to_string(),
             block_number: 1,
             slippage_bps: Vec::new(),
             pool_utilization_bps: None,
@@ -487,7 +508,6 @@ mod tests {
             pool_address: "0x1".to_string(),
             amounts_out: vec!["1".to_string()],
             gas_used: vec![1],
-            gas_in_sell: "0".to_string(),
             block_number: 1,
             slippage_bps: Vec::new(),
             pool_utilization_bps: None,

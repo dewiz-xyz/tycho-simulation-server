@@ -21,7 +21,6 @@ The per-pool response shape is `AmountOutResponse`:
 - `pool_address`
 - `amounts_out`
 - `gas_used`
-- `gas_in_sell`
 - `block_number`
 
 The request-level metadata shape is `QuoteMeta`:
@@ -123,7 +122,6 @@ Candidate discovery:
 
 - native candidates come from the native state store
 - VM candidates come from the VM state store only when VM state is ready
-- spot-native helper candidates are loaded for request-scoped gas conversion when the sell token is not native or wrapped native
 
 Execution rules:
 
@@ -193,7 +191,7 @@ Router-level timeout behavior:
 `/encode` is intentionally different:
 
 - router timeouts return `408 Request Timeout`
-- the payload shape is `{ error, requestId }`
+- the payload shape is `{ error }`, with `requestId` included when available
 
 ## Observability contract
 
@@ -221,6 +219,15 @@ Operational guidance:
 - use `partial_kind` to split partial requested-amount coverage from incomplete pool coverage
 - treat `simulate-successes` style queries as `ready + (complete|partial)` only
 
+`/encode` observability:
+
+- `/encode` still does not expose `QuoteMeta`; its API contract stays success/error oriented
+- the handler emits one structured completion event per request instead of relying on per-hop `info` logs
+- summary logs include route shape fields such as `segments`, `hops`, `swaps`, `route_protocols`, `swap_kind`, request amounts, and whether the route uses VM pools
+- failure logs also include stable `encode_error_kind` and `failure_stage` fields
+- current `failure_stage` values are `validation`, `readiness`, `normalization`, `resimulation`, `min_amount_out_guard`, `encoding`, `interaction_build`, `internal`, `handler_timeout`, and `router_timeout`
+- per-segment, per-hop, and per-swap resimulation traces are emitted at `debug`, not `info`
+
 ## Integrations
 
 `/encode` integration:
@@ -231,11 +238,11 @@ Operational guidance:
 - clients should filter returned rows explicitly for the amount position they need instead of relying on `data[0]`
 - repo encode smoke uses dedicated realistic amount presets per default route and requires every tested amount to stay usable across both simulated hops
 
-Repo scripts:
+Repo analysis workflow:
 
-- `scripts/run_suite.sh` is intentionally stricter than the public `/simulate` contract and keeps verification on successful paths with usable quotes
-- `simulate_smoke.py`, `coverage_sweep.py`, and `latency_percentiles.py` all evaluate `result_quality`, not just `status`
-- helper flags such as `--allow-failures` only relax request-visible failures on otherwise usable `complete` or `partial` results
+- `cargo run --bin sim-analysis -- ...` is intentionally reporting-first and summarizes healthy, degraded, and errored outcomes instead of acting like a strict branch gate
+- the analyzer still evaluates `result_quality`, `partial_kind`, `meta.failures`, and protocol visibility rather than looking only at HTTP status or `meta.status`
+- saved artifacts under `logs/simulation-reports/` make it easier to compare local runs and investigate odd protocol-specific behavior without hard-coding business assertions
 
 CloudWatch and query presets:
 

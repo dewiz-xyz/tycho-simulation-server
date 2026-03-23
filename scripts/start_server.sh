@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: start_server.sh [--repo <path>] [--log-file <path>] [--chain-id <id>] [--env KEY=VALUE] [--enable-vm-pools]
 
-Start the tycho-simulation-server from a repo checkout.
+Start the dsolver-simulator-service from a repo checkout.
 
 Options:
   --repo             Path to repo root (default: current directory)
@@ -127,7 +127,7 @@ fi
   echo $! > "$pid_file"
 )
 
-echo "Started tycho-simulation-server."
+echo "Started dsolver-simulator-service."
 echo "Chain ID: $CHAIN_ID"
 echo "PID: $(cat "$pid_file")"
 echo "Log: $log_file"

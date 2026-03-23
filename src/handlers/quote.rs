@@ -613,7 +613,6 @@ mod tests {
             pool_address: format!("0x{gas_used:040x}"),
             amounts_out: vec![amount_out.to_string(), "0".to_string()],
             gas_used: vec![gas_used, 0],
-            gas_in_sell: "0".to_string(),
             block_number: 1,
             slippage_bps: Vec::new(),
             pool_utilization_bps: None,

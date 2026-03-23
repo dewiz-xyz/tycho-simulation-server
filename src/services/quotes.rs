@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -33,22 +32,10 @@ use crate::models::tokens::TokenStoreError;
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
-const SPOT_PRICE_SCALE: u128 = 1_000_000_000;
-const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
-const MIN_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e-12;
-const MAX_REASONABLE_ETH_TO_SELL_SPOT: f64 = 1e12;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
 
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpotProbeMode {
-    NativeOnly,
-    WrappedOnly,
-    Both,
-    None,
 }
 
 // Per-request scheduling metrics (logged once by the handler).
@@ -75,7 +62,6 @@ pub struct QuoteComputation {
 }
 
 type CandidatePool = (String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-type RawCandidatePool = (String, (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>));
 type PoolTask = Pin<Box<dyn Future<Output = Result<PoolSimOutcome, QuoteFailure>> + Send>>;
 
 fn build_request_exit(
@@ -159,13 +145,6 @@ enum PoolScheduleOutcome {
     Scheduled(PreparedPoolSimulation),
     Skip,
     Abort,
-}
-
-#[derive(Clone, Copy)]
-struct SpotPriceProbe<'a> {
-    base: &'a Token,
-    quote: &'a Token,
-    inverted: bool,
 }
 
 #[derive(Clone)]
@@ -363,7 +342,6 @@ struct RequestPair {
 struct CandidateSets {
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
-    spot_native_candidates: Vec<CandidatePool>,
 }
 
 struct PreparedQuoteExecution {
@@ -372,9 +350,6 @@ struct PreparedQuoteExecution {
     amounts_in: Arc<Vec<BigUint>>,
     expected_len: usize,
     quote_deadline: Instant,
-    gas_price_wei: Option<u128>,
-    eth_to_sell_spot_price: Option<f64>,
-    sell_token_decimals: u32,
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
     cancel_token: CancellationToken,
@@ -818,8 +793,7 @@ impl QuoteRequestRunner {
         );
         let quote_deadline = Instant::now() + self.quote_timeout;
         let expected_len = amounts_in.len();
-        let sell_token_decimals = token_in_ref.decimals;
-        let mut candidates = self.load_candidate_sets(pair, &token_in_ref).await;
+        let mut candidates = self.load_candidate_sets(pair).await;
         self.prepare_candidate_metadata(
             &pair.token_in_address,
             &pair.token_out_address,
@@ -828,20 +802,12 @@ impl QuoteRequestRunner {
             &amounts_in,
             &mut candidates,
         )?;
-        let eth_to_sell_spot_price = resolve_request_eth_to_sell_spot_price(
-            &token_in_ref,
-            &candidates.spot_native_candidates,
-            &[],
-        );
         Ok(PreparedQuoteExecution {
             token_in: Arc::new(token_in_ref),
             token_out: Arc::new(token_out_ref),
             amounts_in,
             expected_len,
             quote_deadline,
-            gas_price_wei: self.state.effective_native_gas_price_wei_for_quotes().await,
-            eth_to_sell_spot_price,
-            sell_token_decimals,
             native_candidates: candidates.native_candidates,
             vm_candidates: candidates.vm_candidates,
             cancel_token: self
@@ -852,11 +818,7 @@ impl QuoteRequestRunner {
         })
     }
 
-    async fn load_candidate_sets(
-        &mut self,
-        pair: &RequestPair,
-        token_in_ref: &Token,
-    ) -> CandidateSets {
+    async fn load_candidate_sets(&mut self, pair: &RequestPair) -> CandidateSets {
         let native_candidates = self
             .state
             .native_state_store
@@ -886,41 +848,10 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
-        let spot_native_candidates = self
-            .load_spot_native_candidates(&pair.token_in_bytes, token_in_ref)
-            .await;
         CandidateSets {
             native_candidates,
             vm_candidates,
-            spot_native_candidates,
         }
-    }
-
-    async fn load_spot_native_candidates(
-        &self,
-        token_in_bytes: &Bytes,
-        token_in_ref: &Token,
-    ) -> Vec<CandidatePool> {
-        let native = token_in_ref.chain.native_token();
-        let wrapped_native = token_in_ref.chain.wrapped_native_token();
-        if token_in_ref.address == native.address || token_in_ref.address == wrapped_native.address
-        {
-            return Vec::new();
-        }
-        let mut candidates = self
-            .state
-            .native_state_store
-            .matching_pools_by_addresses(token_in_bytes, &wrapped_native.address)
-            .await;
-        if native.address != wrapped_native.address {
-            candidates.extend(
-                self.state
-                    .native_state_store
-                    .matching_pools_by_addresses(token_in_bytes, &native.address)
-                    .await,
-            );
-        }
-        dedupe_candidate_pools(candidates)
     }
 
     fn prepare_candidate_metadata(
@@ -961,9 +892,6 @@ impl QuoteRequestRunner {
         );
         candidates.native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         candidates.vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        candidates
-            .spot_native_candidates
-            .sort_by(|a, b| a.0.cmp(&b.0));
         Ok(())
     }
 
@@ -1154,12 +1082,6 @@ impl QuoteRequestRunner {
         self.record_pool_outcome(&result, prepared.expected_len);
         self.record_pool_errors(&result, had_timeout, is_partial, prepared.expected_len);
         if has_usable_output {
-            let gas_in_sell = compute_gas_in_sell_base_units(
-                prepared.gas_price_wei,
-                result.last_successful_gas_used,
-                prepared.eth_to_sell_spot_price,
-                prepared.sell_token_decimals,
-            );
             let slippage_bps = compute_slippage_bps(
                 &prepared.amounts_in,
                 &result.amounts_out,
@@ -1182,7 +1104,6 @@ impl QuoteRequestRunner {
                 pool_address: result.pool_address,
                 amounts_out: result.amounts_out,
                 gas_used: result.gas_used,
-                gas_in_sell,
                 block_number: self.run.meta.block_number,
                 slippage_bps,
                 pool_utilization_bps,
@@ -1374,17 +1295,6 @@ fn filter_unsupported_erc4626_candidates(
         .collect()
 }
 
-fn dedupe_candidate_pools(candidates: Vec<RawCandidatePool>) -> Vec<CandidatePool> {
-    let mut seen_ids = HashSet::new();
-    let mut deduped = Vec::new();
-    for (id, (pool_state, component)) in candidates {
-        if seen_ids.insert(id.clone()) {
-            deduped.push((id, pool_state, component));
-        }
-    }
-    deduped
-}
-
 fn simulation_tokens_for_pool(
     request_token_in: &Token,
     request_token_out: &Token,
@@ -1474,7 +1384,6 @@ struct PoolQuoteResult {
     gas_used: Vec<u64>,
     successful_steps: usize,
     first_successful_gas_used: Option<u64>,
-    last_successful_gas_used: Option<u64>,
     errors: Vec<String>,
     timed_out: bool,
     /// Marginal spot price: token_out per token_in, human-readable (decimal-adjusted) units.
@@ -1542,7 +1451,6 @@ impl BlockingPoolRunner {
             gas_used: Vec::new(),
             successful_steps: 0,
             first_successful_gas_used: None,
-            last_successful_gas_used: None,
             errors: vec![error.to_string()],
             timed_out,
             spot_price: None,
@@ -1555,7 +1463,6 @@ impl BlockingPoolRunner {
         let mut gas_used = Vec::with_capacity(self.expected_len);
         let mut successful_steps = 0;
         let mut first_successful_gas_used = None;
-        let mut last_successful_gas_used = None;
         let mut errors = Vec::new();
         let mut timed_out = false;
         let limit_max_in = self
@@ -1592,7 +1499,6 @@ impl BlockingPoolRunner {
                         gas_used.clear();
                         successful_steps = 0;
                         first_successful_gas_used = None;
-                        last_successful_gas_used = None;
                         break;
                     };
                     if result.amount.is_zero() {
@@ -1605,7 +1511,6 @@ impl BlockingPoolRunner {
                         gas_used.push(gas_u64);
                         successful_steps += 1;
                         first_successful_gas_used.get_or_insert(gas_u64);
-                        last_successful_gas_used = Some(gas_u64);
                     }
                 }
                 Err(error) => {
@@ -1655,7 +1560,6 @@ impl BlockingPoolRunner {
             gas_used,
             successful_steps,
             first_successful_gas_used,
-            last_successful_gas_used,
             errors,
             timed_out,
             spot_price,
@@ -1805,257 +1709,6 @@ fn failure_context(descriptor: &PoolDescriptor) -> FailureContext<'_> {
         pool_address: Some(descriptor.address.as_str()),
         protocol: Some(descriptor.protocol.as_str()),
     }
-}
-
-fn resolve_request_eth_to_sell_spot_price(
-    sell_token: &Token,
-    native_candidates: &[(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)],
-    vm_candidates: &[(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)],
-) -> Option<f64> {
-    let native = sell_token.chain.native_token();
-    let wrapped_native = sell_token.chain.wrapped_native_token();
-
-    // Gas price is denominated in native token units (wei for ETH family).
-    // Wrapped/native are interchangeable for conversion purposes.
-    if sell_token.address == native.address || sell_token.address == wrapped_native.address {
-        return Some(1.0);
-    }
-
-    let mut fallback_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
-    let mut selected_pool: Option<(&Arc<dyn ProtocolSim>, &Arc<ProtocolComponent>)> = None;
-    let mut best_liquidity_score: Option<BigUint> = None;
-
-    for (_, pool_state, component) in native_candidates.iter().chain(vm_candidates.iter()) {
-        if fallback_pool.is_none() {
-            fallback_pool = Some((pool_state, component));
-        }
-
-        let Some(liquidity_score) = spot_liquidity_score_in_sell_token(
-            pool_state.as_ref(),
-            sell_token,
-            &wrapped_native,
-            &native,
-        ) else {
-            continue;
-        };
-
-        let should_replace = best_liquidity_score
-            .as_ref()
-            .map(|current| liquidity_score > *current)
-            .unwrap_or(true);
-
-        if should_replace {
-            best_liquidity_score = Some(liquidity_score);
-            selected_pool = Some((pool_state, component));
-        }
-    }
-
-    let (pool_state, component) = selected_pool.or(fallback_pool)?;
-    let probe_mode = spot_probe_mode(component.as_ref(), sell_token, &wrapped_native, &native);
-    spot_price_eth_to_sell_from_pool(
-        pool_state.as_ref(),
-        sell_token,
-        &wrapped_native,
-        &native,
-        probe_mode,
-    )
-}
-
-fn spot_liquidity_counterparts<'a>(
-    wrapped_native: &'a Token,
-    native: &'a Token,
-) -> [Option<&'a Token>; 2] {
-    if native.address == wrapped_native.address {
-        [Some(wrapped_native), None]
-    } else {
-        [Some(wrapped_native), Some(native)]
-    }
-}
-
-fn spot_liquidity_score_in_sell_token(
-    pool_state: &dyn ProtocolSim,
-    sell_token: &Token,
-    wrapped_native: &Token,
-    native: &Token,
-) -> Option<BigUint> {
-    let mut best_score: Option<BigUint> = None;
-
-    let mut consider = |candidate: BigUint| {
-        if candidate.is_zero() {
-            return;
-        }
-        let should_replace = best_score
-            .as_ref()
-            .map(|current| candidate > *current)
-            .unwrap_or(true);
-        if should_replace {
-            best_score = Some(candidate);
-        }
-    };
-
-    for counterpart in spot_liquidity_counterparts(wrapped_native, native)
-        .into_iter()
-        .flatten()
-    {
-        if let Ok((max_in, _)) =
-            pool_state.get_limits(sell_token.address.clone(), counterpart.address.clone())
-        {
-            consider(max_in);
-        }
-        if let Ok((_, max_out)) =
-            pool_state.get_limits(counterpart.address.clone(), sell_token.address.clone())
-        {
-            consider(max_out);
-        }
-    }
-
-    best_score
-}
-
-fn spot_price_probes<'a>(
-    probe_mode: SpotProbeMode,
-    sell_token: &'a Token,
-    wrapped_native: &'a Token,
-    native: &'a Token,
-) -> [Option<SpotPriceProbe<'a>>; 4] {
-    let wrapped_forward = SpotPriceProbe {
-        base: wrapped_native,
-        quote: sell_token,
-        inverted: false,
-    };
-    let wrapped_reverse = SpotPriceProbe {
-        base: sell_token,
-        quote: wrapped_native,
-        inverted: true,
-    };
-    let native_forward = SpotPriceProbe {
-        base: native,
-        quote: sell_token,
-        inverted: false,
-    };
-    let native_reverse = SpotPriceProbe {
-        base: sell_token,
-        quote: native,
-        inverted: true,
-    };
-
-    match probe_mode {
-        SpotProbeMode::NativeOnly => [Some(native_forward), Some(native_reverse), None, None],
-        SpotProbeMode::WrappedOnly => [Some(wrapped_forward), Some(wrapped_reverse), None, None],
-        SpotProbeMode::Both => [
-            Some(wrapped_forward),
-            Some(native_forward),
-            Some(wrapped_reverse),
-            Some(native_reverse),
-        ],
-        SpotProbeMode::None => [None, None, None, None],
-    }
-}
-
-fn spot_price_eth_to_sell_from_pool(
-    pool_state: &dyn ProtocolSim,
-    sell_token: &Token,
-    wrapped_native: &Token,
-    native: &Token,
-    probe_mode: SpotProbeMode,
-) -> Option<f64> {
-    for probe in spot_price_probes(probe_mode, sell_token, wrapped_native, native)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(candidate) = spot_price_candidate(
-            pool_state.spot_price(probe.base, probe.quote).ok(),
-            probe.inverted,
-        ) {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
-fn spot_probe_mode(
-    component: &ProtocolComponent,
-    sell_token: &Token,
-    wrapped_native: &Token,
-    native: &Token,
-) -> SpotProbeMode {
-    let has_sell = component
-        .tokens
-        .iter()
-        .any(|token| token.address == sell_token.address);
-    if !has_sell {
-        return SpotProbeMode::None;
-    }
-
-    let has_wrapped = component
-        .tokens
-        .iter()
-        .any(|token| token.address == wrapped_native.address);
-    let has_native = component
-        .tokens
-        .iter()
-        .any(|token| token.address == native.address);
-    match (has_native, has_wrapped) {
-        (true, true) => SpotProbeMode::Both,
-        (true, false) => SpotProbeMode::NativeOnly,
-        (false, true) => SpotProbeMode::WrappedOnly,
-        (false, false) => SpotProbeMode::None,
-    }
-}
-
-fn spot_price_candidate(raw_price: Option<f64>, inverted: bool) -> Option<f64> {
-    let raw_spot_price = raw_price.filter(|price| price.is_finite() && *price > 0.0)?;
-    let eth_to_sell_spot_price = if inverted {
-        1.0 / raw_spot_price
-    } else {
-        raw_spot_price
-    };
-    if !eth_to_sell_spot_price.is_finite()
-        || eth_to_sell_spot_price <= 0.0
-        || !(MIN_REASONABLE_ETH_TO_SELL_SPOT..=MAX_REASONABLE_ETH_TO_SELL_SPOT)
-            .contains(&eth_to_sell_spot_price)
-    {
-        return None;
-    }
-
-    Some(eth_to_sell_spot_price)
-}
-
-fn compute_gas_in_sell_base_units(
-    gas_price_wei: Option<u128>,
-    gas_used_last: Option<u64>,
-    eth_to_sell_spot_price: Option<f64>,
-    sell_token_decimals: u32,
-) -> String {
-    // TODO: This still treats gas cost as `gas_used * cached_native_gas_price`. That's fine on
-    // Ethereum, but on Base we're still missing the L1 data fee part of the tx cost. We'll clean
-    // this up in a follow-up PR once the quote path has enough tx context to price Base more
-    // accurately.
-    let Some(gas_price_wei) = gas_price_wei else {
-        return "0".to_string();
-    };
-    let Some(gas_used_last) = gas_used_last else {
-        return "0".to_string();
-    };
-    let Some(spot_price) = eth_to_sell_spot_price.filter(|price| price.is_finite() && *price > 0.0)
-    else {
-        return "0".to_string();
-    };
-    let Some(spot_price_scaled) = (spot_price * SPOT_PRICE_SCALE as f64).floor().to_u128() else {
-        return "0".to_string();
-    };
-    if spot_price_scaled == 0 {
-        return "0".to_string();
-    }
-
-    let decimals_scale = BigUint::from(10u32).pow(sell_token_decimals);
-    let numerator = BigUint::from(gas_price_wei)
-        * BigUint::from(spot_price_scaled)
-        * decimals_scale
-        * BigUint::from(gas_used_last);
-    let denominator = BigUint::from(SPOT_PRICE_SCALE) * BigUint::from(WEI_PER_ETH);
-    (numerator / denominator).to_string()
 }
 
 /// Compute per-ladder-step slippage in basis points.
@@ -2556,7 +2209,7 @@ mod tests {
     use super::*;
 
     use std::any::Any;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2768,43 +2421,6 @@ mod tests {
         assert!(metrics.vm_low_first_gas_samples.is_empty());
     }
 
-    #[test]
-    fn compute_gas_in_sell_base_units_uses_floor_and_decimals() {
-        assert_eq!(
-            compute_gas_in_sell_base_units(Some(2_000_000_000_000_000_000), Some(1), Some(1.5), 6),
-            "3000000"
-        );
-        assert_eq!(
-            compute_gas_in_sell_base_units(
-                Some(3_000_000_000_000_000_000),
-                Some(5),
-                Some(1.234567),
-                2
-            ),
-            "1851"
-        );
-    }
-
-    #[test]
-    fn compute_gas_in_sell_base_units_returns_zero_for_invalid_inputs() {
-        assert_eq!(
-            compute_gas_in_sell_base_units(None, Some(1), Some(1.5), 6),
-            "0"
-        );
-        assert_eq!(
-            compute_gas_in_sell_base_units(Some(42), None, Some(1.5), 6),
-            "0"
-        );
-        assert_eq!(
-            compute_gas_in_sell_base_units(Some(42), Some(1), None, 6),
-            "0"
-        );
-        assert_eq!(
-            compute_gas_in_sell_base_units(Some(42), Some(1), Some(f64::NAN), 6),
-            "0"
-        );
-    }
-
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct LimitCountingSim {
         max_in: BigUint,
@@ -2994,8 +2610,6 @@ mod tests {
         erc4626_deposits_enabled: bool,
         native_sim_concurrency: usize,
         vm_sim_concurrency: usize,
-        gas_price_wei: Option<u128>,
-        gas_reporting_enabled: bool,
         quote_timeout: Duration,
         pool_timeout_native: Duration,
         pool_timeout_vm: Duration,
@@ -3009,8 +2623,6 @@ mod tests {
                 erc4626_deposits_enabled: false,
                 native_sim_concurrency: 1,
                 vm_sim_concurrency: 1,
-                gas_price_wei: None,
-                gas_reporting_enabled: false,
                 quote_timeout: Duration::from_secs(1),
                 pool_timeout_native: Duration::from_millis(50),
                 pool_timeout_vm: Duration::from_millis(50),
@@ -3034,10 +2646,6 @@ mod tests {
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(config.gas_price_wei)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(
-                config.gas_reporting_enabled,
-            )),
             enable_vm_pools: config.enable_vm_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: config.quote_timeout,
@@ -3185,81 +2793,6 @@ mod tests {
         );
     }
 
-    async fn make_gas_in_sell_zero_fixture(
-        request_id: &str,
-        token_in_decimals: u32,
-        gas_reporting_enabled: bool,
-        pair_spot_price: Option<f64>,
-        include_spot_source: bool,
-    ) -> (AppState, AmountOutRequest, Arc<AtomicUsize>) {
-        let token_in_hex = "0x0000000000000000000000000000000000000001";
-        let token_out_hex = "0x0000000000000000000000000000000000000002";
-        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
-        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
-
-        let token_in_meta = make_token_with_decimals(&token_in, "TK1", token_in_decimals);
-        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
-        let mut tokens = vec![token_in_meta.clone(), token_out_meta.clone()];
-        if include_spot_source {
-            tokens.push(wrapped_native_meta.clone());
-        }
-        let token_store = make_token_store(tokens);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
-
-        let spot_price_calls = Arc::new(AtomicUsize::new(0));
-        let mut states = HashMap::new();
-        let mut new_pairs = HashMap::new();
-        insert_pool_state(
-            &mut states,
-            &mut new_pairs,
-            "pool-a",
-            "0x0000000000000000000000000000000000000011",
-            "uniswap_v2",
-            "uniswap_v2",
-            vec![token_in_meta.clone(), token_out_meta.clone()],
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: pair_spot_price,
-                max_in: 1_000_000,
-                spot_price_calls: Arc::clone(&spot_price_calls),
-            }),
-        );
-        if include_spot_source {
-            insert_pool_state(
-                &mut states,
-                &mut new_pairs,
-                "pool-spot",
-                "0x0000000000000000000000000000000000000013",
-                "uniswap_v2",
-                "uniswap_v2",
-                vec![token_in_meta.clone(), wrapped_native_meta],
-                Box::new(SpotPriceCountingSim {
-                    spot_price_value: Some(1.5),
-                    max_in: 10_000_000,
-                    spot_price_calls: Arc::new(AtomicUsize::new(0)),
-                }),
-            );
-        }
-        native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
-            .await;
-
-        let app_state = make_test_app_state(
-            token_store,
-            native_state_store,
-            vm_state_store,
-            TestAppStateConfig {
-                gas_price_wei: Some(5_000_000_000_000_000_000),
-                gas_reporting_enabled,
-                ..TestAppStateConfig::default()
-            },
-        );
-        let request = make_amount_out_request(request_id, token_in_hex, token_out_hex, &["2", "5"]);
-
-        (app_state, request, spot_price_calls)
-    }
-
     async fn make_vm_unavailable_fixture(enable_vm_pools: bool) -> (AppState, AmountOutRequest) {
         let fixture = BasicQuoteFixture::new();
         let ready_token_a =
@@ -3314,244 +2847,6 @@ mod tests {
 
         (app_state, request)
     }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct SpotPriceCountingSim {
-        spot_price_value: Option<f64>,
-        max_in: u64,
-        #[serde(skip, default = "default_calls")]
-        spot_price_calls: Arc<AtomicUsize>,
-    }
-
-    #[typetag::serde]
-    impl ProtocolSim for SpotPriceCountingSim {
-        fn fee(&self) -> f64 {
-            0.0
-        }
-
-        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
-            self.spot_price_calls.fetch_add(1, Ordering::SeqCst);
-            self.spot_price_value
-                .ok_or_else(|| SimulationError::FatalError("spot unavailable".to_string()))
-        }
-
-        fn get_amount_out(
-            &self,
-            amount_in: BigUint,
-            _token_in: &Token,
-            _token_out: &Token,
-        ) -> Result<GetAmountOutResult, SimulationError> {
-            Ok(GetAmountOutResult::new(
-                amount_in.clone(),
-                amount_in,
-                self.clone_box(),
-            ))
-        }
-
-        fn get_limits(
-            &self,
-            _sell_token: Bytes,
-            _buy_token: Bytes,
-        ) -> Result<(BigUint, BigUint), SimulationError> {
-            Ok((BigUint::from(self.max_in), BigUint::zero()))
-        }
-
-        fn delta_transition(
-            &mut self,
-            _delta: ProtocolStateDelta,
-            _tokens: &HashMap<Bytes, Token>,
-            _balances: &Balances,
-        ) -> Result<(), TransitionError> {
-            Ok(())
-        }
-
-        fn clone_box(&self) -> Box<dyn ProtocolSim> {
-            Box::new(self.clone())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        fn eq(&self, other: &dyn ProtocolSim) -> bool {
-            other.as_any().is::<Self>()
-        }
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PairAwareSpotPriceSim {
-        sell_token: Bytes,
-        wrapped_native: Bytes,
-        native_token: Bytes,
-        wrapped_price: f64,
-        native_price: f64,
-    }
-
-    #[typetag::serde]
-    impl ProtocolSim for PairAwareSpotPriceSim {
-        fn fee(&self) -> f64 {
-            0.0
-        }
-
-        fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-            if quote.address == self.sell_token && base.address == self.wrapped_native {
-                return Ok(self.wrapped_price);
-            }
-            if quote.address == self.sell_token && base.address == self.native_token {
-                return Ok(self.native_price);
-            }
-            Err(SimulationError::FatalError(
-                "pair not supported".to_string(),
-            ))
-        }
-
-        fn get_amount_out(
-            &self,
-            amount_in: BigUint,
-            _token_in: &Token,
-            _token_out: &Token,
-        ) -> Result<GetAmountOutResult, SimulationError> {
-            Ok(GetAmountOutResult::new(
-                amount_in.clone(),
-                amount_in,
-                self.clone_box(),
-            ))
-        }
-
-        fn get_limits(
-            &self,
-            _sell_token: Bytes,
-            _buy_token: Bytes,
-        ) -> Result<(BigUint, BigUint), SimulationError> {
-            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
-        }
-
-        fn delta_transition(
-            &mut self,
-            _delta: ProtocolStateDelta,
-            _tokens: &HashMap<Bytes, Token>,
-            _balances: &Balances,
-        ) -> Result<(), TransitionError> {
-            Ok(())
-        }
-
-        fn clone_box(&self) -> Box<dyn ProtocolSim> {
-            Box::new(self.clone())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        fn eq(&self, other: &dyn ProtocolSim) -> bool {
-            other.as_any().is::<Self>()
-        }
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct ProbeModeGuardSpotPriceSim {
-        sell_token: Bytes,
-        wrapped_native: Bytes,
-        native_token: Bytes,
-        native_price: f64,
-        wrapped_price: f64,
-        #[serde(skip, default = "default_calls")]
-        native_calls: Arc<AtomicUsize>,
-        #[serde(skip, default = "default_calls")]
-        wrapped_calls: Arc<AtomicUsize>,
-    }
-
-    #[typetag::serde]
-    impl ProtocolSim for ProbeModeGuardSpotPriceSim {
-        fn fee(&self) -> f64 {
-            0.0
-        }
-
-        fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-            let is_native_pair = (base.address == self.native_token
-                && quote.address == self.sell_token)
-                || (base.address == self.sell_token && quote.address == self.native_token);
-            if is_native_pair {
-                self.native_calls.fetch_add(1, Ordering::SeqCst);
-                return if base.address == self.sell_token {
-                    Ok(1.0 / self.native_price)
-                } else {
-                    Ok(self.native_price)
-                };
-            }
-
-            let is_wrapped_pair = (base.address == self.wrapped_native
-                && quote.address == self.sell_token)
-                || (base.address == self.sell_token && quote.address == self.wrapped_native);
-            if is_wrapped_pair {
-                self.wrapped_calls.fetch_add(1, Ordering::SeqCst);
-                return if base.address == self.sell_token {
-                    Ok(1.0 / self.wrapped_price)
-                } else {
-                    Ok(self.wrapped_price)
-                };
-            }
-
-            Err(SimulationError::FatalError(
-                "pair not supported".to_string(),
-            ))
-        }
-
-        fn get_amount_out(
-            &self,
-            amount_in: BigUint,
-            _token_in: &Token,
-            _token_out: &Token,
-        ) -> Result<GetAmountOutResult, SimulationError> {
-            Ok(GetAmountOutResult::new(
-                amount_in.clone(),
-                amount_in,
-                self.clone_box(),
-            ))
-        }
-
-        fn get_limits(
-            &self,
-            _sell_token: Bytes,
-            _buy_token: Bytes,
-        ) -> Result<(BigUint, BigUint), SimulationError> {
-            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
-        }
-
-        fn delta_transition(
-            &mut self,
-            _delta: ProtocolStateDelta,
-            _tokens: &HashMap<Bytes, Token>,
-            _balances: &Balances,
-        ) -> Result<(), TransitionError> {
-            Ok(())
-        }
-
-        fn clone_box(&self) -> Box<dyn ProtocolSim> {
-            Box::new(self.clone())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        fn eq(&self, other: &dyn ProtocolSim) -> bool {
-            other.as_any().is::<Self>()
-        }
-    }
-
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct StrictPairTokenSim {
         expected_sell: Bytes,
@@ -3638,389 +2933,6 @@ mod tests {
 
         fn eq(&self, other: &dyn ProtocolSim) -> bool {
             other.as_any().is::<Self>()
-        }
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_returns_one_for_wrapped_native_sell() {
-        let sell_token = Chain::Ethereum.wrapped_native_token();
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            Vec::new();
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates);
-
-        assert_eq!(price, Some(1.0));
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_prefers_wrapped_native_source() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b1")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = PairAwareSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            wrapped_price: 2_500.0,
-            native_price: 552_709_307.0,
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_native_only_pool_ignores_wrapped_path() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-        let native_calls = Arc::new(AtomicUsize::new(0));
-        let wrapped_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b1")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![native_token.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = ProbeModeGuardSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            native_price: 2_500.0,
-            wrapped_price: 552_709_307.0,
-            native_calls: Arc::clone(&native_calls),
-            wrapped_calls: Arc::clone(&wrapped_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_wrapped_only_pool_ignores_native_path() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let native_token = Chain::Ethereum.native_token();
-        let native_calls = Arc::new(AtomicUsize::new(0));
-        let wrapped_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b2")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = ProbeModeGuardSpotPriceSim {
-            sell_token: sell_token.address.clone(),
-            wrapped_native: wrapped_native.address.clone(),
-            native_token: native_token.address.clone(),
-            native_price: 552_709_307.0,
-            wrapped_price: 2_500.0,
-            native_calls: Arc::clone(&native_calls),
-            wrapped_calls: Arc::clone(&wrapped_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 2_500.0).abs() < f64::EPSILON);
-        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(wrapped_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_returns_none_when_probe_mode_is_none() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000a1").expect("valid address"),
-            "USDT",
-            6,
-        );
-        let unrelated_a = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000d1").expect("valid address"),
-            "AAA",
-            18,
-        );
-        let unrelated_b = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000d2").expect("valid address"),
-            "BBB",
-            18,
-        );
-        let spot_price_calls = Arc::new(AtomicUsize::new(0));
-
-        let component = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000b3")
-                .expect("valid pool address"),
-            "uniswap_v2".to_string(),
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            vec![unrelated_a, unrelated_b],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let sim = SpotPriceCountingSim {
-            spot_price_value: Some(2_500.0),
-            max_in: 1_000_000,
-            spot_price_calls: Arc::clone(&spot_price_calls),
-        };
-
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> =
-            vec![(
-                "pool-a".to_string(),
-                Arc::new(sim) as Arc<dyn ProtocolSim>,
-                Arc::new(component),
-            )];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let spot_price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates);
-        assert_eq!(spot_price, None);
-        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            compute_gas_in_sell_base_units(
-                Some(1_000_000_000_000_000_000),
-                Some(21_000),
-                spot_price,
-                sell_token.decimals,
-            ),
-            "0"
-        );
-    }
-
-    #[test]
-    fn resolve_request_eth_to_sell_spot_price_uses_most_liquid_pool() {
-        let sell_token = make_token_with_decimals(
-            &Bytes::from_str("0x00000000000000000000000000000000000000b2").expect("valid address"),
-            "WBTC",
-            8,
-        );
-        let wrapped_native = Chain::Ethereum.wrapped_native_token();
-        let low_liquidity_calls = Arc::new(AtomicUsize::new(0));
-        let high_liquidity_calls = Arc::new(AtomicUsize::new(0));
-
-        let component_a = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000c1")
-                .expect("valid pool address"),
-            "uniswap_v4".to_string(),
-            "uniswap_v4".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-        let component_b = ProtocolComponent::new(
-            Bytes::from_str("0x00000000000000000000000000000000000000c2")
-                .expect("valid pool address"),
-            "uniswap_v3".to_string(),
-            "uniswap_v3".to_string(),
-            Chain::Ethereum,
-            vec![wrapped_native.clone(), sell_token.clone()],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::default(),
-            NaiveDateTime::default(),
-        );
-
-        let outlier = SpotPriceCountingSim {
-            spot_price_value: Some(1.0e18),
-            max_in: 10,
-            spot_price_calls: Arc::clone(&low_liquidity_calls),
-        };
-        let consensus = SpotPriceCountingSim {
-            spot_price_value: Some(0.03125),
-            max_in: 1_000_000_000,
-            spot_price_calls: Arc::clone(&high_liquidity_calls),
-        };
-
-        // Keep ids ordered so the low-liquidity outlier candidate is visited first.
-        let native_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = vec![
-            (
-                "a-outlier".to_string(),
-                Arc::new(outlier) as Arc<dyn ProtocolSim>,
-                Arc::new(component_a),
-            ),
-            (
-                "b-liquid".to_string(),
-                Arc::new(consensus) as Arc<dyn ProtocolSim>,
-                Arc::new(component_b),
-            ),
-        ];
-        let vm_candidates: Vec<(String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>)> = Vec::new();
-
-        let price =
-            resolve_request_eth_to_sell_spot_price(&sell_token, &native_candidates, &vm_candidates)
-                .expect("spot price should resolve");
-
-        assert!((price - 0.03125).abs() < f64::EPSILON);
-        assert_eq!(low_liquidity_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(high_liquidity_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn get_amounts_out_uses_request_scoped_gas_snapshot_across_all_pools() {
-        let token_in_hex = "0x0000000000000000000000000000000000000001";
-        let token_out_hex = "0x0000000000000000000000000000000000000002";
-        let token_in = Bytes::from_str(token_in_hex).expect("valid address");
-        let token_out = Bytes::from_str(token_out_hex).expect("valid address");
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
-
-        let token_in_meta = make_token_with_decimals(&token_in, "TK1", 2);
-        let token_out_meta = make_token_with_decimals(&token_out, "TK2", 6);
-        let wrapped_native_meta = make_token_with_decimals(&wrapped_native, "WETH", 18);
-        let token_store = make_token_store(vec![
-            token_in_meta.clone(),
-            token_out_meta.clone(),
-            wrapped_native_meta.clone(),
-        ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
-
-        let pair_spot_price_calls = Arc::new(AtomicUsize::new(0));
-        let spot_source_calls = Arc::new(AtomicUsize::new(0));
-        let mut states = HashMap::new();
-        let mut new_pairs = HashMap::new();
-        for (pool_id, pool_address_hex) in [
-            ("pool-a", "0x0000000000000000000000000000000000000011"),
-            ("pool-b", "0x0000000000000000000000000000000000000012"),
-        ] {
-            insert_pool_state(
-                &mut states,
-                &mut new_pairs,
-                pool_id,
-                pool_address_hex,
-                "uniswap_v2",
-                "uniswap_v2",
-                vec![token_in_meta.clone(), token_out_meta.clone()],
-                Box::new(SpotPriceCountingSim {
-                    spot_price_value: Some(1.5),
-                    max_in: 1_000_000,
-                    spot_price_calls: Arc::clone(&pair_spot_price_calls),
-                }),
-            );
-        }
-        insert_pool_state(
-            &mut states,
-            &mut new_pairs,
-            "pool-spot",
-            "0x0000000000000000000000000000000000000013",
-            "uniswap_v2",
-            "uniswap_v2",
-            vec![token_in_meta.clone(), wrapped_native_meta.clone()],
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.5),
-                max_in: 10_000_000,
-                spot_price_calls: Arc::clone(&spot_source_calls),
-            }),
-        );
-
-        native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
-            .await;
-
-        let app_state = make_test_app_state(
-            Arc::clone(&token_store),
-            Arc::clone(&native_state_store),
-            Arc::clone(&vm_state_store),
-            TestAppStateConfig {
-                gas_price_wei: Some(5_000_000_000_000_000_000),
-                gas_reporting_enabled: true,
-                native_sim_concurrency: 2,
-                ..TestAppStateConfig::default()
-            },
-        );
-        let request =
-            make_amount_out_request("req-spot-reuse", token_in_hex, token_out_hex, &["2", "5"]);
-
-        let computation = get_amounts_out(app_state, request, None).await;
-
-        // Each pair pool is now queried for spot_price inside simulate_pool() for slippage.
-        assert_eq!(pair_spot_price_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(spot_source_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(computation.responses.len(), 2);
-        let unique_gas_in_sell: HashSet<&str> = computation
-            .responses
-            .iter()
-            .map(|response| response.gas_in_sell.as_str())
-            .collect();
-        assert_eq!(unique_gas_in_sell.len(), 1);
-        for response in &computation.responses {
-            assert_eq!(response.gas_used, vec![2, 5]);
-            assert_eq!(response.gas_in_sell, "3750");
         }
     }
 
@@ -4690,10 +3602,9 @@ mod tests {
             "uniswap_v2",
             "uniswap_v2",
             vec![native_dummy_meta_a, native_dummy_meta_b],
-            Box::new(SpotPriceCountingSim {
-                spot_price_value: Some(1.0),
-                max_in: 1_000_000,
-                spot_price_calls: Arc::new(AtomicUsize::new(0)),
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(1_000_000u64),
+                calls: default_calls(),
             }),
         );
         native_state_store
@@ -4749,31 +3660,6 @@ mod tests {
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
         assert!(computation.meta.failures.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
-    }
-
-    #[tokio::test]
-    async fn get_amounts_out_sets_gas_in_sell_to_zero_when_reporting_disabled() {
-        let (app_state, request, _) =
-            make_gas_in_sell_zero_fixture("req-reporting-disabled", 6, false, Some(1.5), true)
-                .await;
-        let computation = get_amounts_out(app_state, request, None).await;
-
-        assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].gas_used, vec![2, 5]);
-        assert_eq!(computation.responses[0].gas_in_sell, "0");
-    }
-
-    #[tokio::test]
-    async fn get_amounts_out_sets_gas_in_sell_to_zero_when_spot_price_fails() {
-        let (app_state, request, spot_price_calls) =
-            make_gas_in_sell_zero_fixture("req-spot-failure", 2, true, None, false).await;
-        let computation = get_amounts_out(app_state, request, None).await;
-
-        // Pool is queried once for spot_price inside simulate_pool() for slippage calculation.
-        assert_eq!(spot_price_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].gas_used, vec![2, 5]);
-        assert_eq!(computation.responses[0].gas_in_sell, "0");
     }
 
     #[tokio::test]
@@ -5734,7 +4620,6 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000010".to_string(),
                 amounts_out: vec!["9".to_string(), "10".to_string()],
                 gas_used: vec![1, 1],
-                gas_in_sell: "1".to_string(),
                 block_number: 1,
                 slippage_bps: Vec::new(),
                 pool_utilization_bps: None,
@@ -5746,7 +4631,6 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["0".to_string(), "200".to_string()],
                 gas_used: vec![0, 2],
-                gas_in_sell: "2".to_string(),
                 block_number: 1,
                 slippage_bps: Vec::new(),
                 pool_utilization_bps: None,
@@ -5786,7 +4670,6 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000002".to_string(),
                 amounts_out: vec!["7".to_string()],
                 gas_used: vec![1],
-                gas_in_sell: "1".to_string(),
                 block_number: 1,
                 slippage_bps: Vec::new(),
                 pool_utilization_bps: None,
@@ -5798,7 +4681,6 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["8".to_string()],
                 gas_used: vec![1],
-                gas_in_sell: "1".to_string(),
                 block_number: 1,
                 slippage_bps: Vec::new(),
                 pool_utilization_bps: None,

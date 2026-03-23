@@ -1,6 +1,8 @@
 # Tycho Simulation Server
 
-An HTTP service that ingests Tycho protocol streams, keeps an in-memory view of pool state, and serves swap quote simulation, route encoding, and readiness APIs.
+Fast simulation API for DeFi swaps and routing, built on Tycho state.
+
+It ingests Tycho protocol streams, keeps an in-memory view of pool state, and serves quote simulation, route encoding, and readiness APIs.
 
 ## Service Role
 
@@ -19,6 +21,8 @@ cp .env.example .env
 cargo run --release
 ```
 
+`cargo run --release` starts `dsolver-simulator-service` via the repo's Cargo `default-run`.
+
 Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
@@ -26,7 +30,7 @@ Required runtime inputs:
 
 Common optional inputs:
 
-- `RPC_URL` for cached `eth_gasPrice` refreshes used by `gas_in_sell`
+- `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
 - `HOST` and `PORT` to change the bind address
 - timeout, concurrency, and stream-health knobs from `src/config/mod.rs`
@@ -38,6 +42,8 @@ Common optional inputs:
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
 - `GET /status` reports native readiness, VM readiness, block progress, and VM rebuild/restart context for pollers and deploy scripts.
+
+`/encode` keeps its current HTTP control flow, but the server now emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
 Detailed integration docs:
 
@@ -115,8 +121,10 @@ Timeout behavior differs by endpoint:
 
 - `/simulate` request-guard timeouts return `200 OK` with a contract-valid payload whose `meta.status=ready`, `meta.result_quality=request_level_failure`, and `meta.failures` includes a `timeout`
 - `/simulate` router-boundary timeouts also return `200 OK` with `result_quality=request_level_failure`
-- `/encode` timeouts return `408 Request Timeout` with `{ "error": "...", "requestId": ... }`
+- `/encode` router-boundary timeouts return `408 Request Timeout` with `{ "error": "..." }`, plus `requestId` when it is available
 - `/status` is not wrapped in the router timeout layer
+
+For ops, `/encode` timeout and failure logs include stable `encode_error_kind` and `failure_stage` fields so CloudWatch queries can separate validation, readiness, normalization, resimulation, encoding, `handler_timeout`, and `router_timeout` paths.
 
 If you are integrating against `/simulate`, inspect `meta` on every successful HTTP response. If you are integrating against `/encode`, normal HTTP success and error handling is still the right control flow.
 
@@ -131,11 +139,11 @@ cargo nextest run
 cargo build --release
 ```
 
-Repo harness:
+Local analysis harness:
 
 ```bash
-scripts/run_suite.sh --repo . --chain-id 1 --stop
-scripts/run_suite.sh --repo . --chain-id 8453 --stop
+cargo run --bin sim-analysis -- --chain-id 1 --stop
+cargo run --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 Useful helpers:
@@ -143,19 +151,17 @@ Useful helpers:
 - `scripts/start_server.sh` to start the server with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain and VM readiness expectations
 - `scripts/stop_server.sh` to stop a server started by the repo helper
-- `scripts/run_suite.sh` to run smoke, encode smoke, coverage, and latency checks
+- `cargo run --bin sim-analysis -- ...` to generate a JSON + markdown local behavior report
 
-The repo suite is intentionally strict: it keeps verification on successful responses with usable quotes and fails on request-visible degradation even when `/simulate` still returns a contract-valid `200 OK` payload.
-
-That strictness also applies to requested-amount semantics: smoke validation treats `amounts_out[i] = "0"` as "no usable quote for that requested amount," not as a valid quote, and encode smoke uses dedicated realistic amount presets that must stay usable across both tested hops.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass/fail harness.
 
 ## Docs Map
 
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
-- [STRESS_TEST_README.md](STRESS_TEST_README.md): coverage, latency, and stress-test workflows
-- `skills/simulation-service-tests/SKILL.md`: repo-local validation workflow
+- [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
+- `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
 
 ## License

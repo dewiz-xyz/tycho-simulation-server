@@ -1,0 +1,98 @@
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+      - shadow
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target stack
+        required: true
+        type: choice
+        options:
+          - quote-base
+          - solve-base
+          - shadow
+          - staging-solve-base
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  determine-targets:
+    name: Determine Targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      environment: ${{ steps.targets.outputs.environment }}
+    steps:
+      - id: targets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TARGET: ${{ inputs.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TARGETS="[\"$INPUT_TARGET\"]"
+            case "$INPUT_TARGET" in
+              quote-base|solve-base) ENV="production" ;;
+              shadow|staging-solve-base) ENV="staging" ;;
+            esac
+          elif [ "$REF_NAME" = "shadow" ]; then
+            TARGETS='["shadow"]'
+            ENV="staging"
+          elif [ "$REF_NAME" = "staging" ]; then
+            TARGETS='["staging-solve-base"]'
+            ENV="staging"
+          else
+            TARGETS='["quote-base","solve-base"]'
+            ENV="production"
+          fi
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & Push (${{ matrix.target }})
+    needs: determine-targets
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-targets.outputs.environment }}
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.determine-targets.outputs.targets) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Force deploy ECS service
+        env:
+          CLUSTER: ${{ matrix.target }}
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service tycho-simulator --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text

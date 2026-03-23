@@ -33,8 +33,6 @@ pub struct AppState {
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub latest_native_gas_price_wei: Arc<RwLock<Option<u128>>>,
-    pub native_gas_price_reporting_enabled: Arc<RwLock<bool>>,
     pub enable_vm_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
@@ -47,6 +45,71 @@ pub struct AppState {
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeReadiness {
+    Ready,
+    WarmingUp,
+    Stale,
+}
+
+impl NativeReadiness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::WarmingUp | Self::Stale => "warming_up",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmReadiness {
+    Disabled,
+    WarmingUp,
+    Rebuilding,
+    Ready,
+    Stale,
+}
+
+impl VmReadiness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::WarmingUp | Self::Stale => "warming_up",
+            Self::Rebuilding => "rebuilding",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeAvailability {
+    Ready,
+    NativeWarmingUp,
+    NativeStale,
+    VmDisabled,
+    VmWarmingUp,
+    VmRebuilding,
+    VmStale,
+}
+
+impl EncodeAvailability {
+    pub const fn availability_message(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::NativeWarmingUp => Some("Encode unavailable: native state warming up"),
+            Self::NativeStale => Some("Encode unavailable: native state stale"),
+            Self::VmDisabled => Some("Encode unavailable: VM pools disabled for requested route"),
+            Self::VmWarmingUp => {
+                Some("Encode unavailable: VM state warming up for requested route")
+            }
+            Self::VmRebuilding => {
+                Some("Encode unavailable: VM state rebuilding for requested route")
+            }
+            Self::VmStale => Some("Encode unavailable: VM state stale for requested route"),
+        }
+    }
 }
 
 impl AppState {
@@ -69,6 +132,76 @@ impl AppState {
 
     pub fn is_ready(&self) -> bool {
         self.native_state_store.is_ready()
+    }
+
+    pub fn readiness_stale_ms(&self) -> u64 {
+        self.readiness_stale.as_millis() as u64
+    }
+
+    pub async fn native_update_age_ms(&self) -> Option<u64> {
+        self.native_stream_health.last_update_age_ms().await
+    }
+
+    pub async fn vm_update_age_ms(&self) -> Option<u64> {
+        self.vm_stream_health.last_update_age_ms().await
+    }
+
+    pub async fn native_readiness(&self) -> NativeReadiness {
+        if !self.is_ready() {
+            return NativeReadiness::WarmingUp;
+        }
+
+        if is_update_stale(self.native_update_age_ms().await, self.readiness_stale_ms()) {
+            NativeReadiness::Stale
+        } else {
+            NativeReadiness::Ready
+        }
+    }
+
+    pub async fn vm_readiness(&self) -> VmReadiness {
+        if !self.enable_vm_pools {
+            return VmReadiness::Disabled;
+        }
+
+        if self.vm_rebuilding().await {
+            return VmReadiness::Rebuilding;
+        }
+
+        if !self.vm_state_store.is_ready() {
+            return VmReadiness::WarmingUp;
+        }
+
+        if is_update_stale(self.vm_update_age_ms().await, self.readiness_stale_ms()) {
+            VmReadiness::Stale
+        } else {
+            VmReadiness::Ready
+        }
+    }
+
+    pub(crate) async fn encode_availability(
+        &self,
+        uses_native: bool,
+        uses_vm: bool,
+    ) -> EncodeAvailability {
+        if uses_native {
+            match self.native_readiness().await {
+                NativeReadiness::Ready => {}
+                NativeReadiness::WarmingUp => return EncodeAvailability::NativeWarmingUp,
+                NativeReadiness::Stale => return EncodeAvailability::NativeStale,
+            }
+        }
+
+        if !uses_vm {
+            return EncodeAvailability::Ready;
+        }
+
+        match self.vm_readiness().await {
+            VmReadiness::Disabled => EncodeAvailability::VmDisabled,
+            VmReadiness::WarmingUp => EncodeAvailability::VmWarmingUp,
+            VmReadiness::Rebuilding => EncodeAvailability::VmRebuilding,
+            VmReadiness::Ready => EncodeAvailability::Ready,
+            VmReadiness::Stale => EncodeAvailability::VmStale,
+        }
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
@@ -131,33 +264,12 @@ impl AppState {
     pub async fn vm_pools(&self) -> usize {
         self.vm_state_store.total_states().await
     }
+}
 
-    pub async fn latest_native_gas_price_wei(&self) -> Option<u128> {
-        *self.latest_native_gas_price_wei.read().await
-    }
-
-    pub async fn set_latest_native_gas_price_wei(&self, value: Option<u128>) {
-        *self.latest_native_gas_price_wei.write().await = value;
-    }
-
-    pub async fn native_gas_price_reporting_enabled(&self) -> bool {
-        *self.native_gas_price_reporting_enabled.read().await
-    }
-
-    pub async fn set_native_gas_price_reporting_enabled(&self, enabled: bool) {
-        *self.native_gas_price_reporting_enabled.write().await = enabled;
-    }
-
-    pub async fn effective_native_gas_price_wei_for_quotes(&self) -> Option<u128> {
-        // Keep the reporting flag read lock held while reading the cached value so a disable
-        // transition cannot interleave between the flag check and cached-gas lookup.
-        let reporting_enabled = self.native_gas_price_reporting_enabled.read().await;
-        if !*reporting_enabled {
-            return None;
-        }
-
-        *self.latest_native_gas_price_wei.read().await
-    }
+fn is_update_stale(last_update_age_ms: Option<u64>, readiness_stale_ms: u64) -> bool {
+    last_update_age_ms
+        .map(|age| age >= readiness_stale_ms)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -879,26 +991,10 @@ mod tests {
         Update::new(1, states, new_pairs)
     }
 
-    fn empty_token_store() -> Arc<TokenStore> {
-        Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ))
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "test helper keeps AppState setup explicit while removing repeated literals"
-    )]
     fn build_test_app_state(
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
-        latest_native_gas_price_wei: Option<u128>,
-        native_gas_price_reporting_enabled: bool,
         enable_vm_pools: bool,
         native_sim_concurrency: usize,
         vm_sim_concurrency: usize,
@@ -912,10 +1008,6 @@ mod tests {
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            latest_native_gas_price_wei: Arc::new(RwLock::new(latest_native_gas_price_wei)),
-            native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(
-                native_gas_price_reporting_enabled,
-            )),
             enable_vm_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
@@ -929,6 +1021,187 @@ mod tests {
             native_sim_concurrency,
             vm_sim_concurrency,
         }
+    }
+
+    async fn build_readiness_test_state(enable_vm_pools: bool) -> AppState {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_component = mk_component(
+            28,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
+        );
+        native_state_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                native_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        build_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            enable_vm_pools,
+            1,
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_readiness_distinguishes_ready_stale_and_warming_up() {
+        let warming_up_state = {
+            let token_store = Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            ));
+            let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+            let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+            build_test_app_state(token_store, native_state_store, vm_state_store, false, 1, 1)
+        };
+        assert_eq!(
+            warming_up_state.native_readiness().await,
+            NativeReadiness::WarmingUp
+        );
+
+        let mut ready_state = build_readiness_test_state(false).await;
+        ready_state.native_stream_health.record_update(1).await;
+        assert_eq!(ready_state.native_readiness().await, NativeReadiness::Ready);
+
+        ready_state.readiness_stale = Duration::ZERO;
+        assert_eq!(ready_state.native_readiness().await, NativeReadiness::Stale);
+    }
+
+    #[tokio::test]
+    async fn vm_readiness_distinguishes_disabled_warming_up_rebuilding_ready_and_stale() {
+        let disabled_state = build_readiness_test_state(false).await;
+        assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
+
+        let mut state = build_readiness_test_state(true).await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+
+        let vm_component = mk_component(
+            31,
+            "vm:curve",
+            "curve_pool",
+            vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+        );
+        state
+            .vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                vm_component,
+                Box::new(DummySim),
+            )]))
+            .await;
+        state.vm_stream_health.record_update(1).await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = true;
+        }
+        assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = false;
+        }
+        state.readiness_stale = Duration::ZERO;
+        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+    }
+
+    #[tokio::test]
+    async fn encode_availability_gates_backends_by_route_shape() {
+        let native_ready_vm_disabled = build_readiness_test_state(false).await;
+        native_ready_vm_disabled
+            .native_stream_health
+            .record_update(1)
+            .await;
+
+        assert_eq!(
+            native_ready_vm_disabled
+                .encode_availability(true, false)
+                .await,
+            EncodeAvailability::Ready
+        );
+        assert_eq!(
+            native_ready_vm_disabled
+                .encode_availability(false, true)
+                .await,
+            EncodeAvailability::VmDisabled
+        );
+        assert_eq!(
+            native_ready_vm_disabled
+                .encode_availability(true, true)
+                .await,
+            EncodeAvailability::VmDisabled
+        );
+
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let native_warming_vm_ready = build_test_app_state(
+            token_store,
+            native_state_store,
+            Arc::clone(&vm_state_store),
+            true,
+            1,
+            1,
+        );
+        vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    31,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        native_warming_vm_ready
+            .vm_stream_health
+            .record_update(1)
+            .await;
+
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(true, false)
+                .await,
+            EncodeAvailability::NativeWarmingUp
+        );
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(false, true)
+                .await,
+            EncodeAvailability::Ready
+        );
+        assert_eq!(
+            native_warming_vm_ready
+                .encode_availability(true, true)
+                .await,
+            EncodeAvailability::NativeWarmingUp
+        );
     }
 
     #[test]
@@ -1280,8 +1553,6 @@ mod tests {
             Arc::clone(&token_store),
             Arc::clone(&native_store),
             Arc::clone(&vm_store),
-            None,
-            false,
             true,
             1,
             1,
@@ -1289,6 +1560,58 @@ mod tests {
 
         assert_eq!(app_state.total_pools().await, 2);
         assert_eq!(app_state.current_vm_block().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn vm_readiness_reports_rebuilding_before_staleness() {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+        native_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                mk_component(
+                    34,
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    vec![mk_token(19, "TKNA"), mk_token(20, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        vm_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    35,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(21, "TKNA"), mk_token(22, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        let app_state = build_test_app_state(token_store, native_store, vm_store, true, 1, 1);
+        app_state.native_stream_health.record_update(1).await;
+        app_state.vm_stream_health.record_update(1).await;
+        {
+            let mut vm_status = app_state.vm_stream.write().await;
+            vm_status.rebuilding = true;
+        }
+
+        assert_eq!(app_state.vm_readiness().await, VmReadiness::Rebuilding);
+        assert_eq!(
+            app_state.encode_availability(false, true).await,
+            EncodeAvailability::VmRebuilding
+        );
     }
 
     enum RequestTokenIn {
@@ -1557,69 +1880,5 @@ mod tests {
         let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
 
         assert_eq!(ids, HashSet::from(["pool-v1".to_string()]));
-    }
-
-    #[tokio::test]
-    async fn app_state_native_gas_price_defaults_to_none() {
-        let app_state = gas_price_test_app_state(None, false);
-
-        assert_eq!(app_state.latest_native_gas_price_wei().await, None);
-    }
-
-    #[tokio::test]
-    async fn app_state_native_gas_price_updates() {
-        let app_state = gas_price_test_app_state(None, false);
-
-        app_state.set_latest_native_gas_price_wei(Some(42)).await;
-        assert_eq!(app_state.latest_native_gas_price_wei().await, Some(42));
-    }
-
-    #[tokio::test]
-    async fn app_state_effective_native_gas_price_for_quotes_serializes_with_disable_transition() {
-        let app_state = gas_price_test_app_state(Some(42), true);
-
-        assert_eq!(
-            app_state.effective_native_gas_price_wei_for_quotes().await,
-            Some(42)
-        );
-
-        let reporting_read_guard = app_state.native_gas_price_reporting_enabled.read().await;
-        let state_for_disable = app_state.clone();
-        let disable_task = tokio::spawn(async move {
-            state_for_disable
-                .set_native_gas_price_reporting_enabled(false)
-                .await;
-        });
-        tokio::task::yield_now().await;
-        assert!(!disable_task.is_finished());
-
-        drop(reporting_read_guard);
-        disable_task
-            .await
-            .unwrap_or_else(|err| unreachable!("disable task should complete: {err}"));
-
-        assert_eq!(
-            app_state.effective_native_gas_price_wei_for_quotes().await,
-            None
-        );
-    }
-
-    fn gas_price_test_app_state(
-        gas_price_wei: Option<u128>,
-        gas_reporting_enabled: bool,
-    ) -> AppState {
-        let token_store = empty_token_store();
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        build_test_app_state(
-            token_store,
-            native_state_store,
-            vm_state_store,
-            gas_price_wei,
-            gas_reporting_enabled,
-            true,
-            1,
-            1,
-        )
     }
 }

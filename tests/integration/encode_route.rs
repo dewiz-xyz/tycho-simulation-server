@@ -9,6 +9,14 @@ use anyhow::{anyhow, Result};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::NaiveDateTime;
+use dsolver_simulator::api::create_router;
+use dsolver_simulator::models::messages::{
+    EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
+    RouteEncodeResponse, SegmentDraft, SwapKind,
+};
+use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::stream_health::StreamHealth;
+use dsolver_simulator::models::tokens::TokenStore;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tokio::sync::Semaphore;
@@ -21,17 +29,77 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
     Balances, GetAmountOutResult, ProtocolSim,
 };
 use tycho_simulation::tycho_common::Bytes;
-use tycho_simulation_server::api::create_router;
-use tycho_simulation_server::models::messages::{
-    EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
-    RouteEncodeResponse, SegmentDraft, SwapKind,
-};
-use tycho_simulation_server::models::state::{AppState, StateStore, VmStreamStatus};
-use tycho_simulation_server::models::stream_health::StreamHealth;
-use tycho_simulation_server::models::tokens::TokenStore;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+struct SlowAmountSim {
+    sleep_for: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+struct SleepAmountSim {
+    sleep_for: Duration,
+}
+
+#[typetag::serde]
+impl ProtocolSim for SleepAmountSim {
+    fn fee(&self) -> f64 {
+        0.0
+    }
+
+    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+        Ok(0.0)
+    }
+
+    fn get_amount_out(
+        &self,
+        amount_in: BigUint,
+        _token_in: &Token,
+        _token_out: &Token,
+    ) -> Result<GetAmountOutResult, SimulationError> {
+        std::thread::sleep(self.sleep_for);
+        Ok(GetAmountOutResult::new(
+            amount_in,
+            BigUint::zero(),
+            self.clone_box(),
+        ))
+    }
+
+    fn get_limits(
+        &self,
+        _sell_token: Bytes,
+        _buy_token: Bytes,
+    ) -> Result<(BigUint, BigUint), SimulationError> {
+        Ok((BigUint::zero(), BigUint::zero()))
+    }
+
+    fn delta_transition(
+        &mut self,
+        _delta: ProtocolStateDelta,
+        _tokens: &HashMap<Bytes, Token>,
+        _balances: &Balances,
+    ) -> Result<(), TransitionError> {
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolSim> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn eq(&self, other: &dyn ProtocolSim) -> bool {
+        other.as_any().downcast_ref::<SleepAmountSim>() == Some(self)
+    }
+}
 
 #[typetag::serde]
 impl ProtocolSim for EchoAmountSim {
@@ -87,6 +155,64 @@ impl ProtocolSim for EchoAmountSim {
 
     fn eq(&self, other: &dyn ProtocolSim) -> bool {
         other.as_any().is::<EchoAmountSim>()
+    }
+}
+
+#[typetag::serde]
+impl ProtocolSim for SlowAmountSim {
+    fn fee(&self) -> f64 {
+        0.0
+    }
+
+    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+        Ok(0.0)
+    }
+
+    fn get_amount_out(
+        &self,
+        amount_in: BigUint,
+        _token_in: &Token,
+        _token_out: &Token,
+    ) -> Result<GetAmountOutResult, SimulationError> {
+        std::thread::sleep(self.sleep_for);
+        Ok(GetAmountOutResult::new(
+            amount_in,
+            BigUint::zero(),
+            self.clone_box(),
+        ))
+    }
+
+    fn get_limits(
+        &self,
+        _sell_token: Bytes,
+        _buy_token: Bytes,
+    ) -> Result<(BigUint, BigUint), SimulationError> {
+        Ok((BigUint::zero(), BigUint::zero()))
+    }
+
+    fn delta_transition(
+        &mut self,
+        _delta: ProtocolStateDelta,
+        _tokens: &HashMap<Bytes, Token>,
+        _balances: &Balances,
+    ) -> Result<(), TransitionError> {
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolSim> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn eq(&self, other: &dyn ProtocolSim) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
     }
 }
 
@@ -170,6 +296,10 @@ struct EncodeFixtureConfig<'a> {
     enable_vm_pools: bool,
     erc4626_deposits_enabled: bool,
     reset_allowance: bool,
+    ensure_native_ready_store: bool,
+    mark_native_healthy: bool,
+    mark_vm_healthy: bool,
+    vm_rebuilding: bool,
     request_id: &'a str,
 }
 
@@ -190,6 +320,10 @@ impl Default for EncodeFixtureConfig<'_> {
             enable_vm_pools: false,
             erc4626_deposits_enabled: false,
             reset_allowance: true,
+            ensure_native_ready_store: true,
+            mark_native_healthy: true,
+            mark_vm_healthy: true,
+            vm_rebuilding: false,
             request_id: "req-1",
         }
     }
@@ -267,6 +401,39 @@ async fn build_fixture_stores(
     Ok((native_state_store, vm_state_store))
 }
 
+async fn ensure_native_store_ready(
+    native_state_store: &Arc<StateStore>,
+    fixture_tokens: &FixtureTokens,
+) -> Result<()> {
+    if native_state_store.is_ready() {
+        return Ok(());
+    }
+
+    let component = ProtocolComponent::new(
+        parse_bytes("0x00000000000000000000000000000000000000aa")?,
+        "uniswap_v2".to_string(),
+        "uniswap_v2".to_string(),
+        fixture_tokens.token_in_meta.chain,
+        vec![
+            fixture_tokens.token_in_meta.clone(),
+            fixture_tokens.token_out_meta.clone(),
+        ],
+        Vec::new(),
+        HashMap::new(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    let states = HashMap::from([(
+        "native-ready".to_string(),
+        Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+    )]);
+    let new_pairs = HashMap::from([("native-ready".to_string(), component)]);
+    native_state_store
+        .apply_update(Update::new(42, states, new_pairs))
+        .await;
+    Ok(())
+}
+
 fn build_route_encode_request(
     config: &EncodeFixtureConfig<'_>,
     pool_id: String,
@@ -306,15 +473,18 @@ fn build_route_encode_request(
     }
 }
 
-async fn setup_app_state_and_request(
+async fn build_app_state_and_request(
     config: EncodeFixtureConfig<'_>,
-) -> Result<(axum::Router, RouteEncodeRequest)> {
+) -> Result<(AppState, RouteEncodeRequest)> {
     let fixture_tokens = build_fixture_tokens(&config)?;
     let settlement = "0x0000000000000000000000000000000000000003".to_string();
     let router = "0x0000000000000000000000000000000000000004".to_string();
     let pool_id = config.pool_id.to_string();
     let (native_state_store, vm_state_store) =
         build_fixture_stores(&config, &fixture_tokens, &pool_id).await?;
+    if config.ensure_native_ready_store {
+        ensure_native_store_ready(&native_state_store, &fixture_tokens).await?;
+    }
 
     let mut reset_allowance_tokens: HashMap<u64, HashSet<Bytes>> = HashMap::new();
     if config.reset_allowance {
@@ -324,17 +494,29 @@ async fn setup_app_state_and_request(
             .insert(fixture_tokens.token_in.clone());
     }
 
+    let native_stream_health = Arc::new(StreamHealth::new());
+    if config.mark_native_healthy {
+        native_stream_health.record_update(42).await;
+    }
+    let vm_stream_health = Arc::new(StreamHealth::new());
+    if config.mark_vm_healthy {
+        vm_stream_health.record_update(42).await;
+    }
+
+    let vm_stream = Arc::new(tokio::sync::RwLock::new(VmStreamStatus {
+        rebuilding: config.vm_rebuilding,
+        ..VmStreamStatus::default()
+    }));
+
     let state = AppState {
         chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
-        native_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
+        native_stream_health,
+        vm_stream_health,
+        vm_stream,
         enable_vm_pools: config.enable_vm_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
@@ -349,11 +531,17 @@ async fn setup_app_state_and_request(
         vm_sim_concurrency: 1,
     };
 
-    let app = create_router(state);
     Ok((
-        app,
+        state,
         build_route_encode_request(&config, pool_id, settlement, router),
     ))
+}
+
+async fn setup_app_state_and_request(
+    config: EncodeFixtureConfig<'_>,
+) -> Result<(axum::Router, RouteEncodeRequest)> {
+    let (state, request) = build_app_state_and_request(config).await?;
+    Ok((create_router(state), request))
 }
 
 async fn post_encode(
@@ -372,6 +560,73 @@ async fn post_encode(
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await?;
     Ok((status, body))
+}
+
+async fn setup_timeout_app(
+    sim: Box<dyn ProtocolSim>,
+    request_timeout: Duration,
+    pool_timeout_native: Duration,
+) -> Result<(axum::Router, RouteEncodeRequest, Arc<Semaphore>)> {
+    let config = EncodeFixtureConfig::default();
+    let fixture_tokens = build_fixture_tokens(&config)?;
+    let settlement = "0x0000000000000000000000000000000000000003".to_string();
+    let router = "0x0000000000000000000000000000000000000004".to_string();
+    let pool_id = config.pool_id.to_string();
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
+    let component = ProtocolComponent::new(
+        parse_bytes(config.component_address_hex)?,
+        config.component_protocol_system.to_string(),
+        config.component_protocol_type_name.to_string(),
+        config.chain,
+        vec![
+            fixture_tokens.token_in_meta.clone(),
+            fixture_tokens.token_out_meta.clone(),
+        ],
+        Vec::new(),
+        config.component_static_attributes.clone(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    let states = HashMap::from([(pool_id.clone(), sim)]);
+    let new_pairs = HashMap::from([(pool_id.clone(), component)]);
+    native_state_store
+        .apply_update(Update::new(42, states, new_pairs))
+        .await;
+
+    let native_stream_health = Arc::new(StreamHealth::new());
+    native_stream_health.record_update(42).await;
+    let vm_stream_health = Arc::new(StreamHealth::new());
+    let native_sim_semaphore = Arc::new(Semaphore::new(1));
+
+    let state = AppState {
+        chain: config.chain,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        tokens: Arc::clone(&fixture_tokens.store),
+        native_state_store,
+        vm_state_store,
+        native_stream_health,
+        vm_stream_health,
+        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        enable_vm_pools: false,
+        readiness_stale: Duration::from_secs(120),
+        quote_timeout: Duration::from_secs(1),
+        pool_timeout_native,
+        pool_timeout_vm: Duration::from_secs(1),
+        request_timeout,
+        native_sim_semaphore: Arc::clone(&native_sim_semaphore),
+        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        erc4626_deposits_enabled: false,
+        reset_allowance_tokens: Arc::new(HashMap::new()),
+        native_sim_concurrency: 1,
+        vm_sim_concurrency: 1,
+    };
+
+    Ok((
+        create_router(state),
+        build_route_encode_request(&config, pool_id, settlement, router),
+        native_sim_semaphore,
+    ))
 }
 
 #[tokio::test]
@@ -513,6 +768,194 @@ async fn encode_route_rejects_when_request_chain_does_not_match_runtime_chain() 
         response.error
     );
     assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_vm_only_succeeds_when_native_state_is_not_ready() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: true,
+        ensure_native_ready_store: false,
+        mark_native_healthy: false,
+        request_id: "req-native-not-ready",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-native-stale",
+        ..EncodeFixtureConfig::default()
+    };
+    let (mut state, request) = build_app_state_and_request(config).await?;
+    state.readiness_stale = Duration::from_millis(1);
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let app = create_router(state);
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(response.error, "Encode unavailable: native state stale");
+    assert_eq!(response.request_id.as_deref(), Some("req-native-stale"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_native_only_succeeds_when_vm_is_unavailable() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        enable_vm_pools: true,
+        mark_vm_healthy: false,
+        request_id: "req-native-ignores-vm",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_vm_route_when_vm_is_disabled() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: false,
+        request_id: "req-vm-disabled",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM pools disabled for requested route"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_vm_route_when_vm_is_warming_up() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: false,
+        enable_vm_pools: true,
+        request_id: "req-vm-warming-up",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state warming up for requested route"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_vm_route_when_vm_is_rebuilding() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: true,
+        vm_rebuilding: true,
+        request_id: "req-vm-rebuilding",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state rebuilding for requested route"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: true,
+        request_id: "req-vm-stale",
+        ..EncodeFixtureConfig::default()
+    };
+    let (mut state, request) = build_app_state_and_request(config).await?;
+    state.readiness_stale = Duration::from_millis(1);
+    tokio::time::advance(Duration::from_millis(2)).await;
+    state.native_stream_health.record_update(42).await;
+    let app = create_router(state);
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state stale for requested route"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_keeps_validation_precedence_over_readiness_failures() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        vm_pool: true,
+        ensure_native_ready_store: false,
+        mark_native_healthy: false,
+        request_id: "req-validation-precedence",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, mut request) = setup_app_state_and_request(config).await?;
+    request.chain_id = 8453;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(
+        response
+            .error
+            .contains("Unsupported chainId: 8453 (this instance serves chain 1)"),
+        "unexpected error: {}",
+        response.error
+    );
     Ok(())
 }
 
@@ -889,8 +1332,6 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        latest_native_gas_price_wei: Arc::new(tokio::sync::RwLock::new(None)),
-        native_gas_price_reporting_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         enable_vm_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
@@ -965,5 +1406,58 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         "unexpected error: {}",
         response.error
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_when_pool_is_missing() -> Result<()> {
+    let (app, mut request) = setup_app_state_and_request(EncodeFixtureConfig::default()).await?;
+    request.segments[0].hops[0].swaps[0].pool.component_id = "pool-missing".to_string();
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert!(response.error.contains("Pool pool-missing not found"));
+    assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_times_out_while_waiting_for_native_sim_permit() -> Result<()> {
+    let (app, request, native_sim_semaphore) = setup_timeout_app(
+        Box::new(EchoAmountSim),
+        Duration::from_millis(20),
+        Duration::from_secs(1),
+    )
+    .await?;
+    let permit = native_sim_semaphore.acquire().await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    drop(permit);
+
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(response.error, "Encode request timed out after 20ms");
+    assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_times_out_during_slow_resimulation() -> Result<()> {
+    let (app, request, _native_sim_semaphore) = setup_timeout_app(
+        Box::new(SlowAmountSim {
+            sleep_for: Duration::from_millis(100),
+        }),
+        Duration::from_millis(20),
+        Duration::from_secs(1),
+    )
+    .await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(response.error, "Encode request timed out after 20ms");
+    assert_eq!(response.request_id.as_deref(), Some("req-1"));
     Ok(())
 }
