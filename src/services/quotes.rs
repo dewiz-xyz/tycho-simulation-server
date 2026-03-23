@@ -23,9 +23,7 @@ use tycho_simulation::{
 
 use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
-    AmountOutRequest, AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome,
-    QuoteFailure, QuoteFailureKind, QuoteMeta, QuoteResultQuality, QuoteStatus, RiskLevel,
-    QuotePartialKind,
+    AmountOutRequest, AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome, PoolType, QuoteFailure, QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus, RiskLevel
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
@@ -1097,6 +1095,7 @@ impl QuoteRequestRunner {
                 &slippage_bps,
                 pool_utilization_bps,
                 prepared.expected_len,
+                Some(self.request.pool_type),
             );
             self.run.responses.push(AmountOutResponse {
                 pool: result.pool,
@@ -1797,6 +1796,7 @@ fn compute_execution_risk(
     slippage_bps: &[Option<i32>],
     pool_utilization_bps: Option<u32>,
     requested_steps: usize,
+    _pool_type: Option<PoolType>,
 ) -> Option<ExecutionRisk> {
     const W1: f64 = 0.35;
     const W2: f64 = 0.35;
@@ -2680,6 +2680,7 @@ mod tests {
             token_in: token_in.to_string(),
             token_out: token_out.to_string(),
             amounts: amounts.iter().map(ToString::to_string).collect(),
+            pool_type: PoolType::Volatile,
         }
     }
 
@@ -4726,7 +4727,7 @@ mod tests {
     fn execution_risk_low_for_deep_pool_small_slippage_and_utilization() {
         // slippage_last=5, utilization=100, flat curve, full ladder
         // score ≈ 5×0.35 + 100×0.35 + 1.0×0.15 = 1.75+35.0+0.15 ≈ 37 → Low
-        let risk = compute_execution_risk(&[Some(5)], Some(100), 1).unwrap();
+        let risk = compute_execution_risk(&[Some(5)], Some(100), 1, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::Low);
         assert!(risk.risk_score < 200, "score={}", risk.risk_score);
     }
@@ -4735,7 +4736,7 @@ mod tests {
     fn execution_risk_medium_for_moderate_slippage_and_utilization() {
         // slippage_last=30, utilization=600, flat curve, full ladder
         // score ≈ 30×0.35 + 600×0.35 + 1.0×0.15 = 10.5+210.0+0.15 ≈ 221 → Medium
-        let risk = compute_execution_risk(&[Some(30)], Some(600), 1).unwrap();
+        let risk = compute_execution_risk(&[Some(30)], Some(600), 1, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::Medium);
         assert!(
             risk.risk_score >= 200 && risk.risk_score < 500,
@@ -4748,7 +4749,7 @@ mod tests {
     fn execution_risk_high_for_elevated_slippage_and_utilization() {
         // slippage_last=100, utilization=2000, flat curve, full ladder
         // score ≈ 100×0.35 + 2000×0.35 + 0.15 = 35+700+0.15 ≈ 735 → High
-        let risk = compute_execution_risk(&[Some(100)], Some(2000), 1).unwrap();
+        let risk = compute_execution_risk(&[Some(100)], Some(2000), 1, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::High);
         assert!(
             risk.risk_score >= 500 && risk.risk_score < 1000,
@@ -4760,7 +4761,7 @@ mod tests {
     #[test]
     fn execution_risk_very_high_for_high_utilization_with_no_slippage() {
         // All slippage None but utilization=8000 → score ≈ 8000×0.35 = 2800 → VeryHigh
-        let risk = compute_execution_risk(&[None, None], Some(8000), 2).unwrap();
+        let risk = compute_execution_risk(&[None, None], Some(8000), 2, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::VeryHigh);
         assert!(risk.risk_score >= 1000, "score={}", risk.risk_score);
     }
@@ -4768,7 +4769,7 @@ mod tests {
     #[test]
     fn execution_risk_unknown_when_no_signal_available() {
         // All None slippage + no utilization → Unknown
-        let risk = compute_execution_risk(&[None, None], None, 2).unwrap();
+        let risk = compute_execution_risk(&[None, None], None, 2, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::Unknown);
         assert_eq!(risk.risk_score, 0);
     }
@@ -4778,7 +4779,7 @@ mod tests {
         // 2 amounts_out returned for 3 requested steps → partial_ladder penalty
         // slippage=[Some(5), Some(5)], no utilization
         // base ≈ 5×0.35 + 1.0×0.15 ≈ 1.9; partial = 10000×0.05 = 500 → score ≈ 502 → High
-        let risk = compute_execution_risk(&[Some(5), Some(5)], None, 3).unwrap();
+        let risk = compute_execution_risk(&[Some(5), Some(5)], None, 3, None).unwrap();
         assert_eq!(risk.risk_level, RiskLevel::High);
         // penalty contribution is exactly 500 bps
         assert!(risk.risk_score >= 500, "score={}", risk.risk_score);
@@ -4787,8 +4788,8 @@ mod tests {
     #[test]
     fn execution_risk_full_ladder_does_not_include_partial_penalty() {
         // same slippage as above but requested_steps == actual steps
-        let without_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 2).unwrap();
-        let with_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 3).unwrap();
+        let without_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 2, None).unwrap();
+        let with_penalty = compute_execution_risk(&[Some(5), Some(5)], None, 3, None).unwrap();
         assert!(
             with_penalty.risk_score > without_penalty.risk_score + 490,
             "partial={} full={}",
@@ -4802,11 +4803,11 @@ mod tests {
         // slippage=[Some(1), Some(100)] → convexity = 100/1 = 100
         // score ≈ 100×0.35 + 100×0.15 = 35+15 = 50 → Low (convexity alone is modest)
         // But verify convexity IS counted: flat curve [Some(50), Some(50)] gives lower score.
-        let steep = compute_execution_risk(&[Some(1), Some(100)], None, 2).unwrap();
-        let flat = compute_execution_risk(&[Some(50), Some(50)], None, 2).unwrap();
+        let steep = compute_execution_risk(&[Some(1), Some(100)], None, 2, None).unwrap();
+        let flat = compute_execution_risk(&[Some(50), Some(50)], None, 2, None).unwrap();
         // steep has lower slippage_last (100 vs 50 × W1 — actually 100 > 50, but convexity is 100 vs 1)
         // Let's just assert convexity adds something vs a zero-convexity baseline.
-        let no_convexity = compute_execution_risk(&[Some(100), Some(100)], None, 2).unwrap();
+        let no_convexity = compute_execution_risk(&[Some(100), Some(100)], None, 2, None).unwrap();
         assert!(
             steep.risk_score > no_convexity.risk_score,
             "steep={} no_convexity={}",
@@ -4819,7 +4820,7 @@ mod tests {
     #[test]
     fn execution_risk_zero_slippage_first_does_not_panic_or_produce_infinite_convexity() {
         // slippage_first = 0 → convexity should be 0, not Inf/NaN
-        let risk = compute_execution_risk(&[Some(0), Some(50)], None, 2).unwrap();
+        let risk = compute_execution_risk(&[Some(0), Some(50)], None, 2, None).unwrap();
         assert!(risk.risk_score < u32::MAX);
         assert_ne!(risk.risk_level, RiskLevel::Unknown);
     }
@@ -4828,8 +4829,8 @@ mod tests {
     fn execution_risk_negative_slippage_treated_as_zero_for_score() {
         // Negative slippage (favourable fill) should not reduce the score below what
         // utilization alone would produce.
-        let risk_neg = compute_execution_risk(&[Some(-50)], Some(300), 1).unwrap();
-        let risk_zero = compute_execution_risk(&[Some(0)], Some(300), 1).unwrap();
+        let risk_neg = compute_execution_risk(&[Some(-50)], Some(300), 1, None).unwrap();
+        let risk_zero = compute_execution_risk(&[Some(0)], Some(300), 1, None).unwrap();
         assert_eq!(
             risk_neg.risk_score, risk_zero.risk_score,
             "negative slippage should be clamped to 0"

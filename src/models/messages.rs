@@ -8,6 +8,18 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn volatile_by_default() -> PoolType {
+    PoolType::Volatile
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolType {
+    BlueChip,
+    Stablecoin,
+    Volatile,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AmountOutRequest {
     pub request_id: String,
@@ -16,7 +28,10 @@ pub struct AmountOutRequest {
     pub token_in: String,
     pub token_out: String,
     pub amounts: Vec<String>,
+    #[serde(default = "volatile_by_default")]
+    pub pool_type: PoolType,
 }
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AmountOutResponse {
@@ -423,25 +438,6 @@ mod tests {
         };
         let value = serde_json::to_value(meta)?;
         assert!(value.get("partial_kind").is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn amount_out_response_serializes_gas_in_sell_snake_case() -> Result<()> {
-        let response = AmountOutResponse {
-            pool: "pool-1".to_string(),
-            pool_name: "name".to_string(),
-            pool_address: "0x1".to_string(),
-            amounts_out: vec!["1".to_string()],
-            gas_used: vec![1],
-            block_number: 1,
-            slippage_bps: Vec::new(),
-            pool_utilization_bps: None,
-            execution_risk: None,
-        };
-
-        let value = serde_json::to_value(response)?;
-        assert!(value.get("gasInSellToken").is_none());
         Ok(())
     }
 

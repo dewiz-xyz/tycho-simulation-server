@@ -19,7 +19,8 @@ use tokio::task::JoinSet;
 
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, EncodeErrorResponse, HopDraft, InteractionKind, PoolRef,
-    PoolSwapDraft, QuoteResult, RouteEncodeRequest, RouteEncodeResponse, SegmentDraft, SwapKind,
+    PoolSwapDraft, PoolType, QuoteResult, RouteEncodeRequest, RouteEncodeResponse, SegmentDraft,
+    SwapKind,
 };
 
 use self::presets::{
@@ -528,6 +529,7 @@ async fn run_encode_scenarios(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        pool_type: PoolType::Volatile,
     };
     let first_hop = run_encode_prep_hop(
         client,
@@ -567,6 +569,7 @@ async fn run_encode_scenarios(
         token_in: mid_token.to_string(),
         token_out: token_out.to_string(),
         amounts: hop_amounts,
+        pool_type: PoolType::Volatile,
     };
     let second_hop = run_encode_prep_hop(
         client,
@@ -1282,6 +1285,7 @@ fn simulate_request(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        pool_type: PoolType::Volatile,
     })
 }
 
