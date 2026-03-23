@@ -38,3 +38,4 @@ review-viewer/
 *.pdb 
 src/.DS_Store
 .DS_Store
+.cargo/
