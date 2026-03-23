@@ -9,7 +9,7 @@ use dsolver_simulator::config::MemoryConfig;
 use dsolver_simulator::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
-use dsolver_simulator::models::messages::AmountOutRequest;
+use dsolver_simulator::models::messages::{AmountOutRequest, PoolType};
 use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
 use dsolver_simulator::models::stream_health::StreamHealth;
 use dsolver_simulator::models::tokens::TokenStore;
@@ -553,6 +553,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         token_in: format!("0x{}", address_hex(1)),
         token_out: format!("0x{}", address_hex(2)),
         amounts: vec!["1000".to_string()],
+        pool_type: PoolType::Volatile,
     };
 
     let computation = get_amounts_out(app_state.clone(), request, None).await;

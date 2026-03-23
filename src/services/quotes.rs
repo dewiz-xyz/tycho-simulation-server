@@ -14,16 +14,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
-    tycho_common::{
-        models::token::Token,
-        simulation::protocol_sim::ProtocolSim,
-        Bytes,
-    },
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
-    AmountOutRequest, AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome, PoolType, QuoteFailure, QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus, RiskLevel
+    AmountOutRequest, AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome,
+    PoolType, QuoteFailure, QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality,
+    QuoteStatus, RiskLevel,
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
@@ -82,7 +80,6 @@ fn build_request_exit(
         metrics,
     }
 }
-
 
 #[derive(Debug, Clone, Copy)]
 enum ScheduledPoolKind {
@@ -1087,8 +1084,12 @@ impl QuoteRequestRunner {
                 prepared.token_in.decimals,
                 prepared.token_out.decimals,
             );
-            let requested_max_in =
-                prepared.amounts_in.iter().max().cloned().unwrap_or_default();
+            let requested_max_in = prepared
+                .amounts_in
+                .iter()
+                .max()
+                .cloned()
+                .unwrap_or_default();
             let pool_utilization_bps =
                 compute_pool_utilization_bps(&requested_max_in, result.max_in.as_ref());
             let execution_risk = compute_execution_risk(
@@ -1796,12 +1797,34 @@ fn compute_execution_risk(
     slippage_bps: &[Option<i32>],
     pool_utilization_bps: Option<u32>,
     requested_steps: usize,
-    _pool_type: Option<PoolType>,
+    pool_type: Option<PoolType>,
 ) -> Option<ExecutionRisk> {
-    const W1: f64 = 0.35;
-    const W2: f64 = 0.35;
-    const W3: f64 = 0.15;
-    const W5: f64 = 0.05;
+
+    let w1: f64;
+    let w2: f64;
+    let w3: f64;
+    let w5: f64;
+
+    match pool_type {
+        Some(PoolType::Stablecoin) => {
+            w1 = 0.25;
+            w2 = 0.55;
+            w3 = 0.15;
+            w5 = 0.05;
+        }
+        Some(PoolType::BlueChip) => {
+            w1 = 0.25;
+            w2 = 0.45;
+            w3 = 0.15;
+            w5 = 0.05;
+        }
+        _ => {
+            w1 = 0.35;
+            w2 = 0.35;
+            w3 = 0.15;
+            w5 = 0.05;
+        }
+    }
 
     // Last non-None slippage value (clamped to >= 0; negative = favourable fill).
     let slippage_last = slippage_bps
@@ -1811,7 +1834,10 @@ fn compute_execution_risk(
         .map(|v| v.max(0) as f64);
 
     // First non-None slippage value.
-    let slippage_first = slippage_bps.iter().find_map(|&s| s).map(|v| v.max(0) as f64);
+    let slippage_first = slippage_bps
+        .iter()
+        .find_map(|&s| s)
+        .map(|v| v.max(0) as f64);
 
     // If every entry is None and utilization is unknown, we have no signal.
     if slippage_last.is_none() && pool_utilization_bps.is_none() {
@@ -1830,10 +1856,10 @@ fn compute_execution_risk(
 
     let partial_ladder = slippage_bps.len() < requested_steps;
 
-    let score = slippage_last.unwrap_or(0.0) * W1
-        + pool_utilization_bps.unwrap_or(0) as f64 * W2
-        + convexity * W3
-        + if partial_ladder { 10_000.0 * W5 } else { 0.0 };
+    let score = slippage_last.unwrap_or(0.0) * w1
+        + pool_utilization_bps.unwrap_or(0) as f64 * w2
+        + convexity * w3
+        + if partial_ladder { 10_000.0 * w5 } else { 0.0 };
 
     let risk_score = score.round().clamp(0.0, u32::MAX as f64) as u32;
 

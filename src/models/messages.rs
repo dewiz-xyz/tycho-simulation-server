@@ -441,6 +441,7 @@ mod tests {
         Ok(())
     }
 
+
     #[test]
     fn risk_level_serializes_as_snake_case() {
         assert_eq!(
