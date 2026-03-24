@@ -13,7 +13,7 @@ on:
         required: true
         type: choice
         options:
-          - quote-base
+          - quoter-base
           - solve-base
           - shadow
           - staging-solve-base
@@ -42,7 +42,7 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             TARGETS="[\"$INPUT_TARGET\"]"
             case "$INPUT_TARGET" in
-              quote-base|solve-base) ENV="production" ;;
+              quoter-base|solve-base) ENV="production" ;;
               shadow|staging-solve-base) ENV="staging" ;;
             esac
           elif [ "$REF_NAME" = "shadow" ]; then
@@ -52,7 +52,7 @@ jobs:
             TARGETS='["staging-solve-base"]'
             ENV="staging"
           else
-            TARGETS='["quote-base","solve-base"]'
+            TARGETS='["quoter-base","solve-base"]'
             ENV="production"
           fi
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
