@@ -1,6 +1,6 @@
-# Local Simulation Analysis
+# DSolver Simulator Local Analysis
 
-This repo ships a reporting-first Rust CLI for local simulation-service analysis. It starts or reuses the server, waits for readiness, exercises representative `/simulate` and `/encode` flows, runs latency and light stress probes, captures sampled evidence, and writes a structured report instead of enforcing a strict pass/fail gate.
+This repo ships a reporting-first Rust CLI for local DSolver Simulator analysis. It starts or reuses the server, waits for readiness, exercises representative `/simulate` and `/encode` flows, runs latency and light stress probes, captures sampled evidence, and writes a structured report instead of enforcing a strict pass/fail gate.
 
 ## Quick start
 
