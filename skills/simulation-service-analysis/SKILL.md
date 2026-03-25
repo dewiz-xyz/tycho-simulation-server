@@ -1,8 +1,8 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local Tycho simulation server in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
-  short-description: Tycho simulation local analysis
+  short-description: DSolver Simulator local analysis
 ---
 
 # Simulation Service Analysis

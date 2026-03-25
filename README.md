@@ -1,20 +1,73 @@
-# Tycho Simulation Server
+<p align="center">
+  <img src=".github/assets/dsolver-logo.png" alt="DSolver Simulator logo" width="180">
+</p>
 
-Fast simulation API for DeFi swaps and routing, built on Tycho state.
+<h1 align="center">DSolver Simulator</h1>
 
-It ingests Tycho protocol streams, keeps an in-memory view of pool state, and serves quote simulation, route encoding, and readiness APIs.
+<p align="center">
+  High-throughput DeFi swap simulation and route encoding on live Tycho-backed state.
+</p>
 
-## Service Role
+<p align="center">
+  <a href="https://github.com/dewiz-xyz/dsolver-simulator/actions/workflows/ci.yml">
+    <img src="https://github.com/dewiz-xyz/dsolver-simulator/actions/workflows/ci.yml/badge.svg" alt="CI status">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/github/license/dewiz-xyz/dsolver-simulator" alt="MIT license">
+  </a>
+  <a href="https://github.com/dewiz-xyz/dsolver-simulator/stargazers">
+    <img src="https://img.shields.io/github/stars/dewiz-xyz/dsolver-simulator?logo=github" alt="GitHub stars">
+  </a>
+  <a href="https://github.com/dewiz-xyz/dsolver-simulator/network/members">
+    <img src="https://img.shields.io/github/forks/dewiz-xyz/dsolver-simulator?logo=github" alt="GitHub forks">
+  </a>
+  <a href="https://github.com/dewiz-xyz/dsolver-simulator/issues">
+    <img src="https://img.shields.io/github/issues/dewiz-xyz/dsolver-simulator?logo=github" alt="GitHub issues">
+  </a>
+</p>
 
-This service owns three things:
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-1.91%2B-000000?logo=rust" alt="Rust 1.91+">
+  <img src="https://img.shields.io/badge/Axum-0.7-111827" alt="Axum 0.7">
+  <img src="https://img.shields.io/badge/Chains-Ethereum%20%7C%20Base-2563eb" alt="Supported chains: Ethereum and Base">
+</p>
 
-- continuous ingestion of native and optional VM-backed Tycho pool state
-- on-demand quote simulation through `POST /simulate`
-- route calldata generation through `POST /encode`
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#api-surface">API</a> ·
+  <a href="#verification">Verification</a> ·
+  <a href="#docs-map">Docs</a>
+</p>
 
-It runs on Axum and Tokio, uses `tycho-simulation` for pricing and execution, and keeps request handling aligned with the live runtime contract implemented in `src/models/messages.rs`, `src/services/quotes.rs`, and `src/services/encode/`.
+DSolver Simulator is a Rust service for DeFi quote simulation and route encoding. It ingests Tycho protocol streams, maintains an in-memory view of pool state, and exposes fast HTTP endpoints for quoting, route settlement encoding, and readiness checks.
 
-### Local run
+## What It Is
+
+- Live-state simulation service for swap and routing workloads.
+- Built on Axum and Tokio, with `tycho-simulation` and `tycho-execution` handling pricing and route execution details.
+- Designed for solver and routing integrations that need both quote coverage and deterministic route encoding behavior.
+
+## Why Teams Use It
+
+- Continuous ingestion of native and optional VM-backed Tycho pool state.
+- Structured `/simulate` responses that distinguish usable quotes, partial coverage, warmup states, and request-level failures.
+- `/encode` route resimulation before calldata generation, so settlement interactions are built from the same runtime view used for quoting.
+- Reporting-first local analysis tooling for readiness, latency, sampled evidence, and quick regression investigation.
+
+## At A Glance
+
+| Category | Details |
+| --- | --- |
+| Language | Rust 2021 |
+| Runtime | Axum + Tokio |
+| Binary | `dsolver-simulator-service` |
+| Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
+| Supported chains | Ethereum (`1`), Base (`8453`) |
+| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID` |
+| Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `HOST`, `PORT` |
+| License | MIT |
+
+## Quick Start
 
 ```bash
 cp .env.example .env
@@ -41,9 +94,9 @@ Common optional inputs:
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
-- `GET /status` reports native readiness, VM readiness, block progress, and VM rebuild/restart context for pollers and deploy scripts.
+- `GET /status` reports native readiness, VM readiness, block progress, and VM rebuild or restart context for pollers and deploy scripts.
 
-`/encode` keeps its current HTTP control flow, but the server now emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
+`/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
 Detailed integration docs:
 
@@ -83,7 +136,7 @@ Summary matrix:
 | Usable quotes with full coverage | `ready` | `complete` | yes |
 | Usable quotes with partial requested-amount coverage or incomplete pool coverage | `ready` | `partial` | yes |
 | No usable quote because liquidity is absent or exhausted | `no_liquidity` | `no_results` | no |
-| Request completed with a valid payload but request-level failure details | `ready` or `internal_error` | `request_level_failure` | no |
+| Request completed with valid payload but request-level failure details | `ready` or `internal_error` | `request_level_failure` | no |
 | Warm-up, token coverage, or request validation problem | `warming_up`, `token_missing`, or `invalid_request` | `request_level_failure` | no |
 
 `/simulate` results are usable for quoting when:
@@ -151,9 +204,9 @@ Useful helpers:
 - `scripts/start_server.sh` to start the server with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain and VM readiness expectations
 - `scripts/stop_server.sh` to stop a server started by the repo helper
-- `cargo run --bin sim-analysis -- ...` to generate a JSON + markdown local behavior report
+- `cargo run --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass/fail harness.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
 ## Docs Map
 
@@ -166,4 +219,4 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).

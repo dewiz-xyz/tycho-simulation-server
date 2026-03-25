@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: stop_server.sh [--repo <path>] [--force]
 
-Stop the tycho-simulation-server started by start_server.sh.
+Stop the dsolver-simulator-service started by start_server.sh.
 
 Options:
   --repo       Path to repo root (default: current directory)

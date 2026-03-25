@@ -1,8 +1,8 @@
-# Tycho Simulation Server (repo context)
+# DSolver Simulator (repo context)
 
 ## What this service does
-- Fast simulation API for DeFi swaps and routing, built on Tycho state.
-- Rust Axum service that ingests Tycho protocol streams, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation.
+- DSolver Simulator is a fast simulation API for DeFi swaps and routing, built on Tycho state.
+- Rust Axum service that ingests Tycho protocol streams, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation and route encoding.
 - Main binary: `dsolver-simulator-service` (see `src/main.rs`).
 
 ## Local run
