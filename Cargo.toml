@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.0"
 default-run = "dsolver-simulator-service"
-description = "Fast simulation API for DeFi swaps and routing, built on Tycho state."
+description = "DSolver Simulator: fast DeFi swap simulation and route encoding on live Tycho state."
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 
