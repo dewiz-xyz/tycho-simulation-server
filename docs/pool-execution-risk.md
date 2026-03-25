@@ -205,29 +205,93 @@ and set a conservative `minAmountOut`.
 
 ---
 
-## Composite Risk Score (Derived)
+## Composite Risk Score
 
-The `/simulate` response carries all the data needed to compute a composite
-score client-side.  A simple weighted formula for a solver context:
+The service computes a composite risk score for each pool and returns it in
+the `execution_risk` field of every pool entry in the `/simulate` response:
+
+```json
+"execution_risk": {
+  "risk_score": 312,
+  "risk_level": "medium"
+}
+```
+
+`risk_score` is a dimensionless integer.  `risk_level` is a qualitative label
+derived from that score:
+
+| `risk_score` | `risk_level` | Interpretation |
+|-------------|--------------|---------------|
+| < 200 | `low` | Deep pool; minimal sensitivity to concurrent activity |
+| 200–499 | `medium` | Moderate sensitivity; suitable for most orders |
+| 500–999 | `high` | Pool state sensitive to competing solver routing |
+| ≥ 1 000 | `very_high` | Prefer splitting across multiple pools |
+| — | `unknown` | All slippage entries are null and utilization is absent |
+
+### Formula
 
 ```
 risk_score = w1 × slippage_last_bps
            + w2 × utilization_bps
            + w3 × (slippage_last / slippage_first)    ← convexity factor
-           + w4 × block_lag × 100                     ← staleness penalty
            + w5 × (1 if partial_ladder else 0) × 10_000
 ```
 
-Suggested weights for a batch-auction solver (CoW / Near Intents):
-- `w1 = 0.35` (price sensitivity — primary signal)
-- `w2 = 0.35` (capacity risk — critical in contested auctions)
-- `w3 = 0.15` (curve convexity — amplifies both above under competition)
-- `w4 = 0.10` (staleness — more significant in longer auction windows)
-- `w5 = 0.05` (ladder failure flag)
+Block-lag staleness (`w4` in earlier drafts of this document) is **not**
+included in the server-side score.  Clients must add that penalty separately
+using `block_number` vs. the current chain head (see §6 above).
 
-A pool with `risk_score < 200` is generally safe to include in the solution.
-A pool with `risk_score > 1000` should be avoided or the order split across
-multiple lower-risk pools.
+### Pool-Type-Aware Weights (`pool_type`)
+
+The weights `w1`, `w2`, and `w3` are not fixed — they adapt to the economic
+character of the pool specified by the caller via the `pool_type` request
+field.
+
+**Request field:**
+
+```json
+{
+  "pool_type": "volatile"   // "volatile" | "stablecoin" | "blue_chip"
+}
+```
+
+`pool_type` defaults to `"volatile"` when omitted.
+
+**Weight table:**
+
+| `pool_type` | `w1` (slippage) | `w2` (utilization) | `w3` (convexity) | `w5` (partial ladder) |
+|-------------|-----------------|--------------------|-----------------|-----------------------|
+| `volatile` *(default)* | **0.35** | **0.35** | 0.15 | 0.05 |
+| `stablecoin` | 0.25 | **0.55** | 0.15 | 0.05 |
+| `blue_chip` | 0.25 | **0.45** | 0.15 | 0.05 |
+
+**Rationale for each type:**
+
+- **`volatile`** — standard AMM (e.g. Uniswap V3 WETH/USDC, Aerodrome
+  volatile pairs).  Slippage and utilization are equally important; neither
+  signal dominates in isolation.
+
+- **`stablecoin`** — correlated-asset pools (e.g. Curve 3pool, USDC/USDT
+  Uniswap V3).  Slippage is expected to be very low even for large amounts
+  (flat bonding curve), so slippage alone is a weak signal.  Utilization
+  carries more weight because the risk of capacity exhaustion by a competing
+  solver is the primary failure mode.
+
+- **`blue_chip`** — deep, battle-tested pools with large TVL (e.g. ETH/USDC
+  500 bps, WBTC/ETH on Uniswap V3).  Deep liquidity means slippage is
+  structurally low.  Utilization is still more informative than slippage, but
+  less so than for stablecoins where any slippage at all is already a
+  meaningful anomaly.
+
+**Choosing the right `pool_type`:**
+
+| Pool characteristics | Suggested `pool_type` |
+|----------------------|----------------------|
+| Stablecoin-to-stablecoin (Curve, Balancer StableSwap) | `stablecoin` |
+| Correlated pegged assets (wstETH/ETH, rETH/ETH) | `stablecoin` |
+| ETH/BTC blue-chip pairs with > $10 M TVL | `blue_chip` |
+| Long-tail ERC-20 pairs, new pools, meme tokens | `volatile` |
+| Any pair where TVL or pool type is unknown | `volatile` *(safe default)* |
 
 ---
 
@@ -235,6 +299,8 @@ multiple lower-risk pools.
 
 | Signal | Where it comes from | Risk it captures |
 |--------|---------------------|-----------------|
+| `execution_risk.risk_score` | server-computed composite | Weighted aggregate of all signals below |
+| `execution_risk.risk_level` | derived from `risk_score` | Qualitative label (`low` / `medium` / `high` / `very_high` / `unknown`) |
 | `slippage_bps[last]` | `compute_slippage_bps()` | Price sensitivity to pool state changes |
 | `pool_utilization_bps` | `compute_pool_utilization_bps()` | Capacity exhaustion under concurrent solver activity |
 | `slippage_bps[last] / slippage_bps[0]` | derived from ladder | Bonding curve convexity |
@@ -243,6 +309,7 @@ multiple lower-risk pools.
 | `block_number` lag vs chain head | response field | State staleness during auction window |
 | `gas_used` variance across steps | per-step gas | V3 tick crossings / VM anomalies |
 | `slippage_bps` all null | missing spot price | Degraded or exotic pool state |
+| `pool_type` (request) | caller-provided | Selects pool-type-aware weights for `risk_score` |
 
 ---
 
@@ -286,17 +353,22 @@ from simulation data, even in a solver context:
 ```
 For each pool in /simulate response:
 │
-├─ amounts_out empty or all zero?             → REJECT (pool cannot fill trade)
-├─ partial ladder?                            → REJECT for amounts beyond last good step
-├─ slippage_bps[last] > 200?                 → SKIP or split across other pools
-├─ pool_utilization_bps > 8000?              → HIGH RISK — widen tolerance or split
-├─ slippage convexity ratio > 10?            → HIGH SENSITIVITY — prefer deeper pool
-├─ block_number lag > 3?                     → RE-SIMULATE before building settlement
-├─ gas_used jumps > 2× between steps?       → V3 tick crossing — widen gas budget
-├─ slippage_bps all null?                    → TREAT as unknown risk; conservative tolerance
+├─ amounts_out empty or all zero?                       → REJECT (pool cannot fill trade)
+├─ partial ladder?                                      → REJECT for amounts beyond last good step
+├─ execution_risk.risk_level == "very_high"?            → SKIP or split across other pools
+├─ execution_risk.risk_level == "high"?                 → HIGH RISK — widen tolerance or split
+├─ execution_risk.risk_level == "unknown"?              → TREAT as unknown risk; conservative tolerance
+├─ slippage convexity ratio > 10?                       → HIGH SENSITIVITY — prefer deeper pool
+├─ block_number lag > 3?                                → RE-SIMULATE before building settlement
+├─ gas_used jumps > 2× between steps?                  → V3 tick crossing — widen gas budget
 │
 └─ Passed all checks → USE pool; set minAmountOut using formula below
 ```
+
+> **Note:** `execution_risk.risk_score` and `risk_level` are computed
+> server-side using weights appropriate for the `pool_type` you supplied in
+> the request (defaulting to `volatile`).  Pass the correct `pool_type` to
+> get the most accurate risk assessment for your pool class.
 
 ---
 
