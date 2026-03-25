@@ -1807,19 +1807,19 @@ fn compute_execution_risk(
 
     match pool_type {
         Some(PoolType::Stablecoin) => {
-            w1 = 0.25;
-            w2 = 0.55;
+            w1 = 0.10;
+            w2 = 0.70;
             w3 = 0.15;
             w5 = 0.05;
         }
         Some(PoolType::BlueChip) => {
-            w1 = 0.25;
-            w2 = 0.45;
+            w1 = 0.35;
+            w2 = 0.55;
             w3 = 0.15;
             w5 = 0.05;
         }
         _ => {
-            w1 = 0.35;
+            w1 = 0.45;
             w2 = 0.35;
             w3 = 0.15;
             w5 = 0.05;
