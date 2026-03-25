@@ -261,27 +261,29 @@ field.
 
 | `pool_type` | `w1` (slippage) | `w2` (utilization) | `w3` (convexity) | `w5` (partial ladder) |
 |-------------|-----------------|--------------------|-----------------|-----------------------|
-| `volatile` *(default)* | **0.35** | **0.35** | 0.15 | 0.05 |
-| `stablecoin` | 0.25 | **0.55** | 0.15 | 0.05 |
-| `blue_chip` | 0.25 | **0.45** | 0.15 | 0.05 |
+| `volatile` *(default)* | **0.45** | 0.35 | 0.15 | 0.05 |
+| `stablecoin` | 0.10 | **0.70** | 0.15 | 0.05 |
+| `blue_chip` | 0.35 | **0.55** | 0.15 | 0.05 |
 
 **Rationale for each type:**
 
 - **`volatile`** — standard AMM (e.g. Uniswap V3 WETH/USDC, Aerodrome
-  volatile pairs).  Slippage and utilization are equally important; neither
-  signal dominates in isolation.
+  volatile pairs).  Price sensitivity is the dominant signal (`w1 = 0.45`):
+  volatile pools can exhibit wide price swings even for moderate trade sizes,
+  so slippage is the most reliable early-warning indicator.  Utilization acts
+  as a secondary check.
 
 - **`stablecoin`** — correlated-asset pools (e.g. Curve 3pool, USDC/USDT
-  Uniswap V3).  Slippage is expected to be very low even for large amounts
-  (flat bonding curve), so slippage alone is a weak signal.  Utilization
-  carries more weight because the risk of capacity exhaustion by a competing
-  solver is the primary failure mode.
+  Uniswap V3).  Slippage is structurally near-zero for properly functioning
+  stable pools, making it a weak signal (`w1 = 0.10`).  Capacity exhaustion
+  by a competing solver is the primary failure mode, so utilization dominates
+  the score (`w2 = 0.70`).
 
-- **`blue_chip`** — deep, battle-tested pools with large TVL (e.g. ETH/USDC
-  500 bps, WBTC/ETH on Uniswap V3).  Deep liquidity means slippage is
-  structurally low.  Utilization is still more informative than slippage, but
-  less so than for stablecoins where any slippage at all is already a
-  meaningful anomaly.
+- **`blue_chip`** — deep, high-TVL pairs (e.g. ETH/USDC 500 bps, WBTC/ETH
+  on Uniswap V3).  Both slippage and utilization carry meaningful weight
+  (`w1 = 0.35`, `w2 = 0.55`): slippage is informative because large orders
+  can still move a tick boundary, and utilization matters because even deep
+  pools can be contested by multiple large solvers in the same auction window.
 
 **Choosing the right `pool_type`:**
 
