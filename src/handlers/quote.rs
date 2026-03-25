@@ -456,6 +456,7 @@ fn pool_outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
         PoolOutcomeKind::ZeroOutput => "zero_output",
         PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
         PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
+        PoolOutcomeKind::SkippedPrecheck => "skipped_precheck",
         PoolOutcomeKind::TimedOut => "timed_out",
         PoolOutcomeKind::SimulatorError => "simulator_error",
         PoolOutcomeKind::InternalError => "internal_error",
@@ -613,6 +614,9 @@ mod tests {
             amounts_out: vec![amount_out.to_string(), "0".to_string()],
             gas_used: vec![gas_used, 0],
             block_number: 1,
+            slippage_bps: Vec::new(),
+            pool_utilization_bps: None,
+            execution_risk: None,
         }
     }
 

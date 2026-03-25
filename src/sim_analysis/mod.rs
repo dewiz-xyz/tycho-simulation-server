@@ -19,7 +19,8 @@ use tokio::task::JoinSet;
 
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, EncodeErrorResponse, HopDraft, InteractionKind, PoolRef,
-    PoolSwapDraft, QuoteResult, RouteEncodeRequest, RouteEncodeResponse, SegmentDraft, SwapKind,
+    PoolSwapDraft, PoolType, QuoteResult, RouteEncodeRequest, RouteEncodeResponse, SegmentDraft,
+    SwapKind,
 };
 
 use self::presets::{
@@ -528,6 +529,7 @@ async fn run_encode_scenarios(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        pool_type: PoolType::Volatile,
     };
     let first_hop = run_encode_prep_hop(
         client,
@@ -567,6 +569,7 @@ async fn run_encode_scenarios(
         token_in: mid_token.to_string(),
         token_out: token_out.to_string(),
         amounts: hop_amounts,
+        pool_type: PoolType::Volatile,
     };
     let second_hop = run_encode_prep_hop(
         client,
@@ -1282,6 +1285,7 @@ fn simulate_request(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        pool_type: PoolType::Volatile,
     })
 }
 
@@ -1802,8 +1806,7 @@ mod tests {
         BaselineMode, CliArgs, ScriptPaths,
     };
     use crate::models::messages::{
-        AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
-        QuoteResultQuality, QuoteStatus,
+        AmountOutResponse, ExecutionRisk, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus, RiskLevel
     };
     use reqwest::Client;
     use std::fs;
@@ -2068,14 +2071,7 @@ mod tests {
     fn select_best_pool_uses_canonical_protocol_from_quote_metadata() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UniswapV3::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                block_number: 1,
-            }],
+            data: vec![AmountOutResponse {pool:"pool-1".to_string(),pool_name:"UniswapV3::DAI/USDC".to_string(),pool_address:"0x0000000000000000000000000000000000000001".to_string(),amounts_out:vec!["10".to_string()],gas_used:vec![1],block_number:1, slippage_bps: vec![Some(1)], pool_utilization_bps: Some(1), execution_risk: Some(ExecutionRisk { risk_score: 100, risk_level: RiskLevel::Low }) }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
                 result_quality: QuoteResultQuality::Complete,
@@ -2117,14 +2113,7 @@ mod tests {
     fn select_best_pool_falls_back_to_known_pool_name_prefixes() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UniswapV3::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                block_number: 1,
-            }],
+            data: vec![AmountOutResponse {pool:"pool-1".to_string(),pool_name:"UniswapV3::DAI/USDC".to_string(),pool_address:"0x0000000000000000000000000000000000000001".to_string(),amounts_out:vec!["10".to_string()],gas_used:vec![1],block_number:1, slippage_bps: vec![Some(1)], pool_utilization_bps: Some(1), execution_risk: Some(ExecutionRisk { risk_score: 100, risk_level: RiskLevel::Low }) }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
                 result_quality: QuoteResultQuality::Complete,
@@ -2153,14 +2142,7 @@ mod tests {
     fn select_best_pool_preserves_vm_protocol_from_quote_metadata() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Curve::USDC/USDT".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                block_number: 1,
-            }],
+            data: vec![AmountOutResponse {pool:"pool-1".to_string(),pool_name:"Curve::USDC/USDT".to_string(),pool_address:"0x0000000000000000000000000000000000000001".to_string(),amounts_out:vec!["10".to_string()],gas_used:vec![1],block_number:1, slippage_bps: vec![Some(1)], pool_utilization_bps: Some(1), execution_risk: Some(ExecutionRisk { risk_score: 100, risk_level: RiskLevel::Low }) }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
                 result_quality: QuoteResultQuality::Complete,
@@ -2198,14 +2180,7 @@ mod tests {
     fn select_best_pool_falls_back_to_vm_protocol_from_pool_name() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Curve::USDC/USDT".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                block_number: 1,
-            }],
+            data: vec![AmountOutResponse {pool:"pool-1".to_string(),pool_name:"Curve::USDC/USDT".to_string(),pool_address:"0x0000000000000000000000000000000000000001".to_string(),amounts_out:vec!["10".to_string()],gas_used:vec![1],block_number:1, slippage_bps: vec![Some(1)], pool_utilization_bps: Some(1), execution_risk: Some(ExecutionRisk { risk_score: 100, risk_level: RiskLevel::Low }) }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
                 result_quality: QuoteResultQuality::Complete,
@@ -2234,14 +2209,7 @@ mod tests {
     fn select_best_pool_falls_back_to_normalized_pool_name_prefix() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UnknownProtocol::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                block_number: 1,
-            }],
+            data: vec![AmountOutResponse {pool:"pool-1".to_string(),pool_name:"UnknownProtocol::DAI/USDC".to_string(),pool_address:"0x0000000000000000000000000000000000000001".to_string(),amounts_out:vec!["10".to_string()],gas_used:vec![1],block_number:1, slippage_bps: vec![Some(1)], pool_utilization_bps: Some(1), execution_risk: Some(ExecutionRisk { risk_score: 100, risk_level: RiskLevel::Low }) }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
                 result_quality: QuoteResultQuality::Complete,
