@@ -351,6 +351,7 @@ struct RequestPair {
 struct CandidateSets {
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
+    rfq_candidates: Vec<CandidatePool>,
 }
 
 struct PreparedQuoteExecution {
@@ -361,6 +362,7 @@ struct PreparedQuoteExecution {
     quote_deadline: Instant,
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
+    rfq_candidates: Vec<CandidatePool>,
     cancel_token: CancellationToken,
 }
 
@@ -690,6 +692,7 @@ impl QuoteRequestRunner {
         }
         self.run.meta.block_number = self.state.current_block().await;
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
+        self.run.meta.rfq_block_number = self.state.current_rfq_block().await;
         self.run.meta.total_pools = Some(self.state.total_pools().await);
         Ok(())
     }
@@ -822,6 +825,7 @@ impl QuoteRequestRunner {
             quote_deadline,
             native_candidates: candidates.native_candidates,
             vm_candidates: candidates.vm_candidates,
+            rfq_candidates: candidates.rfq_candidates,
             cancel_token: self
                 .cancel
                 .as_ref()
@@ -860,9 +864,25 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
+        let rfq_ready = self.state.rfq_ready().await;
+        if self.state.enable_rfq_pools && !rfq_ready {
+            self.run.metrics.skipped_rfq_unavailable = true;
+        }
+        let rfq_candidates = if rfq_ready {
+            self.state
+                .rfq_state_store
+                .matching_pools_by_addresses(&pair.token_in_bytes, &pair.token_out_bytes)
+                .await
+                .into_iter()
+                .map(|(id, (pool_state, component))| (id, pool_state, component))
+                .collect()
+        } else {
+            Vec::new()
+        };
         CandidateSets {
             native_candidates,
             vm_candidates,
+            rfq_candidates,
         }
     }
 
@@ -875,7 +895,9 @@ impl QuoteRequestRunner {
         amounts_in: &Arc<Vec<BigUint>>,
         candidates: &mut CandidateSets,
     ) -> Result<(), RequestExit> {
-        let total_candidates = candidates.native_candidates.len() + candidates.vm_candidates.len();
+        let total_candidates = candidates.native_candidates.len()
+            + candidates.vm_candidates.len()
+            + candidates.rfq_candidates.len();
         self.run.meta.matching_pools = total_candidates;
         self.run.meta.candidate_pools = total_candidates;
         self.run.failures.reserve(total_candidates);
@@ -904,18 +926,26 @@ impl QuoteRequestRunner {
         );
         candidates.native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         candidates.vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.rfq_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(())
     }
 
     async fn execute_pool_quotes(&mut self, prepared: PreparedQuoteExecution) {
         let mut tasks = self.schedule_pool_tasks(&prepared);
         let mut vm_first_gases = Vec::new();
+        let mut rfq_first_gases = Vec::new();
         if !tasks.is_empty() {
-            self.collect_pool_task_results(&prepared, &mut tasks, &mut vm_first_gases)
-                .await;
+            self.collect_pool_task_results(
+                &prepared,
+                &mut tasks,
+                &mut vm_first_gases,
+                &mut rfq_first_gases,
+            )
+            .await;
         }
         drop(tasks);
         finalize_vm_first_gas_metrics(&mut self.run.metrics, &mut vm_first_gases);
+        finalize_rfq_first_gas_metrics(&mut self.run.metrics, &mut rfq_first_gases);
         self.apply_scheduling_failures();
         self.apply_empty_response_state();
     }
@@ -927,6 +957,7 @@ impl QuoteRequestRunner {
         let mut tasks = FuturesUnordered::new();
         let native_semaphore = self.state.native_sim_semaphore();
         let vm_semaphore = self.state.vm_sim_semaphore();
+        let rfq_semaphore = self.state.rfq_sim_semaphore();
         for (kind, candidates, pool_timeout, semaphore) in [
             (
                 ScheduledPoolKind::Native,
@@ -939,6 +970,12 @@ impl QuoteRequestRunner {
                 &prepared.vm_candidates,
                 self.state.pool_timeout_vm(),
                 vm_semaphore,
+            ),
+            (
+                ScheduledPoolKind::Rfq,
+                &prepared.rfq_candidates,
+                self.state.pool_timeout_rfq(),
+                rfq_semaphore,
             ),
         ] {
             self.schedule_pool_group(
@@ -1011,6 +1048,7 @@ impl QuoteRequestRunner {
         prepared: &PreparedQuoteExecution,
         tasks: &mut FuturesUnordered<PoolTask>,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         let remaining = prepared
             .quote_deadline
@@ -1049,7 +1087,12 @@ impl QuoteRequestRunner {
                     let Some(outcome) = maybe_outcome else {
                         break;
                     };
-                    self.handle_pool_task_outcome(outcome, prepared, vm_first_gases);
+                    self.handle_pool_task_outcome(
+                        outcome,
+                        prepared,
+                        vm_first_gases,
+                        rfq_first_gases,
+                    );
                 }
             }
         }
@@ -1060,10 +1103,11 @@ impl QuoteRequestRunner {
         outcome: Result<PoolSimOutcome, QuoteFailure>,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         match outcome {
             Ok(PoolSimOutcome::Simulated(result)) => {
-                self.handle_simulated_pool_result(result, prepared, vm_first_gases)
+                self.handle_simulated_pool_result(result, prepared, vm_first_gases, rfq_first_gases)
             }
             Err(failure) => self.handle_pool_failure(failure, prepared.expected_len),
         }
@@ -1074,6 +1118,7 @@ impl QuoteRequestRunner {
         mut result: PoolQuoteResult,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         if result.successful_steps > 0 {
             while result.amounts_out.len() < prepared.expected_len {
@@ -1087,6 +1132,13 @@ impl QuoteRequestRunner {
         record_vm_first_gas_metrics(
             &mut self.run.metrics,
             vm_first_gases,
+            result.protocol.as_str(),
+            result.pool.as_str(),
+            result.first_successful_gas_used,
+        );
+        record_rfq_first_gas_metrics(
+            &mut self.run.metrics,
+            rfq_first_gases,
             result.protocol.as_str(),
             result.pool.as_str(),
             result.first_successful_gas_used,
@@ -1921,6 +1973,43 @@ fn finalize_vm_first_gas_metrics(metrics: &mut QuoteMetrics, vm_first_gases: &mu
     metrics.vm_median_first_gas = Some(median_gas);
     metrics.vm_low_first_gas_ratio =
         Some(metrics.vm_low_first_gas_count as f64 / metrics.vm_completed_pools as f64);
+}
+
+fn record_rfq_first_gas_metrics(
+    metrics: &mut QuoteMetrics,
+    rfq_first_gases: &mut Vec<u64>,
+    protocol: &str,
+    pool_id: &str,
+    first_gas: Option<u64>,
+) {
+    if !protocol.starts_with("rfq:") {
+        return;
+    }
+
+    let Some(first_gas) = first_gas else {
+        return;
+    };
+
+    metrics.rfq_completed_pools += 1;
+    rfq_first_gases.push(first_gas);
+    if first_gas < VM_LOW_FIRST_GAS_THRESHOLD {
+        metrics.rfq_low_first_gas_count += 1;
+        if metrics.rfq_low_first_gas_samples.len() < VM_LOW_FIRST_GAS_SAMPLE_CAP {
+            metrics
+                .rfq_low_first_gas_samples
+                .push(format!("{protocol}:{pool_id}:{first_gas}"));
+        }
+    }
+}
+
+fn finalize_rfq_first_gas_metrics(metrics: &mut QuoteMetrics, rfq_first_gases: &mut [u64]) {
+    let Some(median_gas) = median_u64(rfq_first_gases) else {
+        return;
+    };
+
+    metrics.rfq_median_first_gas = Some(median_gas);
+    metrics.rfq_low_first_gas_ratio =
+        Some(metrics.rfq_low_first_gas_count as f64 / metrics.rfq_completed_pools as f64);
 }
 
 fn median_u64(values: &mut [u64]) -> Option<u64> {

@@ -152,7 +152,6 @@ async fn main() -> anyhow::Result<()> {
     };
     spawn_rfq_stream_task(
         &config,
-        &tycho_url,
         &supervisor_cfg,
         &tokens,
         &stream_resources,
@@ -475,7 +474,6 @@ fn spawn_vm_stream_task(
 
 fn spawn_rfq_stream_task(
     config: &dsolver_simulator::config::AppConfig,
-    tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: &Arc<TokenStore>,
     resources: &StreamResources,
@@ -507,10 +505,7 @@ fn spawn_rfq_stream_task(
     let health_bg = Arc::clone(&resources.rfq_stream_health);
     let rfq_stream_bg = Arc::clone(&resources.rfq_stream);
     let rfq_semaphore_bg = app_state.rfq_sim_semaphore();
-    let tycho_url = tycho_url.to_string();
-    let api_key = config.api_key.clone();
     let tvl_threshold = config.tvl_threshold;
-    let tvl_keep_threshold = config.tvl_keep_threshold;
     let rfq_protocols = config.chain_profile.rfq_protocols.clone();
     let rfq_sim_concurrency = rfq_sim_concurrency_u32(config.global_rfq_sim_concurrency);
 
