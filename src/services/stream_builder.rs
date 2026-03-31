@@ -193,7 +193,7 @@ pub async fn build_rfq_stream(
         .tokens(rfq_tokens_bebop)
         .tvl_threshold(tvl_add_threshold)
         .build()
-        .expect("Failed to create Bebop RFQ client");
+        .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
     rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
 
     info!("Setting up Hashflow RFQ client...\n");
@@ -207,7 +207,7 @@ pub async fn build_rfq_stream(
         .tvl_threshold(tvl_add_threshold)
         .poll_time(Duration::from_secs(5))
         .build()
-        .expect("Failed to create Hashflow RFQ client");
+        .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
     rfq_builder = rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
 
     info!("Building RFQ Stream...\n");
