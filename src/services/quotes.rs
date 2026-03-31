@@ -2048,7 +2048,7 @@ mod tests {
     };
     use tycho_simulation::tycho_common::Bytes;
 
-    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
 
@@ -2429,12 +2429,15 @@ mod tests {
 
     struct TestAppStateConfig {
         enable_vm_pools: bool,
+        enable_rfq_pools: bool,
         erc4626_deposits_enabled: bool,
         native_sim_concurrency: usize,
         vm_sim_concurrency: usize,
+        rfq_sim_concurrency: usize,
         quote_timeout: Duration,
         pool_timeout_native: Duration,
         pool_timeout_vm: Duration,
+        pool_timeout_rfq: Duration,
         request_timeout: Duration,
     }
 
@@ -2445,9 +2448,11 @@ mod tests {
                 erc4626_deposits_enabled: false,
                 native_sim_concurrency: 1,
                 vm_sim_concurrency: 1,
+                rfq_sim_concurrency: 1,
                 quote_timeout: Duration::from_secs(1),
                 pool_timeout_native: Duration::from_millis(50),
                 pool_timeout_vm: Duration::from_millis(50),
+                pool_timeout_rfq: Duration::from_millis(50),
                 request_timeout: Duration::from_secs(2),
             }
         }
@@ -2457,6 +2462,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
         config: TestAppStateConfig,
     ) -> AppState {
         AppState {
@@ -2465,26 +2471,36 @@ mod tests {
             tokens: token_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: config.enable_vm_pools,
+            enable_rfq_pools: config.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: config.quote_timeout,
             pool_timeout_native: config.pool_timeout_native,
             pool_timeout_vm: config.pool_timeout_vm,
+            pool_timeout_rfq: config.pool_timeout_rfq,
             request_timeout: config.request_timeout,
             native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(config.rfq_sim_concurrency)),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: config.native_sim_concurrency,
             vm_sim_concurrency: config.vm_sim_concurrency,
+            rfq_sim_concurrency: config.rfq_sim_concurrency,
         }
     }
 
-    fn make_test_state_stores(token_store: &Arc<TokenStore>) -> (Arc<StateStore>, Arc<StateStore>) {
+    fn make_test_state_stores(
+        token_store: &Arc<TokenStore>,
+    ) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
         (
+            Arc::new(StateStore::new(Arc::clone(token_store))),
             Arc::new(StateStore::new(Arc::clone(token_store))),
             Arc::new(StateStore::new(Arc::clone(token_store))),
         )
@@ -2513,6 +2529,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
     }
 
     impl BasicQuoteFixture {
@@ -2524,7 +2541,8 @@ mod tests {
             let token_in_meta = make_token(&token_in, "TK1");
             let token_out_meta = make_token(&token_out, "TK2");
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
-            let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+            let (native_state_store, vm_state_store, rfq_state_store) =
+                make_test_state_stores(&token_store);
 
             Self {
                 token_in_hex,
@@ -2534,6 +2552,7 @@ mod tests {
                 token_store,
                 native_state_store,
                 vm_state_store,
+                rfq_state_store,
             }
         }
 
@@ -2554,6 +2573,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
     }
 
     impl Erc4626QuoteFixture {
@@ -2572,7 +2592,8 @@ mod tests {
             let token_out_meta =
                 make_token_with_decimals(&token_out, token_out_symbol, token_out_decimals);
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
-            let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+            let (native_state_store, vm_state_store, rfq_state_store) =
+                make_test_state_stores(&token_store);
 
             Self {
                 token_in_hex,
@@ -2582,6 +2603,7 @@ mod tests {
                 token_store,
                 native_state_store,
                 vm_state_store,
+                rfq_state_store,
             }
         }
 
@@ -2652,6 +2674,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 enable_vm_pools,
                 ..TestAppStateConfig::default()
@@ -2761,11 +2784,13 @@ mod tests {
     #[tokio::test]
     async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
         let token_store = make_token_store(Vec::new());
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
         let app_state = make_test_app_state(
             token_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -2843,6 +2868,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 erc4626_deposits_enabled: true,
                 ..TestAppStateConfig::default()
@@ -2897,6 +2923,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-filtered", &["2"]);
@@ -2949,7 +2976,8 @@ mod tests {
         let app_state = make_test_app_state(
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
-            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.vm_state_store),,
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-deposit-disabled", &["2"]);
@@ -3003,6 +3031,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-redeem-disabled", &["2"]);
@@ -3071,6 +3100,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-mixed", &["2"]);
@@ -3101,7 +3131,7 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) = make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3131,6 +3161,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 

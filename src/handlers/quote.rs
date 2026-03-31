@@ -656,6 +656,7 @@ mod tests {
         let meta = simulate_timeout_meta(
             12,
             Some(11),
+            Some(12),
             Some(42),
             Some("auction-1".to_string()),
             "Simulate request timed out after 1500ms".to_string(),
