@@ -142,9 +142,6 @@ pub fn load_config() -> AppConfig {
         env::var("HASHFLOW_USER").expect("HASHFLOW_USER must be set"),
         env::var("HASHFLOW_KEY").expect("HASHFLOW_KEY must be set"),
     );
-    let hashflow_filename =
-        env::var("HASHFLOW_FILENAME_CSV").expect("HASHFLOW_FILENAME_CSV must be set");
-    let bebop_url = env::var("BEBOP_URL").expect("BEBOP_URL must be set");
 
     AppConfig {
         chain_profile,
