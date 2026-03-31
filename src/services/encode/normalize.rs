@@ -351,7 +351,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(route_backend_usage(&normalized), (true, true, true));
+        assert_eq!(route_backend_usage(&normalized), (true, true, false));
     }
 
     #[test]

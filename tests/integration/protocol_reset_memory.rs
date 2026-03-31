@@ -10,7 +10,7 @@ use dsolver_simulator::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
 use dsolver_simulator::models::messages::AmountOutRequest;
-use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use dsolver_simulator::models::stream_health::StreamHealth;
 use dsolver_simulator::models::tokens::TokenStore;
 use dsolver_simulator::services::quotes::get_amounts_out;
@@ -481,6 +481,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
 
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
     let native_component = make_component(
         10,
@@ -505,12 +506,24 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         "curve_pool",
         vec![token_a.clone(), token_b.clone()],
     );
+    let rfq_component = make_component(
+        11,
+        "rfq:hashflow",
+        "curve_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
     let vm_update = make_update(
         1,
         vec![("pool-vm".to_string(), vm_component, Box::new(DummySim))],
         HashMap::from([ready_state("vm:curve", 1)]),
     );
+    let rfq_update = make_update(
+        1,
+        vec![("pool-rfq".to_string(), rfq_component, Box::new(DummySim))],
+        HashMap::from([ready_state("rfq:hashflow", 1)]),
+    );
     vm_state_store.apply_update(vm_update).await;
+    rfq_state_store.apply_update(rfq_update).await;
 
     let app_state = AppState {
         chain: Chain::Ethereum,
@@ -518,24 +531,32 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         tokens: Arc::clone(&token_store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: true,
+        enable_rfq_pools: true,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_millis(100),
         pool_timeout_native: Duration::from_millis(50),
         pool_timeout_vm: Duration::from_millis(50),
+        pool_timeout_rfq: Duration::from_millis(50),
         request_timeout: Duration::from_millis(1000),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 4,
+        rfq_sim_concurrency: 4,
     };
 
     assert!(app_state.vm_ready().await);
+    assert!(app_state.rfq_ready().await);
 
     vm_state_store.reset().await;
     {
@@ -544,8 +565,18 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         status.rebuild_started_at = Some(tokio::time::Instant::now());
     }
 
+    rfq_state_store.reset().await;
+    {
+        let mut status = app_state.rfq_stream.write().await;
+        status.rebuilding = true;
+        status.rebuild_started_at = Some(tokio::time::Instant::now());
+    }
+
     assert!(!app_state.vm_ready().await);
     assert_eq!(vm_state_store.total_states().await, 0);
+
+    assert!(!app_state.rfq_ready().await);
+    assert_eq!(rfq_state_store.total_states().await, 0);
 
     let request = AmountOutRequest {
         request_id: "req-1".to_string(),
@@ -557,7 +588,9 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
 
     let computation = get_amounts_out(app_state.clone(), request, None).await;
     assert!(computation.metrics.skipped_vm_unavailable);
+    assert!(computation.metrics.skipped_rfq_unavailable);
     assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+    assert_eq!(computation.metrics.scheduled_rfq_pools, 0);
     assert!(computation.metrics.scheduled_native_pools > 0);
 }
 

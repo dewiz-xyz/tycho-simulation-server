@@ -79,7 +79,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{status, StatusPayload};
-    use crate::models::state::{AppState, StateStore, VmStreamStatus};
+    use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use axum::{extract::State, http::StatusCode, Json};
@@ -199,7 +199,7 @@ mod tests {
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-            vm_state_store: Arc::new(StateStore::new(token_store)),
+            vm_state_store: Arc::new(StateStore::new(token_store.clone())),
             rfq_state_store: Arc::new(StateStore::new(token_store)),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_returns_service_unavailable_for_stale_native_state() {
-        let mut state = test_state(false);
+        let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
         state.native_stream_health.record_update(1).await;
@@ -241,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_vm_rebuilding() {
-        let state = test_state(true);
+        let state = test_state(true, true);
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;

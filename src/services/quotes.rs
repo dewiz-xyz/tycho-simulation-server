@@ -38,16 +38,25 @@ fn native_token_address() -> Bytes {
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub scheduled_rfq_pools: usize,
     pub skipped_vm_unavailable: bool,
+    pub skipped_rfq_unavailable: bool,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
+    pub skipped_rfq_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+    pub skipped_rfq_deadline: usize,
     pub vm_completed_pools: usize,
+    pub rfq_completed_pools: usize,
     pub vm_median_first_gas: Option<u64>,
+    pub rfq_median_first_gas: Option<u64>,
     pub vm_low_first_gas_count: usize,
+    pub rfq_low_first_gas_count: usize,
     pub vm_low_first_gas_ratio: Option<f64>,
+    pub rfq_low_first_gas_ratio: Option<f64>,
     pub vm_low_first_gas_samples: Vec<String>,
+    pub rfq_low_first_gas_samples: Vec<String>,
 }
 
 pub struct QuoteComputation {
@@ -72,6 +81,7 @@ fn build_request_exit(
     meta.partial_kind = exit.partial_kind;
     meta.pool_results = pool_results;
     meta.vm_unavailable = metrics.skipped_vm_unavailable;
+    meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
     meta.failures = failures;
     QuoteComputation {
         responses,
@@ -84,6 +94,7 @@ fn build_request_exit(
 enum ScheduledPoolKind {
     Native,
     Vm,
+    Rfq,
 }
 
 impl ScheduledPoolKind {
@@ -93,6 +104,7 @@ impl ScheduledPoolKind {
                 "Pool scheduling skipped because native concurrency permits were exhausted"
             }
             Self::Vm => "Pool scheduling skipped because VM concurrency permits were exhausted",
+            Self::Rfq => "Pool scheduling skipped because RFQ concurrency permits were exhausted",
         }
     }
 
@@ -100,6 +112,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => "Native pool semaphore closed",
             Self::Vm => "VM pool semaphore closed",
+            Self::Rfq => "RFQ pool semaphore closed",
         }
     }
 
@@ -107,6 +120,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.skipped_native_deadline += 1,
             Self::Vm => metrics.skipped_vm_deadline += 1,
+            Self::Rfq => metrics.skipped_rfq_deadline += 1,
         }
     }
 
@@ -114,6 +128,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.skipped_native_concurrency += 1,
             Self::Vm => metrics.skipped_vm_concurrency += 1,
+            Self::Rfq => metrics.skipped_rfq_concurrency += 1,
         }
     }
 
@@ -121,6 +136,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.scheduled_native_pools += 1,
             Self::Vm => metrics.scheduled_vm_pools += 1,
+            Self::Rfq => metrics.scheduled_rfq_pools += 1,
         }
     }
 }
@@ -1177,8 +1193,10 @@ impl QuoteRequestRunner {
     fn apply_scheduling_failures(&mut self) {
         if self.run.metrics.skipped_native_concurrency == 0
             && self.run.metrics.skipped_vm_concurrency == 0
+            && self.run.metrics.skipped_rfq_concurrency == 0
             && self.run.metrics.skipped_native_deadline == 0
             && self.run.metrics.skipped_vm_deadline == 0
+            && self.run.metrics.skipped_rfq_deadline == 0
         {
             return;
         }
@@ -1186,11 +1204,13 @@ impl QuoteRequestRunner {
         self.push_failure(make_failure(
             QuoteFailureKind::ConcurrencyLimit,
             format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} rfq_concurrency={} native_deadline={} vm_deadline={} rfq_deadline={}",
                 self.run.metrics.skipped_native_concurrency,
                 self.run.metrics.skipped_vm_concurrency,
+                self.run.metrics.skipped_rfq_concurrency,
                 self.run.metrics.skipped_native_deadline,
-                self.run.metrics.skipped_vm_deadline
+                self.run.metrics.skipped_vm_deadline,
+                self.run.metrics.skipped_rfq_deadline
             ),
             None,
         ));
@@ -2445,6 +2465,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 enable_vm_pools: false,
+                enable_rfq_pools: false,
                 erc4626_deposits_enabled: false,
                 native_sim_concurrency: 1,
                 vm_sim_concurrency: 1,
@@ -2976,7 +2997,7 @@ mod tests {
         let app_state = make_test_app_state(
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
-            Arc::clone(&fixture.vm_state_store),,
+            Arc::clone(&fixture.vm_state_store),
             Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
@@ -3131,7 +3152,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store, rfq_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3197,7 +3219,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3245,6 +3268,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3284,7 +3308,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3332,6 +3357,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3371,7 +3397,8 @@ mod tests {
             native_meta.clone(),
             token_in_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3401,6 +3428,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3436,7 +3464,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         // Keep native store ready without creating any matching pools for the request pair.
         let native_dummy_token_a =
@@ -3491,6 +3520,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig {
                 enable_vm_pools: true,
                 ..TestAppStateConfig::default()
@@ -3563,6 +3593,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-1", &["1", "5", "11"]);
@@ -3925,6 +3956,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-2", &["1", "11"]);
@@ -3977,6 +4009,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-zero-then-positive", &["1", "2"]);
@@ -4174,6 +4207,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-limit-partial-amounts", &["1", "11"]);
@@ -4246,6 +4280,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 native_sim_concurrency: 2,
                 ..TestAppStateConfig::default()
@@ -4329,6 +4364,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 native_sim_concurrency: 1,
                 ..TestAppStateConfig::default()
@@ -4391,6 +4427,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-insufficient-reserve", &["1", "11"]);
@@ -4424,6 +4461,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-internal-fallback", &["1"]);
@@ -4462,6 +4500,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-finalize-order", &["1", "2"]);
@@ -4506,6 +4545,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-finalize-tiebreak", &["1"]);

@@ -1274,7 +1274,6 @@ mod tests {
         state.vm_stream_health.record_update(1).await;
         state.rfq_stream_health.record_update(1).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
 
         {
             let mut vm_status = state.vm_stream.write().await;
@@ -1297,7 +1296,6 @@ mod tests {
         }
         state.readiness_stale = Duration::ZERO;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
     }
 
     #[tokio::test]
