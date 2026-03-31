@@ -186,7 +186,7 @@ mod tests {
             .await;
     }
 
-    fn test_state(enable_vm_pools: bool) -> AppState {
+    fn test_state(enable_vm_pools: bool, enable_rfq_pools: bool) -> AppState {
         let token_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
@@ -200,21 +200,28 @@ mod tests {
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             vm_state_store: Arc::new(StateStore::new(token_store)),
+            rfq_state_store: Arc::new(StateStore::new(token_store)),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools,
+            enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         }
     }
 

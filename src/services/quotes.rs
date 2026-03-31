@@ -462,6 +462,7 @@ impl QuoteRequestRunner {
     ) -> Self {
         let current_block = state.current_block().await;
         let current_vm_block = state.current_vm_block().await;
+        let current_rfq_block = state.current_rfq_block().await;
         let total_pools = state.total_pools().await;
         let quote_timeout = state.quote_timeout();
         let meta = QuoteMeta {
@@ -470,12 +471,14 @@ impl QuoteRequestRunner {
             partial_kind: None,
             block_number: current_block,
             vm_block_number: current_vm_block,
+            rfq_block_number: current_rfq_block,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: Some(total_pools),
             auction_id: request.auction_id.clone(),
             pool_results: Vec::new(),
             vm_unavailable: false,
+            rfq_unavailable: false,
             failures: Vec::new(),
         };
         Self {
