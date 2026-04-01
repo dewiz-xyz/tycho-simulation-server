@@ -8,10 +8,7 @@ use std::time::Duration;
 use dsolver_simulator::models::rfq::bebop::BebopResponse;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
-use tycho_simulation::tycho_common::{
-    models::token::Token,
-    Bytes,
-};
+use tycho_simulation::tycho_common::{models::token::Token, Bytes};
 use tycho_simulation::utils::load_all_tokens;
 
 use dsolver_simulator::api::create_router;
