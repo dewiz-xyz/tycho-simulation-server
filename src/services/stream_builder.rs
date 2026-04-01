@@ -167,8 +167,8 @@ pub struct RFQConfig {
 pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
     tokens: Arc<TokenStore>,
-    chain: Chain,
-    protocols: &[String],
+    _chain: Chain,
+    _protocols: &[String],
     bebop_tokens: Arc<TokenStore>,
     hashflow_tokens: Arc<TokenStore>,
     rfq_config: RFQConfig,
