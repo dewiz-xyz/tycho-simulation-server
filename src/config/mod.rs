@@ -134,14 +134,37 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
 
-    let (bebop_user, bebop_key) = (
-        env::var("BEBOP_USER").expect("BEBOP_USER must be set"),
-        env::var("BEBOP_KEY").expect("BEBOP_KEY must be set"),
-    );
-    let (hashflow_user, hashflow_key) = (
-        env::var("HASHFLOW_USER").expect("HASHFLOW_USER must be set"),
-        env::var("HASHFLOW_KEY").expect("HASHFLOW_KEY must be set"),
-    );
+    let bebop_user = match env::var("BEBOP_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let bebop_key = match env::var("BEBOP_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let hashflow_user = match env::var("HASHFLOW_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let hashflow_key = match env::var("HASHFLOW_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
 
     AppConfig {
         chain_profile,

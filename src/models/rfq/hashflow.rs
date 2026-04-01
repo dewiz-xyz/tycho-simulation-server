@@ -9,11 +9,11 @@ use tycho_simulation::tycho_common::{
 //evm,1,1INCH,1inch,0x111111111117dc0aa78b770fa6a738034120c302,18
 #[derive(Deserialize)]
 struct Record {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     chain_type: String,
     chain_id: u32,
     name: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     display_name: String,
     address: String,
     decimals: u32,
