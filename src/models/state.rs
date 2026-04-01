@@ -1115,45 +1115,57 @@ mod tests {
         Update::new(1, states, new_pairs)
     }
 
-    fn build_test_app_state(
+    struct TestAppStateStores {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
         rfq_state_store: Arc<StateStore>,
+    }
+
+    struct PoolFlags {
         enable_vm_pools: bool,
         enable_rfq_pools: bool,
-        native_sim_concurrency: usize,
-        vm_sim_concurrency: usize,
-        rfq_sim_concurrency: usize,
+    }
+
+    struct SimConcurrency {
+        native: usize,
+        vm: usize,
+        rfq: usize,
+    }
+
+    fn build_test_app_state(
+        stores: TestAppStateStores,
+        flags: PoolFlags,
+        concurrency: SimConcurrency,
     ) -> AppState {
         AppState {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
-            tokens: token_store,
-            native_state_store,
-            vm_state_store,
-            rfq_state_store,
+            tokens: stores.token_store,
+            native_state_store: stores.native_state_store,
+            vm_state_store: stores.vm_state_store,
+            rfq_state_store: stores.rfq_state_store,
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
-            enable_vm_pools,
-            enable_rfq_pools,
+            enable_vm_pools: flags.enable_vm_pools,
+            enable_rfq_pools: flags.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
             pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
-            rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
+            native_sim_semaphore: Arc::new(Semaphore::new(concurrency.native)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(concurrency.vm)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(concurrency.rfq)),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency,
-            vm_sim_concurrency,
-            rfq_sim_concurrency,
+            native_sim_concurrency: concurrency.native,
+            vm_sim_concurrency: concurrency.vm,
+            rfq_sim_concurrency: concurrency.rfq,
         }
     }
 
@@ -1183,15 +1195,21 @@ mod tests {
             .await;
 
         build_test_app_state(
-            token_store,
-            native_state_store,
-            vm_state_store,
-            rfq_state_store,
-            enable_vm_pools,
-            enable_rfq_pools,
-            1,
-            1,
-            1,
+            TestAppStateStores {
+                token_store,
+                native_state_store,
+                vm_state_store,
+                rfq_state_store,
+            },
+            PoolFlags {
+                enable_vm_pools,
+                enable_rfq_pools,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         )
     }
 
@@ -1209,15 +1227,21 @@ mod tests {
             let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
             let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
             build_test_app_state(
-                token_store,
-                native_state_store,
-                vm_state_store,
-                rfq_state_store,
-                false,
-                false,
-                1,
-                1,
-                1,
+                TestAppStateStores {
+                    token_store,
+                    native_state_store,
+                    vm_state_store,
+                    rfq_state_store,
+                },
+                PoolFlags {
+                    enable_vm_pools: false,
+                    enable_rfq_pools: false,
+                },
+                SimConcurrency {
+                    native: 1,
+                    vm: 1,
+                    rfq: 1,
+                },
             )
         };
         assert_eq!(
@@ -1336,15 +1360,21 @@ mod tests {
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let native_warming_vm_ready = build_test_app_state(
-            token_store,
-            native_state_store,
-            Arc::clone(&vm_state_store),
-            Arc::clone(&rfq_state_store),
-            true,
-            true,
-            1,
-            1,
-            1,
+            TestAppStateStores {
+                token_store,
+                native_state_store,
+                vm_state_store: Arc::clone(&vm_state_store),
+                rfq_state_store: Arc::clone(&rfq_state_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         );
         vm_state_store
             .apply_update(mk_update(vec![(
@@ -1730,15 +1760,21 @@ mod tests {
             .await;
 
         let app_state = build_test_app_state(
-            Arc::clone(&token_store),
-            Arc::clone(&native_store),
-            Arc::clone(&vm_store),
-            Arc::clone(&rfq_store),
-            true,
-            true,
-            1,
-            1,
-            1,
+            TestAppStateStores {
+                token_store: Arc::clone(&token_store),
+                native_state_store: Arc::clone(&native_store),
+                vm_state_store: Arc::clone(&vm_store),
+                rfq_state_store: Arc::clone(&rfq_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         );
 
         assert_eq!(app_state.total_pools().await, 2);
@@ -1784,15 +1820,21 @@ mod tests {
             .await;
 
         let app_state = build_test_app_state(
-            Arc::clone(&token_store),
-            Arc::clone(&native_store),
-            Arc::clone(&vm_store),
-            Arc::clone(&rfq_store),
-            true,
-            true,
-            1,
-            1,
-            1,
+            TestAppStateStores {
+                token_store: Arc::clone(&token_store),
+                native_state_store: Arc::clone(&native_store),
+                vm_state_store: Arc::clone(&vm_store),
+                rfq_state_store: Arc::clone(&rfq_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         );
 
         app_state.native_stream_health.record_update(1).await;

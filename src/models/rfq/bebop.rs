@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, io, str::FromStr};
 
 use serde::Deserialize;
 use tycho_simulation::tycho_common::{
@@ -50,21 +50,30 @@ pub struct ChainInfo {
 }
 
 impl TokenBebop {
-    pub fn to_tycho_token(&self) -> Option<Token> {
+    pub fn to_tycho_token(&self) -> Result<Option<Token>, io::Error> {
         for chain_info in &self.chain_info {
             if chain_info.chain_id == 1 {
-                return Some(Token {
-                    address: Bytes::from_str(chain_info.contract_address.clone().as_str())
-                        .expect("valid contract address"),
+                let address =
+                    Bytes::from_str(chain_info.contract_address.as_str()).map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid Bebop contract address {}: {err}",
+                                chain_info.contract_address
+                            ),
+                        )
+                    })?;
+                return Ok(Some(Token {
+                    address,
                     symbol: self.ticker.clone(),
                     decimals: chain_info.decimals as u32,
                     tax: 0,
                     gas: vec![],
                     chain: Chain::Ethereum,
                     quality: Default::default(),
-                });
+                }));
             }
         }
-        None
+        Ok(None)
     }
 }

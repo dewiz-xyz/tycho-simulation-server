@@ -71,10 +71,13 @@ async fn main() -> anyhow::Result<()> {
         let all_bebop_tokens: HashMap<Bytes, Token> = response
             .tokens
             .into_iter()
-            .filter_map(|(_ticker, token)| {
-                token.to_tycho_token().map(|new| (new.address.clone(), new))
+            .filter_map(|(_ticker, token)| match token.to_tycho_token() {
+                Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
             })
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("Failed to parse Bebop token: {}", e))?;
 
         info!("all bebop tokens: {:?}", all_bebop_tokens);
 

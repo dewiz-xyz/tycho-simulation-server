@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, fs::File, path::Path, str::FromStr};
+use std::{collections::HashMap, error::Error, fs::File, io, path::Path, str::FromStr};
 
 use serde::Deserialize;
 use tycho_simulation::tycho_common::{
@@ -31,7 +31,15 @@ pub fn read_hashflow_csv<P: AsRef<Path>>(
         let record: Record = result?;
 
         if record.chain_id == 1 {
-            let address = Bytes::from_str(record.address.as_str()).expect("valid contract address");
+            let address = Bytes::from_str(record.address.as_str()).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid Hashflow contract address {}: {err}",
+                        record.address
+                    ),
+                )
+            })?;
             let token = Token {
                 address: address.clone(),
                 symbol: record.name,
