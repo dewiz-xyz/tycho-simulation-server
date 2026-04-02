@@ -35,6 +35,10 @@ const UTILIZATION_COEFFICIENT_BPS: u32 = 60;
 const SENSITIVITY_COEFFICIENT_BPS: u32 = 2_500;
 const SOFT_LADDER_UTILIZATION_CAP_BPS: u32 = 3_500;
 const CUMULATIVE_DEGRADATION_COEFFICIENT_BPS: u32 = 300;
+const CUMULATIVE_DEGRADATION_THRESHOLD_BPS: u32 = 25;
+const MONOTONIC_SLIPPAGE_ENFORCEMENT_START_BPS: u32 = 10;
+const SENSITIVITY_DEGRADATION_THRESHOLD_BPS: u32 = 6;
+const SENSITIVITY_FULL_STRENGTH_UTILIZATION_BPS: u32 = 4_000;
 const STRESS_INPUT_DIVISOR: u32 = 100;
 const MIN_STRESS_INPUT: u8 = 1;
 const SATURATION_THRESHOLD_BPS: u32 = 9_999;
@@ -2055,11 +2059,16 @@ fn compute_dynamic_slippage_bps(
         (stressed_amount_in, stressed_amount_out)
     {
         if !stressed_amount_in.is_zero() && !stressed_amount_out.is_zero() {
-            total_scaled += sensitivity_term_scaled(
+            let sensitivity_scaled = sensitivity_term_scaled(
                 amount_in,
                 amount_out,
                 stressed_amount_in,
                 stressed_amount_out,
+                &scale,
+            );
+            total_scaled += scale_sensitivity_term_by_utilization(
+                sensitivity_scaled,
+                &effective_utilization_scaled,
                 &scale,
             );
         }
@@ -2126,6 +2135,14 @@ fn cumulative_degradation_slippage_bps(
         return 0;
     }
 
+    let degradation_bps = round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator.clone()) * BigUint::from(10_000u32),
+        &base_rate_numerator,
+    );
+    if degradation_bps < BigUint::from(CUMULATIVE_DEGRADATION_THRESHOLD_BPS) {
+        return 0;
+    }
+
     let penalty = round_div_biguint(
         (base_rate_numerator.clone() - current_rate_numerator)
             * BigUint::from(CUMULATIVE_DEGRADATION_COEFFICIENT_BPS),
@@ -2135,7 +2152,7 @@ fn cumulative_degradation_slippage_bps(
 }
 
 fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32]) {
-    let mut running_max = 0u32;
+    let mut running_max = None::<u32>;
     for (amount_out, slippage_bps) in amounts_out.iter().zip(slippage.iter_mut()) {
         let Ok(amount_out) = BigUint::from_str(amount_out) else {
             continue;
@@ -2143,8 +2160,12 @@ fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32])
         if amount_out.is_zero() {
             continue;
         }
-        running_max = running_max.max(*slippage_bps);
-        *slippage_bps = running_max;
+        if *slippage_bps >= MONOTONIC_SLIPPAGE_ENFORCEMENT_START_BPS {
+            running_max = Some(running_max.unwrap_or(0).max(*slippage_bps));
+        }
+        if let Some(running_max) = running_max {
+            *slippage_bps = running_max.max(*slippage_bps);
+        }
     }
 }
 
@@ -2190,10 +2211,44 @@ fn sensitivity_term_scaled(
         return BigUint::zero();
     }
 
+    let degradation_bps = round_div_biguint(
+        (current_rate_numerator.clone() - stressed_rate_numerator.clone())
+            * BigUint::from(BPS_DENOMINATOR),
+        &current_rate_numerator,
+    );
+    if degradation_bps < BigUint::from(SENSITIVITY_DEGRADATION_THRESHOLD_BPS) {
+        return BigUint::zero();
+    }
+
     let numerator = (current_rate_numerator.clone() - stressed_rate_numerator)
         * BigUint::from(SENSITIVITY_COEFFICIENT_BPS)
         * scale;
     round_div_biguint(numerator, &current_rate_numerator)
+}
+
+fn scale_sensitivity_term_by_utilization(
+    sensitivity_scaled: BigUint,
+    effective_utilization_scaled: &BigUint,
+    scale: &BigUint,
+) -> BigUint {
+    if sensitivity_scaled.is_zero() || scale.is_zero() {
+        return BigUint::zero();
+    }
+
+    let full_strength_threshold_scaled = round_div_biguint(
+        scale.clone() * BigUint::from(SENSITIVITY_FULL_STRENGTH_UTILIZATION_BPS),
+        &BigUint::from(BPS_DENOMINATOR),
+    );
+    if full_strength_threshold_scaled.is_zero()
+        || effective_utilization_scaled >= &full_strength_threshold_scaled
+    {
+        return sensitivity_scaled;
+    }
+
+    round_div_biguint(
+        sensitivity_scaled * effective_utilization_scaled,
+        &full_strength_threshold_scaled,
+    )
 }
 
 fn round_div_biguint(numerator: BigUint, denominator: &BigUint) -> BigUint {
@@ -4478,7 +4533,7 @@ mod tests {
             computation.responses[0].amounts_out,
             vec!["9900".to_string(), "47500".to_string()]
         );
-        assert_eq!(computation.responses[0].slippage, vec![103, 103]);
+        assert_eq!(computation.responses[0].slippage, vec![21, 21]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -5219,6 +5274,56 @@ mod tests {
     }
 
     #[test]
+    fn compute_dynamic_slippage_bps_ignores_trivial_local_stress_degradation() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(10_000u32),
+            &BigUint::from(10_000u32),
+            Some(&BigUint::from(10_100u32)),
+            Some(&BigUint::from(10_097u32)),
+            None,
+            None,
+        );
+
+        assert_eq!(slippage, MIN_DYNAMIC_SLIPPAGE_BPS);
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_ignores_small_local_stress_degradation() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(10_000u32),
+            &BigUint::from(10_000u32),
+            Some(&BigUint::from(10_000u32)),
+            Some(&BigUint::from(9_995u32)),
+            None,
+            None,
+        );
+
+        assert_eq!(slippage, MIN_DYNAMIC_SLIPPAGE_BPS);
+    }
+
+    #[test]
+    fn scale_sensitivity_term_by_utilization_reduces_low_utilization_linearly() {
+        let scaled = scale_sensitivity_term_by_utilization(
+            BigUint::from(100u32),
+            &BigUint::from(200_000u32),
+            &BigUint::from(SLIPPAGE_SCALE),
+        );
+
+        assert_eq!(scaled, BigUint::from(50u32));
+    }
+
+    #[test]
+    fn scale_sensitivity_term_by_utilization_keeps_full_strength_at_threshold() {
+        let scaled = scale_sensitivity_term_by_utilization(
+            BigUint::from(100u32),
+            &BigUint::from(400_000u32),
+            &BigUint::from(SLIPPAGE_SCALE),
+        );
+
+        assert_eq!(scaled, BigUint::from(100u32));
+    }
+
+    #[test]
     fn compute_dynamic_slippage_bps_uses_soft_ladder_utilization_when_limit_is_unreached() {
         let slippage = compute_dynamic_slippage_bps(
             &BigUint::from(100u32),
@@ -5287,6 +5392,18 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_degradation_slippage_bps_ignores_trivial_rate_decay() {
+        let penalty = cumulative_degradation_slippage_bps(
+            &BigUint::from(10_000u32),
+            &BigUint::from(10_000u32),
+            &BigUint::from(10_000u32),
+            &BigUint::from(9_980u32),
+        );
+
+        assert_eq!(penalty, 0);
+    }
+
+    #[test]
     fn enforce_non_decreasing_slippage_keeps_usable_ladder_monotonic() {
         let amounts_out = vec![
             "100".to_string(),
@@ -5300,6 +5417,16 @@ mod tests {
         enforce_non_decreasing_slippage(&amounts_out, &mut slippage);
 
         assert_eq!(slippage, vec![27, 27, 27, 0, 27]);
+    }
+
+    #[test]
+    fn enforce_non_decreasing_slippage_does_not_pin_small_head_bumps() {
+        let amounts_out = vec!["100".to_string(), "200".to_string(), "300".to_string()];
+        let mut slippage = vec![4, 6, 5];
+
+        enforce_non_decreasing_slippage(&amounts_out, &mut slippage);
+
+        assert_eq!(slippage, vec![4, 6, 5]);
     }
 
     #[test]
