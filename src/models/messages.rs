@@ -24,6 +24,12 @@ pub struct AmountOutResponse {
     pub pool_name: String,
     pub pool_address: String,
     pub amounts_out: Vec<String>,
+    #[serde(default)]
+    pub slippage: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_max_in: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_max_out: Option<String>,
     pub gas_used: Vec<u64>,
     pub block_number: u64,
 }
