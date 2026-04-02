@@ -158,6 +158,12 @@ struct PoolDescriptor {
     protocol: String,
 }
 
+enum LadderStressQuote {
+    Quote((BigUint, BigUint)),
+    PartialTail,
+    Missing,
+}
+
 struct PoolSchedulingContext<'a> {
     quote_deadline: Instant,
     pool_timeout: Duration,
@@ -1605,7 +1611,7 @@ impl BlockingPoolRunner {
                     return 0;
                 }
 
-                let stress_quote = self.compute_local_stress_quote(amount_in);
+                let stress_quote = self.stress_quote_for_index(index, amount_in, amounts_out);
                 compute_dynamic_slippage_bps(
                     amount_in,
                     &amount_out,
@@ -1616,6 +1622,36 @@ impl BlockingPoolRunner {
                 )
             })
             .collect()
+    }
+
+    fn stress_quote_for_index(
+        &self,
+        index: usize,
+        amount_in: &BigUint,
+        amounts_out: &[String],
+    ) -> Option<(BigUint, BigUint)> {
+        match self.next_ladder_stress_quote(index, amounts_out) {
+            LadderStressQuote::Quote(quote) => Some(quote),
+            LadderStressQuote::PartialTail => None,
+            LadderStressQuote::Missing => self.compute_local_stress_quote(amount_in),
+        }
+    }
+
+    fn next_ladder_stress_quote(&self, index: usize, amounts_out: &[String]) -> LadderStressQuote {
+        let Some(stressed_amount_in) = self.amounts.get(index + 1).cloned() else {
+            return LadderStressQuote::Missing;
+        };
+        let Some(stressed_amount_out) = amounts_out
+            .get(index + 1)
+            .and_then(|amount| BigUint::from_str(amount).ok())
+        else {
+            return LadderStressQuote::Missing;
+        };
+        if stressed_amount_out.is_zero() {
+            return LadderStressQuote::PartialTail;
+        }
+
+        LadderStressQuote::Quote((stressed_amount_in, stressed_amount_out))
     }
 
     fn compute_local_stress_quote(&self, amount_in: &BigUint) -> Option<(BigUint, BigUint)> {
@@ -4334,7 +4370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_amounts_out_slippage_uses_local_stress_quote_not_next_ladder_gap() {
+    async fn get_amounts_out_slippage_uses_next_ladder_quote_before_tail_probe() {
         let fixture = BasicQuoteFixture::new();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4366,7 +4402,7 @@ mod tests {
             Arc::clone(&fixture.vm_state_store),
             TestAppStateConfig::default(),
         );
-        let request = fixture.request("req-local-stress-slippage", &["10000", "50000"]);
+        let request = fixture.request("req-next-ladder-stress-slippage", &["10000", "50000"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
 
@@ -4375,8 +4411,53 @@ mod tests {
             computation.responses[0].amounts_out,
             vec!["9900".to_string(), "47500".to_string()]
         );
-        assert_eq!(computation.responses[0].slippage, vec![3, 11]);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(computation.responses[0].slippage, vec![103, 11]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_skips_tail_probe_when_next_ladder_quote_is_zero() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000046",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(StepSelectiveFailureSim {
+                fail_on_calls: vec![1],
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-partial-tail-no-probe", &["1", "2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["1".to_string(), "0".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![2, 0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4673,7 +4754,7 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
