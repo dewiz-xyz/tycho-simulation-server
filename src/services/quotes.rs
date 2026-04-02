@@ -30,9 +30,14 @@ const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
 const MIN_DYNAMIC_SLIPPAGE_BPS: u32 = 2;
 const MAX_DYNAMIC_SLIPPAGE_BPS: u32 = 200;
+const BPS_DENOMINATOR: u32 = 10_000;
 const UTILIZATION_COEFFICIENT_BPS: u32 = 60;
 const SENSITIVITY_COEFFICIENT_BPS: u32 = 2_500;
 const SOFT_LADDER_UTILIZATION_CAP_BPS: u32 = 3_500;
+const CUMULATIVE_DEGRADATION_COEFFICIENT_BPS: u32 = 300;
+const STRESS_INPUT_DIVISOR: u32 = 100;
+const MIN_STRESS_INPUT: u8 = 1;
+const SATURATION_THRESHOLD_BPS: u32 = 9_999;
 const SATURATION_RAMP_START_UTILIZATION_BPS: u32 = 9_500;
 const SATURATION_MAX_UTILIZATION_BPS: u32 = 9_990;
 const SATURATION_RAMP_START_SLIPPAGE_BPS: u32 = 45;
@@ -1097,7 +1102,6 @@ impl QuoteRequestRunner {
                 amounts_out: result.amounts_out,
                 slippage: result.slippage,
                 limit_max_in: result.limit_max_in.map(|value| value.to_string()),
-                limit_max_out: result.limit_max_out.map(|value| value.to_string()),
                 gas_used: result.gas_used,
                 block_number: self.run.meta.block_number,
             });
@@ -1375,7 +1379,6 @@ struct PoolQuoteResult {
     amounts_out: Vec<String>,
     slippage: Vec<u32>,
     limit_max_in: Option<BigUint>,
-    limit_max_out: Option<BigUint>,
     gas_used: Vec<u64>,
     successful_steps: usize,
     first_successful_gas_used: Option<u64>,
@@ -1441,7 +1444,6 @@ impl BlockingPoolRunner {
             amounts_out: Vec::new(),
             slippage: Vec::new(),
             limit_max_in: None,
-            limit_max_out: None,
             gas_used: Vec::new(),
             successful_steps: 0,
             first_successful_gas_used: None,
@@ -1553,7 +1555,6 @@ impl BlockingPoolRunner {
                 amounts_out,
                 slippage,
                 limit_max_in: effective_limit_max_in,
-                limit_max_out,
                 gas_used,
                 successful_steps,
                 first_successful_gas_used,
@@ -1569,7 +1570,6 @@ impl BlockingPoolRunner {
             amounts_out,
             slippage: Vec::new(),
             limit_max_in,
-            limit_max_out,
             gas_used,
             successful_steps,
             first_successful_gas_used,
@@ -1596,8 +1596,16 @@ impl BlockingPoolRunner {
                 .then(|| positive_outputs.last().cloned())
                 .flatten()
         };
+        let first_usable_quote = amounts_out
+            .iter()
+            .enumerate()
+            .find_map(|(index, amount_out)| {
+                let amount_in = self.amounts.get(index)?;
+                let amount_out = BigUint::from_str(amount_out).ok()?;
+                (!amount_out.is_zero()).then(|| (amount_in.clone(), amount_out))
+            });
 
-        amounts_out
+        let mut slippage = amounts_out
             .iter()
             .enumerate()
             .map(|(index, amount_out)| {
@@ -1612,16 +1620,30 @@ impl BlockingPoolRunner {
                 }
 
                 let stress_quote = self.stress_quote_for_index(index, amount_in, amounts_out);
-                compute_dynamic_slippage_bps(
+                let base_slippage = compute_dynamic_slippage_bps(
                     amount_in,
                     &amount_out,
                     stress_quote.as_ref().map(|(amount, _)| amount),
                     stress_quote.as_ref().map(|(_, amount_out)| amount_out),
                     limit_max_out,
                     soft_ladder_max_out.as_ref(),
-                )
+                );
+                let cumulative_penalty =
+                    first_usable_quote
+                        .as_ref()
+                        .map_or(0, |(base_in, base_out)| {
+                            cumulative_degradation_slippage_bps(
+                                base_in,
+                                base_out,
+                                amount_in,
+                                &amount_out,
+                            )
+                        });
+                (base_slippage + cumulative_penalty).min(MAX_DYNAMIC_SLIPPAGE_BPS)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        enforce_non_decreasing_slippage(amounts_out, &mut slippage);
+        slippage
     }
 
     fn stress_quote_for_index(
@@ -1638,6 +1660,8 @@ impl BlockingPoolRunner {
     }
 
     fn next_ladder_stress_quote(&self, index: usize, amounts_out: &[String]) -> LadderStressQuote {
+        // TODO: Make this order-independent by selecting the next larger usable rung instead of
+        // assuming the next request slot is the next larger trade.
         let Some(stressed_amount_in) = self.amounts.get(index + 1).cloned() else {
             return LadderStressQuote::Missing;
         };
@@ -1985,18 +2009,18 @@ fn sanitize_limit_max_in(
         return Some(raw_limit_max_in);
     };
 
-    let saturation_threshold_numerator = limit_max_out * BigUint::from(9_999u32);
-    let saturation_threshold_denominator = BigUint::from(10_000u32);
-    let saturated_amount_in =
-        amounts_in
-            .iter()
-            .zip(amounts_out.iter())
-            .find_map(|(amount_in, amount_out)| {
-                let amount_out = BigUint::from_str(amount_out).ok()?;
-                ((&amount_out * &saturation_threshold_denominator)
-                    >= saturation_threshold_numerator)
-                    .then(|| amount_in.clone())
-            });
+    let saturation_threshold_numerator = limit_max_out * BigUint::from(SATURATION_THRESHOLD_BPS);
+    let saturation_threshold_denominator = BigUint::from(BPS_DENOMINATOR);
+    let saturated_amount_in = amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        // TODO: Make this order-independent by taking the smallest saturated amount_in
+        // instead of the first saturated rung in request order.
+        .find_map(|(amount_in, amount_out)| {
+            let amount_out = BigUint::from_str(amount_out).ok()?;
+            ((&amount_out * &saturation_threshold_denominator) >= saturation_threshold_numerator)
+                .then(|| amount_in.clone())
+        });
 
     Some(match saturated_amount_in {
         Some(observed_cap) => raw_limit_max_in.min(observed_cap),
@@ -2005,7 +2029,7 @@ fn sanitize_limit_max_in(
 }
 
 fn compute_stress_input(amount_in: &BigUint) -> BigUint {
-    (amount_in / 100u32).max(BigUint::from(1u8))
+    (amount_in / STRESS_INPUT_DIVISOR).max(BigUint::from(MIN_STRESS_INPUT))
 }
 
 fn compute_dynamic_slippage_bps(
@@ -2066,7 +2090,7 @@ fn effective_output_utilization_scaled(
         .map(|max_out| {
             round_div_biguint(
                 amount_out * BigUint::from(SOFT_LADDER_UTILIZATION_CAP_BPS) * scale,
-                &(max_out * BigUint::from(10_000u32)),
+                &(max_out * BigUint::from(BPS_DENOMINATOR)),
             )
         })
         .unwrap_or_else(BigUint::zero);
@@ -2082,15 +2106,58 @@ fn utilization_term_scaled(utilization_scaled: &BigUint, scale: &BigUint) -> Big
     round_div_biguint(numerator, scale)
 }
 
+fn cumulative_degradation_slippage_bps(
+    base_amount_in: &BigUint,
+    base_amount_out: &BigUint,
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+) -> u32 {
+    if base_amount_in.is_zero()
+        || base_amount_out.is_zero()
+        || amount_in.is_zero()
+        || amount_out.is_zero()
+    {
+        return 0;
+    }
+
+    let base_rate_numerator = base_amount_out * amount_in;
+    let current_rate_numerator = amount_out * base_amount_in;
+    if current_rate_numerator >= base_rate_numerator {
+        return 0;
+    }
+
+    let penalty = round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator)
+            * BigUint::from(CUMULATIVE_DEGRADATION_COEFFICIENT_BPS),
+        &base_rate_numerator,
+    );
+    penalty.to_u32().unwrap_or(MAX_DYNAMIC_SLIPPAGE_BPS)
+}
+
+fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32]) {
+    let mut running_max = 0u32;
+    for (amount_out, slippage_bps) in amounts_out.iter().zip(slippage.iter_mut()) {
+        let Ok(amount_out) = BigUint::from_str(amount_out) else {
+            continue;
+        };
+        if amount_out.is_zero() {
+            continue;
+        }
+        running_max = running_max.max(*slippage_bps);
+        *slippage_bps = running_max;
+    }
+}
+
 fn saturation_slippage_floor_bps(
     amount_out: &BigUint,
     limit_max_out: Option<&BigUint>,
 ) -> Option<u32> {
     let limit_max_out = limit_max_out.filter(|value| !value.is_zero())?;
-    let utilization_bps = round_div_biguint(amount_out * BigUint::from(10_000u32), limit_max_out)
-        .to_u32()
-        .unwrap_or(10_000u32)
-        .min(10_000u32);
+    let utilization_bps =
+        round_div_biguint(amount_out * BigUint::from(BPS_DENOMINATOR), limit_max_out)
+            .to_u32()
+            .unwrap_or(BPS_DENOMINATOR)
+            .min(BPS_DENOMINATOR);
 
     if utilization_bps >= SATURATION_MAX_UTILIZATION_BPS {
         return Some(MAX_DYNAMIC_SLIPPAGE_BPS);
@@ -4411,7 +4478,7 @@ mod tests {
             computation.responses[0].amounts_out,
             vec!["9900".to_string(), "47500".to_string()]
         );
-        assert_eq!(computation.responses[0].slippage, vec![103, 11]);
+        assert_eq!(computation.responses[0].slippage, vec![103, 103]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -4515,10 +4582,8 @@ mod tests {
             computation.responses[0].limit_max_in.as_deref(),
             Some("30000000000")
         );
-        assert_eq!(
-            computation.responses[0].limit_max_out.as_deref(),
-            Some("29053011332")
-        );
+        let serialized = serde_json::to_value(&computation.responses[0]).unwrap();
+        assert!(serialized.get("limit_max_out").is_none());
         assert!(calls.load(Ordering::SeqCst) >= 4);
     }
 
@@ -5048,7 +5113,6 @@ mod tests {
                 amounts_out: vec!["9".to_string(), "10".to_string()],
                 slippage: vec![1, 1],
                 limit_max_in: None,
-                limit_max_out: None,
                 gas_used: vec![1, 1],
                 block_number: 1,
             },
@@ -5059,7 +5123,6 @@ mod tests {
                 amounts_out: vec!["0".to_string(), "200".to_string()],
                 slippage: vec![0, 1],
                 limit_max_in: None,
-                limit_max_out: None,
                 gas_used: vec![0, 2],
                 block_number: 1,
             },
@@ -5098,7 +5161,6 @@ mod tests {
                 amounts_out: vec!["7".to_string()],
                 slippage: vec![1],
                 limit_max_in: None,
-                limit_max_out: None,
                 gas_used: vec![1],
                 block_number: 1,
             },
@@ -5109,7 +5171,6 @@ mod tests {
                 amounts_out: vec!["8".to_string()],
                 slippage: vec![1],
                 limit_max_in: None,
-                limit_max_out: None,
                 gas_used: vec![1],
                 block_number: 1,
             },
@@ -5211,6 +5272,34 @@ mod tests {
         );
 
         assert_eq!(slippage, MAX_DYNAMIC_SLIPPAGE_BPS);
+    }
+
+    #[test]
+    fn cumulative_degradation_slippage_bps_penalizes_rate_decay_from_first_rung() {
+        let penalty = cumulative_degradation_slippage_bps(
+            &BigUint::from(100u32),
+            &BigUint::from(100u32),
+            &BigUint::from(200u32),
+            &BigUint::from(160u32),
+        );
+
+        assert_eq!(penalty, 60);
+    }
+
+    #[test]
+    fn enforce_non_decreasing_slippage_keeps_usable_ladder_monotonic() {
+        let amounts_out = vec![
+            "100".to_string(),
+            "200".to_string(),
+            "300".to_string(),
+            "0".to_string(),
+            "400".to_string(),
+        ];
+        let mut slippage = vec![27, 25, 26, 0, 24];
+
+        enforce_non_decreasing_slippage(&amounts_out, &mut slippage);
+
+        assert_eq!(slippage, vec![27, 27, 27, 0, 27]);
     }
 
     #[test]

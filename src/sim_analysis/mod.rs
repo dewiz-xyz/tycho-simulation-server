@@ -2076,7 +2076,6 @@ mod tests {
                 gas_used: vec![1],
                 slippage: Vec::new(),
                 limit_max_in: None,
-                limit_max_out: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2128,7 +2127,6 @@ mod tests {
                 gas_used: vec![1],
                 slippage: Vec::new(),
                 limit_max_in: None,
-                limit_max_out: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2167,7 +2165,6 @@ mod tests {
                 gas_used: vec![1],
                 slippage: Vec::new(),
                 limit_max_in: None,
-                limit_max_out: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2215,7 +2212,6 @@ mod tests {
                 gas_used: vec![1],
                 slippage: Vec::new(),
                 limit_max_in: None,
-                limit_max_out: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2254,7 +2250,6 @@ mod tests {
                 gas_used: vec![1],
                 slippage: Vec::new(),
                 limit_max_in: None,
-                limit_max_out: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {

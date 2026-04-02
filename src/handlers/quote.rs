@@ -614,7 +614,6 @@ mod tests {
             gas_used: vec![gas_used, 0],
             slippage: Vec::new(),
             limit_max_in: None,
-            limit_max_out: None,
             block_number: 1,
         }
     }
