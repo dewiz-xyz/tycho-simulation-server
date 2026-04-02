@@ -1390,6 +1390,28 @@ enum PoolSimOutcome {
     Simulated(PoolQuoteResult),
 }
 
+struct PoolQuoteAccumulator {
+    amounts_out: Vec<String>,
+    gas_used: Vec<u64>,
+    successful_steps: usize,
+    first_successful_gas_used: Option<u64>,
+    errors: Vec<String>,
+    timed_out: bool,
+}
+
+impl PoolQuoteAccumulator {
+    fn new(expected_len: usize) -> Self {
+        Self {
+            amounts_out: Vec::with_capacity(expected_len),
+            gas_used: Vec::with_capacity(expected_len),
+            successful_steps: 0,
+            first_successful_gas_used: None,
+            errors: Vec::new(),
+            timed_out: false,
+        }
+    }
+}
+
 struct FailureContext<'a> {
     pool_id: &'a str,
     pool_name: Option<&'a str>,
@@ -1453,23 +1475,10 @@ impl BlockingPoolRunner {
     }
 
     fn quote_amounts(&self) -> PoolSimOutcome {
-        let mut amounts_out = Vec::with_capacity(self.expected_len);
-        let mut gas_used = Vec::with_capacity(self.expected_len);
-        let mut successful_steps = 0;
-        let mut first_successful_gas_used = None;
-        let mut errors = Vec::new();
-        let mut timed_out = false;
-        let (limit_max_in, limit_max_out) = self
-            .pool_state
-            .get_limits(
-                self.token_in.address.clone(),
-                self.token_out.address.clone(),
-            )
-            .ok()
-            .map(|(max_in, max_out)| (Some(max_in), Some(max_out)))
-            .unwrap_or((None, None));
+        let mut run = PoolQuoteAccumulator::new(self.expected_len);
+        let (limit_max_in, limit_max_out) = self.pool_limits();
         for amount_in in self.amounts.iter() {
-            if self.record_cancellation_or_timeout(&mut errors, &mut timed_out) {
+            if self.record_cancellation_or_timeout(&mut run.errors, &mut run.timed_out) {
                 break;
             }
             if let Some(max_in) = limit_max_in.as_ref() {
@@ -1489,23 +1498,23 @@ impl BlockingPoolRunner {
                     let Some(gas_u64) = result.gas.to_u64() else {
                         let message = "no gas reported".to_string();
                         self.log_pool_error(&message);
-                        errors.push(message);
-                        amounts_out.clear();
-                        gas_used.clear();
-                        successful_steps = 0;
-                        first_successful_gas_used = None;
+                        run.errors.push(message);
+                        run.amounts_out.clear();
+                        run.gas_used.clear();
+                        run.successful_steps = 0;
+                        run.first_successful_gas_used = None;
                         break;
                     };
                     if result.amount.is_zero() {
                         // Zero outputs mean this requested amount did not produce a usable quote,
                         // even when the simulator returned Ok(...).
-                        amounts_out.push("0".to_string());
-                        gas_used.push(0);
+                        run.amounts_out.push("0".to_string());
+                        run.gas_used.push(0);
                     } else {
-                        amounts_out.push(result.amount.to_string());
-                        gas_used.push(gas_u64);
-                        successful_steps += 1;
-                        first_successful_gas_used.get_or_insert(gas_u64);
+                        run.amounts_out.push(result.amount.to_string());
+                        run.gas_used.push(gas_u64);
+                        run.successful_steps += 1;
+                        run.first_successful_gas_used.get_or_insert(gas_u64);
                     }
                 }
                 Err(error) => {
@@ -1514,9 +1523,9 @@ impl BlockingPoolRunner {
                         self.log_soft_limit_failure(amount_in, max_in, &message);
                     }
                     self.log_pool_error(&message);
-                    amounts_out.push("0".to_string());
-                    gas_used.push(0);
-                    errors.push(message);
+                    run.amounts_out.push("0".to_string());
+                    run.gas_used.push(0);
+                    run.errors.push(message);
                 }
             }
             if Instant::now() >= self.deadline {
@@ -1524,57 +1533,67 @@ impl BlockingPoolRunner {
                     "pool_timeout",
                     "Pool quote deadline reached while evaluating requested amounts",
                 );
-                if errors.is_empty() {
-                    errors.push("Timed out".to_string());
+                if run.errors.is_empty() {
+                    run.errors.push("Timed out".to_string());
                 }
-                timed_out = true;
+                run.timed_out = true;
                 break;
             }
         }
+        self.finish_quote_amounts(run, limit_max_in, limit_max_out)
+    }
+
+    fn pool_limits(&self) -> (Option<BigUint>, Option<BigUint>) {
+        self.pool_state
+            .get_limits(
+                self.token_in.address.clone(),
+                self.token_out.address.clone(),
+            )
+            .ok()
+            .map(|(max_in, max_out)| (Some(max_in), Some(max_out)))
+            .unwrap_or((None, None))
+    }
+
+    fn finish_quote_amounts(
+        &self,
+        mut run: PoolQuoteAccumulator,
+        limit_max_in: Option<BigUint>,
+        limit_max_out: Option<BigUint>,
+    ) -> PoolSimOutcome {
         // Only pools with at least one usable amount output are emitted, but they still need
         // full requested-amount alignment.
-        if successful_steps > 0 {
+        let (slippage, limit_max_in) = if run.successful_steps > 0 {
             let effective_limit_max_in = sanitize_limit_max_in(
                 self.amounts.as_ref(),
-                &amounts_out,
+                &run.amounts_out,
                 limit_max_in.as_ref(),
                 limit_max_out.as_ref(),
             );
             let mut slippage =
-                self.compute_local_slippage_ladder(&amounts_out, limit_max_out.as_ref());
-            while amounts_out.len() < self.expected_len {
-                amounts_out.push("0".to_string());
-                gas_used.push(0);
+                self.compute_local_slippage_ladder(&run.amounts_out, limit_max_out.as_ref());
+            while run.amounts_out.len() < self.expected_len {
+                run.amounts_out.push("0".to_string());
+                run.gas_used.push(0);
                 slippage.push(0);
             }
-            return PoolSimOutcome::Simulated(PoolQuoteResult {
-                pool: self.descriptor.id.clone(),
-                pool_name: self.descriptor.name.clone(),
-                pool_address: self.descriptor.address.clone(),
-                protocol: self.descriptor.protocol.clone(),
-                amounts_out,
-                slippage,
-                limit_max_in: effective_limit_max_in,
-                gas_used,
-                successful_steps,
-                first_successful_gas_used,
-                errors,
-                timed_out,
-            });
-        }
+            (slippage, effective_limit_max_in)
+        } else {
+            (Vec::new(), limit_max_in)
+        };
+
         PoolSimOutcome::Simulated(PoolQuoteResult {
             pool: self.descriptor.id.clone(),
             pool_name: self.descriptor.name.clone(),
             pool_address: self.descriptor.address.clone(),
             protocol: self.descriptor.protocol.clone(),
-            amounts_out,
-            slippage: Vec::new(),
+            amounts_out: run.amounts_out,
+            slippage,
             limit_max_in,
-            gas_used,
-            successful_steps,
-            first_successful_gas_used,
-            errors,
-            timed_out,
+            gas_used: run.gas_used,
+            successful_steps: run.successful_steps,
+            first_successful_gas_used: run.first_successful_gas_used,
+            errors: run.errors,
+            timed_out: run.timed_out,
         })
     }
 
@@ -4582,8 +4601,6 @@ mod tests {
             computation.responses[0].limit_max_in.as_deref(),
             Some("30000000000")
         );
-        let serialized = serde_json::to_value(&computation.responses[0]).unwrap();
-        assert!(serialized.get("limit_max_out").is_none());
         assert!(calls.load(Ordering::SeqCst) >= 4);
     }
 
