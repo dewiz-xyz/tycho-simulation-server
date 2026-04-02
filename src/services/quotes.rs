@@ -28,7 +28,7 @@ use crate::models::tokens::TokenStoreError;
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
-const MIN_DYNAMIC_SLIPPAGE_BPS: u32 = 2;
+const MIN_DYNAMIC_SLIPPAGE_BPS: u32 = 1;
 const MAX_DYNAMIC_SLIPPAGE_BPS: u32 = 200;
 const BPS_DENOMINATOR: u32 = 10_000;
 const UTILIZATION_COEFFICIENT_BPS: u32 = 60;
@@ -3247,7 +3247,7 @@ mod tests {
 
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
-        assert_eq!(computation.responses[0].slippage, vec![2]);
+        assert_eq!(computation.responses[0].slippage, vec![1]);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert!(computation.meta.failures.is_empty());
         assert_eq!(computation.meta.matching_pools, 1);
@@ -4497,7 +4497,7 @@ mod tests {
             computation.responses[0].amounts_out,
             vec!["9900".to_string(), "47500".to_string()]
         );
-        assert_eq!(computation.responses[0].slippage, vec![103, 103]);
+        assert_eq!(computation.responses[0].slippage, vec![102, 102]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -4542,7 +4542,7 @@ mod tests {
             computation.responses[0].amounts_out,
             vec!["1".to_string(), "0".to_string()]
         );
-        assert_eq!(computation.responses[0].slippage, vec![2, 0]);
+        assert_eq!(computation.responses[0].slippage, vec![1, 0]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -5232,7 +5232,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(slippage, 3);
+        assert_eq!(slippage, 2);
     }
 
     #[test]
@@ -5246,7 +5246,7 @@ mod tests {
             Some(&BigUint::from(100u32)),
         );
 
-        assert_eq!(slippage, 9);
+        assert_eq!(slippage, 8);
     }
 
     #[test]
@@ -5260,7 +5260,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(slippage, 9);
+        assert_eq!(slippage, 8);
     }
 
     #[test]
