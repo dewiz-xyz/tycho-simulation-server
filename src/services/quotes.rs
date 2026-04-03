@@ -2044,7 +2044,7 @@ fn compute_stress_input(amount_in: &BigUint) -> BigUint {
 }
 
 fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) -> Option<BigUint> {
-    let usable_quotes = amounts_in
+    let mut usable_quotes = amounts_in
         .iter()
         .zip(amounts_out.iter())
         .filter_map(|(amount_in, amount_out)| {
@@ -2052,6 +2052,9 @@ fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) 
             (!amount_out.is_zero()).then(|| (amount_in, amount_out))
         })
         .collect::<Vec<_>>();
+    usable_quotes.sort_by(|(left_amount_in, _), (right_amount_in, _)| {
+        left_amount_in.cmp(right_amount_in)
+    });
 
     let (base_amount_in, base_amount_out) = usable_quotes.first()?;
     if usable_quotes.len() < 2
@@ -5386,6 +5389,20 @@ mod tests {
             BigUint::from(300u32),
         ];
         let amounts_out = vec!["100".to_string(), "190".to_string(), "270".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
+    }
+
+    #[test]
+    fn soft_ladder_max_out_is_order_independent() {
+        let amounts_in = vec![
+            BigUint::from(300u32),
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+        ];
+        let amounts_out = vec!["270".to_string(), "100".to_string(), "190".to_string()];
 
         let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
 
