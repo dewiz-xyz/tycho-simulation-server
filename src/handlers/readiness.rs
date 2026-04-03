@@ -79,6 +79,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{status, StatusPayload};
+    use crate::config::SlippageConfig;
     use crate::models::state::{AppState, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -211,6 +212,7 @@ mod tests {
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,

@@ -177,6 +177,7 @@ fn build_app_state(
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
         native_sim_concurrency,
@@ -380,7 +381,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use dsolver_simulator::config::{AppConfig, ChainProfile, MemoryConfig};
+    use dsolver_simulator::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
     use dsolver_simulator::models::tokens::TokenStore;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
@@ -420,6 +421,7 @@ mod tests {
             stream_restart_backoff_max_ms: 30_000,
             stream_restart_backoff_jitter_pct: 0.2,
             readiness_stale_secs: 120,
+            slippage: SlippageConfig::default(),
             memory: MemoryConfig {
                 purge_enabled: true,
                 snapshots_enabled: false,

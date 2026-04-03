@@ -10,6 +10,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::NaiveDateTime;
 use dsolver_simulator::api::create_router;
+use dsolver_simulator::config::SlippageConfig;
 use dsolver_simulator::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
@@ -525,6 +526,7 @@ async fn build_app_state_and_request(
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
         native_sim_concurrency: 4,
@@ -616,6 +618,7 @@ async fn setup_timeout_app(
         request_timeout,
         native_sim_semaphore: Arc::clone(&native_sim_semaphore),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
@@ -1340,6 +1343,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
