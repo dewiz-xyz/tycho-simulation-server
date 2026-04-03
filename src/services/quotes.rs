@@ -2049,12 +2049,11 @@ fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) 
         .zip(amounts_out.iter())
         .filter_map(|(amount_in, amount_out)| {
             let amount_out = BigUint::from_str(amount_out).ok()?;
-            (!amount_out.is_zero()).then(|| (amount_in, amount_out))
+            (!amount_out.is_zero()).then_some((amount_in, amount_out))
         })
         .collect::<Vec<_>>();
-    usable_quotes.sort_by(|(left_amount_in, _), (right_amount_in, _)| {
-        left_amount_in.cmp(right_amount_in)
-    });
+    usable_quotes
+        .sort_by(|(left_amount_in, _), (right_amount_in, _)| left_amount_in.cmp(right_amount_in));
 
     let (base_amount_in, base_amount_out) = usable_quotes.first()?;
     if usable_quotes.len() < 2
