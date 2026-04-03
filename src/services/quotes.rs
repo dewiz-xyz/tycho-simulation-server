@@ -36,6 +36,7 @@ const SATURATION_THRESHOLD_BPS: u32 = 9_999;
 const SATURATION_RAMP_START_UTILIZATION_BPS: u32 = 9_500;
 const SATURATION_MAX_UTILIZATION_BPS: u32 = 9_990;
 const SLIPPAGE_SCALE: u32 = 1_000_000;
+const SOFT_LADDER_ACTIVATION_DEGRADATION_BPS: u32 = 10;
 
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
@@ -1601,17 +1602,7 @@ impl BlockingPoolRunner {
     ) -> Vec<u32> {
         // When the ladder never approaches a trustworthy hard output limit, use the
         // observed ladder envelope as a softer utilization anchor instead.
-        let soft_ladder_max_out = {
-            let mut positive_outputs = amounts_out
-                .iter()
-                .filter_map(|amount| BigUint::from_str(amount).ok())
-                .filter(|amount| !amount.is_zero())
-                .collect::<Vec<_>>();
-            positive_outputs.sort();
-            (positive_outputs.len() > 1)
-                .then(|| positive_outputs.last().cloned())
-                .flatten()
-        };
+        let soft_ladder_max_out = observed_soft_ladder_max_out(self.amounts.as_ref(), amounts_out);
         let first_usable_quote = amounts_out
             .iter()
             .enumerate()
@@ -2050,6 +2041,60 @@ fn sanitize_limit_max_in(
 
 fn compute_stress_input(amount_in: &BigUint) -> BigUint {
     (amount_in / STRESS_INPUT_DIVISOR).max(BigUint::from(MIN_STRESS_INPUT))
+}
+
+fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) -> Option<BigUint> {
+    let usable_quotes = amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        .filter_map(|(amount_in, amount_out)| {
+            let amount_out = BigUint::from_str(amount_out).ok()?;
+            (!amount_out.is_zero()).then(|| (amount_in, amount_out))
+        })
+        .collect::<Vec<_>>();
+
+    let (base_amount_in, base_amount_out) = usable_quotes.first()?;
+    if usable_quotes.len() < 2
+        || !usable_quotes.iter().skip(1).any(|(amount_in, amount_out)| {
+            rate_degradation_bps(base_amount_in, base_amount_out, amount_in, amount_out)
+                >= SOFT_LADDER_ACTIVATION_DEGRADATION_BPS
+        })
+    {
+        return None;
+    }
+
+    usable_quotes
+        .into_iter()
+        .map(|(_, amount_out)| amount_out)
+        .max()
+}
+
+fn rate_degradation_bps(
+    base_amount_in: &BigUint,
+    base_amount_out: &BigUint,
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+) -> u32 {
+    if base_amount_in.is_zero()
+        || base_amount_out.is_zero()
+        || amount_in.is_zero()
+        || amount_out.is_zero()
+    {
+        return 0;
+    }
+
+    let base_rate_numerator = base_amount_out * amount_in;
+    let current_rate_numerator = amount_out * base_amount_in;
+    if current_rate_numerator >= base_rate_numerator {
+        return 0;
+    }
+
+    round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator) * BigUint::from(BPS_DENOMINATOR),
+        &base_rate_numerator,
+    )
+    .to_u32()
+    .unwrap_or(BPS_DENOMINATOR)
 }
 
 fn compute_dynamic_slippage_bps(
@@ -4525,6 +4570,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_amounts_out_slippage_skips_soft_ladder_utilization_for_linear_quotes() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000009",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(PositiveOutputSim {
+                max_in: BigUint::from(100_000u32),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-linear-soft-ladder-slippage", &["100", "200", "300"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["100".to_string(), "200".to_string(), "300".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![1, 1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
     async fn get_amounts_out_skips_tail_probe_when_next_ladder_quote_is_zero() {
         let fixture = BasicQuoteFixture::new();
 
@@ -5272,6 +5362,34 @@ mod tests {
         );
 
         assert_eq!(slippage, 8);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_requires_meaningful_ladder_degradation() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "200".to_string(), "300".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, None);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_activates_when_ladder_rate_degrades() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "190".to_string(), "270".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
     }
 
     #[test]
