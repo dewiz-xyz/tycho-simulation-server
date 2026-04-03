@@ -571,7 +571,9 @@ mod tests {
 
     #[test]
     fn load_slippage_config_uses_defaults_when_env_missing() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_slippage_env();
 
         let config = load_slippage_config();
@@ -581,7 +583,9 @@ mod tests {
 
     #[test]
     fn load_slippage_config_reads_env_overrides() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_slippage_env();
         std::env::set_var("MIN_DYNAMIC_SLIPPAGE_BPS", "3");
         std::env::set_var("MAX_DYNAMIC_SLIPPAGE_BPS", "250");

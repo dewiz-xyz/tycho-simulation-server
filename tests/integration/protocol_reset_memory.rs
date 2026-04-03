@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
-use dsolver_simulator::config::MemoryConfig;
+use dsolver_simulator::config::{MemoryConfig, SlippageConfig};
 use dsolver_simulator::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
@@ -529,6 +529,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         request_timeout: Duration::from_millis(1000),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
