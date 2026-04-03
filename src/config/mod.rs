@@ -111,6 +111,7 @@ pub fn load_config() -> AppConfig {
     let timeouts = load_timeout_config();
     let concurrency = load_concurrency_config();
     let stream = load_stream_config();
+    let slippage = load_slippage_config();
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
 
@@ -141,6 +142,7 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_max_ms: stream.stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
         readiness_stale_secs: stream.readiness_stale_secs,
+        slippage,
         memory,
     }
 }
@@ -179,6 +181,31 @@ struct StreamConfig {
     stream_restart_backoff_max_ms: u64,
     stream_restart_backoff_jitter_pct: f64,
     readiness_stale_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlippageConfig {
+    pub min_dynamic_slippage_bps: u32,
+    pub max_dynamic_slippage_bps: u32,
+    pub utilization_coefficient_bps: u32,
+    pub sensitivity_coefficient_bps: u32,
+    pub soft_ladder_utilization_cap_bps: u32,
+    pub cumulative_degradation_coefficient_bps: u32,
+    pub saturation_ramp_start_slippage_bps: u32,
+}
+
+impl Default for SlippageConfig {
+    fn default() -> Self {
+        Self {
+            min_dynamic_slippage_bps: 1,
+            max_dynamic_slippage_bps: 200,
+            utilization_coefficient_bps: 60,
+            sensitivity_coefficient_bps: 2_500,
+            soft_ladder_utilization_cap_bps: 3_500,
+            cumulative_degradation_coefficient_bps: 300,
+            saturation_ramp_start_slippage_bps: 45,
+        }
+    }
 }
 
 /// Resolve the hosted Tycho endpoint for a supported runtime chain.
@@ -323,6 +350,39 @@ fn load_stream_config() -> StreamConfig {
     }
 }
 
+fn load_slippage_config() -> SlippageConfig {
+    let defaults = SlippageConfig::default();
+    let config = SlippageConfig {
+        min_dynamic_slippage_bps: optional_parsed_env("MIN_DYNAMIC_SLIPPAGE_BPS")
+            .unwrap_or(defaults.min_dynamic_slippage_bps),
+        max_dynamic_slippage_bps: optional_parsed_env("MAX_DYNAMIC_SLIPPAGE_BPS")
+            .unwrap_or(defaults.max_dynamic_slippage_bps),
+        utilization_coefficient_bps: optional_parsed_env("UTILIZATION_COEFFICIENT_BPS")
+            .unwrap_or(defaults.utilization_coefficient_bps),
+        sensitivity_coefficient_bps: optional_parsed_env("SENSITIVITY_COEFFICIENT_BPS")
+            .unwrap_or(defaults.sensitivity_coefficient_bps),
+        soft_ladder_utilization_cap_bps: optional_parsed_env("SOFT_LADDER_UTILIZATION_CAP_BPS")
+            .unwrap_or(defaults.soft_ladder_utilization_cap_bps),
+        cumulative_degradation_coefficient_bps: optional_parsed_env(
+            "CUMULATIVE_DEGRADATION_COEFFICIENT_BPS",
+        )
+        .unwrap_or(defaults.cumulative_degradation_coefficient_bps),
+        saturation_ramp_start_slippage_bps: optional_parsed_env(
+            "SATURATION_RAMP_START_SLIPPAGE_BPS",
+        )
+        .unwrap_or(defaults.saturation_ramp_start_slippage_bps),
+    };
+    assert!(
+        config.min_dynamic_slippage_bps <= config.max_dynamic_slippage_bps,
+        "slippage min must be <= max"
+    );
+    assert!(
+        config.saturation_ramp_start_slippage_bps <= config.max_dynamic_slippage_bps,
+        "saturation ramp start slippage must be <= slippage max"
+    );
+    config
+}
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub chain_profile: ChainProfile,
@@ -351,6 +411,7 @@ pub struct AppConfig {
     pub stream_restart_backoff_max_ms: u64,
     pub stream_restart_backoff_jitter_pct: f64,
     pub readiness_stale_secs: u64,
+    pub slippage: SlippageConfig,
     pub memory: MemoryConfig,
 }
 
@@ -427,6 +488,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    const SLIPPAGE_ENV_KEYS: [&str; 7] = [
+        "MIN_DYNAMIC_SLIPPAGE_BPS",
+        "MAX_DYNAMIC_SLIPPAGE_BPS",
+        "UTILIZATION_COEFFICIENT_BPS",
+        "SENSITIVITY_COEFFICIENT_BPS",
+        "SOFT_LADDER_UTILIZATION_CAP_BPS",
+        "CUMULATIVE_DEGRADATION_COEFFICIENT_BPS",
+        "SATURATION_RAMP_START_SLIPPAGE_BPS",
+    ];
+
+    fn clear_slippage_env() {
+        for key in SLIPPAGE_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
 
     #[test]
     fn resolve_ethereum_profile() {
@@ -487,5 +567,45 @@ mod tests {
             unreachable!("expected base hosted Tycho URL");
         };
         assert_eq!(url, "tycho-base-beta.propellerheads.xyz");
+    }
+
+    #[test]
+    fn load_slippage_config_uses_defaults_when_env_missing() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        clear_slippage_env();
+
+        let config = load_slippage_config();
+
+        assert_eq!(config, SlippageConfig::default());
+    }
+
+    #[test]
+    fn load_slippage_config_reads_env_overrides() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        clear_slippage_env();
+        std::env::set_var("MIN_DYNAMIC_SLIPPAGE_BPS", "3");
+        std::env::set_var("MAX_DYNAMIC_SLIPPAGE_BPS", "250");
+        std::env::set_var("UTILIZATION_COEFFICIENT_BPS", "75");
+        std::env::set_var("SENSITIVITY_COEFFICIENT_BPS", "3000");
+        std::env::set_var("SOFT_LADDER_UTILIZATION_CAP_BPS", "4200");
+        std::env::set_var("CUMULATIVE_DEGRADATION_COEFFICIENT_BPS", "333");
+        std::env::set_var("SATURATION_RAMP_START_SLIPPAGE_BPS", "55");
+
+        let config = load_slippage_config();
+
+        assert_eq!(
+            config,
+            SlippageConfig {
+                min_dynamic_slippage_bps: 3,
+                max_dynamic_slippage_bps: 250,
+                utilization_coefficient_bps: 75,
+                sensitivity_coefficient_bps: 3000,
+                soft_ladder_utilization_cap_bps: 4200,
+                cumulative_degradation_coefficient_bps: 333,
+                saturation_ramp_start_slippage_bps: 55,
+            }
+        );
+
+        clear_slippage_env();
     }
 }

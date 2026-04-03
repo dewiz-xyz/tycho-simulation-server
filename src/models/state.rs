@@ -14,6 +14,8 @@ use tycho_simulation::{
     },
 };
 
+use crate::config::SlippageConfig;
+
 use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
 
 const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
@@ -41,6 +43,7 @@ pub struct AppState {
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
@@ -1016,6 +1019,7 @@ mod tests {
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+            slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency,
