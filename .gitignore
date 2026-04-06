@@ -9,9 +9,6 @@ __pycache__/
 skills/*.dist/
 skills/**/*.skill
 
-# Node.js
-node_modules/
-
 # IDE
 .idea/
 .vscode/
