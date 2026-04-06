@@ -17,6 +17,7 @@ use tycho_simulation::{
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
+use crate::config::SlippageConfig;
 use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
@@ -28,20 +29,14 @@ use crate::models::tokens::TokenStoreError;
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
-const MIN_DYNAMIC_SLIPPAGE_BPS: u32 = 1;
-const MAX_DYNAMIC_SLIPPAGE_BPS: u32 = 200;
 const BPS_DENOMINATOR: u32 = 10_000;
-const UTILIZATION_COEFFICIENT_BPS: u32 = 60;
-const SENSITIVITY_COEFFICIENT_BPS: u32 = 2_500;
-const SOFT_LADDER_UTILIZATION_CAP_BPS: u32 = 3_500;
-const CUMULATIVE_DEGRADATION_COEFFICIENT_BPS: u32 = 300;
 const STRESS_INPUT_DIVISOR: u32 = 100;
 const MIN_STRESS_INPUT: u8 = 1;
 const SATURATION_THRESHOLD_BPS: u32 = 9_999;
 const SATURATION_RAMP_START_UTILIZATION_BPS: u32 = 9_500;
 const SATURATION_MAX_UTILIZATION_BPS: u32 = 9_990;
-const SATURATION_RAMP_START_SLIPPAGE_BPS: u32 = 45;
 const SLIPPAGE_SCALE: u32 = 1_000_000;
+const SOFT_LADDER_ACTIVATION_DEGRADATION_BPS: u32 = 10;
 
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
@@ -190,6 +185,7 @@ struct SimulatePoolInput {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
+    slippage: SlippageConfig,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -999,6 +995,7 @@ impl QuoteRequestRunner {
                 token_in: scheduled.sim_token_in,
                 token_out: scheduled.sim_token_out,
                 amounts: Arc::clone(&prepared.amounts_in),
+                slippage: self.state.slippage,
                 expected_len: prepared.expected_len,
                 deadline: scheduled.pool_deadline,
                 cancel_token: scheduled.pool_cancel,
@@ -1425,6 +1422,7 @@ struct BlockingPoolRunner {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
+    slippage: SlippageConfig,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -1604,17 +1602,7 @@ impl BlockingPoolRunner {
     ) -> Vec<u32> {
         // When the ladder never approaches a trustworthy hard output limit, use the
         // observed ladder envelope as a softer utilization anchor instead.
-        let soft_ladder_max_out = {
-            let mut positive_outputs = amounts_out
-                .iter()
-                .filter_map(|amount| BigUint::from_str(amount).ok())
-                .filter(|amount| !amount.is_zero())
-                .collect::<Vec<_>>();
-            positive_outputs.sort();
-            (positive_outputs.len() > 1)
-                .then(|| positive_outputs.last().cloned())
-                .flatten()
-        };
+        let soft_ladder_max_out = observed_soft_ladder_max_out(self.amounts.as_ref(), amounts_out);
         let first_usable_quote = amounts_out
             .iter()
             .enumerate()
@@ -1646,6 +1634,7 @@ impl BlockingPoolRunner {
                     stress_quote.as_ref().map(|(_, amount_out)| amount_out),
                     limit_max_out,
                     soft_ladder_max_out.as_ref(),
+                    &self.slippage,
                 );
                 let cumulative_penalty =
                     first_usable_quote
@@ -1656,9 +1645,10 @@ impl BlockingPoolRunner {
                                 base_out,
                                 amount_in,
                                 &amount_out,
+                                &self.slippage,
                             )
                         });
-                (base_slippage + cumulative_penalty).min(MAX_DYNAMIC_SLIPPAGE_BPS)
+                (base_slippage + cumulative_penalty).min(self.slippage.max_dynamic_slippage_bps)
             })
             .collect::<Vec<_>>();
         enforce_non_decreasing_slippage(amounts_out, &mut slippage);
@@ -1794,6 +1784,7 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
         token_in,
         token_out,
         amounts,
+        slippage,
         expected_len,
         deadline,
         cancel_token,
@@ -1812,6 +1803,7 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
             token_in,
             token_out,
             amounts,
+            slippage,
             expected_len,
             deadline,
             cancel_token: blocking_cancel_token,
@@ -2051,81 +2043,35 @@ fn compute_stress_input(amount_in: &BigUint) -> BigUint {
     (amount_in / STRESS_INPUT_DIVISOR).max(BigUint::from(MIN_STRESS_INPUT))
 }
 
-fn compute_dynamic_slippage_bps(
-    amount_in: &BigUint,
-    amount_out: &BigUint,
-    stressed_amount_in: Option<&BigUint>,
-    stressed_amount_out: Option<&BigUint>,
-    limit_max_out: Option<&BigUint>,
-    soft_ladder_max_out: Option<&BigUint>,
-) -> u32 {
-    if amount_out.is_zero() {
-        return 0;
-    }
-
-    let scale = BigUint::from(SLIPPAGE_SCALE);
-    let mut total_scaled = BigUint::from(MIN_DYNAMIC_SLIPPAGE_BPS) * &scale;
-
-    let effective_utilization_scaled =
-        effective_output_utilization_scaled(amount_out, limit_max_out, soft_ladder_max_out, &scale);
-    total_scaled += utilization_term_scaled(&effective_utilization_scaled, &scale);
-
-    if let (Some(stressed_amount_in), Some(stressed_amount_out)) =
-        (stressed_amount_in, stressed_amount_out)
-    {
-        if !stressed_amount_in.is_zero() && !stressed_amount_out.is_zero() {
-            total_scaled += sensitivity_term_scaled(
-                amount_in,
-                amount_out,
-                stressed_amount_in,
-                stressed_amount_out,
-                &scale,
-            );
-        }
-    }
-
-    let total_bps = round_div_biguint(total_scaled, &scale)
-        .to_u32()
-        .unwrap_or(MAX_DYNAMIC_SLIPPAGE_BPS);
-    let saturation_floor_bps = saturation_slippage_floor_bps(amount_out, limit_max_out)
-        .unwrap_or(MIN_DYNAMIC_SLIPPAGE_BPS);
-    total_bps
-        .max(saturation_floor_bps)
-        .clamp(MIN_DYNAMIC_SLIPPAGE_BPS, MAX_DYNAMIC_SLIPPAGE_BPS)
-}
-
-fn effective_output_utilization_scaled(
-    amount_out: &BigUint,
-    limit_max_out: Option<&BigUint>,
-    soft_ladder_max_out: Option<&BigUint>,
-    scale: &BigUint,
-) -> BigUint {
-    let hard_utilization_scaled = limit_max_out
-        .filter(|max_out| !max_out.is_zero())
-        .map(|max_out| round_div_biguint(amount_out * scale, max_out))
-        .unwrap_or_else(BigUint::zero);
-    let soft_utilization_scaled = soft_ladder_max_out
-        .filter(|max_out| !max_out.is_zero())
-        .map(|max_out| {
-            round_div_biguint(
-                amount_out * BigUint::from(SOFT_LADDER_UTILIZATION_CAP_BPS) * scale,
-                &(max_out * BigUint::from(BPS_DENOMINATOR)),
-            )
+fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) -> Option<BigUint> {
+    let mut usable_quotes = amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        .filter_map(|(amount_in, amount_out)| {
+            let amount_out = BigUint::from_str(amount_out).ok()?;
+            (!amount_out.is_zero()).then_some((amount_in, amount_out))
         })
-        .unwrap_or_else(BigUint::zero);
+        .collect::<Vec<_>>();
+    usable_quotes
+        .sort_by(|(left_amount_in, _), (right_amount_in, _)| left_amount_in.cmp(right_amount_in));
 
-    hard_utilization_scaled
-        .max(soft_utilization_scaled)
-        .min(scale.clone())
+    let (base_amount_in, base_amount_out) = usable_quotes.first()?;
+    if usable_quotes.len() < 2
+        || !usable_quotes.iter().skip(1).any(|(amount_in, amount_out)| {
+            rate_degradation_bps(base_amount_in, base_amount_out, amount_in, amount_out)
+                >= SOFT_LADDER_ACTIVATION_DEGRADATION_BPS
+        })
+    {
+        return None;
+    }
+
+    usable_quotes
+        .into_iter()
+        .map(|(_, amount_out)| amount_out)
+        .max()
 }
 
-fn utilization_term_scaled(utilization_scaled: &BigUint, scale: &BigUint) -> BigUint {
-    let numerator =
-        BigUint::from(UTILIZATION_COEFFICIENT_BPS) * utilization_scaled * utilization_scaled;
-    round_div_biguint(numerator, scale)
-}
-
-fn cumulative_degradation_slippage_bps(
+fn rate_degradation_bps(
     base_amount_in: &BigUint,
     base_amount_out: &BigUint,
     amount_in: &BigUint,
@@ -2145,12 +2091,131 @@ fn cumulative_degradation_slippage_bps(
         return 0;
     }
 
+    round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator) * BigUint::from(BPS_DENOMINATOR),
+        &base_rate_numerator,
+    )
+    .to_u32()
+    .unwrap_or(BPS_DENOMINATOR)
+}
+
+fn compute_dynamic_slippage_bps(
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+    stressed_amount_in: Option<&BigUint>,
+    stressed_amount_out: Option<&BigUint>,
+    limit_max_out: Option<&BigUint>,
+    soft_ladder_max_out: Option<&BigUint>,
+    slippage: &SlippageConfig,
+) -> u32 {
+    if amount_out.is_zero() {
+        return 0;
+    }
+
+    let scale = BigUint::from(SLIPPAGE_SCALE);
+    let mut total_scaled = BigUint::from(slippage.min_dynamic_slippage_bps) * &scale;
+
+    let effective_utilization_scaled = effective_output_utilization_scaled(
+        amount_out,
+        limit_max_out,
+        soft_ladder_max_out,
+        &scale,
+        slippage,
+    );
+    total_scaled += utilization_term_scaled(&effective_utilization_scaled, &scale, slippage);
+
+    if let (Some(stressed_amount_in), Some(stressed_amount_out)) =
+        (stressed_amount_in, stressed_amount_out)
+    {
+        if !stressed_amount_in.is_zero() && !stressed_amount_out.is_zero() {
+            total_scaled += sensitivity_term_scaled(
+                amount_in,
+                amount_out,
+                stressed_amount_in,
+                stressed_amount_out,
+                &scale,
+                slippage,
+            );
+        }
+    }
+
+    let total_bps = round_div_biguint(total_scaled, &scale)
+        .to_u32()
+        .unwrap_or(slippage.max_dynamic_slippage_bps);
+    let saturation_floor_bps = saturation_slippage_floor_bps(amount_out, limit_max_out, slippage)
+        .unwrap_or(slippage.min_dynamic_slippage_bps);
+    total_bps.max(saturation_floor_bps).clamp(
+        slippage.min_dynamic_slippage_bps,
+        slippage.max_dynamic_slippage_bps,
+    )
+}
+
+fn effective_output_utilization_scaled(
+    amount_out: &BigUint,
+    limit_max_out: Option<&BigUint>,
+    soft_ladder_max_out: Option<&BigUint>,
+    scale: &BigUint,
+    slippage: &SlippageConfig,
+) -> BigUint {
+    let hard_utilization_scaled = limit_max_out
+        .filter(|max_out| !max_out.is_zero())
+        .map(|max_out| round_div_biguint(amount_out * scale, max_out))
+        .unwrap_or_else(BigUint::zero);
+    let soft_utilization_scaled = soft_ladder_max_out
+        .filter(|max_out| !max_out.is_zero())
+        .map(|max_out| {
+            round_div_biguint(
+                amount_out * BigUint::from(slippage.soft_ladder_utilization_cap_bps) * scale,
+                &(max_out * BigUint::from(BPS_DENOMINATOR)),
+            )
+        })
+        .unwrap_or_else(BigUint::zero);
+
+    hard_utilization_scaled
+        .max(soft_utilization_scaled)
+        .min(scale.clone())
+}
+
+fn utilization_term_scaled(
+    utilization_scaled: &BigUint,
+    scale: &BigUint,
+    slippage: &SlippageConfig,
+) -> BigUint {
+    let numerator = BigUint::from(slippage.utilization_coefficient_bps)
+        * utilization_scaled
+        * utilization_scaled;
+    round_div_biguint(numerator, scale)
+}
+
+fn cumulative_degradation_slippage_bps(
+    base_amount_in: &BigUint,
+    base_amount_out: &BigUint,
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+    slippage: &SlippageConfig,
+) -> u32 {
+    if base_amount_in.is_zero()
+        || base_amount_out.is_zero()
+        || amount_in.is_zero()
+        || amount_out.is_zero()
+    {
+        return 0;
+    }
+
+    let base_rate_numerator = base_amount_out * amount_in;
+    let current_rate_numerator = amount_out * base_amount_in;
+    if current_rate_numerator >= base_rate_numerator {
+        return 0;
+    }
+
     let penalty = round_div_biguint(
         (base_rate_numerator.clone() - current_rate_numerator)
-            * BigUint::from(CUMULATIVE_DEGRADATION_COEFFICIENT_BPS),
+            * BigUint::from(slippage.cumulative_degradation_coefficient_bps),
         &base_rate_numerator,
     );
-    penalty.to_u32().unwrap_or(MAX_DYNAMIC_SLIPPAGE_BPS)
+    penalty
+        .to_u32()
+        .unwrap_or(slippage.max_dynamic_slippage_bps)
 }
 
 fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32]) {
@@ -2170,6 +2235,7 @@ fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32])
 fn saturation_slippage_floor_bps(
     amount_out: &BigUint,
     limit_max_out: Option<&BigUint>,
+    slippage: &SlippageConfig,
 ) -> Option<u32> {
     let limit_max_out = limit_max_out.filter(|value| !value.is_zero())?;
     let utilization_bps =
@@ -2179,7 +2245,7 @@ fn saturation_slippage_floor_bps(
             .min(BPS_DENOMINATOR);
 
     if utilization_bps >= SATURATION_MAX_UTILIZATION_BPS {
-        return Some(MAX_DYNAMIC_SLIPPAGE_BPS);
+        return Some(slippage.max_dynamic_slippage_bps);
     }
 
     if utilization_bps <= SATURATION_RAMP_START_UTILIZATION_BPS {
@@ -2188,10 +2254,10 @@ fn saturation_slippage_floor_bps(
 
     let ramp_progress = utilization_bps - SATURATION_RAMP_START_UTILIZATION_BPS;
     let ramp_width = SATURATION_MAX_UTILIZATION_BPS - SATURATION_RAMP_START_UTILIZATION_BPS;
-    let ramp_span = MAX_DYNAMIC_SLIPPAGE_BPS - SATURATION_RAMP_START_SLIPPAGE_BPS;
+    let ramp_span = slippage.max_dynamic_slippage_bps - slippage.saturation_ramp_start_slippage_bps;
 
     Some(
-        SATURATION_RAMP_START_SLIPPAGE_BPS
+        slippage.saturation_ramp_start_slippage_bps
             + ((ramp_span * ramp_progress) + (ramp_width / 2)) / ramp_width,
     )
 }
@@ -2202,6 +2268,7 @@ fn sensitivity_term_scaled(
     stressed_amount_in: &BigUint,
     stressed_amount_out: &BigUint,
     scale: &BigUint,
+    slippage: &SlippageConfig,
 ) -> BigUint {
     let current_rate_numerator = amount_out * stressed_amount_in;
     let stressed_rate_numerator = stressed_amount_out * amount_in;
@@ -2210,7 +2277,7 @@ fn sensitivity_term_scaled(
     }
 
     let numerator = (current_rate_numerator.clone() - stressed_rate_numerator)
-        * BigUint::from(SENSITIVITY_COEFFICIENT_BPS)
+        * BigUint::from(slippage.sensitivity_coefficient_bps)
         * scale;
     round_div_biguint(numerator, &current_rate_numerator)
 }
@@ -2869,6 +2936,7 @@ mod tests {
             request_timeout: config.request_timeout,
             native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
+            slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: config.native_sim_concurrency,
@@ -3980,6 +4048,7 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
+            slippage: SlippageConfig::default(),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -4032,6 +4101,7 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(11u8), BigUint::from(20u8)]),
+            slippage: SlippageConfig::default(),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -4499,6 +4569,51 @@ mod tests {
         );
         assert_eq!(computation.responses[0].slippage, vec![102, 102]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_slippage_skips_soft_ladder_utilization_for_linear_quotes() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000009",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(PositiveOutputSim {
+                max_in: BigUint::from(100_000u32),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-linear-soft-ladder-slippage", &["100", "200", "300"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["100".to_string(), "200".to_string(), "300".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![1, 1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
@@ -5230,6 +5345,7 @@ mod tests {
             Some(&BigUint::from(9_997u32)),
             Some(&BigUint::from(100_000u32)),
             None,
+            &SlippageConfig::default(),
         );
 
         assert_eq!(slippage, 2);
@@ -5244,9 +5360,52 @@ mod tests {
             None,
             Some(&BigUint::from(10_000u32)),
             Some(&BigUint::from(100u32)),
+            &SlippageConfig::default(),
         );
 
         assert_eq!(slippage, 8);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_requires_meaningful_ladder_degradation() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "200".to_string(), "300".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, None);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_activates_when_ladder_rate_degrades() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "190".to_string(), "270".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
+    }
+
+    #[test]
+    fn soft_ladder_max_out_is_order_independent() {
+        let amounts_in = vec![
+            BigUint::from(300u32),
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+        ];
+        let amounts_out = vec!["270".to_string(), "100".to_string(), "190".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
     }
 
     #[test]
@@ -5258,6 +5417,7 @@ mod tests {
             None,
             Some(&BigUint::from(300u32)),
             None,
+            &SlippageConfig::default(),
         );
 
         assert_eq!(slippage, 8);
@@ -5272,6 +5432,7 @@ mod tests {
             None,
             Some(&BigUint::from(10_000u32)),
             None,
+            &SlippageConfig::default(),
         );
 
         assert_eq!(slippage, 108);
@@ -5286,9 +5447,10 @@ mod tests {
             None,
             Some(&BigUint::from(10_000u32)),
             None,
+            &SlippageConfig::default(),
         );
 
-        assert_eq!(slippage, MAX_DYNAMIC_SLIPPAGE_BPS);
+        assert_eq!(slippage, SlippageConfig::default().max_dynamic_slippage_bps);
     }
 
     #[test]
@@ -5298,6 +5460,7 @@ mod tests {
             &BigUint::from(100u32),
             &BigUint::from(200u32),
             &BigUint::from(160u32),
+            &SlippageConfig::default(),
         );
 
         assert_eq!(penalty, 60);
