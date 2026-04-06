@@ -1,5 +1,4 @@
 node_modules
-npm-debug.log
 dist
 target
 .git
@@ -8,4 +7,3 @@ target
 .DS_Store
 *.md
 !README.md
-cdk*
