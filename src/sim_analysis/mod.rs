@@ -36,6 +36,7 @@ const DEFAULT_PROFILE: &str = "balanced";
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
 const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 2;
 const SAMPLE_LIMIT: usize = 4;
@@ -400,16 +401,21 @@ async fn ensure_server_ready(
     }
 
     let readiness_result = async {
-        wait_for_readiness(scripts, &status_url, args.chain_id, false)?;
+        wait_for_readiness(scripts, &status_url, args.chain_id, false, false)?;
         let mut snapshot = fetch_readiness_snapshot(client, &status_url)
             .await
             .context("failed to fetch readiness after wait_ready")?;
 
-        if snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready") {
-            wait_for_readiness(scripts, &status_url, args.chain_id, true)?;
+        let require_vm = snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready");
+        let require_rfq = snapshot.rfq_enabled.unwrap_or(false)
+            && snapshot.rfq_status.as_deref() != Some("ready");
+
+        if require_vm || require_rfq {
+            let wait_label = readiness_wait_label(require_vm, require_rfq);
+            wait_for_readiness(scripts, &status_url, args.chain_id, require_vm, require_rfq)?;
             snapshot = fetch_readiness_snapshot(client, &status_url)
                 .await
-                .context("failed to fetch readiness after VM wait")?;
+                .with_context(|| format!("failed to fetch readiness after {wait_label}"))?;
         }
 
         Ok(snapshot)
@@ -1369,12 +1375,25 @@ fn wait_for_readiness(
     status_url: &str,
     chain_id: u64,
     require_vm: bool,
+    require_rfq: bool,
 ) -> Result<()> {
-    let timeout_secs = if require_vm {
-        DEFAULT_VM_READY_TIMEOUT_SECS
-    } else {
-        DEFAULT_READY_TIMEOUT_SECS
+    let timeout_secs = match (require_vm, require_rfq) {
+        (true, true) => DEFAULT_VM_READY_TIMEOUT_SECS.max(DEFAULT_RFQ_READY_TIMEOUT_SECS),
+        (true, false) => DEFAULT_VM_READY_TIMEOUT_SECS,
+        (false, true) => DEFAULT_RFQ_READY_TIMEOUT_SECS,
+        (false, false) => DEFAULT_READY_TIMEOUT_SECS,
     };
+    let args = build_wait_ready_args(status_url, timeout_secs, chain_id, require_vm, require_rfq);
+    run_script(&scripts.wait_ready, &args).map(|_| ())
+}
+
+fn build_wait_ready_args(
+    status_url: &str,
+    timeout_secs: u64,
+    chain_id: u64,
+    require_vm: bool,
+    require_rfq: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--url".to_string(),
         status_url.to_string(),
@@ -1386,7 +1405,19 @@ fn wait_for_readiness(
     if require_vm {
         args.push("--require-vm-ready".to_string());
     }
-    run_script(&scripts.wait_ready, &args).map(|_| ())
+    if require_rfq {
+        args.push("--require-rfq-ready".to_string());
+    }
+    args
+}
+
+fn readiness_wait_label(require_vm: bool, require_rfq: bool) -> &'static str {
+    match (require_vm, require_rfq) {
+        (true, true) => "VM and RFQ wait",
+        (true, false) => "VM wait",
+        (false, true) => "RFQ wait",
+        (false, false) => "wait_ready",
+    }
 }
 
 fn run_script(script: &Path, args: &[String]) -> Result<String> {
@@ -1797,9 +1828,9 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_log_boundary, collect_logs, discover_latest_baseline, ensure_server_ready,
-        maybe_load_baseline, percentile, sanitize_filename, select_best_pool, startup_bind_config,
-        BaselineMode, CliArgs, ScriptPaths,
+        build_wait_ready_args, capture_log_boundary, collect_logs, discover_latest_baseline,
+        ensure_server_ready, maybe_load_baseline, percentile, sanitize_filename, select_best_pool,
+        startup_bind_config, BaselineMode, CliArgs, ScriptPaths,
     };
     use crate::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
@@ -1868,6 +1899,23 @@ mod tests {
 
         assert_eq!(bind.host, "127.0.0.1");
         assert_eq!(bind.port, 443);
+    }
+
+    #[test]
+    fn build_wait_ready_args_supports_vm_and_rfq_requirements() {
+        let rfq_only_args =
+            build_wait_ready_args("http://localhost:3000/status", 600, 1, false, true);
+        assert!(rfq_only_args.iter().any(|arg| arg == "--require-rfq-ready"));
+        assert!(!rfq_only_args.iter().any(|arg| arg == "--require-vm-ready"));
+
+        let vm_and_rfq_args =
+            build_wait_ready_args("http://localhost:3000/status", 600, 1, true, true);
+        assert!(vm_and_rfq_args
+            .iter()
+            .any(|arg| arg == "--require-vm-ready"));
+        assert!(vm_and_rfq_args
+            .iter()
+            .any(|arg| arg == "--require-rfq-ready"));
     }
 
     #[tokio::test]
