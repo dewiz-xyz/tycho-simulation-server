@@ -184,6 +184,9 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
     // Canonicalize address tokens so CloudWatch queries compare one stable representation.
     let token_in = canonicalize_token_for_log(event.request.token_in.as_str());
     let token_out = canonicalize_token_for_log(event.request.token_out.as_str());
+    let simulation_runs = event.computation.metrics.scheduled_native_pools
+        + event.computation.metrics.scheduled_vm_pools
+        + event.computation.metrics.scheduled_rfq_pools;
 
     if event.timed_out {
         tracing::event!(
@@ -196,22 +199,32 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
             partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
             vm_unavailable = event.computation.meta.vm_unavailable,
+            rfq_unavailable = event.computation.meta.rfq_unavailable,
             responses = event.computation.responses.len(),
             failures = event.computation.meta.failures.len(),
             pool_results = event.computation.meta.pool_results.len(),
             scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
             scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
-            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
+            scheduled_rfq_pools = event.computation.metrics.scheduled_rfq_pools,
+            simulation_runs,
             skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
+            skipped_rfq_unavailable = event.computation.metrics.skipped_rfq_unavailable,
             skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
             skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
+            skipped_rfq_concurrency = event.computation.metrics.skipped_rfq_concurrency,
             skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
+            skipped_rfq_deadline = event.computation.metrics.skipped_rfq_deadline,
             vm_completed_pools = event.computation.metrics.vm_completed_pools,
+            rfq_completed_pools = event.computation.metrics.rfq_completed_pools,
             vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
+            rfq_median_first_gas = event.computation.metrics.rfq_median_first_gas,
             vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
+            rfq_low_first_gas_count = event.computation.metrics.rfq_low_first_gas_count,
             vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
+            rfq_low_first_gas_ratio = event.computation.metrics.rfq_low_first_gas_ratio,
             vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
+            rfq_low_first_gas_samples = ?event.computation.metrics.rfq_low_first_gas_samples,
             token_in = token_in.as_ref(),
             token_out = token_out.as_ref(),
             amounts = event.request.amounts.len(),
@@ -241,22 +254,32 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
             quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
             partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
             vm_unavailable = event.computation.meta.vm_unavailable,
+            rfq_unavailable = event.computation.meta.rfq_unavailable,
             responses = event.computation.responses.len(),
             failures = event.computation.meta.failures.len(),
             pool_results = event.computation.meta.pool_results.len(),
             scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
             scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
-            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
+            scheduled_rfq_pools = event.computation.metrics.scheduled_rfq_pools,
+            simulation_runs,
             skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
+            skipped_rfq_unavailable = event.computation.metrics.skipped_rfq_unavailable,
             skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
             skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
+            skipped_rfq_concurrency = event.computation.metrics.skipped_rfq_concurrency,
             skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
             skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
+            skipped_rfq_deadline = event.computation.metrics.skipped_rfq_deadline,
             vm_completed_pools = event.computation.metrics.vm_completed_pools,
+            rfq_completed_pools = event.computation.metrics.rfq_completed_pools,
             vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
+            rfq_median_first_gas = event.computation.metrics.rfq_median_first_gas,
             vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
+            rfq_low_first_gas_count = event.computation.metrics.rfq_low_first_gas_count,
             vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
+            rfq_low_first_gas_ratio = event.computation.metrics.rfq_low_first_gas_ratio,
             vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
+            rfq_low_first_gas_samples = ?event.computation.metrics.rfq_low_first_gas_samples,
             token_in = token_in.as_ref(),
             token_out = token_out.as_ref(),
             amounts = event.request.amounts.len(),
@@ -377,11 +400,7 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
 
         if let Some(protocol) = failure.protocol.as_deref() {
             *protocol_counts.entry(protocol.to_string()).or_insert(0) += 1;
-            let pool_kind = if protocol.starts_with("vm:") {
-                "vm"
-            } else {
-                "native"
-            };
+            let pool_kind = classify_protocol_pool_kind(protocol);
             *pool_kind_counts.entry(pool_kind.to_string()).or_insert(0) += 1;
         } else {
             *pool_kind_counts.entry("unknown".to_string()).or_insert(0) += 1;
@@ -406,6 +425,16 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
         protocol_counts: protocol_counts.into_iter().collect(),
         pool_kind_counts: pool_kind_counts.into_iter().collect(),
         samples,
+    }
+}
+
+fn classify_protocol_pool_kind(protocol: &str) -> &'static str {
+    if protocol.starts_with("vm:") {
+        "vm"
+    } else if protocol.starts_with("rfq:") {
+        "rfq"
+    } else {
+        "native"
     }
 }
 
@@ -574,6 +603,29 @@ mod tests {
             vec![("native".to_string(), 2), ("vm".to_string(), 2)]
         );
         assert_eq!(summary.samples.len(), 4);
+    }
+
+    #[test]
+    fn rfq_failures_are_bucketed_separately_from_native() {
+        let failures = vec![
+            make_failure(QuoteFailureKind::Simulator, Some("rfq:hashflow")),
+            make_failure(QuoteFailureKind::Timeout, Some("rfq:bebop")),
+            make_failure(QuoteFailureKind::Overflow, Some("uniswap_v3")),
+        ];
+        let summary = summarize_failures(&failures);
+
+        assert_eq!(
+            summary.protocol_counts,
+            vec![
+                ("rfq:bebop".to_string(), 1),
+                ("rfq:hashflow".to_string(), 1),
+                ("uniswap_v3".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            summary.pool_kind_counts,
+            vec![("native".to_string(), 1), ("rfq".to_string(), 2)]
+        );
     }
 
     #[test]

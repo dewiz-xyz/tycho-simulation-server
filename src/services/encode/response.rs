@@ -55,6 +55,7 @@ struct EncodeRequestSummary {
     swaps: usize,
     route_protocols: String,
     route_uses_vm: bool,
+    route_uses_rfq: bool,
     token_in: String,
     token_out: String,
     amount_in: String,
@@ -132,6 +133,7 @@ pub(crate) fn log_success(
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -157,6 +159,7 @@ pub(crate) fn log_received(request: &RouteEncodeRequest) {
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         "Received encode request"
     );
 }
@@ -185,6 +188,7 @@ pub(crate) fn log_failure(
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -213,6 +217,7 @@ pub(crate) fn log_handler_timeout(request: &RouteEncodeRequest, timeout_ms: u64,
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -256,6 +261,18 @@ fn summarize_request(request: &RouteEncodeRequest) -> EncodeRequestSummary {
         .flat_map(|hop| hop.swaps.iter())
         .map(|swap| swap.pool.protocol.trim().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
+    let route_uses_vm = request
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .any(|swap| swap.pool.protocol.trim().starts_with("vm:"));
+    let route_uses_rfq = request
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .any(|swap| swap.pool.protocol.trim().starts_with("rfq:"));
 
     EncodeRequestSummary {
         request_id: request.request_id.clone(),
@@ -265,12 +282,8 @@ fn summarize_request(request: &RouteEncodeRequest) -> EncodeRequestSummary {
         hops,
         swaps,
         route_protocols: protocols.into_iter().collect::<Vec<_>>().join(","),
-        route_uses_vm: request
-            .segments
-            .iter()
-            .flat_map(|segment| segment.hops.iter())
-            .flat_map(|hop| hop.swaps.iter())
-            .any(|swap| swap.pool.protocol.trim().starts_with("vm:")),
+        route_uses_vm,
+        route_uses_rfq,
         token_in: request.token_in.clone(),
         token_out: request.token_out.clone(),
         amount_in: request.amount_in.clone(),
@@ -509,7 +522,7 @@ mod tests {
 
     #[test]
     fn summarize_request_collects_route_shape_and_protocols() {
-        let request = route_request(&["curve_v2", "vm:maverick_v2", "uniswap_v3"]);
+        let request = route_request(&["curve_v2", "vm:maverick_v2", "rfq:hashflow"]);
 
         let summary = summarize_request(&request);
 
@@ -520,9 +533,10 @@ mod tests {
         assert_eq!(summary.swaps, 3);
         assert_eq!(
             summary.route_protocols,
-            "curve_v2,uniswap_v3,vm:maverick_v2"
+            "curve_v2,rfq:hashflow,vm:maverick_v2"
         );
         assert!(summary.route_uses_vm);
+        assert!(summary.route_uses_rfq);
         assert!(summary.is_native_input);
     }
 
