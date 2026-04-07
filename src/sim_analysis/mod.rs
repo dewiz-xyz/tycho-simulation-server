@@ -407,8 +407,7 @@ async fn ensure_server_ready(
             .context("failed to fetch readiness after wait_ready")?;
 
         let require_vm = snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready");
-        let require_rfq = snapshot.rfq_enabled.unwrap_or(false)
-            && snapshot.rfq_status.as_deref() != Some("ready");
+        let require_rfq = snapshot.rfq_enabled && snapshot.rfq_status.as_deref() != Some("ready");
 
         if require_vm || require_rfq {
             let wait_label = readiness_wait_label(require_vm, require_rfq);
@@ -975,6 +974,7 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
         && quote.meta.result_quality == crate::models::messages::QuoteResultQuality::Complete
         && quote.meta.failures.is_empty()
         && !quote.meta.vm_unavailable
+        && !quote.meta.rfq_unavailable
         && !quote.data.is_empty()
     {
         ObservationClass::Healthy
@@ -1828,15 +1828,18 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_wait_ready_args, capture_log_boundary, collect_logs, discover_latest_baseline,
-        ensure_server_ready, maybe_load_baseline, percentile, sanitize_filename, select_best_pool,
-        startup_bind_config, BaselineMode, CliArgs, ScriptPaths,
+        build_wait_ready_args, capture_log_boundary, classify_simulate_response, collect_logs,
+        discover_latest_baseline, ensure_server_ready, maybe_load_baseline, percentile,
+        sanitize_filename, select_best_pool, startup_bind_config, BaselineMode, CliArgs,
+        HttpJsonResponse, ObservationClass, ScriptPaths,
     };
     use crate::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
         QuoteResultQuality, QuoteStatus,
     };
     use reqwest::Client;
+    use reqwest::StatusCode;
+    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -2110,6 +2113,51 @@ mod tests {
         assert!(summary.highlights[0].contains("new error"));
 
         assert!(fs::remove_dir_all(&root).is_ok());
+    }
+
+    #[test]
+    fn classify_simulate_response_marks_rfq_unavailable_as_degraded() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "UniswapV3::DAI/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(1),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: Some(1),
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                rfq_unavailable: true,
+                failures: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&quote).unwrap_or_default();
+        let response = HttpJsonResponse {
+            status_code: StatusCode::OK,
+            elapsed_ms: 1.0,
+            body_text: body,
+            json: serde_json::to_value(quote).ok(),
+        };
+
+        let observation = classify_simulate_response(json!({ "request_id": "req-1" }), response);
+
+        assert!(matches!(
+            observation.classification,
+            ObservationClass::Degraded
+        ));
     }
 
     #[test]
