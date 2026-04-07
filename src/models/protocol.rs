@@ -19,10 +19,12 @@ pub enum ProtocolKind {
     Rocketpool,
     EkuboV3,
     ERC4626,
+    Hashflow,
+    Bebop,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 15] = [
+    pub const ALL: [ProtocolKind; 17] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -38,6 +40,8 @@ impl ProtocolKind {
         ProtocolKind::Rocketpool,
         ProtocolKind::EkuboV3,
         ProtocolKind::ERC4626,
+        ProtocolKind::Hashflow,
+        ProtocolKind::Bebop,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -57,6 +61,8 @@ impl ProtocolKind {
             ProtocolKind::Rocketpool => "rocketpool",
             ProtocolKind::EkuboV3 => "ekubo_v3",
             ProtocolKind::ERC4626 => "erc4626",
+            ProtocolKind::Hashflow => "rfq:hashflow",
+            ProtocolKind::Bebop => "rfq:bebop",
         }
     }
 
@@ -90,6 +96,8 @@ impl ProtocolKind {
             "balancer_v2_pool" => Some(ProtocolKind::BalancerV2),
             "maverick_v2_pool" => Some(ProtocolKind::MaverickV2),
             "erc4626_pool" => Some(ProtocolKind::ERC4626),
+            "hashflow_pool" => Some(ProtocolKind::Hashflow),
+            "bebop_pool" => Some(ProtocolKind::Bebop),
             _ => None,
         }
     }
@@ -111,6 +119,8 @@ impl ProtocolKind {
             "vm:balancer_v2" => Some(ProtocolKind::BalancerV2),
             "vm:maverick_v2" => Some(ProtocolKind::MaverickV2),
             "erc4626" => Some(ProtocolKind::ERC4626),
+            "rfq:hashflow" => Some(ProtocolKind::Hashflow),
+            "rfq:bebop" => Some(ProtocolKind::Bebop),
             _ => None,
         }
     }
@@ -135,7 +145,7 @@ mod tests {
 
     use super::*;
 
-    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 15] = [
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 17] = [
         ("uniswap_v2", ProtocolKind::UniswapV2),
         ("sushiswap_v2", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
@@ -151,9 +161,11 @@ mod tests {
         ("vm:balancer_v2", ProtocolKind::BalancerV2),
         ("vm:maverick_v2", ProtocolKind::MaverickV2),
         ("erc4626", ProtocolKind::ERC4626),
+        ("rfq:hashflow", ProtocolKind::Hashflow),
+        ("rfq:bebop", ProtocolKind::Bebop),
     ];
 
-    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 13] = [
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 15] = [
         ("uniswap_v2_pool", ProtocolKind::UniswapV2),
         ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
@@ -167,9 +179,11 @@ mod tests {
         ("balancer_v2_pool", ProtocolKind::BalancerV2),
         ("maverick_v2_pool", ProtocolKind::MaverickV2),
         ("erc4626_pool", ProtocolKind::ERC4626),
+        ("hashflow_pool", ProtocolKind::Hashflow),
+        ("bebop_pool", ProtocolKind::Bebop),
     ];
 
-    const NON_CANONICAL_ALIASES: [&str; 12] = [
+    const NON_CANONICAL_ALIASES: [&str; 14] = [
         "uniswapv2",
         "uniswapv3",
         "uniswapv4",
@@ -182,6 +196,8 @@ mod tests {
         "balancerv2_pool",
         "rocketpool_pool",
         "base_pool",
+        "hashflow",
+        "bebop",
     ];
 
     fn protocol_component(protocol_system: &str, protocol_type_name: &str) -> ProtocolComponent {
@@ -290,6 +306,8 @@ mod tests {
             "balancer_v2_pool",
             "maverick_v2_pool",
             "erc4626_pool",
+            "hashflow_pool",
+            "bebop_pool",
         ];
 
         for type_name in type_names {
