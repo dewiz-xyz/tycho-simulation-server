@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
-use crate::models::state::{AppState, NativeReadiness, VmReadiness};
+use crate::models::state::{AppState, NativeReadiness, RfqReadiness, VmReadiness};
 
 #[derive(Serialize)]
 pub struct StatusPayload {
@@ -20,6 +20,17 @@ pub struct StatusPayload {
     vm_rebuild_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vm_last_update_age_ms: Option<u64>,
+    rfq_enabled: bool,
+    rfq_status: &'static str,
+    rfq_block: u64,
+    rfq_pools: usize,
+    rfq_restarts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfq_last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfq_rebuild_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfq_last_update_age_ms: Option<u64>,
 }
 
 pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
@@ -28,14 +39,22 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
     let native_readiness = state.native_readiness().await;
 
     let vm_enabled = state.enable_vm_pools;
+    let rfq_enabled = state.enable_rfq_pools;
     let vm_status_snapshot = state.vm_stream.read().await.clone();
+    let rfq_status_snapshot = state.rfq_stream.read().await.clone();
     let vm_readiness = state.vm_readiness().await;
+    let rfq_readiness = state.rfq_readiness().await;
     let vm_status = vm_readiness.label();
+    let rfq_status = rfq_readiness.label();
 
     let vm_block = state.vm_block().await;
+    let rfq_block = state.rfq_block().await;
     let vm_pools = state.vm_pools().await;
+    let rfq_pools = state.rfq_pools().await;
     let vm_restarts = vm_status_snapshot.restart_count;
+    let rfq_restarts = rfq_status_snapshot.restart_count;
     let vm_last_error = vm_status_snapshot.last_error.clone();
+    let rfq_last_error = rfq_status_snapshot.last_error.clone();
     let vm_rebuild_duration_ms = if matches!(vm_readiness, VmReadiness::Rebuilding) {
         vm_status_snapshot
             .rebuild_started_at
@@ -43,7 +62,15 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
     } else {
         None
     };
+    let rfq_rebuild_duration_ms = if matches!(rfq_readiness, RfqReadiness::Rebuilding) {
+        rfq_status_snapshot
+            .rebuild_started_at
+            .map(|instant| instant.elapsed().as_millis() as u64)
+    } else {
+        None
+    };
     let vm_last_update_age_ms = state.vm_update_age_ms().await;
+    let rfq_last_update_age_ms = state.rfq_update_age_ms().await;
     let status = native_readiness.label();
 
     let status_code = if matches!(native_readiness, NativeReadiness::Ready) {
@@ -67,6 +94,14 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
             vm_last_error,
             vm_rebuild_duration_ms,
             vm_last_update_age_ms,
+            rfq_enabled,
+            rfq_status,
+            rfq_block,
+            rfq_pools,
+            rfq_restarts,
+            rfq_last_error,
+            rfq_rebuild_duration_ms,
+            rfq_last_update_age_ms,
         }),
     )
 }
@@ -240,15 +275,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_vm_rebuilding() {
+    async fn status_reports_vm_and_rfq_rebuilding() {
         let state = test_state(true, true);
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;
         }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = true;
+        }
 
         let (_, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
         assert_eq!(payload.vm_status, "rebuilding");
+        assert!(payload.rfq_enabled);
+        assert_eq!(payload.rfq_status, "rebuilding");
     }
 }
