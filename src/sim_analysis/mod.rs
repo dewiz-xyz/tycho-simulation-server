@@ -2127,6 +2127,8 @@ mod tests {
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
                 block_number: 1,
+                limit_max_in: None,
+                slippage: Vec::new(),
             }],
             meta: QuoteMeta {
                 status: QuoteStatus::Ready,
@@ -2171,6 +2173,8 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2222,6 +2226,8 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2260,6 +2266,8 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2307,6 +2315,8 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {
@@ -2345,6 +2355,8 @@ mod tests {
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["10".to_string()],
                 gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
                 block_number: 1,
             }],
             meta: QuoteMeta {

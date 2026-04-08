@@ -17,6 +17,7 @@ use tycho_simulation::{
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
+use crate::config::SlippageConfig;
 use crate::models::erc4626::component_direction_supported;
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
@@ -28,6 +29,14 @@ use crate::models::tokens::TokenStoreError;
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+const BPS_DENOMINATOR: u32 = 10_000;
+const STRESS_INPUT_DIVISOR: u32 = 100;
+const MIN_STRESS_INPUT: u8 = 1;
+const SATURATION_THRESHOLD_BPS: u32 = 9_999;
+const SATURATION_RAMP_START_UTILIZATION_BPS: u32 = 9_500;
+const SATURATION_MAX_UTILIZATION_BPS: u32 = 9_990;
+const SLIPPAGE_SCALE: u32 = 1_000_000;
+const SOFT_LADDER_ACTIVATION_DEGRADATION_BPS: u32 = 10;
 
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
@@ -165,6 +174,12 @@ struct PoolDescriptor {
     protocol: String,
 }
 
+enum LadderStressQuote {
+    Quote((BigUint, BigUint)),
+    PartialTail,
+    Missing,
+}
+
 struct PoolSchedulingContext<'a> {
     quote_deadline: Instant,
     pool_timeout: Duration,
@@ -186,6 +201,7 @@ struct SimulatePoolInput {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
+    slippage: SlippageConfig,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -1035,6 +1051,7 @@ impl QuoteRequestRunner {
                 token_in: scheduled.sim_token_in,
                 token_out: scheduled.sim_token_out,
                 amounts: Arc::clone(&prepared.amounts_in),
+                slippage: self.state.slippage,
                 expected_len: prepared.expected_len,
                 deadline: scheduled.pool_deadline,
                 cancel_token: scheduled.pool_cancel,
@@ -1151,6 +1168,8 @@ impl QuoteRequestRunner {
                 pool_name: result.pool_name,
                 pool_address: result.pool_address,
                 amounts_out: result.amounts_out,
+                slippage: result.slippage,
+                limit_max_in: result.limit_max_in.map(|value| value.to_string()),
                 gas_used: result.gas_used,
                 block_number: self.run.meta.block_number,
             });
@@ -1430,6 +1449,8 @@ struct PoolQuoteResult {
     pool_address: String,
     protocol: String,
     amounts_out: Vec<String>,
+    slippage: Vec<u32>,
+    limit_max_in: Option<BigUint>,
     gas_used: Vec<u64>,
     successful_steps: usize,
     first_successful_gas_used: Option<u64>,
@@ -1439,6 +1460,28 @@ struct PoolQuoteResult {
 
 enum PoolSimOutcome {
     Simulated(PoolQuoteResult),
+}
+
+struct PoolQuoteAccumulator {
+    amounts_out: Vec<String>,
+    gas_used: Vec<u64>,
+    successful_steps: usize,
+    first_successful_gas_used: Option<u64>,
+    errors: Vec<String>,
+    timed_out: bool,
+}
+
+impl PoolQuoteAccumulator {
+    fn new(expected_len: usize) -> Self {
+        Self {
+            amounts_out: Vec::with_capacity(expected_len),
+            gas_used: Vec::with_capacity(expected_len),
+            successful_steps: 0,
+            first_successful_gas_used: None,
+            errors: Vec::new(),
+            timed_out: false,
+        }
+    }
 }
 
 struct FailureContext<'a> {
@@ -1454,6 +1497,7 @@ struct BlockingPoolRunner {
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
+    slippage: SlippageConfig,
     expected_len: usize,
     deadline: Instant,
     cancel_token: CancellationToken,
@@ -1493,6 +1537,8 @@ impl BlockingPoolRunner {
             pool_address: self.descriptor.address.clone(),
             protocol: self.descriptor.protocol.clone(),
             amounts_out: Vec::new(),
+            slippage: Vec::new(),
+            limit_max_in: None,
             gas_used: Vec::new(),
             successful_steps: 0,
             first_successful_gas_used: None,
@@ -1502,22 +1548,10 @@ impl BlockingPoolRunner {
     }
 
     fn quote_amounts(&self) -> PoolSimOutcome {
-        let mut amounts_out = Vec::with_capacity(self.expected_len);
-        let mut gas_used = Vec::with_capacity(self.expected_len);
-        let mut successful_steps = 0;
-        let mut first_successful_gas_used = None;
-        let mut errors = Vec::new();
-        let mut timed_out = false;
-        let limit_max_in = self
-            .pool_state
-            .get_limits(
-                self.token_in.address.clone(),
-                self.token_out.address.clone(),
-            )
-            .ok()
-            .map(|(max_in, _)| max_in);
+        let mut run = PoolQuoteAccumulator::new(self.expected_len);
+        let (limit_max_in, limit_max_out) = self.pool_limits();
         for amount_in in self.amounts.iter() {
-            if self.record_cancellation_or_timeout(&mut errors, &mut timed_out) {
+            if self.record_cancellation_or_timeout(&mut run.errors, &mut run.timed_out) {
                 break;
             }
             if let Some(max_in) = limit_max_in.as_ref() {
@@ -1537,23 +1571,23 @@ impl BlockingPoolRunner {
                     let Some(gas_u64) = result.gas.to_u64() else {
                         let message = "no gas reported".to_string();
                         self.log_pool_error(&message);
-                        errors.push(message);
-                        amounts_out.clear();
-                        gas_used.clear();
-                        successful_steps = 0;
-                        first_successful_gas_used = None;
+                        run.errors.push(message);
+                        run.amounts_out.clear();
+                        run.gas_used.clear();
+                        run.successful_steps = 0;
+                        run.first_successful_gas_used = None;
                         break;
                     };
                     if result.amount.is_zero() {
                         // Zero outputs mean this requested amount did not produce a usable quote,
                         // even when the simulator returned Ok(...).
-                        amounts_out.push("0".to_string());
-                        gas_used.push(0);
+                        run.amounts_out.push("0".to_string());
+                        run.gas_used.push(0);
                     } else {
-                        amounts_out.push(result.amount.to_string());
-                        gas_used.push(gas_u64);
-                        successful_steps += 1;
-                        first_successful_gas_used.get_or_insert(gas_u64);
+                        run.amounts_out.push(result.amount.to_string());
+                        run.gas_used.push(gas_u64);
+                        run.successful_steps += 1;
+                        run.first_successful_gas_used.get_or_insert(gas_u64);
                     }
                 }
                 Err(error) => {
@@ -1562,9 +1596,9 @@ impl BlockingPoolRunner {
                         self.log_soft_limit_failure(amount_in, max_in, &message);
                     }
                     self.log_pool_error(&message);
-                    amounts_out.push("0".to_string());
-                    gas_used.push(0);
-                    errors.push(message);
+                    run.amounts_out.push("0".to_string());
+                    run.gas_used.push(0);
+                    run.errors.push(message);
                 }
             }
             if Instant::now() >= self.deadline {
@@ -1572,33 +1606,179 @@ impl BlockingPoolRunner {
                     "pool_timeout",
                     "Pool quote deadline reached while evaluating requested amounts",
                 );
-                if errors.is_empty() {
-                    errors.push("Timed out".to_string());
+                if run.errors.is_empty() {
+                    run.errors.push("Timed out".to_string());
                 }
-                timed_out = true;
+                run.timed_out = true;
                 break;
             }
         }
+        self.finish_quote_amounts(run, limit_max_in, limit_max_out)
+    }
+
+    fn pool_limits(&self) -> (Option<BigUint>, Option<BigUint>) {
+        self.pool_state
+            .get_limits(
+                self.token_in.address.clone(),
+                self.token_out.address.clone(),
+            )
+            .ok()
+            .map(|(max_in, max_out)| (Some(max_in), Some(max_out)))
+            .unwrap_or((None, None))
+    }
+
+    fn finish_quote_amounts(
+        &self,
+        mut run: PoolQuoteAccumulator,
+        limit_max_in: Option<BigUint>,
+        limit_max_out: Option<BigUint>,
+    ) -> PoolSimOutcome {
         // Only pools with at least one usable amount output are emitted, but they still need
         // full requested-amount alignment.
-        if successful_steps > 0 {
-            while amounts_out.len() < self.expected_len {
-                amounts_out.push("0".to_string());
-                gas_used.push(0);
+        let (slippage, limit_max_in) = if run.successful_steps > 0 {
+            let effective_limit_max_in = sanitize_limit_max_in(
+                self.amounts.as_ref(),
+                &run.amounts_out,
+                limit_max_in.as_ref(),
+                limit_max_out.as_ref(),
+            );
+            let mut slippage =
+                self.compute_local_slippage_ladder(&run.amounts_out, limit_max_out.as_ref());
+            while run.amounts_out.len() < self.expected_len {
+                run.amounts_out.push("0".to_string());
+                run.gas_used.push(0);
+                slippage.push(0);
             }
-        }
+            (slippage, effective_limit_max_in)
+        } else {
+            (Vec::new(), limit_max_in)
+        };
+
         PoolSimOutcome::Simulated(PoolQuoteResult {
             pool: self.descriptor.id.clone(),
             pool_name: self.descriptor.name.clone(),
             pool_address: self.descriptor.address.clone(),
             protocol: self.descriptor.protocol.clone(),
-            amounts_out,
-            gas_used,
-            successful_steps,
-            first_successful_gas_used,
-            errors,
-            timed_out,
+            amounts_out: run.amounts_out,
+            slippage,
+            limit_max_in,
+            gas_used: run.gas_used,
+            successful_steps: run.successful_steps,
+            first_successful_gas_used: run.first_successful_gas_used,
+            errors: run.errors,
+            timed_out: run.timed_out,
         })
+    }
+
+    fn compute_local_slippage_ladder(
+        &self,
+        amounts_out: &[String],
+        limit_max_out: Option<&BigUint>,
+    ) -> Vec<u32> {
+        // When the ladder never approaches a trustworthy hard output limit, use the
+        // observed ladder envelope as a softer utilization anchor instead.
+        let soft_ladder_max_out = observed_soft_ladder_max_out(self.amounts.as_ref(), amounts_out);
+        let first_usable_quote = amounts_out
+            .iter()
+            .enumerate()
+            .find_map(|(index, amount_out)| {
+                let amount_in = self.amounts.get(index)?;
+                let amount_out = BigUint::from_str(amount_out).ok()?;
+                (!amount_out.is_zero()).then(|| (amount_in.clone(), amount_out))
+            });
+
+        let mut slippage = amounts_out
+            .iter()
+            .enumerate()
+            .map(|(index, amount_out)| {
+                let Some(amount_in) = self.amounts.get(index) else {
+                    return 0;
+                };
+                let Ok(amount_out) = BigUint::from_str(amount_out) else {
+                    return 0;
+                };
+                if amount_out.is_zero() {
+                    return 0;
+                }
+
+                let stress_quote = self.stress_quote_for_index(index, amount_in, amounts_out);
+                let base_slippage = compute_dynamic_slippage_bps(
+                    amount_in,
+                    &amount_out,
+                    stress_quote.as_ref().map(|(amount, _)| amount),
+                    stress_quote.as_ref().map(|(_, amount_out)| amount_out),
+                    limit_max_out,
+                    soft_ladder_max_out.as_ref(),
+                    &self.slippage,
+                );
+                let cumulative_penalty =
+                    first_usable_quote
+                        .as_ref()
+                        .map_or(0, |(base_in, base_out)| {
+                            cumulative_degradation_slippage_bps(
+                                base_in,
+                                base_out,
+                                amount_in,
+                                &amount_out,
+                                &self.slippage,
+                            )
+                        });
+                (base_slippage + cumulative_penalty).min(self.slippage.max_dynamic_slippage_bps)
+            })
+            .collect::<Vec<_>>();
+        enforce_non_decreasing_slippage(amounts_out, &mut slippage);
+        slippage
+    }
+
+    fn stress_quote_for_index(
+        &self,
+        index: usize,
+        amount_in: &BigUint,
+        amounts_out: &[String],
+    ) -> Option<(BigUint, BigUint)> {
+        match self.next_ladder_stress_quote(index, amounts_out) {
+            LadderStressQuote::Quote(quote) => Some(quote),
+            LadderStressQuote::PartialTail => None,
+            LadderStressQuote::Missing => self.compute_local_stress_quote(amount_in),
+        }
+    }
+
+    fn next_ladder_stress_quote(&self, index: usize, amounts_out: &[String]) -> LadderStressQuote {
+        // TODO: Make this order-independent by selecting the next larger usable rung instead of
+        // assuming the next request slot is the next larger trade.
+        let Some(stressed_amount_in) = self.amounts.get(index + 1).cloned() else {
+            return LadderStressQuote::Missing;
+        };
+        let Some(stressed_amount_out) = amounts_out
+            .get(index + 1)
+            .and_then(|amount| BigUint::from_str(amount).ok())
+        else {
+            return LadderStressQuote::Missing;
+        };
+        if stressed_amount_out.is_zero() {
+            return LadderStressQuote::PartialTail;
+        }
+
+        LadderStressQuote::Quote((stressed_amount_in, stressed_amount_out))
+    }
+
+    fn compute_local_stress_quote(&self, amount_in: &BigUint) -> Option<(BigUint, BigUint)> {
+        if self.cancel_token.is_cancelled() || Instant::now() >= self.deadline {
+            return None;
+        }
+
+        let stress_in = compute_stress_input(amount_in);
+        let stressed_amount_in = amount_in + &stress_in;
+        let stressed_amount_out = self
+            .pool_state
+            .get_amount_out(stressed_amount_in.clone(), &self.token_in, &self.token_out)
+            .ok()?
+            .amount;
+        if stressed_amount_out.is_zero() {
+            return None;
+        }
+
+        Some((stressed_amount_in, stressed_amount_out))
     }
 
     fn record_cancellation_or_timeout(
@@ -1679,6 +1859,7 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
         token_in,
         token_out,
         amounts,
+        slippage,
         expected_len,
         deadline,
         cancel_token,
@@ -1697,6 +1878,7 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
             token_in,
             token_out,
             amounts,
+            slippage,
             expected_len,
             deadline,
             cancel_token: blocking_cancel_token,
@@ -1900,6 +2082,287 @@ fn amounts_out_include_positive_quote(amounts_out: &[String]) -> bool {
         .iter()
         .filter_map(|amount| BigUint::from_str(amount).ok())
         .any(|amount| !amount.is_zero())
+}
+
+fn sanitize_limit_max_in(
+    amounts_in: &[BigUint],
+    amounts_out: &[String],
+    limit_max_in: Option<&BigUint>,
+    limit_max_out: Option<&BigUint>,
+) -> Option<BigUint> {
+    let raw_limit_max_in = limit_max_in?.clone();
+    let Some(limit_max_out) = limit_max_out.filter(|value| !value.is_zero()) else {
+        return Some(raw_limit_max_in);
+    };
+
+    let saturation_threshold_numerator = limit_max_out * BigUint::from(SATURATION_THRESHOLD_BPS);
+    let saturation_threshold_denominator = BigUint::from(BPS_DENOMINATOR);
+    let saturated_amount_in = amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        // TODO: Make this order-independent by taking the smallest saturated amount_in
+        // instead of the first saturated rung in request order.
+        .find_map(|(amount_in, amount_out)| {
+            let amount_out = BigUint::from_str(amount_out).ok()?;
+            ((&amount_out * &saturation_threshold_denominator) >= saturation_threshold_numerator)
+                .then(|| amount_in.clone())
+        });
+
+    Some(match saturated_amount_in {
+        Some(observed_cap) => raw_limit_max_in.min(observed_cap),
+        None => raw_limit_max_in,
+    })
+}
+
+fn compute_stress_input(amount_in: &BigUint) -> BigUint {
+    (amount_in / STRESS_INPUT_DIVISOR).max(BigUint::from(MIN_STRESS_INPUT))
+}
+
+fn observed_soft_ladder_max_out(amounts_in: &[BigUint], amounts_out: &[String]) -> Option<BigUint> {
+    let mut usable_quotes = amounts_in
+        .iter()
+        .zip(amounts_out.iter())
+        .filter_map(|(amount_in, amount_out)| {
+            let amount_out = BigUint::from_str(amount_out).ok()?;
+            (!amount_out.is_zero()).then_some((amount_in, amount_out))
+        })
+        .collect::<Vec<_>>();
+    usable_quotes
+        .sort_by(|(left_amount_in, _), (right_amount_in, _)| left_amount_in.cmp(right_amount_in));
+
+    let (base_amount_in, base_amount_out) = usable_quotes.first()?;
+    if usable_quotes.len() < 2
+        || !usable_quotes.iter().skip(1).any(|(amount_in, amount_out)| {
+            rate_degradation_bps(base_amount_in, base_amount_out, amount_in, amount_out)
+                >= SOFT_LADDER_ACTIVATION_DEGRADATION_BPS
+        })
+    {
+        return None;
+    }
+
+    usable_quotes
+        .into_iter()
+        .map(|(_, amount_out)| amount_out)
+        .max()
+}
+
+fn rate_degradation_bps(
+    base_amount_in: &BigUint,
+    base_amount_out: &BigUint,
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+) -> u32 {
+    if base_amount_in.is_zero()
+        || base_amount_out.is_zero()
+        || amount_in.is_zero()
+        || amount_out.is_zero()
+    {
+        return 0;
+    }
+
+    let base_rate_numerator = base_amount_out * amount_in;
+    let current_rate_numerator = amount_out * base_amount_in;
+    if current_rate_numerator >= base_rate_numerator {
+        return 0;
+    }
+
+    round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator) * BigUint::from(BPS_DENOMINATOR),
+        &base_rate_numerator,
+    )
+    .to_u32()
+    .unwrap_or(BPS_DENOMINATOR)
+}
+
+fn compute_dynamic_slippage_bps(
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+    stressed_amount_in: Option<&BigUint>,
+    stressed_amount_out: Option<&BigUint>,
+    limit_max_out: Option<&BigUint>,
+    soft_ladder_max_out: Option<&BigUint>,
+    slippage: &SlippageConfig,
+) -> u32 {
+    if amount_out.is_zero() {
+        return 0;
+    }
+
+    let scale = BigUint::from(SLIPPAGE_SCALE);
+    let mut total_scaled = BigUint::from(slippage.min_dynamic_slippage_bps) * &scale;
+
+    let effective_utilization_scaled = effective_output_utilization_scaled(
+        amount_out,
+        limit_max_out,
+        soft_ladder_max_out,
+        &scale,
+        slippage,
+    );
+    total_scaled += utilization_term_scaled(&effective_utilization_scaled, &scale, slippage);
+
+    if let (Some(stressed_amount_in), Some(stressed_amount_out)) =
+        (stressed_amount_in, stressed_amount_out)
+    {
+        if !stressed_amount_in.is_zero() && !stressed_amount_out.is_zero() {
+            total_scaled += sensitivity_term_scaled(
+                amount_in,
+                amount_out,
+                stressed_amount_in,
+                stressed_amount_out,
+                &scale,
+                slippage,
+            );
+        }
+    }
+
+    let total_bps = round_div_biguint(total_scaled, &scale)
+        .to_u32()
+        .unwrap_or(slippage.max_dynamic_slippage_bps);
+    let saturation_floor_bps = saturation_slippage_floor_bps(amount_out, limit_max_out, slippage)
+        .unwrap_or(slippage.min_dynamic_slippage_bps);
+    total_bps.max(saturation_floor_bps).clamp(
+        slippage.min_dynamic_slippage_bps,
+        slippage.max_dynamic_slippage_bps,
+    )
+}
+
+fn effective_output_utilization_scaled(
+    amount_out: &BigUint,
+    limit_max_out: Option<&BigUint>,
+    soft_ladder_max_out: Option<&BigUint>,
+    scale: &BigUint,
+    slippage: &SlippageConfig,
+) -> BigUint {
+    let hard_utilization_scaled = limit_max_out
+        .filter(|max_out| !max_out.is_zero())
+        .map(|max_out| round_div_biguint(amount_out * scale, max_out))
+        .unwrap_or_else(BigUint::zero);
+    let soft_utilization_scaled = soft_ladder_max_out
+        .filter(|max_out| !max_out.is_zero())
+        .map(|max_out| {
+            round_div_biguint(
+                amount_out * BigUint::from(slippage.soft_ladder_utilization_cap_bps) * scale,
+                &(max_out * BigUint::from(BPS_DENOMINATOR)),
+            )
+        })
+        .unwrap_or_else(BigUint::zero);
+
+    hard_utilization_scaled
+        .max(soft_utilization_scaled)
+        .min(scale.clone())
+}
+
+fn utilization_term_scaled(
+    utilization_scaled: &BigUint,
+    scale: &BigUint,
+    slippage: &SlippageConfig,
+) -> BigUint {
+    let numerator = BigUint::from(slippage.utilization_coefficient_bps)
+        * utilization_scaled
+        * utilization_scaled;
+    round_div_biguint(numerator, scale)
+}
+
+fn cumulative_degradation_slippage_bps(
+    base_amount_in: &BigUint,
+    base_amount_out: &BigUint,
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+    slippage: &SlippageConfig,
+) -> u32 {
+    if base_amount_in.is_zero()
+        || base_amount_out.is_zero()
+        || amount_in.is_zero()
+        || amount_out.is_zero()
+    {
+        return 0;
+    }
+
+    let base_rate_numerator = base_amount_out * amount_in;
+    let current_rate_numerator = amount_out * base_amount_in;
+    if current_rate_numerator >= base_rate_numerator {
+        return 0;
+    }
+
+    let penalty = round_div_biguint(
+        (base_rate_numerator.clone() - current_rate_numerator)
+            * BigUint::from(slippage.cumulative_degradation_coefficient_bps),
+        &base_rate_numerator,
+    );
+    penalty
+        .to_u32()
+        .unwrap_or(slippage.max_dynamic_slippage_bps)
+}
+
+fn enforce_non_decreasing_slippage(amounts_out: &[String], slippage: &mut [u32]) {
+    let mut running_max = 0u32;
+    for (amount_out, slippage_bps) in amounts_out.iter().zip(slippage.iter_mut()) {
+        let Ok(amount_out) = BigUint::from_str(amount_out) else {
+            continue;
+        };
+        if amount_out.is_zero() {
+            continue;
+        }
+        running_max = running_max.max(*slippage_bps);
+        *slippage_bps = running_max;
+    }
+}
+
+fn saturation_slippage_floor_bps(
+    amount_out: &BigUint,
+    limit_max_out: Option<&BigUint>,
+    slippage: &SlippageConfig,
+) -> Option<u32> {
+    let limit_max_out = limit_max_out.filter(|value| !value.is_zero())?;
+    let utilization_bps =
+        round_div_biguint(amount_out * BigUint::from(BPS_DENOMINATOR), limit_max_out)
+            .to_u32()
+            .unwrap_or(BPS_DENOMINATOR)
+            .min(BPS_DENOMINATOR);
+
+    if utilization_bps >= SATURATION_MAX_UTILIZATION_BPS {
+        return Some(slippage.max_dynamic_slippage_bps);
+    }
+
+    if utilization_bps <= SATURATION_RAMP_START_UTILIZATION_BPS {
+        return None;
+    }
+
+    let ramp_progress = utilization_bps - SATURATION_RAMP_START_UTILIZATION_BPS;
+    let ramp_width = SATURATION_MAX_UTILIZATION_BPS - SATURATION_RAMP_START_UTILIZATION_BPS;
+    let ramp_span = slippage.max_dynamic_slippage_bps - slippage.saturation_ramp_start_slippage_bps;
+
+    Some(
+        slippage.saturation_ramp_start_slippage_bps
+            + ((ramp_span * ramp_progress) + (ramp_width / 2)) / ramp_width,
+    )
+}
+
+fn sensitivity_term_scaled(
+    amount_in: &BigUint,
+    amount_out: &BigUint,
+    stressed_amount_in: &BigUint,
+    stressed_amount_out: &BigUint,
+    scale: &BigUint,
+    slippage: &SlippageConfig,
+) -> BigUint {
+    let current_rate_numerator = amount_out * stressed_amount_in;
+    let stressed_rate_numerator = stressed_amount_out * amount_in;
+    if stressed_rate_numerator >= current_rate_numerator {
+        return BigUint::zero();
+    }
+
+    let numerator = (current_rate_numerator.clone() - stressed_rate_numerator)
+        * BigUint::from(slippage.sensitivity_coefficient_bps)
+        * scale;
+    round_div_biguint(numerator, &current_rate_numerator)
+}
+
+fn round_div_biguint(numerator: BigUint, denominator: &BigUint) -> BigUint {
+    if denominator.is_zero() {
+        return BigUint::zero();
+    }
+
+    (numerator + (denominator.clone() / 2u8)) / denominator
 }
 
 fn is_limit_like_error_message(message: &str) -> bool {
@@ -2598,6 +3061,7 @@ mod tests {
             native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
             rfq_sim_semaphore: Arc::new(Semaphore::new(config.rfq_sim_concurrency)),
+            slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: config.native_sim_concurrency,
@@ -2990,11 +3454,12 @@ mod tests {
 
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert_eq!(computation.responses[0].slippage, vec![1]);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert!(computation.meta.failures.is_empty());
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
         assert!(limit_calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -3152,7 +3617,7 @@ mod tests {
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
         assert!(limit_calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -3221,7 +3686,7 @@ mod tests {
         assert_eq!(computation.responses[0].pool, "pool-uniswap");
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.matching_pools, 1);
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
         assert_eq!(erc4626_calls.load(Ordering::SeqCst), 0);
         assert!(limit_calls.load(Ordering::SeqCst) >= 1);
     }
@@ -3285,7 +3750,7 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
         assert!(!computation.responses.is_empty());
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
         assert!(computation.meta.failures.is_empty());
@@ -3373,7 +3838,7 @@ mod tests {
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
         assert_eq!(computation.metrics.skipped_native_concurrency, 0);
-        assert_eq!(wrapped_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wrapped_quote_calls.load(Ordering::SeqCst), 2);
         assert!(wrapped_limit_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(native_quote_calls.load(Ordering::SeqCst), 0);
         assert_eq!(native_limit_calls.load(Ordering::SeqCst), 0);
@@ -3462,7 +3927,7 @@ mod tests {
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
         assert_eq!(computation.metrics.skipped_native_concurrency, 0);
-        assert_eq!(native_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(native_quote_calls.load(Ordering::SeqCst), 2);
         assert!(native_limit_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(wrapped_quote_calls.load(Ordering::SeqCst), 0);
         assert_eq!(wrapped_limit_calls.load(Ordering::SeqCst), 0);
@@ -3530,7 +3995,7 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
         assert!(limit_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
@@ -3626,7 +4091,7 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
 
         assert!(vm_limit_calls.load(Ordering::SeqCst) >= 1);
-        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.metrics.scheduled_vm_pools, 1);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
@@ -3737,6 +4202,7 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
+            slippage: SlippageConfig::default(),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -3789,6 +4255,7 @@ mod tests {
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(11u8), BigUint::from(20u8)]),
+            slippage: SlippageConfig::default(),
             expected_len: 2,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
@@ -3944,6 +4411,150 @@ mod tests {
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct QuadraticImpactSim {
+        max_in: BigUint,
+        divisor: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for QuadraticImpactSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in > self.max_in {
+                return Err(SimulationError::InvalidInput(
+                    "amount_in exceeds get_limits max_in".to_string(),
+                    None,
+                ));
+            }
+            let penalty = (&amount_in * &amount_in) / &self.divisor;
+            let amount_out = if penalty >= amount_in {
+                BigUint::zero()
+            } else {
+                amount_in - penalty
+            };
+            Ok(GetAmountOutResult::new(
+                amount_out,
+                BigUint::from(21_000u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.max_in.clone(), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PlateauLimitSim {
+        raw_max_in: BigUint,
+        max_out: BigUint,
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for PlateauLimitSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GetAmountOutResult::new(
+                amount_in.min(self.max_out.clone()),
+                BigUint::from(21_000u64),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((self.raw_max_in.clone(), self.max_out.clone()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct ZeroThenPositiveSim {
         #[serde(skip, default = "default_calls")]
         calls: Arc<AtomicUsize>,
@@ -4070,6 +4681,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_amounts_out_slippage_uses_next_ladder_quote_before_tail_probe() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000009",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(QuadraticImpactSim {
+                max_in: BigUint::from(100_000u32),
+                divisor: BigUint::from(1_000_000u32),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-next-ladder-stress-slippage", &["10000", "50000"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["9900".to_string(), "47500".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![102, 102]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_slippage_skips_soft_ladder_utilization_for_linear_quotes() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000009",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(PositiveOutputSim {
+                max_in: BigUint::from(100_000u32),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-linear-soft-ladder-slippage", &["100", "200", "300"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["100".to_string(), "200".to_string(), "300".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![1, 1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_skips_tail_probe_when_next_ladder_quote_is_zero() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000046",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(StepSelectiveFailureSim {
+                fail_on_calls: vec![1],
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-partial-tail-no-probe", &["1", "2"]);
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["1".to_string(), "0".to_string()]
+        );
+        assert_eq!(computation.responses[0].slippage, vec![1, 0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_caps_limit_max_in_when_limit_max_out_is_binding() {
+        let fixture = BasicQuoteFixture::new();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-1",
+            "0x0000000000000000000000000000000000000009",
+            "uniswap_v3",
+            "uniswap_v3",
+            fixture.pair_tokens(),
+            Box::new(PlateauLimitSim {
+                raw_max_in: BigUint::from(80_108_715_832_839_134u64)
+                    * BigUint::from(1_000_000_000u64),
+                max_out: BigUint::from(29_053_011_332u64),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request(
+            "req-cap-limit-max-in",
+            &["2000000000", "10000000000", "30000000000", "50000000000"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec![
+                "2000000000".to_string(),
+                "10000000000".to_string(),
+                "29053011332".to_string(),
+                "29053011332".to_string()
+            ]
+        );
+        assert_eq!(
+            computation.responses[0].limit_max_in.as_deref(),
+            Some("30000000000")
+        );
+        assert!(calls.load(Ordering::SeqCst) >= 4);
+    }
+
+    #[tokio::test]
     async fn mixed_zero_and_positive_outputs_are_classified_as_partial() {
         let fixture = BasicQuoteFixture::new();
 
@@ -4105,7 +4914,7 @@ mod tests {
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
@@ -4600,6 +5409,8 @@ mod tests {
                 pool_name: "Pool Z".to_string(),
                 pool_address: "0x0000000000000000000000000000000000000010".to_string(),
                 amounts_out: vec!["9".to_string(), "10".to_string()],
+                slippage: vec![1, 1],
+                limit_max_in: None,
                 gas_used: vec![1, 1],
                 block_number: 1,
             },
@@ -4608,6 +5419,8 @@ mod tests {
                 pool_name: "Pool A".to_string(),
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["0".to_string(), "200".to_string()],
+                slippage: vec![0, 1],
+                limit_max_in: None,
                 gas_used: vec![0, 2],
                 block_number: 1,
             },
@@ -4645,6 +5458,8 @@ mod tests {
                 pool_name: "Pool Shared".to_string(),
                 pool_address: "0x0000000000000000000000000000000000000002".to_string(),
                 amounts_out: vec!["7".to_string()],
+                slippage: vec![1],
+                limit_max_in: None,
                 gas_used: vec![1],
                 block_number: 1,
             },
@@ -4653,6 +5468,8 @@ mod tests {
                 pool_name: "Pool Shared".to_string(),
                 pool_address: "0x0000000000000000000000000000000000000001".to_string(),
                 amounts_out: vec!["8".to_string()],
+                slippage: vec![1],
+                limit_max_in: None,
                 gas_used: vec![1],
                 block_number: 1,
             },
@@ -4672,6 +5489,164 @@ mod tests {
                 "0x0000000000000000000000000000000000000002",
             ]
         );
+    }
+
+    #[test]
+    fn compute_stress_input_uses_one_percent_with_minimum_floor() {
+        assert_eq!(
+            compute_stress_input(&BigUint::from(995u32)),
+            BigUint::from(9u32)
+        );
+        assert_eq!(
+            compute_stress_input(&BigUint::from(50u32)),
+            BigUint::from(1u32)
+        );
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_uses_local_stress_quote() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(10_000u32),
+            &BigUint::from(9_900u32),
+            Some(&BigUint::from(10_100u32)),
+            Some(&BigUint::from(9_997u32)),
+            Some(&BigUint::from(100_000u32)),
+            None,
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(slippage, 2);
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_uses_soft_ladder_utilization_when_limit_is_unreached() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(100u32),
+            &BigUint::from(100u32),
+            None,
+            None,
+            Some(&BigUint::from(10_000u32)),
+            Some(&BigUint::from(100u32)),
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(slippage, 8);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_requires_meaningful_ladder_degradation() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "200".to_string(), "300".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, None);
+    }
+
+    #[test]
+    fn soft_ladder_max_out_activates_when_ladder_rate_degrades() {
+        let amounts_in = vec![
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+            BigUint::from(300u32),
+        ];
+        let amounts_out = vec!["100".to_string(), "190".to_string(), "270".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
+    }
+
+    #[test]
+    fn soft_ladder_max_out_is_order_independent() {
+        let amounts_in = vec![
+            BigUint::from(300u32),
+            BigUint::from(100u32),
+            BigUint::from(200u32),
+        ];
+        let amounts_out = vec!["270".to_string(), "100".to_string(), "190".to_string()];
+
+        let soft_ladder_max_out = observed_soft_ladder_max_out(&amounts_in, &amounts_out);
+
+        assert_eq!(soft_ladder_max_out, Some(BigUint::from(270u32)));
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_uses_limit_max_out_when_available() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(100u32),
+            &BigUint::from(100u32),
+            None,
+            None,
+            Some(&BigUint::from(300u32)),
+            None,
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(slippage, 8);
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_ramps_aggressively_near_limit_max_out() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(9_700u32),
+            &BigUint::from(9_700u32),
+            None,
+            None,
+            Some(&BigUint::from(10_000u32)),
+            None,
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(slippage, 108);
+    }
+
+    #[test]
+    fn compute_dynamic_slippage_bps_hits_max_when_effectively_at_limit_max_out() {
+        let slippage = compute_dynamic_slippage_bps(
+            &BigUint::from(9_990u32),
+            &BigUint::from(9_990u32),
+            None,
+            None,
+            Some(&BigUint::from(10_000u32)),
+            None,
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(slippage, SlippageConfig::default().max_dynamic_slippage_bps);
+    }
+
+    #[test]
+    fn cumulative_degradation_slippage_bps_penalizes_rate_decay_from_first_rung() {
+        let penalty = cumulative_degradation_slippage_bps(
+            &BigUint::from(100u32),
+            &BigUint::from(100u32),
+            &BigUint::from(200u32),
+            &BigUint::from(160u32),
+            &SlippageConfig::default(),
+        );
+
+        assert_eq!(penalty, 60);
+    }
+
+    #[test]
+    fn enforce_non_decreasing_slippage_keeps_usable_ladder_monotonic() {
+        let amounts_out = vec![
+            "100".to_string(),
+            "200".to_string(),
+            "300".to_string(),
+            "0".to_string(),
+            "400".to_string(),
+        ];
+        let mut slippage = vec![27, 25, 26, 0, 24];
+
+        enforce_non_decreasing_slippage(&amounts_out, &mut slippage);
+
+        assert_eq!(slippage, vec![27, 27, 27, 0, 27]);
     }
 
     #[test]

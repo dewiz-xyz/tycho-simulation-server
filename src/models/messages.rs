@@ -24,6 +24,10 @@ pub struct AmountOutResponse {
     pub pool_name: String,
     pub pool_address: String,
     pub amounts_out: Vec<String>,
+    #[serde(default)]
+    pub slippage: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_max_in: Option<String>,
     pub gas_used: Vec<u64>,
     pub block_number: u64,
 }
@@ -313,7 +317,10 @@ pub struct EncodeErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus};
+    use super::{
+        AmountOutResponse, PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality,
+        QuoteStatus,
+    };
     use anyhow::Result;
 
     #[test]
@@ -385,6 +392,26 @@ mod tests {
         };
         let value = serde_json::to_value(meta)?;
         assert!(value.get("partial_kind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn amount_out_response_drops_limit_max_out_from_public_serialization() -> Result<()> {
+        let response: AmountOutResponse = serde_json::from_value(serde_json::json!({
+            "pool": "pool-1",
+            "pool_name": "Pool 1",
+            "pool_address": "0x0000000000000000000000000000000000000001",
+            "amounts_out": ["10"],
+            "slippage": [3],
+            "limit_max_in": "100",
+            "limit_max_out": "99",
+            "gas_used": [1],
+            "block_number": 1
+        }))?;
+
+        let value = serde_json::to_value(response)?;
+
+        assert!(value.get("limit_max_out").is_none());
         Ok(())
     }
 }

@@ -4,6 +4,9 @@ on:
   pull_request:
     branches:
       - master
+      - shadow
+      - staging
+      - dev
   workflow_dispatch:
 
 concurrency:

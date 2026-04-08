@@ -304,6 +304,17 @@ fn add_warning_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
 
 pub fn render_summary(report: &AnalysisReport) -> String {
     let mut lines = Vec::new();
+    append_summary_header(&mut lines, report);
+    append_findings_section(&mut lines, report);
+    append_warning_section(&mut lines, report);
+    append_scenario_overview(&mut lines, report);
+    append_readiness_section(&mut lines, report);
+    append_evidence_section(&mut lines, report);
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn append_summary_header(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push("# Simulation analysis summary".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -321,6 +332,9 @@ pub fn render_summary(report: &AnalysisReport) -> String {
         }
     ));
     lines.push(String::new());
+}
+
+fn append_findings_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push("## Findings".to_string());
     for finding in &report.findings {
         lines.push(format!(
@@ -328,13 +342,21 @@ pub fn render_summary(report: &AnalysisReport) -> String {
             finding.severity, finding.title, finding.detail
         ));
     }
-    if !report.warnings.is_empty() {
-        lines.push(String::new());
-        lines.push("## Analyzer warnings".to_string());
-        for warning in &report.warnings {
-            lines.push(format!("- {}", warning));
-        }
+}
+
+fn append_warning_section(lines: &mut Vec<String>, report: &AnalysisReport) {
+    if report.warnings.is_empty() {
+        return;
     }
+
+    lines.push(String::new());
+    lines.push("## Analyzer warnings".to_string());
+    for warning in &report.warnings {
+        lines.push(format!("- {}", warning));
+    }
+}
+
+fn append_scenario_overview(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Scenario overview".to_string());
     for scenario in &report.scenarios {
@@ -352,44 +374,30 @@ pub fn render_summary(report: &AnalysisReport) -> String {
             lines.push(format!("  note: {}", note));
         }
     }
+}
+
+fn append_readiness_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Readiness".to_string());
-    lines.push(format!(
-        "- Initial: status={} block={} pools={} vm_status={} rfq_status={}",
-        report.readiness.initial.status,
-        report
-            .readiness
-            .initial
-            .block
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-        report
-            .readiness
-            .initial
-            .pools
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-        readiness_component_status(
-            report.readiness.initial.vm_enabled,
-            report.readiness.initial.vm_status.as_deref(),
-        ),
-        readiness_component_status(
-            report.readiness.initial.rfq_enabled,
-            report.readiness.initial.rfq_status.as_deref(),
-        )
-    ));
+    append_readiness_snapshot(lines, "Initial", &report.readiness.initial);
     if let Some(final_state) = &report.readiness.final_state {
-        lines.push(format!(
-            "- Final: status={} block={} pools={} vm_status={} rfq_status={}",
-            final_state.status,
-            final_state
-                .block
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            final_state
-                .pools
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            readiness_component_status(final_state.vm_enabled, final_state.vm_status.as_deref()),
-            readiness_component_status(final_state.rfq_enabled, final_state.rfq_status.as_deref())
-        ));
+        append_readiness_snapshot(lines, "Final", final_state);
     }
+}
+
+fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &ReadinessSnapshot) {
+    lines.push(format!(
+        "- {}: status={} block={} pools={} vm_status={} rfq_status={}",
+        label,
+        snapshot.status,
+        fmt_optional_u64(snapshot.block),
+        fmt_optional_u64(snapshot.pools),
+        readiness_component_status(snapshot.vm_enabled, snapshot.vm_status.as_deref()),
+        readiness_component_status(snapshot.rfq_enabled, snapshot.rfq_status.as_deref())
+    ));
+}
+
+fn append_evidence_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Evidence".to_string());
     lines.push(format!("- Log file: {}", report.logs.log_file));
@@ -405,8 +413,6 @@ pub fn render_summary(report: &AnalysisReport) -> String {
     lines.push("- Primary artifact: report.json".to_string());
     lines.push("- Human summary: summary.md".to_string());
     lines.push(String::new());
-
-    format!("{}\n", lines.join("\n"))
 }
 
 pub fn relative_path(root: &Path, path: &Path) -> String {
@@ -422,6 +428,10 @@ fn fmt_latency(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+fn fmt_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
 fn fmt_protocols(protocols: &BTreeMap<String, usize>) -> String {
     if protocols.is_empty() {
         return "none".to_string();
@@ -435,7 +445,7 @@ fn fmt_protocols(protocols: &BTreeMap<String, usize>) -> String {
         .join(", ")
 }
 
-fn readiness_component_status<'a>(enabled: bool, status: Option<&'a str>) -> &'a str {
+fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
     match status {
         Some(status) => status,
         None if enabled => "unknown",

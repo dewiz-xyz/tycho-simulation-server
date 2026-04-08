@@ -10,6 +10,7 @@ use tycho_simulation::tycho_common::models::token::Token;
 use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::Bytes;
 
+use crate::config::SlippageConfig;
 use crate::models::messages::PoolRef;
 use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
@@ -149,6 +150,7 @@ pub(super) fn test_app_state(
         native_sim_semaphore: Arc::new(Semaphore::new(1)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
         rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+        slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
