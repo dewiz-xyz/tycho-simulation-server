@@ -20,6 +20,7 @@ use crate::{
             QuoteFailure, QuoteFailureKind, QuotePartialKind, QuoteResult, QuoteResultQuality,
             QuoteStatus,
         },
+        protocol,
         state::AppState,
     },
     services::quotes::{get_amounts_out, QuoteComputation},
@@ -436,11 +437,11 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
 
 fn classify_protocol_pool_kind(protocol: &str) -> &'static str {
     if protocol.starts_with("vm:") {
-        "vm"
+        protocol::VM
     } else if protocol.starts_with("rfq:") {
-        "rfq"
+        protocol::RFQ
     } else {
-        "native"
+        protocol::NATIVE
     }
 }
 
@@ -606,7 +607,10 @@ mod tests {
         );
         assert_eq!(
             summary.pool_kind_counts,
-            vec![("native".to_string(), 2), ("vm".to_string(), 2)]
+            vec![
+                (protocol::NATIVE.to_string(), 2),
+                (protocol::VM.to_string(), 2),
+            ]
         );
         assert_eq!(summary.samples.len(), 4);
     }
@@ -630,7 +634,10 @@ mod tests {
         );
         assert_eq!(
             summary.pool_kind_counts,
-            vec![("native".to_string(), 1), ("rfq".to_string(), 2)]
+            vec![
+                (protocol::NATIVE.to_string(), 1),
+                (protocol::RFQ.to_string(), 2),
+            ]
         );
     }
 

@@ -14,6 +14,7 @@ use tycho_simulation::{
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
+    protocol,
     state::{RfqStreamStatus, StateStore, VmStreamStatus},
     stream_health::StreamHealth,
 };
@@ -28,9 +29,9 @@ pub enum StreamKind {
 impl StreamKind {
     fn as_str(self) -> &'static str {
         match self {
-            StreamKind::Native => "native",
-            StreamKind::Vm => "vm",
-            StreamKind::Rfq => "rfq",
+            StreamKind::Native => protocol::NATIVE,
+            StreamKind::Vm => protocol::VM,
+            StreamKind::Rfq => protocol::RFQ,
         }
     }
 }
@@ -575,7 +576,7 @@ async fn begin_vm_rebuild(
     };
 
     info!(event = "vm_rebuild_start", rebuild_id, "VM rebuild started");
-    maybe_log_memory_snapshot("vm", "vm_rebuild_start", None, memory_cfg, true);
+    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
 
@@ -585,7 +586,13 @@ async fn begin_vm_rebuild(
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
     }
     maybe_purge_allocator("vm_rebuild", memory_cfg);
-    maybe_log_memory_snapshot("vm", "vm_rebuild_after_clear", None, memory_cfg, true);
+    maybe_log_memory_snapshot(
+        protocol::VM,
+        "vm_rebuild_after_clear",
+        None,
+        memory_cfg,
+        true,
+    );
 
     VmRebuildState {
         guard,
@@ -614,7 +621,7 @@ async fn begin_rfq_rebuild(
         event = "rfq_rebuild_start",
         rebuild_id, "RFQ rebuild started"
     );
-    maybe_log_memory_snapshot("rfq", "rfq_rebuild_start", None, memory_cfg, true);
+    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
 
@@ -624,7 +631,13 @@ async fn begin_rfq_rebuild(
         warn!(error = %err, "Failed clearing TychoDB during RFQ rebuild");
     }
     maybe_purge_allocator("rfq_rebuild", memory_cfg);
-    maybe_log_memory_snapshot("rfq", "rfq_rebuild_after_clear", None, memory_cfg, true);
+    maybe_log_memory_snapshot(
+        protocol::RFQ,
+        "rfq_rebuild_after_clear",
+        None,
+        memory_cfg,
+        true,
+    );
 
     RfqRebuildState {
         guard,
@@ -689,7 +702,7 @@ async fn finish_vm_rebuild(
         duration_ms,
         "VM rebuild completed"
     );
-    maybe_log_memory_snapshot("vm", "vm_rebuild_success", None, memory_cfg, true);
+    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_success", None, memory_cfg, true);
 }
 
 async fn finish_rfq_rebuild(
@@ -712,7 +725,7 @@ async fn finish_rfq_rebuild(
         duration_ms,
         "RFQ rebuild completed"
     );
-    maybe_log_memory_snapshot("rfq", "rfq_rebuild_success", None, memory_cfg, true);
+    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {

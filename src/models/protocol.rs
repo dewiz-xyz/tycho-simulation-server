@@ -2,6 +2,10 @@ use std::fmt;
 
 use tycho_simulation::protocol::models::ProtocolComponent;
 
+pub const NATIVE: &str = "native";
+pub const VM: &str = "vm";
+pub const RFQ: &str = "rfq";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {
     UniswapV2,
