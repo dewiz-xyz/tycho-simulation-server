@@ -64,7 +64,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
 | Supported chains | Ethereum (`1`), Base (`8453`) |
 | Required inputs | `TYCHO_API_KEY`, `CHAIN_ID` |
-| Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `HOST`, `PORT` |
+| Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
 ## Quick Start
@@ -85,6 +85,8 @@ Common optional inputs:
 
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
+- `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds
+- `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY` only when RFQ feeds are enabled
 - `HOST` and `PORT` to change the bind address
 - timeout, concurrency, and stream-health knobs from `src/config/mod.rs`
 

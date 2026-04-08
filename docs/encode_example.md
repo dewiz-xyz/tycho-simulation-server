@@ -22,7 +22,7 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
 
 ## Request body (shape)
 
-`estimatedAmountIn` is an optional top-level request field. It is accepted for compatibility, but RFQ routes still derive the actual per-swap estimated input internally from the route `amountIn` and split allocation.
+`estimatedAmountIn` is an optional top-level request field. RFQ routes still derive the actual per-swap estimated input internally from the route `amountIn` and split allocation.
 
 ```json
 {
