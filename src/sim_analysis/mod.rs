@@ -42,6 +42,7 @@ const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 2;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
+const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
 
 pub async fn run() -> Result<()> {
     let args = CliArgs::parse()?;
@@ -499,6 +500,16 @@ async fn run_simulate_scenario(
         report
             .notes
             .push(format!("scenario tags: {}", scenario.tags.join(", ")));
+    }
+    if scenario.expect_rfq_visibility
+        && !report
+            .protocols_seen
+            .keys()
+            .any(|protocol| protocol.starts_with("rfq:"))
+    {
+        report
+            .notes
+            .push(EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE.to_string());
     }
     Ok(report)
 }
@@ -1253,6 +1264,8 @@ fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
         "fluid_v1" | "FluidV1" => Some("fluid_v1"),
         "rocketpool" | "RocketPool" => Some("rocketpool"),
         "erc4626" | "ERC4626" => Some("erc4626"),
+        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some("rfq:hashflow"),
+        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some("rfq:bebop"),
         "vm:curve" | "Curve" => Some("vm:curve"),
         "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
         "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
@@ -1831,13 +1844,14 @@ mod tests {
     use super::{
         build_wait_ready_args, capture_log_boundary, classify_simulate_response, collect_logs,
         discover_latest_baseline, ensure_server_ready, maybe_load_baseline, percentile,
-        sanitize_filename, select_best_pool, startup_bind_config, BaselineMode, CliArgs,
-        HttpJsonResponse, ObservationClass, ScriptPaths,
+        protocol_from_pool_name, sanitize_filename, select_best_pool, startup_bind_config,
+        BaselineMode, CliArgs, HttpJsonResponse, ObservationClass, ScriptPaths,
     };
     use crate::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
         QuoteResultQuality, QuoteStatus,
     };
+    use crate::sim_analysis::presets::balanced_profile;
     use reqwest::Client;
     use reqwest::StatusCode;
     use serde_json::json;
@@ -2306,6 +2320,104 @@ mod tests {
     }
 
     #[test]
+    fn select_best_pool_preserves_rfq_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Hashflow::WETH/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "Hashflow::WETH/USDC".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "rfq:hashflow".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:hashflow")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_preserves_bebop_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Bebop::WETH/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "Bebop::WETH/USDC".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "rfq:bebop".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:bebop")
+        );
+    }
+
+    #[test]
     fn select_best_pool_falls_back_to_vm_protocol_from_pool_name() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
@@ -2383,5 +2495,39 @@ mod tests {
             selected.as_ref().map(|pool| pool.protocol.as_str()),
             Some("unknownprotocol")
         );
+    }
+
+    #[test]
+    fn protocol_from_pool_name_normalizes_rfq_aliases() {
+        assert_eq!(
+            protocol_from_pool_name("Hashflow::WETH/USDC"),
+            "rfq:hashflow"
+        );
+        assert_eq!(protocol_from_pool_name("Bebop::WETH/USDC"), "rfq:bebop");
+        assert_eq!(protocol_from_pool_name("hashflow_pool"), "rfq:hashflow");
+        assert_eq!(protocol_from_pool_name("bebop_pool"), "rfq:bebop");
+    }
+
+    #[test]
+    fn balanced_profile_only_marks_ethereum_scenarios_as_rfq_targeted() {
+        let ethereum_profile_result = balanced_profile(1, false);
+        assert!(ethereum_profile_result.is_ok());
+        let Some(ethereum_profile) = ethereum_profile_result.ok() else {
+            return;
+        };
+        assert!(ethereum_profile
+            .simulate_scenarios
+            .iter()
+            .any(|scenario| scenario.expect_rfq_visibility));
+
+        let base_profile_result = balanced_profile(8453, false);
+        assert!(base_profile_result.is_ok());
+        let Some(base_profile) = base_profile_result.ok() else {
+            return;
+        };
+        assert!(base_profile
+            .simulate_scenarios
+            .iter()
+            .all(|scenario| !scenario.expect_rfq_visibility));
     }
 }

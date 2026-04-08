@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSnapshot {
     pub status: String,
@@ -233,6 +235,21 @@ fn add_scenario_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
                 ),
             });
         }
+
+        if scenario
+            .notes
+            .iter()
+            .any(|note| note == EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE)
+        {
+            findings.push(Finding {
+                severity: "attention".to_string(),
+                title: format!("{} missed expected RFQ visibility", scenario.label),
+                detail: format!(
+                    "{} expected at least one RFQ protocol to surface, but none were observed in the scenario report.",
+                    scenario.label
+                ),
+            });
+        }
     }
 }
 
@@ -457,7 +474,7 @@ fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
 mod tests {
     use super::{
         build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSummary,
-        ReadinessReport,
+        ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
     use super::{ReadinessSnapshot, RunMetadata, ScenarioReport};
     use std::collections::BTreeMap;
@@ -562,6 +579,22 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.title == "RFQ pools were enabled but not fully ready"
                 && finding.detail.contains("rfq_pools=0")
+        }));
+    }
+
+    #[test]
+    fn build_findings_marks_missing_rfq_visibility() {
+        let mut scenario = scenario("rfq-usdc-weth", 0, 0);
+        scenario
+            .notes
+            .push(EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE.to_string());
+        let analysis = report(Vec::new(), vec![scenario]);
+
+        let findings = build_findings(&analysis);
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "rfq-usdc-weth missed expected RFQ visibility"
+                && finding.severity == "attention"
         }));
     }
 

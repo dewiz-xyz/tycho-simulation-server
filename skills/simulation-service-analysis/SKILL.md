@@ -11,6 +11,8 @@ metadata:
 
 1. Confirm the repo root (expect `Cargo.toml` and `src/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
+   For Ethereum RFQ analysis with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+   Base does not need RFQ credentials today because no RFQ protocols are configured for `CHAIN_ID=8453`.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
@@ -23,8 +25,8 @@ metadata:
 ## What the analyzer does
 
 - Reuses the existing local server if it is already responding, otherwise starts it with the repo lifecycle scripts.
-- Waits for `/status`, including VM readiness when VM pools are enabled.
-- Fresh VM-pool warmups can take much longer than native readiness. Budget up to 10 minutes before treating VM readiness as stuck.
+- Waits for `/status`, including VM and RFQ readiness when those pool backends are enabled.
+- Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
 - Builds a narrow 2-hop `/encode` probe from live `/simulate` results.
 - Runs latency and light stress sweeps.
@@ -59,6 +61,16 @@ Manual VM-ready wait when you want to confirm the service itself before rerunnin
 scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
 
+Manual RFQ-ready wait for Ethereum when RFQ pools are enabled:
+```bash
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600
+```
+
+Manual combined VM and RFQ wait for Ethereum when both backends matter:
+```bash
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600
+```
+
 Write to a custom directory:
 ```bash
 cargo run --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
@@ -74,7 +86,7 @@ cargo run --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --
 After the analyzer runs:
 
 1. Read `summary.md` first for the high-level picture.
-2. Use `report.json` for exact counts, latencies, status/result-quality splits, and protocol visibility.
+2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
 3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and log excerpts.
 4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
 5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.

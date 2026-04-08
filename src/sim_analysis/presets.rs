@@ -7,6 +7,7 @@ pub struct SimulateScenarioPreset {
     pub token_out_symbol: &'static str,
     pub amounts: &'static [&'static str],
     pub tags: &'static [&'static str],
+    pub expect_rfq_visibility: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +145,20 @@ fn ethereum_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             "USDT",
             STABLE_AMOUNTS,
             &["stables"],
+        ),
+        rfq_scenario(
+            "rfq-usdc-weth",
+            "USDC",
+            "WETH",
+            STABLE_AMOUNTS,
+            &["stables"],
+        ),
+        rfq_scenario(
+            "rfq-weth-usdc",
+            "WETH",
+            "USDC",
+            ETH_LARGE_AMOUNTS,
+            &["native"],
         ),
         scenario(
             "lst-steth-weth",
@@ -339,6 +354,24 @@ fn scenario(
         token_out_symbol,
         amounts,
         tags,
+        expect_rfq_visibility: false,
+    }
+}
+
+fn rfq_scenario(
+    label: &'static str,
+    token_in_symbol: &'static str,
+    token_out_symbol: &'static str,
+    amounts: &'static [&'static str],
+    tags: &'static [&'static str],
+) -> SimulateScenarioPreset {
+    SimulateScenarioPreset {
+        label,
+        token_in_symbol,
+        token_out_symbol,
+        amounts,
+        tags: rfq_tags(tags),
+        expect_rfq_visibility: true,
     }
 }
 
@@ -347,5 +380,51 @@ fn tokens_for_chain(chain_id: u64) -> &'static [(&'static str, &'static str)] {
         1 => ETHEREUM_TOKENS,
         8453 => BASE_TOKENS,
         _ => &[],
+    }
+}
+
+fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
+    match tags {
+        ["stables"] => &["stables", "rfq-targeted"],
+        ["native"] => &["native", "rfq-targeted"],
+        _ => &["rfq-targeted"],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::balanced_profile;
+
+    #[test]
+    fn ethereum_balanced_profile_includes_rfq_targeted_scenarios() {
+        let profile_result = balanced_profile(1, false);
+        assert!(profile_result.is_ok());
+        let Some(profile) = profile_result.ok() else {
+            return;
+        };
+
+        assert!(profile
+            .simulate_scenarios
+            .iter()
+            .any(|scenario| scenario.expect_rfq_visibility));
+        assert!(profile
+            .simulate_scenarios
+            .iter()
+            .filter(|scenario| scenario.expect_rfq_visibility)
+            .all(|scenario| scenario.tags.contains(&"rfq-targeted")));
+    }
+
+    #[test]
+    fn base_balanced_profile_has_no_rfq_targeted_scenarios() {
+        let profile_result = balanced_profile(8453, false);
+        assert!(profile_result.is_ok());
+        let Some(profile) = profile_result.ok() else {
+            return;
+        };
+
+        assert!(profile
+            .simulate_scenarios
+            .iter()
+            .all(|scenario| !scenario.expect_rfq_visibility));
     }
 }
