@@ -22,6 +22,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
 
 ## Request body (shape)
 
+`estimatedAmountIn` is an optional top-level request field. It is accepted for compatibility, but RFQ routes still derive the actual per-swap estimated input internally from the route `amountIn` and split allocation.
+
 ```json
 {
   "chainId": 1,
@@ -114,7 +116,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
       ]
     }
   ],
-  "requestId": "encode-example-split-only-1"
+  "requestId": "encode-example-split-only-1",
+  "estimatedAmountIn": "1000000000000000000"
 }
 ```
 
@@ -200,6 +203,7 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 - MegaSwap has multiple segments. Each segment is a MultiSwap or SimpleSwap and gets a segment share.
 - The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` based on route shape and splits.
 - `poolAddress` is optional and may be omitted when unavailable.
+- `estimatedAmountIn` is optional and may be omitted.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
 - Native `tokenIn`/`tokenOut` is supported only for allowlisted protocols (currently `rocketpool`).
   - Native `tokenIn` routes emit a `CALL`-only interaction with `value=amountIn` (no ERC20 approvals).

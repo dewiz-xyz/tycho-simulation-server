@@ -338,6 +338,7 @@ mod tests {
                 ],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let normalized = normalize_route(
@@ -396,6 +397,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -462,6 +464,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
@@ -534,6 +537,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -597,6 +601,7 @@ mod tests {
                 ],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -652,6 +657,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -704,6 +710,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -765,6 +772,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();

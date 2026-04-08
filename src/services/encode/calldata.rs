@@ -405,6 +405,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {
@@ -486,6 +487,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {
@@ -553,6 +555,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {

@@ -481,6 +481,7 @@ fn build_route_encode_request(
             }],
         }],
         request_id: Some(config.request_id.to_string()),
+        estimated_amount_in: None,
     }
 }
 
@@ -1435,6 +1436,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
             ],
         }],
         request_id: Some("req-erc4626-mixed".to_string()),
+        estimated_amount_in: None,
     };
 
     let (status, body) = post_encode(app, &request).await?;

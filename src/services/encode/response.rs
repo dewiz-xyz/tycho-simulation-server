@@ -395,6 +395,7 @@ mod tests {
             swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: request_id.map(str::to_string),
+            estimated_amount_in: None,
         }
     }
 
@@ -463,6 +464,7 @@ mod tests {
                 },
             ],
             request_id: Some("req-logging".to_string()),
+            estimated_amount_in: None,
         }
     }
 

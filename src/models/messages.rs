@@ -252,6 +252,12 @@ pub struct RouteEncodeRequest {
     pub segments: Vec<SegmentDraft>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "estimatedAmountIn"
+    )]
+    pub estimated_amount_in: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

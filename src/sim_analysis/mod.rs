@@ -766,6 +766,7 @@ fn build_encode_route_request(
             ],
         }],
         request_id: Some(format!("encode-probe-{}", epoch_now_s()?)),
+        estimated_amount_in: None,
     })
 }
 
