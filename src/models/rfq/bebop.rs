@@ -51,8 +51,10 @@ pub struct ChainInfo {
 
 impl TokenBebop {
     pub fn to_tycho_token(&self) -> Result<Option<Token>, io::Error> {
-        for chain_info in &self.chain_info {
-            if chain_info.chain_id == 1 {
+        self.chain_info
+            .iter()
+            .find(|chain_info| chain_info.chain_id == 1)
+            .map(|chain_info| {
                 let address =
                     Bytes::from_str(chain_info.contract_address.as_str()).map_err(|err| {
                         io::Error::new(
@@ -63,7 +65,7 @@ impl TokenBebop {
                             ),
                         )
                     })?;
-                return Ok(Some(Token {
+                Ok(Token {
                     address,
                     symbol: self.ticker.clone(),
                     decimals: chain_info.decimals as u32,
@@ -71,9 +73,8 @@ impl TokenBebop {
                     gas: vec![],
                     chain: Chain::Ethereum,
                     quality: Default::default(),
-                }));
-            }
-        }
-        Ok(None)
+                })
+            })
+            .transpose()
     }
 }
