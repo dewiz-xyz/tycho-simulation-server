@@ -133,38 +133,8 @@ pub fn load_config() -> AppConfig {
     let stream = load_stream_config();
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
-
-    let bebop_user = match env::var("BEBOP_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-
-    let bebop_key = match env::var("BEBOP_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-
-    let hashflow_user = match env::var("HASHFLOW_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-
-    let hashflow_key = match env::var("HASHFLOW_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
+    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
+    let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(rfq_enabled);
 
     AppConfig {
         chain_profile,
@@ -202,6 +172,47 @@ pub fn load_config() -> AppConfig {
         hashflow_key,
         hashflow_user,
     }
+}
+
+fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile) -> bool {
+    enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
+}
+
+fn load_rfq_credentials(rfq_enabled: bool) -> (String, String, String, String) {
+    if !rfq_enabled {
+        return (String::new(), String::new(), String::new(), String::new());
+    }
+
+    let bebop_user = match env::var("BEBOP_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let bebop_key = match env::var("BEBOP_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let hashflow_user = match env::var("HASHFLOW_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let hashflow_key = match env::var("HASHFLOW_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    (bebop_user, bebop_key, hashflow_user, hashflow_key)
 }
 
 struct NetworkConfig {
@@ -578,5 +589,25 @@ mod tests {
             unreachable!("expected base hosted Tycho URL");
         };
         assert_eq!(url, "tycho-base-beta.propellerheads.xyz");
+    }
+
+    #[test]
+    fn rfq_effectively_enabled_requires_flag_and_protocols() {
+        let ethereum = ethereum_profile();
+        let base = base_profile();
+
+        assert!(rfq_effectively_enabled(true, &ethereum));
+        assert!(!rfq_effectively_enabled(false, &ethereum));
+        assert!(!rfq_effectively_enabled(true, &base));
+    }
+
+    #[test]
+    fn load_rfq_credentials_skips_env_when_disabled() {
+        let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(false);
+
+        assert!(bebop_user.is_empty());
+        assert!(bebop_key.is_empty());
+        assert!(hashflow_user.is_empty());
+        assert!(hashflow_key.is_empty());
     }
 }

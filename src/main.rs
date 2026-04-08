@@ -43,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config();
     let chain = config.chain_profile.chain;
     let tycho_url = hosted_tycho_url(chain).map_err(anyhow::Error::msg)?;
-    let bebop_url = hosted_bebop_url(chain).map_err(anyhow::Error::msg)?;
-    let hashflow_filename = hosted_hashflow_filename(chain).map_err(anyhow::Error::msg)?;
+    let effective_rfq_enabled =
+        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
     log_erc4626_capability(&config);
@@ -54,7 +54,9 @@ async fn main() -> anyhow::Result<()> {
     let bebop_tokens: Arc<TokenStore>;
     let hashflow_tokens: Arc<TokenStore>;
 
-    if config.enable_rfq_pools {
+    if effective_rfq_enabled {
+        let bebop_url = hosted_bebop_url(chain).map_err(anyhow::Error::msg)?;
+        let hashflow_filename = hosted_hashflow_filename(chain).map_err(anyhow::Error::msg)?;
         bebop_tokens = load_bebop_token_store(&config, &tycho_url, &bebop_url).await?;
         hashflow_tokens = load_hashflow_token_store(&config, &tycho_url, &hashflow_filename)?;
     } else {
