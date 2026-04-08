@@ -19,6 +19,7 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
+use crate::models::protocol::ProtocolKind;
 use crate::models::state::AppState;
 
 use super::allocation::allocate_swaps_by_bps;
@@ -54,6 +55,13 @@ struct BlockingSwapRequest<'a> {
     pool_timeout: Duration,
     pool_id: &'a str,
     component: &'a ProtocolComponent,
+}
+
+#[derive(Clone, Copy)]
+enum SimulationBackend {
+    Native,
+    Vm,
+    Rfq,
 }
 
 pub(super) async fn resimulate_route(
@@ -271,10 +279,10 @@ fn require_hop_amount_in(
 }
 
 fn pool_timeout_for_component(state: &AppState, component: &ProtocolComponent) -> Duration {
-    if component.protocol_system.starts_with("vm:") {
-        state.pool_timeout_vm()
-    } else {
-        state.pool_timeout_native()
+    match simulation_backend(component) {
+        SimulationBackend::Native => state.pool_timeout_native(),
+        SimulationBackend::Vm => state.pool_timeout_vm(),
+        SimulationBackend::Rfq => state.pool_timeout_rfq(),
     }
 }
 
@@ -325,18 +333,32 @@ async fn acquire_pool_permit(
     state: &AppState,
     component: &ProtocolComponent,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, EncodeError> {
-    if component.protocol_system.starts_with("vm:") {
-        state
-            .vm_sim_semaphore()
-            .acquire_owned()
-            .await
-            .map_err(|_| EncodeError::internal("VM pool semaphore closed"))
-    } else {
-        state
+    match simulation_backend(component) {
+        SimulationBackend::Native => state
             .native_sim_semaphore()
             .acquire_owned()
             .await
-            .map_err(|_| EncodeError::internal("Native pool semaphore closed"))
+            .map_err(|_| EncodeError::internal("Native pool semaphore closed")),
+        SimulationBackend::Vm => state
+            .vm_sim_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| EncodeError::internal("VM pool semaphore closed")),
+        SimulationBackend::Rfq => state
+            .rfq_sim_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| EncodeError::internal("RFQ pool semaphore closed")),
+    }
+}
+
+fn simulation_backend(component: &ProtocolComponent) -> SimulationBackend {
+    match ProtocolKind::from_component(component) {
+        Some(ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2) => {
+            SimulationBackend::Vm
+        }
+        Some(ProtocolKind::Hashflow | ProtocolKind::Bebop) => SimulationBackend::Rfq,
+        _ => SimulationBackend::Native,
     }
 }
 
@@ -571,6 +593,7 @@ mod tests {
     use tycho_simulation::protocol::models::Update;
 
     use super::*;
+    use crate::models::messages::PoolRef;
     use crate::services::encode::fixtures::{
         component_with_protocol, component_with_tokens, dummy_token, pool_ref, test_app_state,
         test_state_stores, token_store_with_tokens, TestAppStateConfig,
@@ -709,6 +732,14 @@ mod tests {
         );
     }
 
+    fn pool_ref_with_protocol(id: &str, protocol: &str) -> PoolRef {
+        PoolRef {
+            protocol: protocol.to_string(),
+            component_id: id.to_string(),
+            pool_address: None,
+        }
+    }
+
     #[tokio::test]
     async fn resimulate_route_advances_pool_state_for_repeated_swaps() {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
@@ -736,7 +767,10 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            TestAppStateConfig::default(),
+            TestAppStateConfig {
+                pool_timeout_native: Duration::from_millis(100),
+                ..TestAppStateConfig::default()
+            },
         );
 
         let normalized = NormalizedRouteInternal {
@@ -1136,6 +1170,327 @@ mod tests {
         };
 
         assert_timeout_error(err, "pool-vm-slow");
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_times_out_rfq_pool_simulation() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
+
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "rfq:bebop",
+            "rfq:bebop",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-rfq-slow".to_string(),
+            Box::new(SlowProtocolSim {
+                sleep_for: Duration::from_millis(80),
+            }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-rfq-slow".to_string(), component);
+        rfq_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            timeout_test_config(
+                false,
+                true,
+                Duration::from_millis(1000),
+                Duration::from_millis(1000),
+                Duration::from_millis(10),
+            ),
+        );
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref_with_protocol("pool-rfq-slow", "rfq:bebop"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let err = match resimulate_route(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+            &app_state.native_token_protocol_allowlist,
+        )
+        .await
+        {
+            Ok(_) => panic!("Expected RFQ pool simulation timeout"),
+            Err(err) => err,
+        };
+
+        assert_timeout_error(err, "pool-rfq-slow");
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_uses_rfq_semaphore_for_rfq_pool() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
+
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "rfq:hashflow",
+            "rfq:hashflow",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-rfq-fast".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-rfq-fast".to_string(), component);
+        rfq_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let _native_permit = match app_state.native_sim_semaphore().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => panic!("native semaphore should be open: {err}"),
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref_with_protocol("pool-rfq-fast", "rfq:hashflow"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let resimulated = match tokio::time::timeout(
+            Duration::from_millis(100),
+            resimulate_route(
+                &app_state,
+                &normalized,
+                Chain::Ethereum,
+                &token_in.address,
+                &token_out.address,
+                &app_state.native_token_protocol_allowlist,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(resimulated)) => resimulated,
+            Ok(Err(err)) => panic!("RFQ route should resimulate successfully: {err:?}"),
+            Err(err) => panic!("RFQ route should not block on the native semaphore: {err}"),
+        };
+
+        assert_eq!(
+            resimulated.segments[0].hops[0].swaps[0].expected_amount_out,
+            BigUint::from(10u32)
+        );
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_uses_rfq_semaphore_for_type_name_only_hashflow_pool() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
+
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "",
+            "hashflow_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-rfq-type-name".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-rfq-type-name".to_string(), component);
+        rfq_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let _native_permit = match app_state.native_sim_semaphore().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => panic!("native semaphore should be open: {err}"),
+        };
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref_with_protocol("pool-rfq-type-name", "rfq:hashflow"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let resimulated = match tokio::time::timeout(
+            Duration::from_millis(100),
+            resimulate_route(
+                &app_state,
+                &normalized,
+                Chain::Ethereum,
+                &token_in.address,
+                &token_out.address,
+                &app_state.native_token_protocol_allowlist,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(resimulated)) => resimulated,
+            Ok(Err(err)) => panic!("RFQ route should resimulate successfully: {err:?}"),
+            Err(err) => panic!("RFQ route should not block on the native semaphore: {err}"),
+        };
+
+        assert_eq!(
+            resimulated.segments[0].hops[0].swaps[0].expected_amount_out,
+            BigUint::from(10u32)
+        );
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_uses_rfq_timeout_budget_for_type_name_only_bebop_pool() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
+
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "not-rfq",
+            "bebop_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-rfq-type-name-slow".to_string(),
+            Box::new(SlowProtocolSim {
+                sleep_for: Duration::from_millis(500),
+            }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-rfq-type-name-slow".to_string(), component);
+        rfq_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            timeout_test_config(
+                false,
+                true,
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(1000),
+            ),
+        );
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref_with_protocol("pool-rfq-type-name-slow", "rfq:bebop"),
+                        token_in: token_in.address.clone(),
+                        token_out: token_out.address.clone(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+
+        let resimulated = match tokio::time::timeout(
+            Duration::from_secs(2),
+            resimulate_route(
+                &app_state,
+                &normalized,
+                Chain::Ethereum,
+                &token_in.address,
+                &token_out.address,
+                &app_state.native_token_protocol_allowlist,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(resimulated)) => resimulated,
+            Ok(Err(err)) => panic!("RFQ route should use the RFQ timeout budget: {err:?}"),
+            Err(err) => panic!("RFQ route should finish within the outer test timeout: {err}"),
+        };
+
+        assert_eq!(
+            resimulated.segments[0].hops[0].swaps[0].expected_amount_out,
+            BigUint::from(10u32)
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
 use futures::StreamExt;
@@ -33,7 +37,10 @@ use tycho_simulation::{
         stream::RFQStreamBuilder,
     },
     tycho_client::feed::component_tracker::ComponentFilter,
-    tycho_common::models::Chain,
+    tycho_common::{
+        models::{token::Token, Chain},
+        Bytes,
+    },
 };
 
 use crate::models::tokens::TokenStore;
@@ -213,15 +220,31 @@ pub async fn build_rfq_stream(
     info!("Building RFQ Stream...\n");
     let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
 
-    let snapshot = tokens.snapshot().await;
-
-    rfq_builder = rfq_builder.set_tokens(snapshot.clone()).await;
+    let decoder_tokens = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+    rfq_builder = rfq_builder.set_tokens(decoder_tokens).await;
     tokio::spawn(rfq_builder.build(tx));
     info!("Connected to RFQs! Streaming live price levels...\n");
 
     // todo consider implementing register_rfq_protocol...
 
     Ok(ReceiverStream::new(rx).map(Ok).boxed())
+}
+
+async fn rfq_decoder_tokens(
+    tokens: &Arc<TokenStore>,
+    bebop_tokens: &Arc<TokenStore>,
+    hashflow_tokens: &Arc<TokenStore>,
+) -> HashMap<Bytes, Token> {
+    let mut snapshot = tokens.snapshot().await;
+    merge_missing_tokens(&mut snapshot, bebop_tokens.snapshot().await);
+    merge_missing_tokens(&mut snapshot, hashflow_tokens.snapshot().await);
+    snapshot
+}
+
+fn merge_missing_tokens(tokens: &mut HashMap<Bytes, Token>, extra: HashMap<Bytes, Token>) {
+    for (address, token) in extra {
+        tokens.entry(address).or_insert(token);
+    }
 }
 
 fn register_vm_protocol(
@@ -271,19 +294,35 @@ fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "stream builder tests use explicit panics for invalid fixture setup"
+)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::{BTreeSet, HashMap},
+        str::FromStr,
+        sync::Arc,
+        time::Duration,
+    };
 
     use super::{
-        decode_skip_state_failures, register_native_protocol, register_vm_protocol,
-        StreamDecodePolicy,
+        decode_skip_state_failures, merge_missing_tokens, register_native_protocol,
+        register_vm_protocol, rfq_decoder_tokens, StreamDecodePolicy,
     };
     use crate::config::{
         BASE_NATIVE_PROTOCOLS, BASE_VM_PROTOCOLS, ETHEREUM_NATIVE_PROTOCOLS, ETHEREUM_VM_PROTOCOLS,
     };
     use tycho_simulation::{
-        evm::stream::ProtocolStreamBuilder, tycho_client::feed::component_tracker::ComponentFilter,
+        evm::stream::ProtocolStreamBuilder,
+        tycho_client::feed::component_tracker::ComponentFilter,
+        tycho_common::{
+            models::{token::Token, Chain},
+            Bytes,
+        },
     };
+
+    use crate::models::tokens::TokenStore;
 
     fn test_builder() -> ProtocolStreamBuilder {
         ProtocolStreamBuilder::new(
@@ -298,6 +337,28 @@ mod tests {
 
     fn unique_protocols<'a>(left: &'a [&'a str], right: &'a [&'a str]) -> BTreeSet<&'a str> {
         left.iter().chain(right.iter()).copied().collect()
+    }
+
+    fn test_token(address: &str, symbol: &str) -> Token {
+        let address = match Bytes::from_str(address) {
+            Ok(address) => address,
+            Err(err) => panic!("test token address must parse: {err}"),
+        };
+        Token::new(&address, symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    fn test_token_store(tokens: impl IntoIterator<Item = Token>) -> Arc<TokenStore> {
+        let initial_tokens = tokens
+            .into_iter()
+            .map(|token| (token.address.clone(), token))
+            .collect();
+        Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ))
     }
 
     #[test]
@@ -358,5 +419,38 @@ mod tests {
                 "expected VM protocol {protocol} to register"
             );
         }
+    }
+
+    #[test]
+    fn merge_missing_tokens_keeps_existing_entries() {
+        let shared = test_token("0x0000000000000000000000000000000000000001", "BASE");
+        let replacement = test_token("0x0000000000000000000000000000000000000001", "RFQ");
+        let mut tokens = HashMap::from([(shared.address.clone(), shared.clone())]);
+
+        merge_missing_tokens(
+            &mut tokens,
+            HashMap::from([(replacement.address.clone(), replacement)]),
+        );
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[&shared.address].symbol, shared.symbol);
+    }
+
+    #[tokio::test]
+    async fn rfq_decoder_tokens_include_rfq_only_assets() {
+        let base = test_token("0x0000000000000000000000000000000000000001", "BASE");
+        let bebop_only = test_token("0x0000000000000000000000000000000000000002", "BEBOP");
+        let hashflow_only = test_token("0x0000000000000000000000000000000000000003", "HASH");
+
+        let tokens = test_token_store(vec![base.clone()]);
+        let bebop_tokens = test_token_store(vec![bebop_only.clone()]);
+        let hashflow_tokens = test_token_store(vec![hashflow_only.clone()]);
+
+        let merged = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains_key(&base.address));
+        assert!(merged.contains_key(&bebop_only.address));
+        assert!(merged.contains_key(&hashflow_only.address));
     }
 }
