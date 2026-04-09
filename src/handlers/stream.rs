@@ -150,7 +150,7 @@ async fn next_stream_message(
         Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
     > + Unpin
               + Send),
-    health: &Arc<StreamHealth>,
+    health: &StreamHealth,
     stream_stale: Duration,
 ) -> StreamMessage {
     match timeout(stream_stale, stream.next()).await {
@@ -182,8 +182,8 @@ async fn next_stream_message(
 async fn handle_stream_update(
     kind: StreamKind,
     update: TychoUpdate,
-    state_store: &Arc<StateStore>,
-    health: &Arc<StreamHealth>,
+    state_store: &StateStore,
+    health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
     ready_logged: &mut bool,
 ) -> Option<StreamExit> {
@@ -275,7 +275,7 @@ fn log_stream_update(kind: StreamKind, metrics: &crate::models::state::UpdateMet
 async fn handle_stream_error(
     kind: StreamKind,
     err_msg: String,
-    health: &Arc<StreamHealth>,
+    health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
 ) -> Option<StreamExit> {
     let error_kind = classify_stream_error(&err_msg);

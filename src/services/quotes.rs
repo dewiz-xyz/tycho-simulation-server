@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
-use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -183,7 +183,7 @@ enum LadderStressQuote {
 struct PoolSchedulingContext<'a> {
     quote_deadline: Instant,
     pool_timeout: Duration,
-    semaphore: &'a Arc<tokio::sync::Semaphore>,
+    semaphore: Arc<Semaphore>,
     cancel_token: &'a CancellationToken,
     token_in: &'a Token,
     token_out: &'a Token,
@@ -428,7 +428,7 @@ fn prepare_pool_simulation(
         return PoolScheduleOutcome::Skip;
     }
 
-    let permit = match context.semaphore.clone().try_acquire_owned() {
+    let permit = match Arc::clone(&context.semaphore).try_acquire_owned() {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => {
             kind.mark_concurrency_skip(context.metrics);
@@ -830,7 +830,7 @@ impl QuoteRequestRunner {
             &pair.token_out_address,
             &token_in_ref,
             &token_out_ref,
-            &amounts_in,
+            expected_len,
             &mut candidates,
         )?;
         Ok(PreparedQuoteExecution {
@@ -908,7 +908,7 @@ impl QuoteRequestRunner {
         token_out_address: &str,
         token_in_ref: &Token,
         token_out_ref: &Token,
-        amounts_in: &Arc<Vec<BigUint>>,
+        expected_len: usize,
         candidates: &mut CandidateSets,
     ) -> Result<(), RequestExit> {
         let total_candidates = candidates.native_candidates.len()
@@ -934,7 +934,7 @@ impl QuoteRequestRunner {
         debug!(
             "Quote candidates prepared: matching_pools={} amounts_per_pool={}, {} ({}) -> {} ({})",
             self.run.meta.matching_pools,
-            amounts_in.len(),
+            expected_len,
             token_in_ref.symbol,
             token_in_address,
             token_out_ref.symbol,
@@ -998,7 +998,7 @@ impl QuoteRequestRunner {
                 kind,
                 candidates,
                 pool_timeout,
-                &semaphore,
+                semaphore,
                 prepared,
                 &mut tasks,
             );
@@ -1011,7 +1011,7 @@ impl QuoteRequestRunner {
         kind: ScheduledPoolKind,
         candidates: &[CandidatePool],
         pool_timeout: Duration,
-        semaphore: &Arc<tokio::sync::Semaphore>,
+        semaphore: Arc<Semaphore>,
         prepared: &PreparedQuoteExecution,
         tasks: &mut FuturesUnordered<PoolTask>,
     ) {
@@ -1023,7 +1023,7 @@ impl QuoteRequestRunner {
             let mut scheduling_context = PoolSchedulingContext {
                 quote_deadline: prepared.quote_deadline,
                 pool_timeout,
-                semaphore,
+                semaphore: Arc::clone(&semaphore),
                 cancel_token: &prepared.cancel_token,
                 token_in: prepared.token_in.as_ref(),
                 token_out: prepared.token_out.as_ref(),
@@ -3071,12 +3071,12 @@ mod tests {
     }
 
     fn make_test_state_stores(
-        token_store: &Arc<TokenStore>,
+        token_store: Arc<TokenStore>,
     ) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
         (
-            Arc::new(StateStore::new(Arc::clone(token_store))),
-            Arc::new(StateStore::new(Arc::clone(token_store))),
-            Arc::new(StateStore::new(Arc::clone(token_store))),
+            Arc::new(StateStore::new(Arc::clone(&token_store))),
+            Arc::new(StateStore::new(Arc::clone(&token_store))),
+            Arc::new(StateStore::new(token_store)),
         )
     }
 
@@ -3116,7 +3116,7 @@ mod tests {
             let token_out_meta = make_token(&token_out, "TK2");
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
             let (native_state_store, vm_state_store, rfq_state_store) =
-                make_test_state_stores(&token_store);
+                make_test_state_stores(Arc::clone(&token_store));
 
             Self {
                 token_in_hex,
@@ -3167,7 +3167,7 @@ mod tests {
                 make_token_with_decimals(&token_out, token_out_symbol, token_out_decimals);
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
             let (native_state_store, vm_state_store, rfq_state_store) =
-                make_test_state_stores(&token_store);
+                make_test_state_stores(Arc::clone(&token_store));
 
             Self {
                 token_in_hex,
@@ -3359,7 +3359,7 @@ mod tests {
     async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
         let token_store = make_token_store(Vec::new());
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
         let app_state = make_test_app_state(
             token_store,
             native_state_store,
@@ -3707,7 +3707,7 @@ mod tests {
             token_out_meta.clone(),
         ]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3774,7 +3774,7 @@ mod tests {
             token_out_meta.clone(),
         ]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3863,7 +3863,7 @@ mod tests {
             token_out_meta.clone(),
         ]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3952,7 +3952,7 @@ mod tests {
             token_in_meta.clone(),
         ]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -4019,7 +4019,7 @@ mod tests {
             token_out_meta.clone(),
         ]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            make_test_state_stores(&token_store);
+            make_test_state_stores(Arc::clone(&token_store));
 
         // Keep native store ready without creating any matching pools for the request pair.
         let native_dummy_token_a =

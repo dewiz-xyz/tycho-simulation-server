@@ -746,7 +746,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -812,8 +812,8 @@ mod tests {
         let swaps = &resimulated.segments[0].hops[0].swaps;
         assert_eq!(swaps[0].expected_amount_out, BigUint::from(5u32));
         assert_eq!(swaps[1].expected_amount_out, BigUint::from(10u32));
-        assert_eq!(step_multiplier(&swaps[0].pool_state), 1);
-        assert_eq!(step_multiplier(&swaps[1].pool_state), 2);
+        assert_eq!(step_multiplier(swaps[0].pool_state.as_ref()), 1);
+        assert_eq!(step_multiplier(swaps[1].pool_state.as_ref()), 2);
     }
 
     #[tokio::test]
@@ -822,7 +822,7 @@ mod tests {
         let token_out = dummy_token("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
@@ -924,7 +924,7 @@ mod tests {
         let tokens_store =
             token_store_with_tokens(vec![token_a.clone(), token_b.clone(), token_c.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component_a = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -1018,9 +1018,9 @@ mod tests {
         let seg_b_hop0_swap = &resimulated.segments[1].hops[0].swaps[0];
 
         assert_eq!(seg_b_hop0_swap.expected_amount_out, BigUint::from(50u32));
-        assert_eq!(step_multiplier(&seg_b_hop0_swap.pool_state), 1);
+        assert_eq!(step_multiplier(seg_b_hop0_swap.pool_state.as_ref()), 1);
         assert_eq!(seg_a_hop1_swap.expected_amount_out, BigUint::from(200u32));
-        assert_eq!(step_multiplier(&seg_a_hop1_swap.pool_state), 2);
+        assert_eq!(step_multiplier(seg_a_hop1_swap.pool_state.as_ref()), 2);
     }
 
     #[tokio::test]
@@ -1029,7 +1029,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -1102,7 +1102,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1178,7 +1178,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1253,7 +1253,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1335,7 +1335,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1417,7 +1417,7 @@ mod tests {
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1504,7 +1504,7 @@ mod tests {
             Duration::from_millis(10),
         ));
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
         let app_state = test_app_state(
             tokens_store,
             native_state_store,

@@ -374,6 +374,7 @@ fn is_native_address(value: &str) -> bool {
 )]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use tycho_simulation::protocol::models::Update;
 
@@ -472,7 +473,7 @@ mod tests {
     async fn build_debug_omits_when_request_id_missing() {
         let tokens_store = token_store_with_tokens(Vec::new());
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -495,7 +496,7 @@ mod tests {
     async fn build_debug_includes_block_when_request_id_present() {
         let tokens_store = token_store_with_tokens(Vec::new());
         let (native_state_store, vm_state_store, rfq_state_store) =
-            test_state_stores(&tokens_store);
+            test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))

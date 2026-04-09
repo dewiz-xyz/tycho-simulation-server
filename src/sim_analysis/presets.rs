@@ -247,14 +247,14 @@ fn ethereum_encode_preset() -> EncodePreset {
 
 fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
     vec![
-        scenario(
+        rfq_scenario(
             "stable-usdc-weth",
             "USDC",
             "WETH",
             STABLE_AMOUNTS,
             &["base-core"],
         ),
-        scenario(
+        rfq_scenario(
             "stable-weth-usdc",
             "WETH",
             "USDC",
@@ -387,6 +387,7 @@ fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
     match tags {
         ["stables"] => &["stables", "rfq-targeted"],
         ["native"] => &["native", "rfq-targeted"],
+        ["base-core"] => &["base-core", "rfq-targeted"],
         _ => &["rfq-targeted"],
     }
 }
@@ -415,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn base_balanced_profile_has_no_rfq_targeted_scenarios() {
+    fn base_balanced_profile_includes_rfq_targeted_scenarios() {
         let profile_result = balanced_profile(8453, false);
         assert!(profile_result.is_ok());
         let Some(profile) = profile_result.ok() else {
@@ -425,6 +426,11 @@ mod tests {
         assert!(profile
             .simulate_scenarios
             .iter()
-            .all(|scenario| !scenario.expect_rfq_visibility));
+            .any(|scenario| scenario.expect_rfq_visibility));
+        assert!(profile
+            .simulate_scenarios
+            .iter()
+            .filter(|scenario| scenario.expect_rfq_visibility)
+            .all(|scenario| scenario.tags.contains(&"rfq-targeted")));
     }
 }

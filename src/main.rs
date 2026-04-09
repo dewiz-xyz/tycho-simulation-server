@@ -8,7 +8,10 @@ use std::time::Duration;
 use dsolver_simulator::models::rfq::bebop::BebopResponse;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
-use tycho_simulation::tycho_common::{models::token::Token, Bytes};
+use tycho_simulation::tycho_common::{
+    models::{token::Token, Chain},
+    Bytes,
+};
 use tycho_simulation::utils::load_all_tokens;
 
 use dsolver_simulator::api::create_router;
@@ -33,8 +36,8 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 struct RfqStreamDeps<'a> {
     resources: &'a StreamResources,
     app_state: &'a AppState,
-    bebop_tokens: &'a Arc<TokenStore>,
-    hashflow_tokens: &'a Arc<TokenStore>,
+    bebop_tokens: Arc<TokenStore>,
+    hashflow_tokens: Arc<TokenStore>,
 }
 
 #[tokio::main]
@@ -55,17 +58,19 @@ async fn main() -> anyhow::Result<()> {
     let hashflow_tokens: Arc<TokenStore>;
 
     if effective_rfq_enabled {
+        // RFQ enabled means RFQ bootstrap must succeed.
         let bebop_url = hosted_bebop_url(chain).map_err(anyhow::Error::msg)?;
         let hashflow_filename = hosted_hashflow_filename(chain).map_err(anyhow::Error::msg)?;
-        bebop_tokens = load_bebop_token_store(&config, &tycho_url, &bebop_url).await?;
-        hashflow_tokens = load_hashflow_token_store(&config, &tycho_url, &hashflow_filename)?;
+        bebop_tokens = load_bebop_token_store(&config, &tycho_url, &bebop_url, chain).await?;
+        hashflow_tokens =
+            load_hashflow_token_store(&config, &tycho_url, &hashflow_filename, chain)?;
     } else {
         bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
         hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
     }
 
-    let stream_resources = create_stream_resources(&tokens);
-    let app_state = build_app_state(&config, &tokens, &stream_resources);
+    let stream_resources = create_stream_resources(Arc::clone(&tokens));
+    let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
 
     log_concurrency_config(&config);
@@ -73,14 +78,14 @@ async fn main() -> anyhow::Result<()> {
         &config,
         &tycho_url,
         &supervisor_cfg,
-        &tokens,
+        Arc::clone(&tokens),
         &stream_resources,
     );
     spawn_vm_stream_task(
         &config,
         &tycho_url,
         &supervisor_cfg,
-        &tokens,
+        Arc::clone(&tokens),
         &stream_resources,
         &app_state,
     );
@@ -93,12 +98,12 @@ async fn main() -> anyhow::Result<()> {
     spawn_rfq_stream_task(
         &config,
         &supervisor_cfg,
-        &tokens,
+        Arc::clone(&tokens),
         RfqStreamDeps {
             resources: &stream_resources,
             app_state: &app_state,
-            bebop_tokens: &bebop_tokens,
-            hashflow_tokens: &hashflow_tokens,
+            bebop_tokens: Arc::clone(&bebop_tokens),
+            hashflow_tokens: Arc::clone(&hashflow_tokens),
         },
         rfq_config,
     );
@@ -180,9 +185,10 @@ async fn load_bebop_token_store(
     config: &dsolver_simulator::config::AppConfig,
     tycho_url: &str,
     bebop_url: &str,
+    chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let client = Client::new();
-    let bebop_tokens = load_bebop_tokens(&client, bebop_url).await?;
+    let bebop_tokens = load_bebop_tokens(&client, bebop_url, chain).await?;
     info!("all bebop tokens: {:?}", bebop_tokens);
     Ok(new_token_store(bebop_tokens, tycho_url, config))
 }
@@ -190,6 +196,7 @@ async fn load_bebop_token_store(
 async fn load_bebop_tokens(
     client: &Client,
     bebop_url: &str,
+    chain: Chain,
 ) -> anyhow::Result<HashMap<Bytes, Token>> {
     let response: BebopResponse = client
         .get(bebop_url)
@@ -207,7 +214,7 @@ async fn load_bebop_tokens(
     response
         .tokens
         .into_iter()
-        .filter_map(|(_ticker, token)| match token.to_tycho_token() {
+        .filter_map(|(_ticker, token)| match token.to_tycho_token(chain) {
             Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
             Ok(None) => None,
             Err(err) => Some(Err(err)),
@@ -220,8 +227,9 @@ fn load_hashflow_token_store(
     config: &dsolver_simulator::config::AppConfig,
     tycho_url: &str,
     hashflow_filename: &str,
+    chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
-    let hashflow_tokens = read_hashflow_csv(hashflow_filename)
+    let hashflow_tokens = read_hashflow_csv(hashflow_filename, chain)
         .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
     info!("all_hashflow_tokens: {:?}", hashflow_tokens);
     Ok(new_token_store(hashflow_tokens, tycho_url, config))
@@ -241,10 +249,10 @@ fn new_token_store(
     ))
 }
 
-fn create_stream_resources(tokens: &Arc<TokenStore>) -> StreamResources {
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
-    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
+fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+    let rfq_state_store = Arc::new(StateStore::new(tokens));
     let native_stream_health = Arc::new(StreamHealth::new());
     let vm_stream_health = Arc::new(StreamHealth::new());
     let rfq_stream_health = Arc::new(StreamHealth::new());
@@ -266,7 +274,7 @@ fn create_stream_resources(tokens: &Arc<TokenStore>) -> StreamResources {
 
 fn build_app_state(
     config: &dsolver_simulator::config::AppConfig,
-    tokens: &Arc<TokenStore>,
+    tokens: Arc<TokenStore>,
     resources: &StreamResources,
 ) -> AppState {
     let chain = config.chain_profile.chain;
@@ -291,7 +299,7 @@ fn build_app_state(
         native_token_protocol_allowlist: Arc::new(
             config.chain_profile.native_token_protocol_allowlist.clone(),
         ),
-        tokens: Arc::clone(tokens),
+        tokens,
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
         rfq_state_store: Arc::clone(&resources.rfq_state_store),
@@ -365,12 +373,12 @@ fn spawn_native_stream_task(
     config: &dsolver_simulator::config::AppConfig,
     tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
-    tokens: &Arc<TokenStore>,
+    tokens: Arc<TokenStore>,
     resources: &StreamResources,
 ) {
     let chain = config.chain_profile.chain;
     let native_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = Arc::clone(tokens);
+    let tokens_bg = tokens;
     let state_store_bg = Arc::clone(&resources.native_state_store);
     let health_bg = Arc::clone(&resources.native_stream_health);
     let tycho_url = tycho_url.to_string();
@@ -413,7 +421,7 @@ fn spawn_vm_stream_task(
     config: &dsolver_simulator::config::AppConfig,
     tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
-    tokens: &Arc<TokenStore>,
+    tokens: Arc<TokenStore>,
     resources: &StreamResources,
     app_state: &AppState,
 ) {
@@ -433,7 +441,7 @@ fn spawn_vm_stream_task(
     }
 
     let vm_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = Arc::clone(tokens);
+    let tokens_bg = tokens;
     let state_store_bg = Arc::clone(&resources.vm_state_store);
     let health_bg = Arc::clone(&resources.vm_stream_health);
     let vm_stream_bg = Arc::clone(&resources.vm_stream);
@@ -483,7 +491,7 @@ fn spawn_vm_stream_task(
 fn spawn_rfq_stream_task(
     config: &dsolver_simulator::config::AppConfig,
     supervisor_cfg: &StreamSupervisorConfig,
-    tokens: &Arc<TokenStore>,
+    tokens: Arc<TokenStore>,
     deps: RfqStreamDeps<'_>,
     rfq_config: RFQConfig,
 ) {
@@ -503,9 +511,9 @@ fn spawn_rfq_stream_task(
     }
 
     let rfq_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = Arc::clone(tokens);
-    let bebop_tokens_bg = Arc::clone(deps.bebop_tokens);
-    let hashflow_tokens_bg = Arc::clone(deps.hashflow_tokens);
+    let tokens_bg = tokens;
+    let bebop_tokens_bg = deps.bebop_tokens;
+    let hashflow_tokens_bg = deps.hashflow_tokens;
     let state_store_bg = Arc::clone(&deps.resources.rfq_state_store);
     let health_bg = Arc::clone(&deps.resources.rfq_stream_health);
     let rfq_stream_bg = Arc::clone(&deps.resources.rfq_stream);
@@ -681,7 +689,7 @@ mod tests {
                 "pancakeswap_v3".to_string(),
             ],
             vm_protocols: Vec::new(),
-            rfq_protocols: Vec::new(),
+            rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
         }
@@ -706,16 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn build_app_state_disables_effective_vm_for_base_profile() {
+    fn build_app_state_disables_effective_vm_but_keeps_rfq_for_base_profile() {
         let config = build_test_config(base_chain_profile(), true, true, None);
         let tokens = build_test_token_store(Chain::Base);
-        let resources = create_stream_resources(&tokens);
+        let resources = create_stream_resources(Arc::clone(&tokens));
 
-        let app_state = build_app_state(&config, &tokens, &resources);
+        let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
         assert_eq!(app_state.chain, Chain::Base);
         assert!(!app_state.enable_vm_pools);
-        assert!(!app_state.enable_rfq_pools);
+        assert!(app_state.enable_rfq_pools);
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
@@ -730,9 +738,9 @@ mod tests {
             Some("http://localhost:8545"),
         );
         let tokens = build_test_token_store(Chain::Ethereum);
-        let resources = create_stream_resources(&tokens);
+        let resources = create_stream_resources(Arc::clone(&tokens));
 
-        let app_state = build_app_state(&config, &tokens, &resources);
+        let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
         assert_eq!(app_state.chain, Chain::Ethereum);
         assert!(app_state.enable_vm_pools);

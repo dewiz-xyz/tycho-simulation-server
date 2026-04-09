@@ -50,10 +50,11 @@ pub struct ChainInfo {
 }
 
 impl TokenBebop {
-    pub fn to_tycho_token(&self) -> Result<Option<Token>, io::Error> {
+    pub fn to_tycho_token(&self, chain: Chain) -> Result<Option<Token>, io::Error> {
         self.chain_info
             .iter()
-            .find(|chain_info| chain_info.chain_id == 1)
+            // Bebop can return the same token across multiple chains in one payload.
+            .find(|chain_info| chain_info.chain_id == chain.id())
             .map(|chain_info| {
                 let address =
                     Bytes::from_str(chain_info.contract_address.as_str()).map_err(|err| {
@@ -71,10 +72,74 @@ impl TokenBebop {
                     decimals: chain_info.decimals as u32,
                     tax: 0,
                     gas: vec![],
-                    chain: Chain::Ethereum,
+                    chain,
                     quality: Default::default(),
                 })
             })
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ETH_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
+    const BASE_ADDRESS: &str = "0x4200000000000000000000000000000000000006";
+
+    fn sample_token() -> TokenBebop {
+        TokenBebop {
+            name: "Wrapped Ether".to_string(),
+            ticker: "WETH".to_string(),
+            availability: Availability {
+                is_available: true,
+                can_buy: true,
+                can_sell: true,
+            },
+            price_usd: Some(2000.0),
+            cid: "weth".to_string(),
+            display_decimals: Some(4),
+            colour: Some("#fff".to_string()),
+            tags: vec!["core".to_string()],
+            icon_url: "https://example.com/weth.png".to_string(),
+            chain_info: vec![
+                ChainInfo {
+                    chain_id: Chain::Ethereum.id(),
+                    contract_address: ETH_ADDRESS.to_string(),
+                    decimals: 18,
+                },
+                ChainInfo {
+                    chain_id: Chain::Base.id(),
+                    contract_address: BASE_ADDRESS.to_string(),
+                    decimals: 18,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn to_tycho_token_selects_ethereum_chain_info() -> Result<(), Box<dyn std::error::Error>> {
+        let token = sample_token()
+            .to_tycho_token(Chain::Ethereum)?
+            .ok_or_else(|| io::Error::other("expected Ethereum token"))?;
+
+        assert_eq!(token.address, Bytes::from_str(ETH_ADDRESS)?);
+        assert_eq!(token.symbol, "WETH");
+        assert_eq!(token.decimals, 18);
+        assert_eq!(token.chain, Chain::Ethereum);
+        Ok(())
+    }
+
+    #[test]
+    fn to_tycho_token_selects_base_chain_info() -> Result<(), Box<dyn std::error::Error>> {
+        let token = sample_token()
+            .to_tycho_token(Chain::Base)?
+            .ok_or_else(|| io::Error::other("expected Base token"))?;
+
+        assert_eq!(token.address, Bytes::from_str(BASE_ADDRESS)?);
+        assert_eq!(token.symbol, "WETH");
+        assert_eq!(token.decimals, 18);
+        assert_eq!(token.chain, Chain::Base);
+        Ok(())
     }
 }

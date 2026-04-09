@@ -174,8 +174,8 @@ pub struct RFQConfig {
 pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
     tokens: Arc<TokenStore>,
-    _chain: Chain,
-    _protocols: &[String],
+    chain: Chain,
+    protocols: &[String],
     bebop_tokens: Arc<TokenStore>,
     hashflow_tokens: Arc<TokenStore>,
     rfq_config: RFQConfig,
@@ -190,32 +190,37 @@ pub async fn build_rfq_stream(
 > {
     let mut rfq_builder = RFQStreamBuilder::new();
 
-    info!("Setting up Bebop RFQ client...\n");
-    let (user, key) = (rfq_config.bebop_user, rfq_config.bebop_key);
-    let mut rfq_tokens_bebop = HashSet::new();
-    for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
-        rfq_tokens_bebop.insert(bebop_token_addr.clone());
+    if rfq_protocol_enabled(protocols, "rfq:bebop") {
+        info!("Setting up Bebop RFQ client...\n");
+        let (user, key) = (rfq_config.bebop_user.clone(), rfq_config.bebop_key.clone());
+        let mut rfq_tokens_bebop = HashSet::new();
+        for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
+            rfq_tokens_bebop.insert(bebop_token_addr.clone());
+        }
+        let bebop_client = BebopClientBuilder::new(chain, user, key)
+            .tokens(rfq_tokens_bebop)
+            .tvl_threshold(tvl_add_threshold)
+            .build()
+            .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
+        rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
     }
-    let bebop_client = BebopClientBuilder::new(Chain::Ethereum, user, key)
-        .tokens(rfq_tokens_bebop)
-        .tvl_threshold(tvl_add_threshold)
-        .build()
-        .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
-    rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
 
-    info!("Setting up Hashflow RFQ client...\n");
-    let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
-    let mut rfq_tokens_hashflow = HashSet::new();
-    for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
-        rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
+    if rfq_protocol_enabled(protocols, "rfq:hashflow") {
+        info!("Setting up Hashflow RFQ client...\n");
+        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+        let mut rfq_tokens_hashflow = HashSet::new();
+        for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
+            rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
+        }
+        let hashflow_client = HashflowClientBuilder::new(chain, user, key)
+            .tokens(rfq_tokens_hashflow)
+            .tvl_threshold(tvl_add_threshold)
+            .poll_time(Duration::from_secs(5))
+            .build()
+            .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
+        rfq_builder =
+            rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
     }
-    let hashflow_client = HashflowClientBuilder::new(Chain::Ethereum, user, key)
-        .tokens(rfq_tokens_hashflow)
-        .tvl_threshold(tvl_add_threshold)
-        .poll_time(Duration::from_secs(5))
-        .build()
-        .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
-    rfq_builder = rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
 
     info!("Building RFQ Stream...\n");
     let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
@@ -230,10 +235,14 @@ pub async fn build_rfq_stream(
     Ok(ReceiverStream::new(rx).map(Ok).boxed())
 }
 
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
+}
+
 async fn rfq_decoder_tokens(
-    tokens: &Arc<TokenStore>,
-    bebop_tokens: &Arc<TokenStore>,
-    hashflow_tokens: &Arc<TokenStore>,
+    tokens: &TokenStore,
+    bebop_tokens: &TokenStore,
+    hashflow_tokens: &TokenStore,
 ) -> HashMap<Bytes, Token> {
     let mut snapshot = tokens.snapshot().await;
     merge_missing_tokens(&mut snapshot, bebop_tokens.snapshot().await);
@@ -359,6 +368,15 @@ mod tests {
             Chain::Ethereum,
             Duration::from_millis(10),
         ))
+    }
+
+    #[test]
+    fn rfq_protocol_enabled_matches_exact_protocol_name() {
+        let protocols = vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()];
+
+        assert!(super::rfq_protocol_enabled(&protocols, "rfq:bebop"));
+        assert!(super::rfq_protocol_enabled(&protocols, "rfq:hashflow"));
+        assert!(!super::rfq_protocol_enabled(&protocols, "rfq:other"));
     }
 
     #[test]
