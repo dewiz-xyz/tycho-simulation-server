@@ -325,7 +325,7 @@ fn load_network_config() -> NetworkConfig {
         port,
         host,
         enable_vm_pools: parse_env_or_default("ENABLE_VM_POOLS", "true"),
-        enable_rfq_pools: parse_env_or_default("ENABLE_RFQ_POOLS", "true"),
+        enable_rfq_pools: parse_env_or_default("ENABLE_RFQ_POOLS", "false"),
     }
 }
 
