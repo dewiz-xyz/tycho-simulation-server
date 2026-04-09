@@ -445,6 +445,7 @@ fn jemalloc_allocated_bytes() -> usize {
 
 fn default_stream_config() -> StreamSupervisorConfig {
     StreamSupervisorConfig {
+        readiness_stale: Duration::from_secs(3600),
         stream_stale: Duration::from_secs(3600),
         missing_block_burst: 3,
         missing_block_window: Duration::from_secs(60),
@@ -537,7 +538,7 @@ async fn native_stream_restarts_on_stale() {
     let health = Arc::new(StreamHealth::new());
 
     let mut cfg = default_stream_config();
-    cfg.stream_stale = Duration::from_secs(5);
+    cfg.readiness_stale = Duration::from_secs(5);
 
     let stream = futures::stream::pending();
     let handle = tokio::spawn(process_stream(

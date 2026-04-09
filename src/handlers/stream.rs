@@ -67,6 +67,7 @@ pub struct StreamExit {
 
 #[derive(Debug, Clone)]
 pub struct StreamSupervisorConfig {
+    pub readiness_stale: Duration,
     pub stream_stale: Duration,
     pub missing_block_burst: u64,
     pub missing_block_window: Duration,
@@ -118,7 +119,7 @@ pub async fn process_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_stream_message(kind, &mut stream, &health, cfg.stream_stale).await {
+        match next_stream_message(kind, &mut stream, &health, &cfg).await {
             StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
             StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
             StreamMessage::Update(update) => {
@@ -151,15 +152,25 @@ async fn next_stream_message(
     > + Unpin
               + Send),
     health: &StreamHealth,
-    stream_stale: Duration,
+    cfg: &StreamSupervisorConfig,
 ) -> StreamMessage {
-    match timeout(stream_stale, stream.next()).await {
+    let has_received_update = health.has_received_update().await;
+    let stream_timeout = if has_received_update {
+        cfg.stream_stale
+    } else {
+        cfg.readiness_stale
+    };
+
+    match timeout(stream_timeout, stream.next()).await {
         Err(_) => {
+            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
             let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
             let last_block = health.last_block().await;
             warn!(
                 event = "stream_stale",
                 stream = kind.as_str(),
+                started_age_ms,
+                has_received_update,
                 last_update_age_ms,
                 last_block,
                 "Stream stale; triggering restart"
@@ -167,9 +178,16 @@ async fn next_stream_message(
             StreamMessage::Stale
         }
         Ok(None) => {
+            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+            let last_block = health.last_block().await;
             warn!(
                 event = "stream_ended",
                 stream = kind.as_str(),
+                started_age_ms,
+                has_received_update,
+                last_update_age_ms,
+                last_block,
                 "Stream ended unexpectedly"
             );
             StreamMessage::Ended
@@ -364,6 +382,8 @@ pub async fn supervise_native_stream<F, Fut, S>(
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -374,6 +394,8 @@ pub async fn supervise_native_stream<F, Fut, S>(
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
+            started_age_ms,
+            has_received_update,
             last_block,
             last_update_age_ms,
             "Restarting native stream"
@@ -437,6 +459,8 @@ pub async fn supervise_vm_stream<F, Fut, S>(
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -457,6 +481,8 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
+            started_age_ms,
+            has_received_update,
             last_block,
             last_update_age_ms,
             "Restarting VM stream"
@@ -517,6 +543,8 @@ pub async fn supervise_rfq_stream<F, Fut, S>(
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -537,6 +565,8 @@ pub async fn supervise_rfq_stream<F, Fut, S>(
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
+            started_age_ms,
+            has_received_update,
             last_block,
             last_update_age_ms,
             "Restarting RFQ stream"
@@ -575,7 +605,12 @@ async fn begin_vm_rebuild(
         status.restart_count
     };
 
-    info!(event = "vm_rebuild_start", rebuild_id, "VM rebuild started");
+    info!(
+        event = "vm_rebuild_start",
+        rebuild_id,
+        rebuild_started_age_ms = 0_u64,
+        "VM rebuild started"
+    );
     maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
@@ -619,7 +654,9 @@ async fn begin_rfq_rebuild(
 
     info!(
         event = "rfq_rebuild_start",
-        rebuild_id, "RFQ rebuild started"
+        rebuild_id,
+        rebuild_started_age_ms = 0_u64,
+        "RFQ rebuild started"
     );
     maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_start", None, memory_cfg, true);
 
@@ -700,6 +737,7 @@ async fn finish_vm_rebuild(
         event = "vm_rebuild_success",
         rebuild_id = rebuild.rebuild_id,
         duration_ms,
+        rebuild_started_age_ms = duration_ms,
         "VM rebuild completed"
     );
     maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_success", None, memory_cfg, true);
@@ -723,6 +761,7 @@ async fn finish_rfq_rebuild(
         event = "rfq_rebuild_success",
         rebuild_id = rebuild.rebuild_id,
         duration_ms,
+        rebuild_started_age_ms = duration_ms,
         "RFQ rebuild completed"
     );
     maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_success", None, memory_cfg, true);

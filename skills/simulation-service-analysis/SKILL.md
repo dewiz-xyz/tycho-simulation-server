@@ -1,6 +1,6 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status health and native readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
   short-description: DSolver Simulator local analysis
 ---
@@ -24,13 +24,14 @@ metadata:
 ## What the analyzer does
 
 - Reuses the existing local server if it is already responding, otherwise starts it with the repo lifecycle scripts.
-- Waits for `/status`, including VM and RFQ readiness when those pool backends are enabled.
+- Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
 - Builds a narrow 2-hop `/encode` probe from live `/simulate` results.
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
+- Top-level `/status.status` is service health; `native_status` carries native readiness separately.
 
 ## Behavior model
 
@@ -59,6 +60,8 @@ Manual VM-ready wait when you want to confirm the service itself before rerunnin
 ```bash
 scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
+
+`scripts/wait_ready.sh` still waits for native readiness by default. Use the VM and RFQ flags only when those backends also matter.
 
 Manual RFQ-ready wait when RFQ pools are enabled:
 ```bash

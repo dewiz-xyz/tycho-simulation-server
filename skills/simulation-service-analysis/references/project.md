@@ -19,11 +19,11 @@
 
 ## Readiness
 - `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }`
-  - `503 Service Unavailable` with `{ "status": "warming_up", ... }`
-- RFQ-enabled Ethereum runs also expose RFQ readiness fields like `rfq_enabled`, `rfq_status`, and `rfq_pools`.
+  - `200 OK` with `{ "status": "ready", "native_status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }` when the service is healthy
+  - `503 Service Unavailable` with `{ "status": "warming_up", "native_status": "...", ... }` while no backend is ready yet
+- `native_status` carries native readiness; `vm_status` and `rfq_status` keep backend-specific readiness separate.
 - Cold starts can take several minutes (3–5+ mins; VM or RFQ pools can take up to roughly 10 minutes on a fresh warmup).
-- `scripts/wait_ready.sh --expect-chain-id <id>` is still the manual guard if you want to verify the running deployment directly.
+- `scripts/wait_ready.sh --expect-chain-id <id>` is still the manual guard if you want the native readiness gate directly.
 - When VM pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id <id> --require-vm-ready --timeout 600`.
 - When RFQ pools matter on Ethereum, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600`.
 - When both VM and RFQ backends matter on Ethereum, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600`.
@@ -32,7 +32,7 @@
 - Run the reporting-first analyzer:
   - `cargo run --bin sim-analysis -- --chain-id 1 --stop`
   - `cargo run --bin sim-analysis -- --chain-id 8453 --stop`
-- The analyzer starts or reuses the local server, waits for readiness, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` and `/encode` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
+- The analyzer starts or reuses the local server, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` and `/encode` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
 - Main artifacts:

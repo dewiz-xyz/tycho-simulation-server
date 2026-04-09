@@ -8,6 +8,8 @@ const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visib
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSnapshot {
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<String>,
     pub chain_id: u64,
     pub block: Option<u64>,
     pub pools: Option<u64>,
@@ -159,12 +161,26 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
     if report.readiness.initial.status != "ready" {
         findings.push(Finding {
             severity: "investigate".to_string(),
-            title: "Initial readiness was not ready".to_string(),
+            title: "Initial service health was not ready".to_string(),
             detail: format!(
-                "The analyzer began with /status={}. The run still proceeded, but the service state looked unstable at the start.",
-                report.readiness.initial.status
+                "The analyzer began with /status={} and native_status={}. The run still proceeded, but overall service health looked unstable at the start.",
+                report.readiness.initial.status,
+                display_status(report.readiness.initial.native_status.as_deref())
             ),
         });
+    }
+
+    if let Some(native_status) = report.readiness.initial.native_status.as_deref() {
+        if native_status != "ready" {
+            findings.push(Finding {
+                severity: "investigate".to_string(),
+                title: "Initial native readiness was not ready".to_string(),
+                detail: format!(
+                    "The analyzer saw native_status={} at the start of the run.",
+                    native_status
+                ),
+            });
+        }
     }
 
     if report.readiness.initial.vm_enabled
@@ -404,9 +420,10 @@ fn append_readiness_section(lines: &mut Vec<String>, report: &AnalysisReport) {
 
 fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &ReadinessSnapshot) {
     lines.push(format!(
-        "- {}: status={} block={} pools={} vm_status={} rfq_status={}",
+        "- {}: status={} native_status={} block={} pools={} vm_status={} rfq_status={}",
         label,
         snapshot.status,
+        display_status(snapshot.native_status.as_deref()),
         fmt_optional_u64(snapshot.block),
         fmt_optional_u64(snapshot.pools),
         readiness_component_status(snapshot.vm_enabled, snapshot.vm_status.as_deref()),
@@ -447,6 +464,10 @@ fn fmt_latency(value: Option<f64>) -> String {
 
 fn fmt_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn display_status(value: Option<&str>) -> &str {
+    value.unwrap_or("unknown")
 }
 
 fn fmt_protocols(protocols: &BTreeMap<String, usize>) -> String {
@@ -499,7 +520,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 2,
+            schema_version: 3,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
@@ -515,6 +536,7 @@ mod tests {
             readiness: ReadinessReport {
                 initial: ReadinessSnapshot {
                     status: "ready".to_string(),
+                    native_status: Some("ready".to_string()),
                     chain_id: 1,
                     block: Some(1),
                     pools: Some(10),
@@ -573,9 +595,15 @@ mod tests {
         analysis.readiness.initial.rfq_enabled = true;
         analysis.readiness.initial.rfq_status = Some("warming_up".to_string());
         analysis.readiness.initial.rfq_pools = Some(0);
+        analysis.readiness.initial.status = "warming_up".to_string();
+        analysis.readiness.initial.native_status = Some("ready".to_string());
 
         let findings = build_findings(&analysis);
 
+        assert!(findings.iter().any(|finding| {
+            finding.title == "Initial service health was not ready"
+                && finding.severity == "investigate"
+        }));
         assert!(findings.iter().any(|finding| {
             finding.title == "RFQ pools were enabled but not fully ready"
                 && finding.detail.contains("rfq_pools=0")
@@ -603,15 +631,20 @@ mod tests {
         let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
         analysis.readiness.initial.rfq_enabled = true;
         analysis.readiness.initial.rfq_status = Some("ready".to_string());
+        analysis.readiness.initial.native_status = Some("warming_up".to_string());
         analysis.readiness.final_state = Some(ReadinessSnapshot {
+            native_status: Some("ready".to_string()),
             rfq_enabled: true,
             rfq_status: Some("rebuilding".to_string()),
+            status: "ready".to_string(),
             ..analysis.readiness.initial.clone()
         });
 
         let summary = render_summary(&analysis);
 
+        assert!(summary.contains("status=ready native_status=warming_up"));
         assert!(summary.contains("vm_status=disabled rfq_status=ready"));
+        assert!(summary.contains("native_status=ready"));
         assert!(summary.contains("vm_status=disabled rfq_status=rebuilding"));
     }
 }

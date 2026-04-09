@@ -11,6 +11,7 @@ pub struct StreamHealth {
 
 #[derive(Debug, Default)]
 struct StreamHealthData {
+    started_at: Option<Instant>,
     last_update_at: Option<Instant>,
     last_block: u64,
     missing_block_burst: u64,
@@ -50,9 +51,10 @@ impl StreamHealth {
 
     pub async fn mark_started(&self) {
         let mut guard = self.inner.write().await;
-        if guard.last_update_at.is_none() {
-            guard.last_update_at = Some(Instant::now());
-        }
+        let now = Instant::now();
+        guard.started_at = Some(now);
+        guard.last_update_at = None;
+        guard.last_block = 0;
     }
 
     pub async fn record_update(&self, block: u64) {
@@ -157,6 +159,20 @@ impl StreamHealth {
     pub async fn set_last_error(&self, message: Option<String>) {
         let mut guard = self.inner.write().await;
         guard.last_error = message;
+    }
+
+    pub async fn started_age_ms(&self) -> Option<u64> {
+        let guard = self.inner.read().await;
+        guard.started_at.map(|instant| {
+            Instant::now()
+                .saturating_duration_since(instant)
+                .as_millis() as u64
+        })
+    }
+
+    pub async fn has_received_update(&self) -> bool {
+        let guard = self.inner.read().await;
+        guard.last_update_at.is_some()
     }
 
     pub async fn last_update_age_ms(&self) -> Option<u64> {

@@ -96,7 +96,7 @@ Common optional inputs:
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
-- `GET /status` reports native readiness, VM readiness, RFQ readiness, block progress, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
+- `GET /status` reports overall service health plus `native_status`, VM readiness, RFQ readiness, block progress, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
 
 `/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
@@ -162,8 +162,10 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 
 `GET /status` is the readiness source of truth:
 
-- `200 OK` with `status="ready"` when native state is ready and not stale
-- `503 Service Unavailable` with `status="warming_up"` while initial state is still loading or native updates are stale
+- `200 OK` with `status="ready"` when the service is healthy
+- `503 Service Unavailable` with `status="warming_up"` while no backend is ready yet
+- `native_status="ready"` when native state is ready and not stale
+- `native_status="warming_up"` while initial native state is still loading or native updates are stale
 
 `vm_status` and `rfq_status` are one of:
 
@@ -204,7 +206,7 @@ cargo run --bin sim-analysis -- --chain-id 8453 --stop
 Useful helpers:
 
 - `scripts/start_server.sh` to start the server with repo-local PID and log files
-- `scripts/wait_ready.sh` to poll `/status` and enforce chain, VM, and RFQ readiness expectations
+- `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
 - `scripts/stop_server.sh` to stop a server started by the repo helper
 - `cargo run --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 

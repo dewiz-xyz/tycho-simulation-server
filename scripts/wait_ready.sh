@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>] [--expect-chain-id <id>] [--require-vm-ready] [--require-vm-pools-min <count>] [--require-rfq-ready] [--require-rfq-pools-min <count>]
 
-Poll the /status endpoint until it returns ready or times out.
+Poll the /status endpoint until native readiness is ready or times out.
 
 Options:
   --url                  Status URL (default: http://localhost:3000/status)
@@ -108,7 +108,7 @@ if expected_chain is not None:
 if status_code != "200":
     raise SystemExit(2)
 
-if payload.get("status") != "ready":
+if payload.get("native_status") != "ready":
     raise SystemExit(2)
 
 if require_vm:

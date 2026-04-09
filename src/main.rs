@@ -340,6 +340,7 @@ fn build_supervisor_config(
     config: &dsolver_simulator::config::AppConfig,
 ) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
+        readiness_stale: Duration::from_secs(config.readiness_stale_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -653,7 +654,7 @@ mod tests {
             stream_restart_backoff_min_ms: 500,
             stream_restart_backoff_max_ms: 30_000,
             stream_restart_backoff_jitter_pct: 0.2,
-            readiness_stale_secs: 120,
+            readiness_stale_secs: 300,
             slippage: SlippageConfig::default(),
             memory: MemoryConfig {
                 purge_enabled: true,

@@ -9,6 +9,7 @@ pub struct StatusPayload {
     chain_id: u64,
     block: u64,
     pools: usize,
+    native_status: &'static str,
     vm_enabled: bool,
     vm_status: &'static str,
     vm_block: u64,
@@ -71,9 +72,17 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
     };
     let vm_last_update_age_ms = state.vm_update_age_ms().await;
     let rfq_last_update_age_ms = state.rfq_update_age_ms().await;
-    let status = native_readiness.label();
+    let native_status = native_readiness.label();
+    let service_is_ready = matches!(native_readiness, NativeReadiness::Ready)
+        || matches!(vm_readiness, VmReadiness::Ready)
+        || matches!(rfq_readiness, RfqReadiness::Ready);
+    let status = if service_is_ready {
+        "ready"
+    } else {
+        "warming_up"
+    };
 
-    let status_code = if matches!(native_readiness, NativeReadiness::Ready) {
+    let status_code = if service_is_ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -86,6 +95,7 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
             chain_id: state.chain.id(),
             block,
             pools,
+            native_status,
             vm_enabled,
             vm_status,
             vm_block,
@@ -274,23 +284,50 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(payload.status, "warming_up");
+        assert_eq!(payload.native_status, "warming_up");
     }
 
     #[tokio::test]
-    async fn status_reports_vm_and_rfq_rebuilding() {
+    async fn status_is_ready_when_vm_is_ready_even_if_native_is_not() {
         let state = test_state(true, true);
+        let vm_component = ProtocolComponent::new(
+            address(4),
+            "vm:curve".to_string(),
+            "curve_pool".to_string(),
+            Chain::Ethereum,
+            vec![token(5, "TKNA"), token(6, "TKNB")],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        state
+            .vm_state_store
+            .apply_update(Update::new(
+                1,
+                HashMap::from([(
+                    "pool-vm".to_string(),
+                    Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([("pool-vm".to_string(), vm_component)]),
+            ))
+            .await;
+        state.vm_stream_health.record_update(1).await;
         {
             let mut vm_status = state.vm_stream.write().await;
-            vm_status.rebuilding = true;
+            vm_status.rebuilding = false;
         }
         {
             let mut rfq_status = state.rfq_stream.write().await;
             rfq_status.rebuilding = true;
         }
 
-        let (_, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+        let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
-        assert_eq!(payload.vm_status, "rebuilding");
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(payload.status, "ready");
+        assert_eq!(payload.native_status, "warming_up");
+        assert_eq!(payload.vm_status, "ready");
         assert!(payload.rfq_enabled);
         assert_eq!(payload.rfq_status, "rebuilding");
     }

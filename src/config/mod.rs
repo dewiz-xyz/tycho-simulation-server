@@ -395,7 +395,7 @@ fn load_stream_config() -> StreamConfig {
         parse_env_or_default("STREAM_RESTART_BACKOFF_MAX_MS", "30000");
     let stream_restart_backoff_jitter_pct =
         parse_env_or_default("STREAM_RESTART_BACKOFF_JITTER_PCT", "0.2");
-    let readiness_stale_secs = parse_env_or_default("READINESS_STALE_SECS", "120");
+    let readiness_stale_secs = parse_env_or_default("READINESS_STALE_SECS", "300");
 
     assert!(stream_stale_secs > 0, "STREAM_STALE_SECS must be > 0");
     assert!(

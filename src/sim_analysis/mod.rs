@@ -16,6 +16,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, EncodeErrorResponse, HopDraft, InteractionKind, PoolRef,
@@ -38,7 +39,7 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 2;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 3;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
@@ -406,6 +407,13 @@ async fn ensure_server_ready(
         let mut snapshot = fetch_readiness_snapshot(client, &status_url)
             .await
             .context("failed to fetch readiness after wait_ready")?;
+
+        if !snapshot_native_ready(&snapshot) {
+            wait_for_native_readiness(client, &status_url, args.chain_id).await?;
+            snapshot = fetch_readiness_snapshot(client, &status_url)
+                .await
+                .context("failed to fetch readiness after native wait")?;
+        }
 
         let require_vm = snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready");
         let require_rfq = snapshot.rfq_enabled && snapshot.rfq_status.as_deref() != Some("ready");
@@ -1399,6 +1407,65 @@ fn wait_for_readiness(
     };
     let args = build_wait_ready_args(status_url, timeout_secs, chain_id, require_vm, require_rfq);
     run_script(&scripts.wait_ready, &args).map(|_| ())
+}
+
+async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS);
+    #[expect(unused_assignments)]
+    let mut last_observation = String::new();
+    #[expect(unused_assignments)]
+    let mut saw_observation = false;
+
+    loop {
+        match fetch_readiness_snapshot(client, status_url).await {
+            Ok(snapshot) => {
+                if snapshot.chain_id != chain_id {
+                    bail!(
+                        "server at {} reported chain_id={} while waiting for native readiness (expected {})",
+                        status_url,
+                        snapshot.chain_id,
+                        chain_id
+                    );
+                }
+                if snapshot_native_ready(&snapshot) {
+                    return Ok(());
+                }
+                last_observation = format!(
+                    "status={} native_status={}",
+                    snapshot.status,
+                    snapshot.native_status.as_deref().unwrap_or("unknown")
+                );
+                saw_observation = true;
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                saw_observation = true;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let suffix = if saw_observation {
+                format!(": last observation {last_observation}")
+            } else {
+                String::new()
+            };
+            bail!(
+                "timed out waiting for native readiness at {}{}",
+                status_url,
+                suffix
+            );
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn snapshot_native_ready(snapshot: &ReadinessSnapshot) -> bool {
+    snapshot
+        .native_status
+        .as_deref()
+        .unwrap_or(snapshot.status.as_str())
+        == "ready"
 }
 
 fn build_wait_ready_args(
