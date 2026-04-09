@@ -11,7 +11,7 @@ metadata:
 
 1. Confirm the repo root (expect `Cargo.toml` and `src/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
-   For RFQ analysis on Ethereum or Base with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+   RFQ feeds default to off. For RFQ analysis on Ethereum or Base, set `ENABLE_RFQ_POOLS=true` and also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash

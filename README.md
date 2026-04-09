@@ -85,8 +85,8 @@ Common optional inputs:
 
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
-- `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds
-- `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY` only when RFQ feeds are enabled
+- `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds (defaults to `false`)
+- `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY` only when `ENABLE_RFQ_POOLS=true`
 - `HOST` and `PORT` to change the bind address
 - timeout, concurrency, and stream-health knobs from `src/config/mod.rs`
 
