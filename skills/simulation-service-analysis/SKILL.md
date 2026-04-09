@@ -11,8 +11,7 @@ metadata:
 
 1. Confirm the repo root (expect `Cargo.toml` and `src/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
-   For Ethereum RFQ analysis with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
-   Base does not need RFQ credentials today because no RFQ protocols are configured for `CHAIN_ID=8453`.
+   For RFQ analysis on Ethereum or Base with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
@@ -61,9 +60,9 @@ Manual VM-ready wait when you want to confirm the service itself before rerunnin
 scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
 
-Manual RFQ-ready wait for Ethereum when RFQ pools are enabled:
+Manual RFQ-ready wait when RFQ pools are enabled:
 ```bash
-scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 8453 --require-rfq-ready --timeout 600
 ```
 
 Manual combined VM and RFQ wait for Ethereum when both backends matter:
