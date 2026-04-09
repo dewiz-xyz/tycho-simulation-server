@@ -825,6 +825,11 @@ impl QuoteRequestRunner {
         let quote_deadline = Instant::now() + self.quote_timeout;
         let expected_len = amounts_in.len();
         let mut candidates = self.load_candidate_sets(pair).await;
+        candidates.rfq_candidates = filter_hashflow_directional_rfq_candidates(
+            candidates.rfq_candidates,
+            &token_in_ref,
+            &token_out_ref,
+        );
         self.prepare_candidate_metadata(
             &pair.token_in_address,
             &pair.token_out_address,
@@ -1374,6 +1379,71 @@ fn simulation_tokens_for_pool(
     )
 }
 
+fn filter_hashflow_directional_rfq_candidates(
+    candidates: Vec<CandidatePool>,
+    request_token_in: &Token,
+    request_token_out: &Token,
+) -> Vec<CandidatePool> {
+    candidates
+        .into_iter()
+        .filter(|(pool_id, _, component)| {
+            if !is_hashflow_component(component.as_ref()) {
+                return true;
+            }
+
+            if hashflow_candidate_matches_direction(request_token_in, request_token_out, component)
+            {
+                return true;
+            }
+
+            let (sim_token_in, sim_token_out) =
+                simulation_tokens_for_pool(request_token_in, request_token_out, component);
+            let expected_token_in = component
+                .tokens
+                .first()
+                .map(|token| token.address.to_string());
+            let expected_token_out = component
+                .tokens
+                .get(1)
+                .map(|token| token.address.to_string());
+            debug!(
+                scope = "hashflow_direction_filter",
+                pool_id = %pool_id,
+                protocol = component.protocol_system.as_str(),
+                requested_token_in = %request_token_in.address,
+                requested_token_out = %request_token_out.address,
+                simulation_token_in = %sim_token_in.address,
+                simulation_token_out = %sim_token_out.address,
+                expected_token_in = ?expected_token_in,
+                expected_token_out = ?expected_token_out,
+                "Skipping Hashflow RFQ candidate whose stored direction does not match request"
+            );
+            false
+        })
+        .collect()
+}
+
+fn hashflow_candidate_matches_direction(
+    request_token_in: &Token,
+    request_token_out: &Token,
+    component: &ProtocolComponent,
+) -> bool {
+    let Some(expected_token_in) = component.tokens.first() else {
+        return false;
+    };
+    let Some(expected_token_out) = component.tokens.get(1) else {
+        return false;
+    };
+
+    // Hashflow pools are directional, so only keep candidates whose ordered pool
+    // tokens line up with the remapped simulation direction for this request.
+    let (sim_token_in, sim_token_out) =
+        simulation_tokens_for_pool(request_token_in, request_token_out, component);
+
+    sim_token_in.address == expected_token_in.address
+        && sim_token_out.address == expected_token_out.address
+}
+
 fn simulation_tokens_for_pool_with_remap_log(
     request_token_in: &Token,
     request_token_out: &Token,
@@ -1427,6 +1497,10 @@ fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolCompo
     }
 
     request_token.clone()
+}
+
+fn is_hashflow_component(component: &ProtocolComponent) -> bool {
+    component.protocol_system == "rfq:hashflow" || component.protocol_type_name == "hashflow_pool"
 }
 
 fn is_direct_native_wrapped_pair(
@@ -3213,36 +3287,7 @@ mod tests {
 
     async fn make_vm_unavailable_fixture(enable_vm_pools: bool) -> (AppState, AmountOutRequest) {
         let fixture = BasicQuoteFixture::new();
-        let ready_token_a =
-            Bytes::from_str("0x0000000000000000000000000000000000000003").expect("valid address");
-        let ready_token_b =
-            Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
-        let mut ready_states = HashMap::new();
-        let mut ready_pairs = HashMap::new();
-        insert_pool_state(
-            &mut ready_states,
-            &mut ready_pairs,
-            "pool-ready",
-            if enable_vm_pools {
-                "0x0000000000000000000000000000000000000010"
-            } else {
-                "0x0000000000000000000000000000000000000009"
-            },
-            "uniswap_v2",
-            "uniswap_v2",
-            vec![
-                make_token(&ready_token_a, "RDY1"),
-                make_token(&ready_token_b, "RDY2"),
-            ],
-            Box::new(LimitCountingSim {
-                max_in: BigUint::from(1u8),
-                calls: default_calls(),
-            }),
-        );
-        fixture
-            .native_state_store
-            .apply_update(Update::new(1, ready_states, ready_pairs))
-            .await;
+        prime_ready_native_store(&fixture.native_state_store).await;
 
         let app_state = make_test_app_state(
             Arc::clone(&fixture.token_store),
@@ -3266,6 +3311,35 @@ mod tests {
 
         (app_state, request)
     }
+
+    async fn prime_ready_native_store(state_store: &Arc<StateStore>) {
+        let ready_token_a =
+            Bytes::from_str("0x0000000000000000000000000000000000000003").expect("valid address");
+        let ready_token_b =
+            Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
+        let mut ready_states = HashMap::new();
+        let mut ready_pairs = HashMap::new();
+        insert_pool_state(
+            &mut ready_states,
+            &mut ready_pairs,
+            "pool-ready",
+            "0x0000000000000000000000000000000000000010",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![
+                make_token(&ready_token_a, "RDY1"),
+                make_token(&ready_token_b, "RDY2"),
+            ],
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(1_000u32),
+                calls: default_calls(),
+            }),
+        );
+        state_store
+            .apply_update(Update::new(1, ready_states, ready_pairs))
+            .await;
+    }
+
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct StrictPairTokenSim {
         expected_sell: Bytes,
@@ -4094,6 +4168,234 @@ mod tests {
         assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.metrics.scheduled_vm_pools, 1);
         assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_filters_wrong_direction_hashflow_candidate_before_simulation() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000101").expect("valid address");
+        let token_out = wrapped_native.clone();
+
+        let token_in_meta = make_token_with_decimals(&token_in, "USDC", 6);
+        let token_out_meta = make_token_with_decimals(&token_out, "WETH", 18);
+        let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(Arc::clone(&token_store));
+        prime_ready_native_store(&native_state_store).await;
+
+        let hashflow_limit_calls = Arc::new(AtomicUsize::new(0));
+        let hashflow_quote_calls = Arc::new(AtomicUsize::new(0));
+        let bebop_limit_calls = Arc::new(AtomicUsize::new(0));
+        let bebop_quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut rfq_states = HashMap::new();
+        let mut rfq_pairs = HashMap::new();
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-hashflow-reversed",
+            "0x0000000000000000000000000000000000000105",
+            "rfq:hashflow",
+            "hashflow_pool",
+            vec![token_out_meta.clone(), token_in_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_out.clone(),
+                expected_buy: token_in.clone(),
+                limit_calls: Arc::clone(&hashflow_limit_calls),
+                quote_calls: Arc::clone(&hashflow_quote_calls),
+            }),
+        );
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-bebop",
+            "0x0000000000000000000000000000000000000106",
+            "rfq:bebop",
+            "bebop_pool",
+            vec![token_in_meta.clone(), token_out_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&bebop_limit_calls),
+                quote_calls: Arc::clone(&bebop_quote_calls),
+            }),
+        );
+        rfq_state_store
+            .apply_update(Update::new(2, rfq_states, rfq_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = make_amount_out_request(
+            "req-rfq-hashflow-direction-filter",
+            &token_in.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 1);
+        assert_eq!(hashflow_limit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hashflow_quote_calls.load(Ordering::SeqCst), 0);
+        assert!(bebop_limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(bebop_quote_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "rfq-bebop");
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_correct_direction_hashflow_candidate() {
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000111").expect("valid address");
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000112").expect("valid address");
+
+        let token_in_meta = make_token_with_decimals(&token_in, "WETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "USDC", 6);
+        let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(Arc::clone(&token_store));
+        prime_ready_native_store(&native_state_store).await;
+
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut rfq_states = HashMap::new();
+        let mut rfq_pairs = HashMap::new();
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-hashflow",
+            "0x0000000000000000000000000000000000000116",
+            "rfq:hashflow",
+            "hashflow_pool",
+            vec![token_in_meta.clone(), token_out_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        rfq_state_store
+            .apply_update(Update::new(2, rfq_states, rfq_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = make_amount_out_request(
+            "req-rfq-hashflow-correct-direction",
+            &token_in.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 1);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "rfq-hashflow");
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_keeps_hashflow_candidate_after_native_wrapped_remap() {
+        let native = Chain::Ethereum.native_token().address;
+        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let token_out =
+            Bytes::from_str("0x0000000000000000000000000000000000000121").expect("valid address");
+
+        let native_meta = make_token_with_decimals(&native, "ETH", 18);
+        let wrapped_meta = make_token_with_decimals(&wrapped, "WETH", 18);
+        let token_out_meta = make_token_with_decimals(&token_out, "USDC", 6);
+        let token_store = make_token_store(vec![
+            native_meta.clone(),
+            wrapped_meta.clone(),
+            token_out_meta.clone(),
+        ]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(Arc::clone(&token_store));
+        prime_ready_native_store(&native_state_store).await;
+
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut rfq_states = HashMap::new();
+        let mut rfq_pairs = HashMap::new();
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-hashflow-native-remap",
+            "0x0000000000000000000000000000000000000125",
+            "rfq:hashflow",
+            "hashflow_pool",
+            vec![wrapped_meta.clone(), token_out_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: wrapped.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        rfq_state_store
+            .apply_update(Update::new(2, rfq_states, rfq_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = make_amount_out_request(
+            "req-rfq-hashflow-native-remap",
+            &native.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 1);
+        assert!(limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "rfq-hashflow-native-remap");
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
         assert!(computation.meta.failures.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
