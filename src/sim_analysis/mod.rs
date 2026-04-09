@@ -2509,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_profile_only_marks_ethereum_scenarios_as_rfq_targeted() {
+    fn balanced_profile_marks_base_and_ethereum_scenarios_as_rfq_targeted() {
         let ethereum_profile_result = balanced_profile(1, false);
         assert!(ethereum_profile_result.is_ok());
         let Some(ethereum_profile) = ethereum_profile_result.ok() else {
@@ -2528,6 +2528,6 @@ mod tests {
         assert!(base_profile
             .simulate_scenarios
             .iter()
-            .all(|scenario| !scenario.expect_rfq_visibility));
+            .any(|scenario| scenario.expect_rfq_visibility));
     }
 }

@@ -85,12 +85,12 @@ pub(super) fn token_store_with_tokens(tokens: impl IntoIterator<Item = Token>) -
 }
 
 pub(super) fn test_state_stores(
-    token_store: &Arc<TokenStore>,
+    token_store: Arc<TokenStore>,
 ) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
     (
-        Arc::new(StateStore::new(Arc::clone(token_store))),
-        Arc::new(StateStore::new(Arc::clone(token_store))),
-        Arc::new(StateStore::new(Arc::clone(token_store))),
+        Arc::new(StateStore::new(Arc::clone(&token_store))),
+        Arc::new(StateStore::new(Arc::clone(&token_store))),
+        Arc::new(StateStore::new(token_store)),
     )
 }
 

@@ -49,6 +49,7 @@ const BASE_TOKENS: &[(&str, &str)] = &[
     ("ETH", "0x0000000000000000000000000000000000000000"),
     ("WETH", "0x4200000000000000000000000000000000000006"),
     ("USDC", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+    ("AERO", "0x940181a94a35a4569e4529a3cdfb74e38fd98631"),
     ("DAI", "0x50c5725949a6f0c72e6c4a641f24049a917db0cb"),
 ];
 
@@ -247,14 +248,14 @@ fn ethereum_encode_preset() -> EncodePreset {
 
 fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
     vec![
-        scenario(
+        rfq_scenario(
             "stable-usdc-weth",
             "USDC",
             "WETH",
             STABLE_AMOUNTS,
             &["base-core"],
         ),
-        scenario(
+        rfq_scenario(
             "stable-weth-usdc",
             "WETH",
             "USDC",
@@ -269,18 +270,18 @@ fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             &["native"],
         ),
         scenario(
-            "stable-dai-usdc",
-            "DAI",
+            "governance-aero-usdc",
+            "AERO",
             "USDC",
-            STABLE_AMOUNTS,
-            &["stables"],
+            LINK_AMOUNTS,
+            &["governance"],
         ),
         scenario(
-            "stable-usdc-dai",
+            "governance-usdc-aero",
             "USDC",
-            "DAI",
+            "AERO",
             STABLE_AMOUNTS,
-            &["stables"],
+            &["governance"],
         ),
     ]
 }
@@ -302,10 +303,10 @@ fn base_latency_scenarios() -> Vec<SimulateScenarioPreset> {
             &["latency"],
         ),
         scenario(
-            "latency-dai-usdc",
-            "DAI",
+            "latency-aero-usdc",
+            "AERO",
             "USDC",
-            STABLE_AMOUNTS,
+            LINK_AMOUNTS,
             &["latency"],
         ),
     ]
@@ -387,13 +388,14 @@ fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
     match tags {
         ["stables"] => &["stables", "rfq-targeted"],
         ["native"] => &["native", "rfq-targeted"],
+        ["base-core"] => &["base-core", "rfq-targeted"],
         _ => &["rfq-targeted"],
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::balanced_profile;
+    use super::{balanced_profile, LINK_AMOUNTS, STABLE_AMOUNTS};
 
     #[test]
     fn ethereum_balanced_profile_includes_rfq_targeted_scenarios() {
@@ -415,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn base_balanced_profile_has_no_rfq_targeted_scenarios() {
+    fn base_balanced_profile_includes_rfq_targeted_scenarios() {
         let profile_result = balanced_profile(8453, false);
         assert!(profile_result.is_ok());
         let Some(profile) = profile_result.ok() else {
@@ -425,6 +427,58 @@ mod tests {
         assert!(profile
             .simulate_scenarios
             .iter()
-            .all(|scenario| !scenario.expect_rfq_visibility));
+            .any(|scenario| scenario.expect_rfq_visibility));
+        assert!(profile
+            .simulate_scenarios
+            .iter()
+            .filter(|scenario| scenario.expect_rfq_visibility)
+            .all(|scenario| scenario.tags.contains(&"rfq-targeted")));
+
+        assert!(matches!(
+            profile
+                .simulate_scenarios
+                .iter()
+                .find(|scenario| scenario.label == "governance-aero-usdc"),
+            Some(scenario)
+                if scenario.token_in_symbol == "AERO"
+                    && scenario.token_out_symbol == "USDC"
+                    && scenario.amounts == LINK_AMOUNTS
+                    && scenario.tags.contains(&"governance")
+        ));
+
+        assert!(matches!(
+            profile
+                .simulate_scenarios
+                .iter()
+                .find(|scenario| scenario.label == "governance-usdc-aero"),
+            Some(scenario)
+                if scenario.token_in_symbol == "USDC"
+                    && scenario.token_out_symbol == "AERO"
+                    && scenario.amounts == STABLE_AMOUNTS
+                    && scenario.tags.contains(&"governance")
+        ));
+
+        assert!(matches!(
+            profile
+                .latency_scenarios
+                .iter()
+                .find(|scenario| scenario.label == "latency-aero-usdc"),
+            Some(scenario)
+                if scenario.token_in_symbol == "AERO"
+                    && scenario.token_out_symbol == "USDC"
+                    && scenario.amounts == LINK_AMOUNTS
+        ));
+
+        assert!(!profile
+            .simulate_scenarios
+            .iter()
+            .chain(profile.latency_scenarios.iter())
+            .any(|scenario| {
+                matches!(
+                    scenario.label,
+                    "stable-dai-usdc" | "stable-usdc-dai" | "latency-dai-usdc"
+                ) || scenario.token_in_symbol == "DAI"
+                    || scenario.token_out_symbol == "DAI"
+            }));
     }
 }

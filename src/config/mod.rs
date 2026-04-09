@@ -47,12 +47,13 @@ pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
     "aerodrome_slipstreams",
 ];
 pub(crate) const BASE_VM_PROTOCOLS: &[&str] = &[];
-pub(crate) const BASE_RFQ_PROTOCOLS: &[&str] = &[];
+pub(crate) const BASE_RFQ_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow"];
 
 /// Get the default Bebop URL for the given chain.
 pub fn get_default_bebop_url(chain: &Chain) -> Option<String> {
     match chain {
         Chain::Ethereum => Some("https://api.bebop.xyz/pmm/ethereum/v3/tokens".to_string()),
+        Chain::Base => Some("https://api.bebop.xyz/pmm/base/v3/tokens".to_string()),
         _ => None,
     }
 }
@@ -60,7 +61,7 @@ pub fn get_default_bebop_url(chain: &Chain) -> Option<String> {
 /// Get the default Hashflow Filename for the given chain.
 pub fn get_default_hashflow_filename(chain: &Chain) -> Option<String> {
     match chain {
-        Chain::Ethereum => Some("./hashflow_supported_tokens.csv".to_string()),
+        Chain::Ethereum | Chain::Base => Some("./hashflow_supported_tokens.csv".to_string()),
         _ => None,
     }
 }
@@ -642,7 +643,8 @@ mod tests {
             .contains(&"aerodrome_slipstreams".to_string()));
         assert_eq!(profile.native_protocols.len(), 5);
         assert!(profile.vm_protocols.is_empty());
-        assert!(profile.rfq_protocols.is_empty());
+        assert!(profile.rfq_protocols.contains(&"rfq:bebop".to_string()));
+        assert!(profile.rfq_protocols.contains(&"rfq:hashflow".to_string()));
         assert!(profile.native_token_protocol_allowlist.is_empty());
         assert!(profile.reset_allowance_tokens.is_empty());
     }
@@ -672,13 +674,46 @@ mod tests {
     }
 
     #[test]
+    fn hosted_bebop_url_uses_ethereum_default() {
+        let Ok(url) = hosted_bebop_url(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Bebop URL");
+        };
+        assert_eq!(url, "https://api.bebop.xyz/pmm/ethereum/v3/tokens");
+    }
+
+    #[test]
+    fn hosted_bebop_url_uses_base_default() {
+        let Ok(url) = hosted_bebop_url(Chain::Base) else {
+            unreachable!("expected base hosted Bebop URL");
+        };
+        assert_eq!(url, "https://api.bebop.xyz/pmm/base/v3/tokens");
+    }
+
+    #[test]
+    fn hosted_hashflow_filename_uses_ethereum_default() {
+        let Ok(filename) = hosted_hashflow_filename(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Hashflow filename");
+        };
+        assert_eq!(filename, "./hashflow_supported_tokens.csv");
+    }
+
+    #[test]
+    fn hosted_hashflow_filename_uses_base_default() {
+        let Ok(filename) = hosted_hashflow_filename(Chain::Base) else {
+            unreachable!("expected base hosted Hashflow filename");
+        };
+        assert_eq!(filename, "./hashflow_supported_tokens.csv");
+    }
+
+    #[test]
     fn rfq_effectively_enabled_requires_flag_and_protocols() {
         let ethereum = ethereum_profile();
         let base = base_profile();
 
         assert!(rfq_effectively_enabled(true, &ethereum));
         assert!(!rfq_effectively_enabled(false, &ethereum));
-        assert!(!rfq_effectively_enabled(true, &base));
+        assert!(rfq_effectively_enabled(true, &base));
+        assert!(!rfq_effectively_enabled(false, &base));
     }
 
     #[test]

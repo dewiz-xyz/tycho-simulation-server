@@ -414,7 +414,7 @@ async fn build_fixture_stores(
 }
 
 async fn ensure_native_store_ready(
-    native_state_store: &Arc<StateStore>,
+    native_state_store: &StateStore,
     fixture_tokens: &FixtureTokens,
 ) -> Result<()> {
     if native_state_store.is_ready() {
