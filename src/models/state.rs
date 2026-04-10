@@ -329,15 +329,19 @@ impl AppState {
             return Some(entry);
         }
 
-        if let Some(entry) = self.vm_state_store.pool_by_id(id).await {
-            return Some(entry);
+        // Route hints can miss VM/RFQ backends, so pool lookup needs to enforce the same
+        // encode-readiness boundary before exposing state from those stores.
+        if matches!(self.vm_readiness().await, VmReadiness::Ready) {
+            if let Some(entry) = self.vm_state_store.pool_by_id(id).await {
+                return Some(entry);
+            }
         }
 
-        if !self.vm_ready().await && !self.rfq_ready().await {
-            return None;
+        if matches!(self.rfq_readiness().await, RfqReadiness::Ready) {
+            return self.rfq_state_store.pool_by_id(id).await;
         }
 
-        self.rfq_state_store.pool_by_id(id).await
+        None
     }
 
     pub async fn vm_ready(&self) -> bool {
@@ -1415,6 +1419,79 @@ mod tests {
                 .await,
             EncodeAvailability::NativeWarmingUp
         );
+    }
+
+    #[tokio::test]
+    async fn pool_by_id_only_exposes_encode_ready_vm_and_rfq_entries() {
+        let mut state = build_readiness_test_state(true, true).await;
+
+        state
+            .vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    36,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state
+            .rfq_state_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                mk_component(
+                    37,
+                    "rfq:hashflow",
+                    "hashflow_pool",
+                    vec![mk_token(36, "TKNA"), mk_token(37, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        state.vm_stream_health.record_update(1).await;
+        state.rfq_stream_health.record_update(1).await;
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
+        assert!(state.pool_by_id("pool-vm").await.is_some());
+        assert!(state.pool_by_id("pool-rfq").await.is_some());
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = true;
+        }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = true;
+        }
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
+        assert!(state.pool_by_id("pool-vm").await.is_none());
+        assert!(state.pool_by_id("pool-rfq").await.is_none());
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = false;
+        }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = false;
+        }
+
+        assert!(state.pool_by_id("pool-vm").await.is_some());
+        assert!(state.pool_by_id("pool-rfq").await.is_some());
+
+        state.readiness_stale = Duration::ZERO;
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
+        assert!(state.pool_by_id("pool-vm").await.is_none());
+        assert!(state.pool_by_id("pool-rfq").await.is_none());
     }
 
     #[test]
