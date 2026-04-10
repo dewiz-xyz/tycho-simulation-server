@@ -1435,6 +1435,10 @@ fn hashflow_candidate_matches_direction(
         return false;
     };
 
+    // TODO: Keep this directional gate until upstream Hashflow support grows a
+    // proper two-sided quote path. Tycho explicitly chose not to swap
+    // directions during Hashflow simulation here:
+    // https://github.com/propeller-heads/tycho-simulation/commit/d09bfe62ba4e333949f194d9497bd7557e59037f
     // Hashflow pools are directional, so only keep candidates whose ordered pool
     // tokens line up with the remapped simulation direction for this request.
     let (sim_token_in, sim_token_out) =
