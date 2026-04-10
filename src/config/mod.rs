@@ -296,6 +296,10 @@ pub fn hosted_bebop_url(chain: Chain) -> Result<String, String> {
 
 /// Resolve the hosted Hashflow endpoint for a supported runtime chain.
 pub fn hosted_hashflow_filename(chain: Chain) -> Result<String, String> {
+    if let Some(filename) = optional_trimmed_env("HASHFLOW_FILENAME_CSV") {
+        return Ok(filename);
+    }
+
     get_default_hashflow_filename(&chain)
         .ok_or_else(|| format!("No default Hashflow URL configured for supported chain {chain}"))
 }
@@ -703,6 +707,21 @@ mod tests {
             unreachable!("expected base hosted Hashflow filename");
         };
         assert_eq!(filename, "./hashflow_supported_tokens.csv");
+    }
+
+    #[test]
+    fn hosted_hashflow_filename_prefers_env_override() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("HASHFLOW_FILENAME_CSV", "/tmp/hashflow.csv");
+
+        let Ok(filename) = hosted_hashflow_filename(Chain::Base) else {
+            unreachable!("expected base hosted Hashflow filename");
+        };
+
+        std::env::remove_var("HASHFLOW_FILENAME_CSV");
+        assert_eq!(filename, "/tmp/hashflow.csv");
     }
 
     #[test]
