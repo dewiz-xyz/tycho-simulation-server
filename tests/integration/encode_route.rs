@@ -975,6 +975,33 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn encode_route_rejects_misclassified_vm_route_when_vm_is_stale() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "maverick_v2",
+        component_protocol_system: "vm:maverick_v2",
+        component_protocol_type_name: "maverick_v2",
+        vm_pool: true,
+        enable_vm_pools: true,
+        request_id: "req-vm-stale-misclassified",
+        ..EncodeFixtureConfig::default()
+    };
+    let (mut state, request) = build_app_state_and_request(config).await?;
+    state.readiness_stale = Duration::from_millis(1);
+    tokio::time::advance(Duration::from_millis(2)).await;
+    state.native_stream_health.record_update(42).await;
+    let app = create_router(state);
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state stale for requested route"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn encode_route_keeps_validation_precedence_over_readiness_failures() -> Result<()> {
     let config = EncodeFixtureConfig {

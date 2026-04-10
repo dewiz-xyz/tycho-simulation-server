@@ -324,24 +324,38 @@ impl AppState {
         Arc::clone(&self.rfq_sim_semaphore)
     }
 
-    pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
-        if let Some(entry) = self.native_state_store.pool_by_id(id).await {
-            return Some(entry);
+    pub async fn pool_by_id(&self, id: &str) -> Result<Option<PoolEntry>, EncodeAvailability> {
+        if self.native_state_store.has_pool(id).await {
+            return match self.native_readiness().await {
+                NativeReadiness::Ready => Ok(self.native_state_store.pool_by_id(id).await),
+                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
+                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
+            };
         }
 
-        // Route hints can miss VM/RFQ backends, so pool lookup needs to enforce the same
-        // encode-readiness boundary before exposing state from those stores.
-        if matches!(self.vm_readiness().await, VmReadiness::Ready) {
-            if let Some(entry) = self.vm_state_store.pool_by_id(id).await {
-                return Some(entry);
-            }
+        // Route hints can miss VM/RFQ backends, so encode lookup needs the actual backend
+        // readiness here to distinguish "unavailable" from "pool not found".
+        if self.vm_state_store.has_pool(id).await {
+            return match self.vm_readiness().await {
+                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
+                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
+                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
+                VmReadiness::Ready => Ok(self.vm_state_store.pool_by_id(id).await),
+                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
+            };
         }
 
-        if matches!(self.rfq_readiness().await, RfqReadiness::Ready) {
-            return self.rfq_state_store.pool_by_id(id).await;
+        if self.rfq_state_store.has_pool(id).await {
+            return match self.rfq_readiness().await {
+                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
+                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
+                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
+                RfqReadiness::Ready => Ok(self.rfq_state_store.pool_by_id(id).await),
+                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
+            };
         }
 
-        None
+        Ok(None)
     }
 
     pub async fn vm_ready(&self) -> bool {
@@ -1457,8 +1471,8 @@ mod tests {
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
-        assert!(state.pool_by_id("pool-vm").await.is_some());
-        assert!(state.pool_by_id("pool-rfq").await.is_some());
+        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
+        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
         {
             let mut vm_status = state.vm_stream.write().await;
@@ -1471,8 +1485,14 @@ mod tests {
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
-        assert!(state.pool_by_id("pool-vm").await.is_none());
-        assert!(state.pool_by_id("pool-rfq").await.is_none());
+        assert!(matches!(
+            state.pool_by_id("pool-vm").await,
+            Err(EncodeAvailability::VmRebuilding)
+        ));
+        assert!(matches!(
+            state.pool_by_id("pool-rfq").await,
+            Err(EncodeAvailability::RfqRebuilding)
+        ));
 
         {
             let mut vm_status = state.vm_stream.write().await;
@@ -1483,15 +1503,21 @@ mod tests {
             rfq_status.rebuilding = false;
         }
 
-        assert!(state.pool_by_id("pool-vm").await.is_some());
-        assert!(state.pool_by_id("pool-rfq").await.is_some());
+        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
+        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
         state.readiness_stale = Duration::ZERO;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
-        assert!(state.pool_by_id("pool-vm").await.is_none());
-        assert!(state.pool_by_id("pool-rfq").await.is_none());
+        assert!(matches!(
+            state.pool_by_id("pool-vm").await,
+            Err(EncodeAvailability::VmStale)
+        ));
+        assert!(matches!(
+            state.pool_by_id("pool-rfq").await,
+            Err(EncodeAvailability::RfqStale)
+        ));
     }
 
     #[test]

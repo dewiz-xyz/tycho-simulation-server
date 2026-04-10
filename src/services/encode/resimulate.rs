@@ -242,6 +242,11 @@ impl<'a> RouteResimulator<'a> {
             .state
             .pool_by_id(pool_id)
             .await
+            .map_err(|availability| {
+                EncodeError::unavailable(availability.availability_message().unwrap_or_else(|| {
+                    unreachable!("unready pool lookup must have an availability message")
+                }))
+            })?
             .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
         let entry = CachedPoolEntry {
             backend: PoolBackend::from_component(component.as_ref()),
