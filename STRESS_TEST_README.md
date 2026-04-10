@@ -31,7 +31,7 @@ cargo run --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ## What the analyzer does
 
 - reuses the existing local server if it is already responding, otherwise starts it
-- waits for `/status`, including VM readiness when VM pools are enabled
+- waits for `/status` service health, then confirms native readiness first and includes VM readiness when VM pools are enabled
 - allows longer VM warmups on fresh starts; budget up to about 10 minutes before assuming VM pools are stuck
 - runs a balanced `/simulate` sweep across representative pairs
 - builds a narrow 2-hop `/encode` probe from live `/simulate` results

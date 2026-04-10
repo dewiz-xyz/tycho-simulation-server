@@ -8,6 +8,8 @@ use tycho_simulation::{
 
 use crate::models::messages::PoolRef;
 
+use super::backend::PoolBackend;
+
 pub(super) struct NormalizedRouteInternal {
     pub(super) segments: Vec<NormalizedSegmentInternal>,
 }
@@ -52,6 +54,7 @@ pub(super) struct ResimulatedHopInternal {
 
 pub(super) struct ResimulatedSwapInternal {
     pub(super) pool: PoolRef,
+    pub(super) backend: PoolBackend,
     pub(super) token_in: Bytes,
     pub(super) token_out: Bytes,
     pub(super) split_bps: u32,

@@ -34,19 +34,36 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 ### Base (`CHAIN_ID=8453`)
 - No VM protocols configured in this iteration.
 
+## RFQ feeds by chain
+
+### Ethereum (`CHAIN_ID=1`)
+- `rfq:bebop`
+- `rfq:hashflow`
+
+### Base (`CHAIN_ID=8453`)
+- `rfq:bebop`
+- `rfq:hashflow`
+
 ## Effective VM enablement
 
 - Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
 - This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
 - The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
 
+## Effective RFQ enablement
+
+- Runtime RFQ state is `effective_rfq_enabled = ENABLE_RFQ_POOLS && rfq_protocols_not_empty`.
+- Enabling RFQ analysis on Ethereum or Base also requires `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+- The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
+
 ## Notes that affect local analysis
 
 - Always pass chain context to the analyzer (`--chain-id` or env `CHAIN_ID`).
-- The analyzer uses representative pairs for native, stable, governance, and VM-sensitive paths. Treat protocol visibility as evidence, not as a hard assertion that every protocol must surface on every run.
-- Ethereum runs can take longer when VM pools are enabled. If the analyzer waits on VM readiness, that is expected on cold starts.
+- The analyzer uses representative pairs for native, stable, governance, VM-sensitive, and RFQ-targeted paths. Treat protocol visibility as evidence, not as a hard assertion that every protocol must surface on every run.
+- Ethereum or Base runs can take longer when RFQ pools are enabled. If the analyzer waits on that backend, that is expected on cold starts.
 - Base should keep Aerodrome visible somewhere in the balanced report, but absence is a finding to investigate rather than an automatic failure.
 - ERC4626 and other edge features are still highly state-sensitive. Use the analyzer report to decide whether you need deeper focused requests rather than baking every edge path into the default run.
 - TVL filtering matters: pools are included or removed based on `TVL_THRESHOLD` and `TVL_KEEP_RATIO`.
   If a protocol disappears unexpectedly, lowering `TVL_THRESHOLD` may be worth testing in a follow-up run.
 - Protocol labels in the analyzer are inferred from returned pool data and `meta.pool_results`. They are useful for comparison and triage, but they are still downstream observations of live state.
+- RFQ-targeted simulate scenarios are meant to make RFQ visibility intentional on Ethereum and Base. If they do not surface any `rfq:*` protocols, treat that as a finding to investigate rather than an automatic failure.

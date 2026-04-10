@@ -72,13 +72,16 @@ pub(super) fn build_route_swaps(
             &swap.token_in,
         )?;
         let common_component: CommonProtocolComponent = swap.component.as_ref().clone().into();
-        let swap_data = Swap::new(
+        let mut swap_data = Swap::new(
             common_component,
             swap.token_in.clone(),
             swap.token_out.clone(),
         )
         .split(split)
         .protocol_state(Arc::clone(&swap.pool_state));
+        if swap.backend.is_rfq() {
+            swap_data = swap_data.estimated_amount_in(swap.amount_in.clone());
+        }
         swaps.push(swap_data);
     }
 
@@ -162,7 +165,10 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::services::encode::fixtures::{dummy_component, fixture_bytes, pool_ref};
+    use crate::services::encode::backend::PoolBackend;
+    use crate::services::encode::fixtures::{
+        component_with_protocol, dummy_component, dummy_token, fixture_bytes, pool_ref,
+    };
     use crate::services::encode::mocks::MockProtocolSim;
     use crate::services::encode::model::{
         ResimulatedHopInternal, ResimulatedRouteInternal, ResimulatedSegmentInternal,
@@ -199,6 +205,7 @@ mod tests {
     ) -> ResimulatedSwapInternal {
         ResimulatedSwapInternal {
             pool: pool_ref(spec.pool),
+            backend: PoolBackend::from_component(fixture.component.as_ref()),
             token_in: spec.token_in.clone(),
             token_out: spec.token_out.clone(),
             split_bps: spec.split_bps,
@@ -361,6 +368,7 @@ mod tests {
                     swaps: vec![
                         ResimulatedSwapInternal {
                             pool: pool_ref("p1"),
+                            backend: PoolBackend::Native,
                             token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                                 .unwrap(),
                             token_out: Bytes::from_str(
@@ -375,6 +383,7 @@ mod tests {
                         },
                         ResimulatedSwapInternal {
                             pool: pool_ref("p2"),
+                            backend: PoolBackend::Native,
                             token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                                 .unwrap(),
                             token_out: Bytes::from_str(
@@ -397,6 +406,104 @@ mod tests {
         assert_eq!(swaps.len(), 2);
         assert!(swap_split(&swaps[0]) > 0.0);
         assert_eq!(swap_split(&swaps[1]), 0.0);
+        assert_eq!(swaps[0].get_estimated_amount_in(), &None);
+        assert_eq!(swaps[1].get_estimated_amount_in(), &None);
+    }
+
+    #[test]
+    fn build_route_swaps_sets_estimated_amount_in_for_rfq_protocols() {
+        let token_in = fixture_bytes("0x0000000000000000000000000000000000000001");
+        let token_out = fixture_bytes("0x0000000000000000000000000000000000000002");
+        let pool_state: Arc<dyn ProtocolSim> = Arc::new(MockProtocolSim {});
+        let component = Arc::new(component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "rfq:bebop",
+            "rfq:bebop",
+            vec![
+                dummy_token("0x0000000000000000000000000000000000000001"),
+                dummy_token("0x0000000000000000000000000000000000000002"),
+            ],
+        ));
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(100u32),
+                expected_amount_out: BigUint::from(99u32),
+                hops: vec![ResimulatedHopInternal {
+                    token_in: token_in.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: BigUint::from(100u32),
+                    expected_amount_out: BigUint::from(99u32),
+                    swaps: vec![ResimulatedSwapInternal {
+                        pool: pool_ref("p1"),
+                        backend: PoolBackend::Rfq,
+                        token_in: token_in.clone(),
+                        token_out: token_out.clone(),
+                        split_bps: 10_000,
+                        amount_in: BigUint::from(100u32),
+                        expected_amount_out: BigUint::from(99u32),
+                        pool_state,
+                        component,
+                    }],
+                }],
+            }],
+        };
+
+        let swaps = build_route_swaps(&resimulated).unwrap();
+
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(
+            swaps[0].get_estimated_amount_in(),
+            &Some(BigUint::from(100u32))
+        );
+    }
+
+    #[test]
+    fn build_route_swaps_sets_estimated_amount_in_for_type_name_only_rfq_components() {
+        let token_in = fixture_bytes("0x0000000000000000000000000000000000000011");
+        let token_out = fixture_bytes("0x0000000000000000000000000000000000000012");
+        let pool_state: Arc<dyn ProtocolSim> = Arc::new(MockProtocolSim {});
+        let component = Arc::new(component_with_protocol(
+            "0x0000000000000000000000000000000000000019",
+            "",
+            "hashflow_pool",
+            vec![
+                dummy_token("0x0000000000000000000000000000000000000011"),
+                dummy_token("0x0000000000000000000000000000000000000012"),
+            ],
+        ));
+        let resimulated = ResimulatedRouteInternal {
+            segments: vec![ResimulatedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(100u32),
+                expected_amount_out: BigUint::from(99u32),
+                hops: vec![ResimulatedHopInternal {
+                    token_in: token_in.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: BigUint::from(100u32),
+                    expected_amount_out: BigUint::from(99u32),
+                    swaps: vec![ResimulatedSwapInternal {
+                        pool: pool_ref("p1"),
+                        backend: PoolBackend::from_component(component.as_ref()),
+                        token_in: token_in.clone(),
+                        token_out: token_out.clone(),
+                        split_bps: 10_000,
+                        amount_in: BigUint::from(100u32),
+                        expected_amount_out: BigUint::from(99u32),
+                        pool_state,
+                        component,
+                    }],
+                }],
+            }],
+        };
+
+        let swaps = build_route_swaps(&resimulated).unwrap();
+
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(
+            swaps[0].get_estimated_amount_in(),
+            &Some(BigUint::from(100u32))
+        );
     }
 
     #[test]
@@ -450,6 +557,7 @@ mod tests {
                         expected_amount_out: BigUint::from(95u32),
                         swaps: vec![ResimulatedSwapInternal {
                             pool: pool_ref("p1"),
+                            backend: PoolBackend::Native,
                             token_in: token_a.clone(),
                             token_out: token_b.clone(),
                             split_bps: 10_000,
@@ -466,6 +574,7 @@ mod tests {
                         expected_amount_out: BigUint::from(92u32),
                         swaps: vec![ResimulatedSwapInternal {
                             pool: pool_ref("p2"),
+                            backend: PoolBackend::Native,
                             token_in: token_b.clone(),
                             token_out: token_a.clone(),
                             split_bps: 10_000,
@@ -482,6 +591,7 @@ mod tests {
                         expected_amount_out: BigUint::from(90u32),
                         swaps: vec![ResimulatedSwapInternal {
                             pool: pool_ref("p3"),
+                            backend: PoolBackend::Native,
                             token_in: token_a.clone(),
                             token_out: token_c.clone(),
                             split_bps: 10_000,

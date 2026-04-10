@@ -16,6 +16,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 
 use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, EncodeErrorResponse, HopDraft, InteractionKind, PoolRef,
@@ -36,11 +37,13 @@ const DEFAULT_PROFILE: &str = "balanced";
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 2;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 3;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
+const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
 
 pub async fn run() -> Result<()> {
     let args = CliArgs::parse()?;
@@ -400,16 +403,27 @@ async fn ensure_server_ready(
     }
 
     let readiness_result = async {
-        wait_for_readiness(scripts, &status_url, args.chain_id, false)?;
+        wait_for_readiness(scripts, &status_url, args.chain_id, false, false)?;
         let mut snapshot = fetch_readiness_snapshot(client, &status_url)
             .await
             .context("failed to fetch readiness after wait_ready")?;
 
-        if snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready") {
-            wait_for_readiness(scripts, &status_url, args.chain_id, true)?;
+        if !snapshot_native_ready(&snapshot) {
+            wait_for_native_readiness(client, &status_url, args.chain_id).await?;
             snapshot = fetch_readiness_snapshot(client, &status_url)
                 .await
-                .context("failed to fetch readiness after VM wait")?;
+                .context("failed to fetch readiness after native wait")?;
+        }
+
+        let require_vm = snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready");
+        let require_rfq = snapshot.rfq_enabled && snapshot.rfq_status.as_deref() != Some("ready");
+
+        if require_vm || require_rfq {
+            let wait_label = readiness_wait_label(require_vm, require_rfq);
+            wait_for_readiness(scripts, &status_url, args.chain_id, require_vm, require_rfq)?;
+            snapshot = fetch_readiness_snapshot(client, &status_url)
+                .await
+                .with_context(|| format!("failed to fetch readiness after {wait_label}"))?;
         }
 
         Ok(snapshot)
@@ -494,6 +508,16 @@ async fn run_simulate_scenario(
         report
             .notes
             .push(format!("scenario tags: {}", scenario.tags.join(", ")));
+    }
+    if scenario.expect_rfq_visibility
+        && !report
+            .protocols_seen
+            .keys()
+            .any(|protocol| protocol.starts_with("rfq:"))
+    {
+        report
+            .notes
+            .push(EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE.to_string());
     }
     Ok(report)
 }
@@ -761,6 +785,7 @@ fn build_encode_route_request(
             ],
         }],
         request_id: Some(format!("encode-probe-{}", epoch_now_s()?)),
+        estimated_amount_in: None,
     })
 }
 
@@ -969,6 +994,7 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
         && quote.meta.result_quality == crate::models::messages::QuoteResultQuality::Complete
         && quote.meta.failures.is_empty()
         && !quote.meta.vm_unavailable
+        && !quote.meta.rfq_unavailable
         && !quote.data.is_empty()
     {
         ObservationClass::Healthy
@@ -1246,6 +1272,8 @@ fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
         "fluid_v1" | "FluidV1" => Some("fluid_v1"),
         "rocketpool" | "RocketPool" => Some("rocketpool"),
         "erc4626" | "ERC4626" => Some("erc4626"),
+        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some("rfq:hashflow"),
+        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some("rfq:bebop"),
         "vm:curve" | "Curve" => Some("vm:curve"),
         "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
         "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
@@ -1369,12 +1397,84 @@ fn wait_for_readiness(
     status_url: &str,
     chain_id: u64,
     require_vm: bool,
+    require_rfq: bool,
 ) -> Result<()> {
-    let timeout_secs = if require_vm {
-        DEFAULT_VM_READY_TIMEOUT_SECS
-    } else {
-        DEFAULT_READY_TIMEOUT_SECS
+    let timeout_secs = match (require_vm, require_rfq) {
+        (true, true) => DEFAULT_VM_READY_TIMEOUT_SECS.max(DEFAULT_RFQ_READY_TIMEOUT_SECS),
+        (true, false) => DEFAULT_VM_READY_TIMEOUT_SECS,
+        (false, true) => DEFAULT_RFQ_READY_TIMEOUT_SECS,
+        (false, false) => DEFAULT_READY_TIMEOUT_SECS,
     };
+    let args = build_wait_ready_args(status_url, timeout_secs, chain_id, require_vm, require_rfq);
+    run_script(&scripts.wait_ready, &args).map(|_| ())
+}
+
+async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS);
+    #[expect(unused_assignments)]
+    let mut last_observation = String::new();
+    #[expect(unused_assignments)]
+    let mut saw_observation = false;
+
+    loop {
+        match fetch_readiness_snapshot(client, status_url).await {
+            Ok(snapshot) => {
+                if snapshot.chain_id != chain_id {
+                    bail!(
+                        "server at {} reported chain_id={} while waiting for native readiness (expected {})",
+                        status_url,
+                        snapshot.chain_id,
+                        chain_id
+                    );
+                }
+                if snapshot_native_ready(&snapshot) {
+                    return Ok(());
+                }
+                last_observation = format!(
+                    "status={} native_status={}",
+                    snapshot.status,
+                    snapshot.native_status.as_deref().unwrap_or("unknown")
+                );
+                saw_observation = true;
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                saw_observation = true;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let suffix = if saw_observation {
+                format!(": last observation {last_observation}")
+            } else {
+                String::new()
+            };
+            bail!(
+                "timed out waiting for native readiness at {}{}",
+                status_url,
+                suffix
+            );
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn snapshot_native_ready(snapshot: &ReadinessSnapshot) -> bool {
+    snapshot
+        .native_status
+        .as_deref()
+        .unwrap_or(snapshot.status.as_str())
+        == "ready"
+}
+
+fn build_wait_ready_args(
+    status_url: &str,
+    timeout_secs: u64,
+    chain_id: u64,
+    require_vm: bool,
+    require_rfq: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--url".to_string(),
         status_url.to_string(),
@@ -1386,7 +1486,19 @@ fn wait_for_readiness(
     if require_vm {
         args.push("--require-vm-ready".to_string());
     }
-    run_script(&scripts.wait_ready, &args).map(|_| ())
+    if require_rfq {
+        args.push("--require-rfq-ready".to_string());
+    }
+    args
+}
+
+fn readiness_wait_label(require_vm: bool, require_rfq: bool) -> &'static str {
+    match (require_vm, require_rfq) {
+        (true, true) => "VM and RFQ wait",
+        (true, false) => "VM wait",
+        (false, true) => "RFQ wait",
+        (false, false) => "wait_ready",
+    }
 }
 
 fn run_script(script: &Path, args: &[String]) -> Result<String> {
@@ -1797,15 +1909,19 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_log_boundary, collect_logs, discover_latest_baseline, ensure_server_ready,
-        maybe_load_baseline, percentile, sanitize_filename, select_best_pool, startup_bind_config,
-        BaselineMode, CliArgs, ScriptPaths,
+        build_wait_ready_args, capture_log_boundary, classify_simulate_response, collect_logs,
+        discover_latest_baseline, ensure_server_ready, maybe_load_baseline, percentile,
+        protocol_from_pool_name, sanitize_filename, select_best_pool, startup_bind_config,
+        BaselineMode, CliArgs, HttpJsonResponse, ObservationClass, ScriptPaths,
     };
     use crate::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
         QuoteResultQuality, QuoteStatus,
     };
+    use crate::sim_analysis::presets::balanced_profile;
     use reqwest::Client;
+    use reqwest::StatusCode;
+    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1868,6 +1984,23 @@ mod tests {
 
         assert_eq!(bind.host, "127.0.0.1");
         assert_eq!(bind.port, 443);
+    }
+
+    #[test]
+    fn build_wait_ready_args_supports_vm_and_rfq_requirements() {
+        let rfq_only_args =
+            build_wait_ready_args("http://localhost:3000/status", 600, 1, false, true);
+        assert!(rfq_only_args.iter().any(|arg| arg == "--require-rfq-ready"));
+        assert!(!rfq_only_args.iter().any(|arg| arg == "--require-vm-ready"));
+
+        let vm_and_rfq_args =
+            build_wait_ready_args("http://localhost:3000/status", 600, 1, true, true);
+        assert!(vm_and_rfq_args
+            .iter()
+            .any(|arg| arg == "--require-vm-ready"));
+        assert!(vm_and_rfq_args
+            .iter()
+            .any(|arg| arg == "--require-rfq-ready"));
     }
 
     #[tokio::test]
@@ -2065,6 +2198,53 @@ mod tests {
     }
 
     #[test]
+    fn classify_simulate_response_marks_rfq_unavailable_as_degraded() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "UniswapV3::DAI/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                block_number: 1,
+                limit_max_in: None,
+                slippage: Vec::new(),
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(1),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: Some(1),
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                rfq_unavailable: true,
+                failures: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&quote).unwrap_or_default();
+        let response = HttpJsonResponse {
+            status_code: StatusCode::OK,
+            elapsed_ms: 1.0,
+            body_text: body,
+            json: serde_json::to_value(quote).ok(),
+        };
+
+        let observation = classify_simulate_response(json!({ "request_id": "req-1" }), response);
+
+        assert!(matches!(
+            observation.classification,
+            ObservationClass::Degraded
+        ));
+    }
+
+    #[test]
     fn select_best_pool_uses_canonical_protocol_from_quote_metadata() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),
@@ -2084,6 +2264,7 @@ mod tests {
                 partial_kind: None,
                 block_number: 1,
                 vm_block_number: None,
+                rfq_block_number: None,
                 matching_pools: 1,
                 candidate_pools: 1,
                 total_pools: None,
@@ -2099,6 +2280,7 @@ mod tests {
                     reason: None,
                 }],
                 vm_unavailable: false,
+                rfq_unavailable: false,
                 failures: Vec::new(),
             },
         };
@@ -2135,12 +2317,14 @@ mod tests {
                 partial_kind: None,
                 block_number: 1,
                 vm_block_number: None,
+                rfq_block_number: None,
                 matching_pools: 1,
                 candidate_pools: 1,
                 total_pools: None,
                 auction_id: None,
                 pool_results: Vec::new(),
                 vm_unavailable: false,
+                rfq_unavailable: false,
                 failures: Vec::new(),
             },
         };
@@ -2173,6 +2357,7 @@ mod tests {
                 partial_kind: None,
                 block_number: 1,
                 vm_block_number: Some(2),
+                rfq_block_number: Some(2),
                 matching_pools: 1,
                 candidate_pools: 1,
                 total_pools: None,
@@ -2188,6 +2373,7 @@ mod tests {
                     reason: None,
                 }],
                 vm_unavailable: false,
+                rfq_unavailable: false,
                 failures: Vec::new(),
             },
         };
@@ -2197,6 +2383,104 @@ mod tests {
         assert_eq!(
             selected.as_ref().map(|pool| pool.protocol.as_str()),
             Some("vm:curve")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_preserves_rfq_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Hashflow::WETH/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "Hashflow::WETH/USDC".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "rfq:hashflow".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:hashflow")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_preserves_bebop_protocol_from_quote_metadata() {
+        let quote = QuoteResult {
+            request_id: "req-1".to_string(),
+            data: vec![AmountOutResponse {
+                pool: "pool-1".to_string(),
+                pool_name: "Bebop::WETH/USDC".to_string(),
+                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                amounts_out: vec!["10".to_string()],
+                gas_used: vec![1],
+                slippage: Vec::new(),
+                limit_max_in: None,
+                block_number: 1,
+            }],
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_block_number: Some(2),
+                matching_pools: 1,
+                candidate_pools: 1,
+                total_pools: None,
+                auction_id: None,
+                pool_results: vec![PoolSimulationOutcome {
+                    pool: "pool-1".to_string(),
+                    pool_name: "Bebop::WETH/USDC".to_string(),
+                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                    protocol: "rfq:bebop".to_string(),
+                    outcome: PoolOutcomeKind::PartialOutput,
+                    reported_steps: 1,
+                    expected_steps: 1,
+                    reason: None,
+                }],
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+        };
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:bebop")
         );
     }
 
@@ -2220,12 +2504,14 @@ mod tests {
                 partial_kind: None,
                 block_number: 1,
                 vm_block_number: Some(2),
+                rfq_block_number: Some(2),
                 matching_pools: 1,
                 candidate_pools: 1,
                 total_pools: None,
                 auction_id: None,
                 pool_results: Vec::new(),
                 vm_unavailable: false,
+                rfq_unavailable: false,
                 failures: Vec::new(),
             },
         };
@@ -2258,12 +2544,14 @@ mod tests {
                 partial_kind: None,
                 block_number: 1,
                 vm_block_number: None,
+                rfq_block_number: None,
                 matching_pools: 1,
                 candidate_pools: 1,
                 total_pools: None,
                 auction_id: None,
                 pool_results: Vec::new(),
                 vm_unavailable: false,
+                rfq_unavailable: false,
                 failures: Vec::new(),
             },
         };
@@ -2274,5 +2562,39 @@ mod tests {
             selected.as_ref().map(|pool| pool.protocol.as_str()),
             Some("unknownprotocol")
         );
+    }
+
+    #[test]
+    fn protocol_from_pool_name_normalizes_rfq_aliases() {
+        assert_eq!(
+            protocol_from_pool_name("Hashflow::WETH/USDC"),
+            "rfq:hashflow"
+        );
+        assert_eq!(protocol_from_pool_name("Bebop::WETH/USDC"), "rfq:bebop");
+        assert_eq!(protocol_from_pool_name("hashflow_pool"), "rfq:hashflow");
+        assert_eq!(protocol_from_pool_name("bebop_pool"), "rfq:bebop");
+    }
+
+    #[test]
+    fn balanced_profile_marks_base_and_ethereum_scenarios_as_rfq_targeted() {
+        let ethereum_profile_result = balanced_profile(1, false);
+        assert!(ethereum_profile_result.is_ok());
+        let Some(ethereum_profile) = ethereum_profile_result.ok() else {
+            return;
+        };
+        assert!(ethereum_profile
+            .simulate_scenarios
+            .iter()
+            .any(|scenario| scenario.expect_rfq_visibility));
+
+        let base_profile_result = balanced_profile(8453, false);
+        assert!(base_profile_result.is_ok());
+        let Some(base_profile) = base_profile_result.ok() else {
+            return;
+        };
+        assert!(base_profile
+            .simulate_scenarios
+            .iter()
+            .any(|scenario| scenario.expect_rfq_visibility));
     }
 }

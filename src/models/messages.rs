@@ -175,6 +175,8 @@ pub struct QuoteMeta {
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfq_block_number: Option<u64>,
     pub matching_pools: usize,
     pub candidate_pools: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,6 +187,8 @@ pub struct QuoteMeta {
     pub pool_results: Vec<PoolSimulationOutcome>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vm_unavailable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rfq_unavailable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<QuoteFailure>,
 }
@@ -252,6 +256,8 @@ pub struct RouteEncodeRequest {
     pub segments: Vec<SegmentDraft>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_amount_in: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +315,7 @@ pub struct EncodeErrorResponse {
 mod tests {
     use super::{
         AmountOutResponse, PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality,
-        QuoteStatus,
+        QuoteStatus, RouteEncodeRequest,
     };
     use anyhow::Result;
 
@@ -370,12 +376,14 @@ mod tests {
             partial_kind: None,
             block_number: 1,
             vm_block_number: None,
+            rfq_block_number: None,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: None,
             auction_id: None,
             pool_results: Vec::new(),
             vm_unavailable: false,
+            rfq_unavailable: false,
             failures: Vec::new(),
         };
         let value = serde_json::to_value(meta)?;
@@ -400,6 +408,25 @@ mod tests {
         let value = serde_json::to_value(response)?;
 
         assert!(value.get("limit_max_out").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn route_encode_request_accepts_estimated_amount_in() -> Result<()> {
+        let request: RouteEncodeRequest = serde_json::from_value(serde_json::json!({
+            "chainId": 1,
+            "tokenIn": "0x0000000000000000000000000000000000000001",
+            "tokenOut": "0x0000000000000000000000000000000000000002",
+            "amountIn": "10",
+            "minAmountOut": "8",
+            "settlementAddress": "0x0000000000000000000000000000000000000003",
+            "tychoRouterAddress": "0x0000000000000000000000000000000000000004",
+            "swapKind": "SimpleSwap",
+            "segments": [],
+            "estimatedAmountIn": "10"
+        }))?;
+
+        assert_eq!(request.estimated_amount_in.as_deref(), Some("10"));
         Ok(())
     }
 }

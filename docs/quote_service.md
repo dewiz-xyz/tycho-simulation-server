@@ -98,10 +98,12 @@ The current classification logic is:
 
 `GET /status` is the readiness contract used by scripts and deploy checks.
 
-Native readiness:
+Service health and native readiness:
 
-- `status="ready"` with HTTP `200` means native state is ready and recent enough
-- `status="warming_up"` with HTTP `503` means initial native state is still loading or native updates are stale
+- `status="ready"` with HTTP `200` means the service is healthy
+- `status="warming_up"` with HTTP `503` means no backend is ready yet
+- `native_status="ready"` means native state is ready and recent enough
+- `native_status="warming_up"` means initial native state is still loading or native updates are stale
 
 VM readiness:
 
@@ -112,7 +114,7 @@ VM readiness:
 
 Quote-path implications:
 
-- native readiness gates the whole request
+- native readiness still gates the whole request
 - VM readiness does not gate the whole request when native pools are still available
 - when VM pools are enabled but not ready, the runner skips VM candidates and sets `meta.vm_unavailable=true`
 
