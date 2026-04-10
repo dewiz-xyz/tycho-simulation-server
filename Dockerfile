@@ -16,6 +16,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/dsolver-simulator-service /usr/local/bin/dsolver-simulator-service
+COPY --from=builder /app/hashflow_supported_tokens.csv /app/hashflow_supported_tokens.csv
+ENV HASHFLOW_FILENAME_CSV=/app/hashflow_supported_tokens.csv
 
 RUN useradd -m appuser
 USER appuser
