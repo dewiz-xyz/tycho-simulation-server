@@ -3,9 +3,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSnapshot {
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<String>,
     pub chain_id: u64,
     pub block: Option<u64>,
     pub pools: Option<u64>,
@@ -17,6 +21,14 @@ pub struct ReadinessSnapshot {
     pub vm_last_error: Option<String>,
     pub vm_rebuild_duration_ms: Option<u64>,
     pub vm_last_update_age_ms: Option<u64>,
+    pub rfq_enabled: bool,
+    pub rfq_status: Option<String>,
+    pub rfq_block: Option<u64>,
+    pub rfq_pools: Option<u64>,
+    pub rfq_restarts: Option<u64>,
+    pub rfq_last_error: Option<String>,
+    pub rfq_rebuild_duration_ms: Option<u64>,
+    pub rfq_last_update_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -149,12 +161,26 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
     if report.readiness.initial.status != "ready" {
         findings.push(Finding {
             severity: "investigate".to_string(),
-            title: "Initial readiness was not ready".to_string(),
+            title: "Initial service health was not ready".to_string(),
             detail: format!(
-                "The analyzer began with /status={}. The run still proceeded, but the service state looked unstable at the start.",
-                report.readiness.initial.status
+                "The analyzer began with /status={} and native_status={}. The run still proceeded, but overall service health looked unstable at the start.",
+                report.readiness.initial.status,
+                display_status(report.readiness.initial.native_status.as_deref())
             ),
         });
+    }
+
+    if let Some(native_status) = report.readiness.initial.native_status.as_deref() {
+        if native_status != "ready" {
+            findings.push(Finding {
+                severity: "investigate".to_string(),
+                title: "Initial native readiness was not ready".to_string(),
+                detail: format!(
+                    "The analyzer saw native_status={} at the start of the run.",
+                    native_status
+                ),
+            });
+        }
     }
 
     if report.readiness.initial.vm_enabled
@@ -179,6 +205,29 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
             ),
         });
     }
+
+    if report.readiness.initial.rfq_enabled
+        && report.readiness.initial.rfq_status.as_deref() != Some("ready")
+    {
+        findings.push(Finding {
+            severity: "attention".to_string(),
+            title: "RFQ pools were enabled but not fully ready".to_string(),
+            detail: format!(
+                "Initial RFQ status was {} with rfq_pools={}.",
+                report
+                    .readiness
+                    .initial
+                    .rfq_status
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                report
+                    .readiness
+                    .initial
+                    .rfq_pools
+                    .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+            ),
+        });
+    }
 }
 
 fn add_scenario_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
@@ -199,6 +248,21 @@ fn add_scenario_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
                 detail: format!(
                     "{} reported {} degraded request(s) across {} total request(s).",
                     scenario.label, scenario.degraded_count, scenario.request_count
+                ),
+            });
+        }
+
+        if scenario
+            .notes
+            .iter()
+            .any(|note| note == EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE)
+        {
+            findings.push(Finding {
+                severity: "attention".to_string(),
+                title: format!("{} missed expected RFQ visibility", scenario.label),
+                detail: format!(
+                    "{} expected at least one RFQ protocol to surface, but none were observed in the scenario report.",
+                    scenario.label
                 ),
             });
         }
@@ -273,6 +337,17 @@ fn add_warning_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
 
 pub fn render_summary(report: &AnalysisReport) -> String {
     let mut lines = Vec::new();
+    append_summary_header(&mut lines, report);
+    append_findings_section(&mut lines, report);
+    append_warning_section(&mut lines, report);
+    append_scenario_overview(&mut lines, report);
+    append_readiness_section(&mut lines, report);
+    append_evidence_section(&mut lines, report);
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn append_summary_header(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push("# Simulation analysis summary".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -290,6 +365,9 @@ pub fn render_summary(report: &AnalysisReport) -> String {
         }
     ));
     lines.push(String::new());
+}
+
+fn append_findings_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push("## Findings".to_string());
     for finding in &report.findings {
         lines.push(format!(
@@ -297,13 +375,21 @@ pub fn render_summary(report: &AnalysisReport) -> String {
             finding.severity, finding.title, finding.detail
         ));
     }
-    if !report.warnings.is_empty() {
-        lines.push(String::new());
-        lines.push("## Analyzer warnings".to_string());
-        for warning in &report.warnings {
-            lines.push(format!("- {}", warning));
-        }
+}
+
+fn append_warning_section(lines: &mut Vec<String>, report: &AnalysisReport) {
+    if report.warnings.is_empty() {
+        return;
     }
+
+    lines.push(String::new());
+    lines.push("## Analyzer warnings".to_string());
+    for warning in &report.warnings {
+        lines.push(format!("- {}", warning));
+    }
+}
+
+fn append_scenario_overview(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Scenario overview".to_string());
     for scenario in &report.scenarios {
@@ -321,41 +407,31 @@ pub fn render_summary(report: &AnalysisReport) -> String {
             lines.push(format!("  note: {}", note));
         }
     }
+}
+
+fn append_readiness_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Readiness".to_string());
-    lines.push(format!(
-        "- Initial: status={} block={} pools={} vm_status={}",
-        report.readiness.initial.status,
-        report
-            .readiness
-            .initial
-            .block
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-        report
-            .readiness
-            .initial
-            .pools
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-        report
-            .readiness
-            .initial
-            .vm_status
-            .as_deref()
-            .unwrap_or("disabled")
-    ));
+    append_readiness_snapshot(lines, "Initial", &report.readiness.initial);
     if let Some(final_state) = &report.readiness.final_state {
-        lines.push(format!(
-            "- Final: status={} block={} pools={} vm_status={}",
-            final_state.status,
-            final_state
-                .block
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            final_state
-                .pools
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            final_state.vm_status.as_deref().unwrap_or("disabled")
-        ));
+        append_readiness_snapshot(lines, "Final", final_state);
     }
+}
+
+fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &ReadinessSnapshot) {
+    lines.push(format!(
+        "- {}: status={} native_status={} block={} pools={} vm_status={} rfq_status={}",
+        label,
+        snapshot.status,
+        display_status(snapshot.native_status.as_deref()),
+        fmt_optional_u64(snapshot.block),
+        fmt_optional_u64(snapshot.pools),
+        readiness_component_status(snapshot.vm_enabled, snapshot.vm_status.as_deref()),
+        readiness_component_status(snapshot.rfq_enabled, snapshot.rfq_status.as_deref())
+    ));
+}
+
+fn append_evidence_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Evidence".to_string());
     lines.push(format!("- Log file: {}", report.logs.log_file));
@@ -371,8 +447,6 @@ pub fn render_summary(report: &AnalysisReport) -> String {
     lines.push("- Primary artifact: report.json".to_string());
     lines.push("- Human summary: summary.md".to_string());
     lines.push(String::new());
-
-    format!("{}\n", lines.join("\n"))
 }
 
 pub fn relative_path(root: &Path, path: &Path) -> String {
@@ -388,6 +462,14 @@ fn fmt_latency(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+fn fmt_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn display_status(value: Option<&str>) -> &str {
+    value.unwrap_or("unknown")
+}
+
 fn fmt_protocols(protocols: &BTreeMap<String, usize>) -> String {
     if protocols.is_empty() {
         return "none".to_string();
@@ -401,10 +483,19 @@ fn fmt_protocols(protocols: &BTreeMap<String, usize>) -> String {
         .join(", ")
 }
 
+fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
+    match status {
+        Some(status) => status,
+        None if enabled => "unknown",
+        None => "disabled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_findings, AnalysisReport, Finding, LatencySummary, LogSummary, ReadinessReport,
+        build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSummary,
+        ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
     use super::{ReadinessSnapshot, RunMetadata, ScenarioReport};
     use std::collections::BTreeMap;
@@ -429,7 +520,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 2,
+            schema_version: 3,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
@@ -445,6 +536,7 @@ mod tests {
             readiness: ReadinessReport {
                 initial: ReadinessSnapshot {
                     status: "ready".to_string(),
+                    native_status: Some("ready".to_string()),
                     chain_id: 1,
                     block: Some(1),
                     pools: Some(10),
@@ -456,6 +548,14 @@ mod tests {
                     vm_last_error: None,
                     vm_rebuild_duration_ms: None,
                     vm_last_update_age_ms: None,
+                    rfq_enabled: false,
+                    rfq_status: None,
+                    rfq_block: None,
+                    rfq_pools: None,
+                    rfq_restarts: None,
+                    rfq_last_error: None,
+                    rfq_rebuild_duration_ms: None,
+                    rfq_last_update_age_ms: None,
                 },
                 final_state: None,
             },
@@ -487,5 +587,64 @@ mod tests {
         let findings = build_findings(&analysis);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, "healthy");
+    }
+
+    #[test]
+    fn build_findings_marks_rfq_not_ready() {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        analysis.readiness.initial.rfq_enabled = true;
+        analysis.readiness.initial.rfq_status = Some("warming_up".to_string());
+        analysis.readiness.initial.rfq_pools = Some(0);
+        analysis.readiness.initial.status = "warming_up".to_string();
+        analysis.readiness.initial.native_status = Some("ready".to_string());
+
+        let findings = build_findings(&analysis);
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "Initial service health was not ready"
+                && finding.severity == "investigate"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.title == "RFQ pools were enabled but not fully ready"
+                && finding.detail.contains("rfq_pools=0")
+        }));
+    }
+
+    #[test]
+    fn build_findings_marks_missing_rfq_visibility() {
+        let mut scenario = scenario("rfq-usdc-weth", 0, 0);
+        scenario
+            .notes
+            .push(EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE.to_string());
+        let analysis = report(Vec::new(), vec![scenario]);
+
+        let findings = build_findings(&analysis);
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "rfq-usdc-weth missed expected RFQ visibility"
+                && finding.severity == "attention"
+        }));
+    }
+
+    #[test]
+    fn render_summary_includes_rfq_status() {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        analysis.readiness.initial.rfq_enabled = true;
+        analysis.readiness.initial.rfq_status = Some("ready".to_string());
+        analysis.readiness.initial.native_status = Some("warming_up".to_string());
+        analysis.readiness.final_state = Some(ReadinessSnapshot {
+            native_status: Some("ready".to_string()),
+            rfq_enabled: true,
+            rfq_status: Some("rebuilding".to_string()),
+            status: "ready".to_string(),
+            ..analysis.readiness.initial.clone()
+        });
+
+        let summary = render_summary(&analysis);
+
+        assert!(summary.contains("status=ready native_status=warming_up"));
+        assert!(summary.contains("vm_status=disabled rfq_status=ready"));
+        assert!(summary.contains("native_status=ready"));
+        assert!(summary.contains("vm_status=disabled rfq_status=rebuilding"));
     }
 }

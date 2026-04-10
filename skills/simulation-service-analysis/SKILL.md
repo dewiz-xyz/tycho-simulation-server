@@ -1,6 +1,6 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status health and native readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
   short-description: DSolver Simulator local analysis
 ---
@@ -11,6 +11,7 @@ metadata:
 
 1. Confirm the repo root (expect `Cargo.toml` and `src/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
+   RFQ feeds default to off. For RFQ analysis on Ethereum or Base, set `ENABLE_RFQ_POOLS=true` and also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
@@ -23,13 +24,14 @@ metadata:
 ## What the analyzer does
 
 - Reuses the existing local server if it is already responding, otherwise starts it with the repo lifecycle scripts.
-- Waits for `/status`, including VM readiness when VM pools are enabled.
-- Fresh VM-pool warmups can take much longer than native readiness. Budget up to 10 minutes before treating VM readiness as stuck.
+- Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
+- Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
 - Builds a narrow 2-hop `/encode` probe from live `/simulate` results.
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
+- Top-level `/status.status` is service health; `native_status` carries native readiness separately.
 
 ## Behavior model
 
@@ -59,6 +61,18 @@ Manual VM-ready wait when you want to confirm the service itself before rerunnin
 scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
 
+`scripts/wait_ready.sh` still waits for native readiness by default. Use the VM and RFQ flags only when those backends also matter.
+
+Manual RFQ-ready wait when RFQ pools are enabled:
+```bash
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 8453 --require-rfq-ready --timeout 600
+```
+
+Manual combined VM and RFQ wait for Ethereum when both backends matter:
+```bash
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600
+```
+
 Write to a custom directory:
 ```bash
 cargo run --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
@@ -74,7 +88,7 @@ cargo run --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --
 After the analyzer runs:
 
 1. Read `summary.md` first for the high-level picture.
-2. Use `report.json` for exact counts, latencies, status/result-quality splits, and protocol visibility.
+2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
 3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and log excerpts.
 4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
 5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.

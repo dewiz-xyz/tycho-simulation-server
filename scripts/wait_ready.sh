@@ -3,9 +3,9 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>] [--expect-chain-id <id>] [--require-vm-ready] [--require-vm-pools-min <count>]
+Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>] [--expect-chain-id <id>] [--require-vm-ready] [--require-vm-pools-min <count>] [--require-rfq-ready] [--require-rfq-pools-min <count>]
 
-Poll the /status endpoint until it returns ready or times out.
+Poll the /status endpoint until native readiness is ready or times out.
 
 Options:
   --url                  Status URL (default: http://localhost:3000/status)
@@ -14,6 +14,8 @@ Options:
   --expect-chain-id      Require /status.chain_id to match this chain id
   --require-vm-ready     Require vm_status=ready before succeeding
   --require-vm-pools-min Minimum vm_pools required when --require-vm-ready is set (default: 1)
+  --require-rfq-ready    Require rfq_status=ready before succeeding
+  --require-rfq-pools-min Minimum rfq_pools required when --require-rfq-ready is set (default: 1)
   -h, --help             Show this help
 USAGE
 }
@@ -24,6 +26,8 @@ interval=2
 expect_chain_id=""
 require_vm_ready="false"
 require_vm_pools_min=1
+require_rfq_ready="false"
+require_rfq_pools_min=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +53,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --require-vm-pools-min)
       require_vm_pools_min="$2"
+      shift 2
+      ;;
+    --require-rfq-ready)
+      require_rfq_ready="true"
+      shift 1
+      ;;
+    --require-rfq-pools-min)
+      require_rfq_pools_min="$2"
       shift 2
       ;;
     -h|--help)
@@ -77,7 +89,9 @@ import sys
 status_code = sys.argv[1]
 require_vm = sys.argv[2] == "true"
 vm_pools_min = int(sys.argv[3])
-expected_chain_raw = sys.argv[4].strip()
+require_rfq = sys.argv[4] == "true"
+rfq_pools_min = int(sys.argv[5])
+expected_chain_raw = sys.argv[6].strip()
 expected_chain = int(expected_chain_raw) if expected_chain_raw else None
 
 try:
@@ -94,7 +108,7 @@ if expected_chain is not None:
 if status_code != "200":
     raise SystemExit(2)
 
-if payload.get("status") != "ready":
+if payload.get("native_status") != "ready":
     raise SystemExit(2)
 
 if require_vm:
@@ -104,7 +118,15 @@ if require_vm:
         raise SystemExit(2)
     if int(payload.get("vm_pools") or 0) < vm_pools_min:
         raise SystemExit(2)
-' "$status_code" "$require_vm_ready" "$require_vm_pools_min" "$expect_chain_id" <<<"$body" 2>&1)"
+
+if require_rfq:
+    if not payload.get("rfq_enabled"):
+        raise SystemExit(2)
+    if payload.get("rfq_status") != "ready":
+        raise SystemExit(2)
+    if int(payload.get("rfq_pools") or 0) < rfq_pools_min:
+        raise SystemExit(2)
+' "$status_code" "$require_vm_ready" "$require_vm_pools_min" "$require_rfq_ready" "$require_rfq_pools_min" "$expect_chain_id" <<<"$body" 2>&1)"
   then
     echo "ready"
     exit 0
