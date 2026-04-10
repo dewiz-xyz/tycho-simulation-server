@@ -145,6 +145,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         match validate_swap_kinds(&request) {

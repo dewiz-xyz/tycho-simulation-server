@@ -14,7 +14,8 @@ use tycho_simulation::{
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
-    state::{StateStore, VmStreamStatus},
+    protocol,
+    state::{RfqStreamStatus, StateStore, VmStreamStatus},
     stream_health::StreamHealth,
 };
 
@@ -22,13 +23,15 @@ use crate::models::{
 pub enum StreamKind {
     Native,
     Vm,
+    Rfq,
 }
 
 impl StreamKind {
     fn as_str(self) -> &'static str {
         match self {
-            StreamKind::Native => "native",
-            StreamKind::Vm => "vm",
+            StreamKind::Native => protocol::NATIVE,
+            StreamKind::Vm => protocol::VM,
+            StreamKind::Rfq => protocol::RFQ,
         }
     }
 }
@@ -64,6 +67,7 @@ pub struct StreamExit {
 
 #[derive(Debug, Clone)]
 pub struct StreamSupervisorConfig {
+    pub readiness_stale: Duration,
     pub stream_stale: Duration,
     pub missing_block_burst: u64,
     pub missing_block_window: Duration,
@@ -80,6 +84,12 @@ pub struct VmStreamControls {
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub vm_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_concurrency: u32,
+}
+
+pub struct RfqStreamControls {
+    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_concurrency: u32,
 }
 
 enum StreamMessage {
@@ -109,7 +119,7 @@ pub async fn process_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_stream_message(kind, &mut stream, &health, cfg.stream_stale).await {
+        match next_stream_message(kind, &mut stream, &health, &cfg).await {
             StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
             StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
             StreamMessage::Update(update) => {
@@ -141,16 +151,26 @@ async fn next_stream_message(
         Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
     > + Unpin
               + Send),
-    health: &Arc<StreamHealth>,
-    stream_stale: Duration,
+    health: &StreamHealth,
+    cfg: &StreamSupervisorConfig,
 ) -> StreamMessage {
-    match timeout(stream_stale, stream.next()).await {
+    let has_received_update = health.has_received_update().await;
+    let stream_timeout = if has_received_update {
+        cfg.stream_stale
+    } else {
+        cfg.readiness_stale
+    };
+
+    match timeout(stream_timeout, stream.next()).await {
         Err(_) => {
+            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
             let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
             let last_block = health.last_block().await;
             warn!(
                 event = "stream_stale",
                 stream = kind.as_str(),
+                started_age_ms,
+                has_received_update,
                 last_update_age_ms,
                 last_block,
                 "Stream stale; triggering restart"
@@ -158,9 +178,16 @@ async fn next_stream_message(
             StreamMessage::Stale
         }
         Ok(None) => {
+            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+            let last_block = health.last_block().await;
             warn!(
                 event = "stream_ended",
                 stream = kind.as_str(),
+                started_age_ms,
+                has_received_update,
+                last_update_age_ms,
+                last_block,
                 "Stream ended unexpectedly"
             );
             StreamMessage::Ended
@@ -173,8 +200,8 @@ async fn next_stream_message(
 async fn handle_stream_update(
     kind: StreamKind,
     update: TychoUpdate,
-    state_store: &Arc<StateStore>,
-    health: &Arc<StreamHealth>,
+    state_store: &StateStore,
+    health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
     ready_logged: &mut bool,
 ) -> Option<StreamExit> {
@@ -266,7 +293,7 @@ fn log_stream_update(kind: StreamKind, metrics: &crate::models::state::UpdateMet
 async fn handle_stream_error(
     kind: StreamKind,
     err_msg: String,
-    health: &Arc<StreamHealth>,
+    health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
 ) -> Option<StreamExit> {
     let error_kind = classify_stream_error(&err_msg);
@@ -355,6 +382,8 @@ pub async fn supervise_native_stream<F, Fut, S>(
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -365,6 +394,8 @@ pub async fn supervise_native_stream<F, Fut, S>(
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
+            started_age_ms,
+            has_received_update,
             last_block,
             last_update_age_ms,
             "Restarting native stream"
@@ -428,6 +459,8 @@ pub async fn supervise_vm_stream<F, Fut, S>(
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -448,6 +481,8 @@ pub async fn supervise_vm_stream<F, Fut, S>(
             reason = exit.reason.as_str(),
             restart_count,
             backoff_ms,
+            started_age_ms,
+            has_received_update,
             last_block,
             last_update_age_ms,
             "Restarting VM stream"
@@ -458,7 +493,97 @@ pub async fn supervise_vm_stream<F, Fut, S>(
     }
 }
 
+pub async fn supervise_rfq_stream<F, Fut, S>(
+    build_stream: F,
+    state_store: Arc<StateStore>,
+    health: Arc<StreamHealth>,
+    cfg: StreamSupervisorConfig,
+    controls: RfqStreamControls,
+) where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
+    S: futures::Stream<
+            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
+        > + Unpin
+        + Send,
+{
+    let mut backoff = cfg.restart_backoff_min;
+    let mut pending_rebuild: Option<RfqRebuildState> = None;
+
+    loop {
+        let stream = match build_stream().await {
+            Ok(stream) => {
+                if let Some(rebuild) = pending_rebuild.take() {
+                    finish_rfq_rebuild(&controls, rebuild, cfg.memory).await;
+                }
+                stream
+            }
+            Err(err) => {
+                warn!(
+                    event = "stream_build_failed",
+                    stream = StreamKind::Rfq.as_str(),
+                    error = %err,
+                    "Failed to build RFQ stream"
+                );
+                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff = next_backoff(backoff, cfg.restart_backoff_max);
+                continue;
+            }
+        };
+
+        let exit = process_stream(
+            StreamKind::Rfq,
+            stream,
+            Arc::clone(&state_store),
+            Arc::clone(&health),
+            cfg.clone(),
+        )
+        .await;
+
+        let restart_count = health.increment_restart().await;
+        health.reset_bursts().await;
+        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+        let has_received_update = health.has_received_update().await;
+        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+        let last_block = health.last_block().await;
+
+        let rebuild_state = begin_rfq_rebuild(
+            &controls,
+            Arc::clone(&state_store),
+            exit.reason,
+            exit.last_error,
+            cfg.memory,
+        )
+        .await;
+        pending_rebuild = Some(rebuild_state);
+
+        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+        warn!(
+            event = "stream_restart",
+            stream = StreamKind::Rfq.as_str(),
+            reason = exit.reason.as_str(),
+            restart_count,
+            backoff_ms,
+            started_age_ms,
+            has_received_update,
+            last_block,
+            last_update_age_ms,
+            "Restarting RFQ stream"
+        );
+
+        sleep(Duration::from_millis(backoff_ms)).await;
+        backoff = next_backoff(backoff, cfg.restart_backoff_max);
+    }
+}
+
 struct VmRebuildState {
+    guard: tokio::sync::OwnedSemaphorePermit,
+    rebuild_id: u64,
+    started_at: Instant,
+}
+
+struct RfqRebuildState {
     guard: tokio::sync::OwnedSemaphorePermit,
     rebuild_id: u64,
     started_at: Instant,
@@ -480,8 +605,13 @@ async fn begin_vm_rebuild(
         status.restart_count
     };
 
-    info!(event = "vm_rebuild_start", rebuild_id, "VM rebuild started");
-    maybe_log_memory_snapshot("vm", "vm_rebuild_start", None, memory_cfg, true);
+    info!(
+        event = "vm_rebuild_start",
+        rebuild_id,
+        rebuild_started_age_ms = 0_u64,
+        "VM rebuild started"
+    );
+    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_start", None, memory_cfg, true);
 
     state_store.reset().await;
 
@@ -491,9 +621,62 @@ async fn begin_vm_rebuild(
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
     }
     maybe_purge_allocator("vm_rebuild", memory_cfg);
-    maybe_log_memory_snapshot("vm", "vm_rebuild_after_clear", None, memory_cfg, true);
+    maybe_log_memory_snapshot(
+        protocol::VM,
+        "vm_rebuild_after_clear",
+        None,
+        memory_cfg,
+        true,
+    );
 
     VmRebuildState {
+        guard,
+        rebuild_id,
+        started_at: Instant::now(),
+    }
+}
+
+async fn begin_rfq_rebuild(
+    controls: &RfqStreamControls,
+    state_store: Arc<StateStore>,
+    reason: StreamRestartReason,
+    last_error: Option<String>,
+    memory_cfg: MemoryConfig,
+) -> RfqRebuildState {
+    let rebuild_id = {
+        let mut status = controls.rfq_stream.write().await;
+        status.rebuilding = true;
+        status.restart_count = status.restart_count.saturating_add(1);
+        status.rebuild_started_at = Some(Instant::now());
+        status.last_error = last_error.or_else(|| Some(reason.as_str().to_string()));
+        status.restart_count
+    };
+
+    info!(
+        event = "rfq_rebuild_start",
+        rebuild_id,
+        rebuild_started_age_ms = 0_u64,
+        "RFQ rebuild started"
+    );
+    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_start", None, memory_cfg, true);
+
+    state_store.reset().await;
+
+    let guard = acquire_rfq_rebuild_guard(controls).await;
+
+    if let Err(err) = SHARED_TYCHO_DB.clear() {
+        warn!(error = %err, "Failed clearing TychoDB during RFQ rebuild");
+    }
+    maybe_purge_allocator("rfq_rebuild", memory_cfg);
+    maybe_log_memory_snapshot(
+        protocol::RFQ,
+        "rfq_rebuild_after_clear",
+        None,
+        memory_cfg,
+        true,
+    );
+
+    RfqRebuildState {
         guard,
         rebuild_id,
         started_at: Instant::now(),
@@ -518,6 +701,24 @@ async fn acquire_vm_rebuild_guard(
     }
 }
 
+#[expect(
+    clippy::panic,
+    reason = "the RFQ rebuild semaphore should remain available for the process lifetime"
+)]
+async fn acquire_rfq_rebuild_guard(
+    controls: &RfqStreamControls,
+) -> tokio::sync::OwnedSemaphorePermit {
+    match controls
+        .rfq_sim_semaphore
+        .clone()
+        .acquire_many_owned(controls.rfq_sim_concurrency)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(_) => panic!("rfq semaphore closed during rebuild"),
+    }
+}
+
 async fn finish_vm_rebuild(
     controls: &VmStreamControls,
     rebuild: VmRebuildState,
@@ -536,9 +737,34 @@ async fn finish_vm_rebuild(
         event = "vm_rebuild_success",
         rebuild_id = rebuild.rebuild_id,
         duration_ms,
+        rebuild_started_age_ms = duration_ms,
         "VM rebuild completed"
     );
-    maybe_log_memory_snapshot("vm", "vm_rebuild_success", None, memory_cfg, true);
+    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_success", None, memory_cfg, true);
+}
+
+async fn finish_rfq_rebuild(
+    controls: &RfqStreamControls,
+    rebuild: RfqRebuildState,
+    memory_cfg: MemoryConfig,
+) {
+    drop(rebuild.guard);
+
+    let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
+    {
+        let mut status = controls.rfq_stream.write().await;
+        status.rebuilding = false;
+        status.rebuild_started_at = None;
+    }
+
+    info!(
+        event = "rfq_rebuild_success",
+        rebuild_id = rebuild.rebuild_id,
+        duration_ms,
+        rebuild_started_age_ms = duration_ms,
+        "RFQ rebuild completed"
+    );
+    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {

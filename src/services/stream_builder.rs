@@ -1,7 +1,13 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
 use futures::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use tycho_simulation::{
     evm::{
@@ -22,8 +28,19 @@ use tycho_simulation::{
         },
         stream::ProtocolStreamBuilder,
     },
+    protocol::models::Update,
+    rfq::{
+        protocols::{
+            bebop::{client_builder::BebopClientBuilder, state::BebopState},
+            hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+        },
+        stream::RFQStreamBuilder,
+    },
     tycho_client::feed::component_tracker::ComponentFilter,
-    tycho_common::models::Chain,
+    tycho_common::{
+        models::{token::Token, Chain},
+        Bytes,
+    },
 };
 
 use crate::models::tokens::TokenStore;
@@ -146,6 +163,99 @@ pub async fn build_vm_stream(
     }))
 }
 
+#[derive(Clone)]
+pub struct RFQConfig {
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
+}
+
+pub async fn build_rfq_stream(
+    tvl_add_threshold: f64,
+    tokens: Arc<TokenStore>,
+    chain: Chain,
+    protocols: &[String],
+    bebop_tokens: Arc<TokenStore>,
+    hashflow_tokens: Arc<TokenStore>,
+    rfq_config: RFQConfig,
+) -> Result<
+    impl futures::Stream<
+            Item = Result<
+                tycho_simulation::protocol::models::Update,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
+> {
+    let mut rfq_builder = RFQStreamBuilder::new();
+
+    if rfq_protocol_enabled(protocols, "rfq:bebop") {
+        info!("Setting up Bebop RFQ client...\n");
+        let (user, key) = (rfq_config.bebop_user.clone(), rfq_config.bebop_key.clone());
+        let mut rfq_tokens_bebop = HashSet::new();
+        for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
+            rfq_tokens_bebop.insert(bebop_token_addr.clone());
+        }
+        let bebop_client = BebopClientBuilder::new(chain, user, key)
+            .tokens(rfq_tokens_bebop)
+            .tvl_threshold(tvl_add_threshold)
+            .build()
+            .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
+        rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
+    }
+
+    if rfq_protocol_enabled(protocols, "rfq:hashflow") {
+        info!("Setting up Hashflow RFQ client...\n");
+        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+        let mut rfq_tokens_hashflow = HashSet::new();
+        for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
+            rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
+        }
+        let hashflow_client = HashflowClientBuilder::new(chain, user, key)
+            .tokens(rfq_tokens_hashflow)
+            .tvl_threshold(tvl_add_threshold)
+            .poll_time(Duration::from_secs(5))
+            .build()
+            .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
+        rfq_builder =
+            rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
+    }
+
+    info!("Building RFQ Stream...\n");
+    let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
+
+    let decoder_tokens = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+    rfq_builder = rfq_builder.set_tokens(decoder_tokens).await;
+    tokio::spawn(rfq_builder.build(tx));
+    info!("Connected to RFQs! Streaming live price levels...\n");
+
+    // todo consider implementing register_rfq_protocol...
+
+    Ok(ReceiverStream::new(rx).map(Ok).boxed())
+}
+
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
+}
+
+async fn rfq_decoder_tokens(
+    tokens: &TokenStore,
+    bebop_tokens: &TokenStore,
+    hashflow_tokens: &TokenStore,
+) -> HashMap<Bytes, Token> {
+    let mut snapshot = tokens.snapshot().await;
+    merge_missing_tokens(&mut snapshot, bebop_tokens.snapshot().await);
+    merge_missing_tokens(&mut snapshot, hashflow_tokens.snapshot().await);
+    snapshot
+}
+
+fn merge_missing_tokens(tokens: &mut HashMap<Bytes, Token>, extra: HashMap<Bytes, Token>) {
+    for (address, token) in extra {
+        tokens.entry(address).or_insert(token);
+    }
+}
+
 fn register_vm_protocol(
     builder: ProtocolStreamBuilder,
     protocol: &str,
@@ -193,19 +303,35 @@ fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "stream builder tests use explicit panics for invalid fixture setup"
+)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::{BTreeSet, HashMap},
+        str::FromStr,
+        sync::Arc,
+        time::Duration,
+    };
 
     use super::{
-        decode_skip_state_failures, register_native_protocol, register_vm_protocol,
-        StreamDecodePolicy,
+        decode_skip_state_failures, merge_missing_tokens, register_native_protocol,
+        register_vm_protocol, rfq_decoder_tokens, StreamDecodePolicy,
     };
     use crate::config::{
         BASE_NATIVE_PROTOCOLS, BASE_VM_PROTOCOLS, ETHEREUM_NATIVE_PROTOCOLS, ETHEREUM_VM_PROTOCOLS,
     };
     use tycho_simulation::{
-        evm::stream::ProtocolStreamBuilder, tycho_client::feed::component_tracker::ComponentFilter,
+        evm::stream::ProtocolStreamBuilder,
+        tycho_client::feed::component_tracker::ComponentFilter,
+        tycho_common::{
+            models::{token::Token, Chain},
+            Bytes,
+        },
     };
+
+    use crate::models::tokens::TokenStore;
 
     fn test_builder() -> ProtocolStreamBuilder {
         ProtocolStreamBuilder::new(
@@ -220,6 +346,37 @@ mod tests {
 
     fn unique_protocols<'a>(left: &'a [&'a str], right: &'a [&'a str]) -> BTreeSet<&'a str> {
         left.iter().chain(right.iter()).copied().collect()
+    }
+
+    fn test_token(address: &str, symbol: &str) -> Token {
+        let address = match Bytes::from_str(address) {
+            Ok(address) => address,
+            Err(err) => panic!("test token address must parse: {err}"),
+        };
+        Token::new(&address, symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    fn test_token_store(tokens: impl IntoIterator<Item = Token>) -> Arc<TokenStore> {
+        let initial_tokens = tokens
+            .into_iter()
+            .map(|token| (token.address.clone(), token))
+            .collect();
+        Arc::new(TokenStore::new(
+            initial_tokens,
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ))
+    }
+
+    #[test]
+    fn rfq_protocol_enabled_matches_exact_protocol_name() {
+        let protocols = vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()];
+
+        assert!(super::rfq_protocol_enabled(&protocols, "rfq:bebop"));
+        assert!(super::rfq_protocol_enabled(&protocols, "rfq:hashflow"));
+        assert!(!super::rfq_protocol_enabled(&protocols, "rfq:other"));
     }
 
     #[test]
@@ -280,5 +437,38 @@ mod tests {
                 "expected VM protocol {protocol} to register"
             );
         }
+    }
+
+    #[test]
+    fn merge_missing_tokens_keeps_existing_entries() {
+        let shared = test_token("0x0000000000000000000000000000000000000001", "BASE");
+        let replacement = test_token("0x0000000000000000000000000000000000000001", "RFQ");
+        let mut tokens = HashMap::from([(shared.address.clone(), shared.clone())]);
+
+        merge_missing_tokens(
+            &mut tokens,
+            HashMap::from([(replacement.address.clone(), replacement)]),
+        );
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[&shared.address].symbol, shared.symbol);
+    }
+
+    #[tokio::test]
+    async fn rfq_decoder_tokens_include_rfq_only_assets() {
+        let base = test_token("0x0000000000000000000000000000000000000001", "BASE");
+        let bebop_only = test_token("0x0000000000000000000000000000000000000002", "BEBOP");
+        let hashflow_only = test_token("0x0000000000000000000000000000000000000003", "HASH");
+
+        let tokens = test_token_store(vec![base.clone()]);
+        let bebop_tokens = test_token_store(vec![bebop_only.clone()]);
+        let hashflow_tokens = test_token_store(vec![hashflow_only.clone()]);
+
+        let merged = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains_key(&base.address));
+        assert!(merged.contains_key(&bebop_only.address));
+        assert!(merged.contains_key(&hashflow_only.address));
     }
 }

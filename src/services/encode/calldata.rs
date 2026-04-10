@@ -287,6 +287,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::services::encode::backend::PoolBackend;
     use crate::services::encode::fixtures::{dummy_component, pool_ref};
     use crate::services::encode::mocks::{MockProtocolSim, MockTychoEncoder};
     use crate::services::encode::model::{
@@ -405,6 +406,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {
@@ -421,6 +423,7 @@ mod tests {
                     expected_amount_out: BigUint::from(9u32),
                     swaps: vec![ResimulatedSwapInternal {
                         pool: pool_ref("p1"),
+                        backend: PoolBackend::Native,
                         token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                             .unwrap(),
                         token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
@@ -486,6 +489,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {
@@ -500,6 +504,7 @@ mod tests {
                     expected_amount_out: BigUint::from(9u32),
                     swaps: vec![ResimulatedSwapInternal {
                         pool: pool_ref("p1"),
+                        backend: PoolBackend::Native,
                         token_in: native.clone(),
                         token_out: token_out.clone(),
                         split_bps: 10_000,
@@ -553,6 +558,7 @@ mod tests {
             swap_kind: crate::models::messages::SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let resimulated = ResimulatedRouteInternal {
@@ -569,6 +575,7 @@ mod tests {
                     expected_amount_out: BigUint::from(9u32),
                     swaps: vec![ResimulatedSwapInternal {
                         pool: pool_ref("p1"),
+                        backend: PoolBackend::Native,
                         token_in: Bytes::from_str("0x0000000000000000000000000000000000000001")
                             .unwrap(),
                         token_out: Bytes::from_str("0x0000000000000000000000000000000000000002")
