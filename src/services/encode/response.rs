@@ -10,6 +10,7 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 
+use super::backend::PoolBackend;
 use super::model::ResimulatedRouteInternal;
 use super::wire::format_address;
 use super::EncodeComputation;
@@ -261,18 +262,21 @@ fn summarize_request(request: &RouteEncodeRequest) -> EncodeRequestSummary {
         .flat_map(|hop| hop.swaps.iter())
         .map(|swap| swap.pool.protocol.trim().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    let route_uses_vm = request
+    let mut route_uses_vm = false;
+    let mut route_uses_rfq = false;
+    for swap in request
         .segments
         .iter()
         .flat_map(|segment| segment.hops.iter())
         .flat_map(|hop| hop.swaps.iter())
-        .any(|swap| swap.pool.protocol.trim().starts_with("vm:"));
-    let route_uses_rfq = request
-        .segments
-        .iter()
-        .flat_map(|segment| segment.hops.iter())
-        .flat_map(|hop| hop.swaps.iter())
-        .any(|swap| swap.pool.protocol.trim().starts_with("rfq:"));
+    {
+        let backend = PoolBackend::from_protocol_hint(&swap.pool.protocol);
+        if backend.is_vm() {
+            route_uses_vm = true;
+        } else if backend.is_rfq() {
+            route_uses_rfq = true;
+        }
+    }
 
     EncodeRequestSummary {
         request_id: request.request_id.clone(),
@@ -525,7 +529,7 @@ mod tests {
 
     #[test]
     fn summarize_request_collects_route_shape_and_protocols() {
-        let request = route_request(&["curve_v2", "vm:maverick_v2", "rfq:hashflow"]);
+        let request = route_request(&["curve_v2", "VM:MAVERICK_V2", "RFQ:HASHFLOW"]);
 
         let summary = summarize_request(&request);
 

@@ -19,10 +19,10 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
-use crate::models::protocol::ProtocolKind;
 use crate::models::state::AppState;
 
 use super::allocation::allocate_swaps_by_bps;
+use super::backend::PoolBackend;
 use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
@@ -30,7 +30,12 @@ use super::model::{
 use super::request::{format_native_protocol_allowlist, is_native_protocol_allowlisted};
 use super::EncodeError;
 
-type CachedPoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
+#[derive(Clone)]
+struct CachedPoolEntry {
+    pool_state: Arc<dyn ProtocolSim>,
+    component: Arc<ProtocolComponent>,
+    backend: PoolBackend,
+}
 
 struct SegmentSimState {
     next_amount_in: BigUint,
@@ -49,19 +54,12 @@ struct RouteResimulator<'a> {
 struct BlockingSwapRequest<'a> {
     state: &'a AppState,
     pool_state: Arc<dyn ProtocolSim>,
+    backend: PoolBackend,
     amount_in_for_sim: BigUint,
     token_in: Token,
     token_out: Token,
     pool_timeout: Duration,
     pool_id: &'a str,
-    component: &'a ProtocolComponent,
-}
-
-#[derive(Clone, Copy)]
-enum SimulationBackend {
-    Native,
-    Vm,
-    Rfq,
 }
 
 pub(super) async fn resimulate_route(
@@ -181,7 +179,7 @@ impl<'a> RouteResimulator<'a> {
     ) -> Result<ResimulatedSwapInternal, EncodeError> {
         let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
         ensure_erc4626_swap_supported(
-            &pool_entry.1,
+            &pool_entry.component,
             &allocated.pool.component_id,
             &allocated.token_in,
             &allocated.token_out,
@@ -191,7 +189,7 @@ impl<'a> RouteResimulator<'a> {
             self.chain,
             &allocated.token_in,
             &allocated.token_out,
-            &pool_entry.1,
+            &pool_entry.component,
             &allocated.pool.component_id,
             &self.state.native_token_protocol_allowlist,
         )?;
@@ -199,16 +197,16 @@ impl<'a> RouteResimulator<'a> {
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
         let token_in = self.token_cache.get(&sim_token_in).await?;
         let token_out = self.token_cache.get(&sim_token_out).await?;
-        let pool_timeout = pool_timeout_for_component(self.state, pool_entry.1.as_ref());
+        let pool_timeout = pool_timeout_for_backend(self.state, pool_entry.backend);
         let (pre_state, result) = simulate_swap_blocking(BlockingSwapRequest {
             state: self.state,
-            pool_state: Arc::clone(&pool_entry.0),
+            pool_state: Arc::clone(&pool_entry.pool_state),
+            backend: pool_entry.backend,
             amount_in_for_sim: allocated.amount_in.clone(),
             token_in,
             token_out,
             pool_timeout,
             pool_id: &allocated.pool.component_id,
-            component: pool_entry.1.as_ref(),
         })
         .await?;
         let expected_out =
@@ -216,30 +214,40 @@ impl<'a> RouteResimulator<'a> {
         // Reusing the same pool in one route should see the updated state from the prior swap.
         self.pool_cache.insert(
             allocated.pool.component_id.clone(),
-            (Arc::from(result.new_state), Arc::clone(&pool_entry.1)),
+            CachedPoolEntry {
+                pool_state: Arc::from(result.new_state),
+                component: Arc::clone(&pool_entry.component),
+                backend: pool_entry.backend,
+            },
         );
         Ok(ResimulatedSwapInternal {
             pool: allocated.pool,
+            backend: pool_entry.backend,
             token_in: allocated.token_in,
             token_out: allocated.token_out,
             split_bps: allocated.split_bps,
             amount_in: allocated.amount_in,
             expected_amount_out: expected_out,
             pool_state: pre_state,
-            component: pool_entry.1,
+            component: pool_entry.component,
         })
     }
 
     async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, EncodeError> {
         if let Some(entry) = self.pool_cache.get(pool_id) {
-            return Ok((Arc::clone(&entry.0), Arc::clone(&entry.1)));
+            return Ok(entry.clone());
         }
 
-        let entry = self
+        let (pool_state, component) = self
             .state
             .pool_by_id(pool_id)
             .await
             .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
+        let entry = CachedPoolEntry {
+            backend: PoolBackend::from_component(component.as_ref()),
+            pool_state,
+            component,
+        };
         self.pool_cache.insert(pool_id.to_string(), entry.clone());
         Ok(entry)
     }
@@ -278,11 +286,11 @@ fn require_hop_amount_in(
     Ok(hop_amount_in)
 }
 
-fn pool_timeout_for_component(state: &AppState, component: &ProtocolComponent) -> Duration {
-    match simulation_backend(component) {
-        SimulationBackend::Native => state.pool_timeout_native(),
-        SimulationBackend::Vm => state.pool_timeout_vm(),
-        SimulationBackend::Rfq => state.pool_timeout_rfq(),
+fn pool_timeout_for_backend(state: &AppState, backend: PoolBackend) -> Duration {
+    match backend {
+        PoolBackend::Native => state.pool_timeout_native(),
+        PoolBackend::Vm => state.pool_timeout_vm(),
+        PoolBackend::Rfq => state.pool_timeout_rfq(),
     }
 }
 
@@ -298,14 +306,14 @@ async fn simulate_swap_blocking(
     let BlockingSwapRequest {
         state,
         pool_state,
+        backend,
         amount_in_for_sim,
         token_in,
         token_out,
         pool_timeout,
         pool_id,
-        component,
     } = request;
-    let permit = acquire_pool_permit(state, component).await?;
+    let permit = acquire_pool_permit(state, backend).await?;
     let handle = spawn_blocking(move || {
         let _permit = permit;
         let pre_state = pool_state;
@@ -331,34 +339,24 @@ async fn simulate_swap_blocking(
 
 async fn acquire_pool_permit(
     state: &AppState,
-    component: &ProtocolComponent,
+    backend: PoolBackend,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, EncodeError> {
-    match simulation_backend(component) {
-        SimulationBackend::Native => state
+    match backend {
+        PoolBackend::Native => state
             .native_sim_semaphore()
             .acquire_owned()
             .await
             .map_err(|_| EncodeError::internal("Native pool semaphore closed")),
-        SimulationBackend::Vm => state
+        PoolBackend::Vm => state
             .vm_sim_semaphore()
             .acquire_owned()
             .await
             .map_err(|_| EncodeError::internal("VM pool semaphore closed")),
-        SimulationBackend::Rfq => state
+        PoolBackend::Rfq => state
             .rfq_sim_semaphore()
             .acquire_owned()
             .await
             .map_err(|_| EncodeError::internal("RFQ pool semaphore closed")),
-    }
-}
-
-fn simulation_backend(component: &ProtocolComponent) -> SimulationBackend {
-    match ProtocolKind::from_component(component) {
-        Some(ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2) => {
-            SimulationBackend::Vm
-        }
-        Some(ProtocolKind::Hashflow | ProtocolKind::Bebop) => SimulationBackend::Rfq,
-        _ => SimulationBackend::Native,
     }
 }
 
