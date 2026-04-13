@@ -10,6 +10,7 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 
+use super::backend::PoolBackend;
 use super::model::ResimulatedRouteInternal;
 use super::wire::format_address;
 use super::EncodeComputation;
@@ -55,6 +56,7 @@ struct EncodeRequestSummary {
     swaps: usize,
     route_protocols: String,
     route_uses_vm: bool,
+    route_uses_rfq: bool,
     token_in: String,
     token_out: String,
     amount_in: String,
@@ -132,6 +134,7 @@ pub(crate) fn log_success(
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -157,6 +160,7 @@ pub(crate) fn log_received(request: &RouteEncodeRequest) {
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         "Received encode request"
     );
 }
@@ -185,6 +189,7 @@ pub(crate) fn log_failure(
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -213,6 +218,7 @@ pub(crate) fn log_handler_timeout(request: &RouteEncodeRequest, timeout_ms: u64,
         swaps = summary.swaps,
         route_protocols = summary.route_protocols.as_str(),
         route_uses_vm = summary.route_uses_vm,
+        route_uses_rfq = summary.route_uses_rfq,
         token_in = summary.token_in.as_str(),
         token_out = summary.token_out.as_str(),
         amount_in = summary.amount_in.as_str(),
@@ -256,6 +262,21 @@ fn summarize_request(request: &RouteEncodeRequest) -> EncodeRequestSummary {
         .flat_map(|hop| hop.swaps.iter())
         .map(|swap| swap.pool.protocol.trim().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
+    let mut route_uses_vm = false;
+    let mut route_uses_rfq = false;
+    for swap in request
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+    {
+        let backend = PoolBackend::from_protocol_hint(&swap.pool.protocol);
+        if backend.is_vm() {
+            route_uses_vm = true;
+        } else if backend.is_rfq() {
+            route_uses_rfq = true;
+        }
+    }
 
     EncodeRequestSummary {
         request_id: request.request_id.clone(),
@@ -265,12 +286,8 @@ fn summarize_request(request: &RouteEncodeRequest) -> EncodeRequestSummary {
         hops,
         swaps,
         route_protocols: protocols.into_iter().collect::<Vec<_>>().join(","),
-        route_uses_vm: request
-            .segments
-            .iter()
-            .flat_map(|segment| segment.hops.iter())
-            .flat_map(|hop| hop.swaps.iter())
-            .any(|swap| swap.pool.protocol.trim().starts_with("vm:")),
+        route_uses_vm,
+        route_uses_rfq,
         token_in: request.token_in.clone(),
         token_out: request.token_out.clone(),
         amount_in: request.amount_in.clone(),
@@ -361,6 +378,7 @@ fn is_native_address(value: &str) -> bool {
 )]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use tycho_simulation::protocol::models::Update;
 
@@ -382,6 +400,7 @@ mod tests {
             swap_kind: SwapKind::SimpleSwap,
             segments: Vec::new(),
             request_id: request_id.map(str::to_string),
+            estimated_amount_in: None,
         }
     }
 
@@ -450,13 +469,15 @@ mod tests {
                 },
             ],
             request_id: Some("req-logging".to_string()),
+            estimated_amount_in: None,
         }
     }
 
     #[tokio::test]
     async fn build_debug_omits_when_request_id_missing() {
         let tokens_store = token_store_with_tokens(Vec::new());
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -466,6 +487,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -477,7 +499,8 @@ mod tests {
     #[tokio::test]
     async fn build_debug_includes_block_when_request_id_present() {
         let tokens_store = token_store_with_tokens(Vec::new());
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -487,6 +510,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -505,7 +529,7 @@ mod tests {
 
     #[test]
     fn summarize_request_collects_route_shape_and_protocols() {
-        let request = route_request(&["curve_v2", "vm:maverick_v2", "uniswap_v3"]);
+        let request = route_request(&["curve_v2", "VM:MAVERICK_V2", "RFQ:HASHFLOW"]);
 
         let summary = summarize_request(&request);
 
@@ -516,9 +540,10 @@ mod tests {
         assert_eq!(summary.swaps, 3);
         assert_eq!(
             summary.route_protocols,
-            "curve_v2,uniswap_v3,vm:maverick_v2"
+            "curve_v2,rfq:hashflow,vm:maverick_v2"
         );
         assert!(summary.route_uses_vm);
+        assert!(summary.route_uses_rfq);
         assert!(summary.is_native_input);
     }
 

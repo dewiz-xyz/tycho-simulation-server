@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use num_bigint::BigUint;
 use num_traits::Zero;
+use std::collections::HashMap;
 use tycho_execution::encoding::errors::EncodingError;
 use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
@@ -169,7 +167,7 @@ impl ProtocolSim for StepProtocolSim {
     clippy::expect_used,
     reason = "Tests only call this helper with StepProtocolSim states."
 )]
-pub(super) fn step_multiplier(state: &Arc<dyn ProtocolSim>) -> u32 {
+pub(super) fn step_multiplier(state: &dyn ProtocolSim) -> u32 {
     state
         .as_any()
         .downcast_ref::<StepProtocolSim>()

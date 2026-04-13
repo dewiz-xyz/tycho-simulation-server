@@ -9,6 +9,7 @@ use crate::models::erc4626::{
 use crate::models::messages::{HopDraft, PoolSwapDraft, RouteEncodeRequest, SegmentDraft};
 
 use super::allocation::{allocate_amounts_by_bps, BPS_DENOMINATOR};
+use super::backend::PoolBackend;
 use super::model::{
     NormalizedHopInternal, NormalizedRouteInternal, NormalizedSegmentInternal,
     NormalizedSwapDraftInternal,
@@ -82,9 +83,10 @@ pub(super) fn normalize_route(
     })
 }
 
-pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool, bool) {
+pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool, bool, bool) {
     let mut uses_native = false;
     let mut uses_vm = false;
+    let mut uses_rfq = false;
 
     for swap in normalized
         .segments
@@ -92,18 +94,21 @@ pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool
         .flat_map(|segment| segment.hops.iter())
         .flat_map(|hop| hop.swaps.iter())
     {
-        if swap.pool.protocol.starts_with("vm:") {
-            uses_vm = true;
-        } else {
+        let backend = PoolBackend::from_protocol_hint(&swap.pool.protocol);
+        if backend.is_native() {
             uses_native = true;
+        } else if backend.is_vm() {
+            uses_vm = true;
+        } else if backend.is_rfq() {
+            uses_rfq = true;
         }
 
-        if uses_native && uses_vm {
+        if uses_native && uses_vm && uses_rfq {
             break;
         }
     }
 
-    (uses_native, uses_vm)
+    (uses_native, uses_vm, uses_rfq)
 }
 
 fn validate_segment_shape(segment: &SegmentDraft, segment_index: usize) -> Result<(), EncodeError> {
@@ -323,7 +328,7 @@ mod tests {
                         token_out: "0x0000000000000000000000000000000000000003".to_string(),
                         swaps: vec![PoolSwapDraft {
                             pool: PoolRef {
-                                protocol: "vm:maverick_v2".to_string(),
+                                protocol: "VM:MAVERICK_V2".to_string(),
                                 component_id: "pool-vm".to_string(),
                                 pool_address: None,
                             },
@@ -335,6 +340,7 @@ mod tests {
                 ],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let normalized = normalize_route(
@@ -348,7 +354,54 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(route_backend_usage(&normalized), (true, true));
+        assert_eq!(route_backend_usage(&normalized), (true, true, false));
+    }
+
+    #[test]
+    fn route_backend_usage_detects_rfq_from_protocol_hint() {
+        let request = RouteEncodeRequest {
+            chain_id: 1,
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "100".to_string(),
+            min_amount_out: "90".to_string(),
+            settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
+            tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
+            swap_kind: SwapKind::SimpleSwap,
+            segments: vec![SegmentDraft {
+                kind: SwapKind::SimpleSwap,
+                share_bps: 0,
+                hops: vec![HopDraft {
+                    token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                    token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                    swaps: vec![PoolSwapDraft {
+                        pool: PoolRef {
+                            protocol: "RFQ:HASHFLOW".to_string(),
+                            component_id: "pool-rfq".to_string(),
+                            pool_address: None,
+                        },
+                        token_in: "0x0000000000000000000000000000000000000001".to_string(),
+                        token_out: "0x0000000000000000000000000000000000000002".to_string(),
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+            request_id: None,
+            estimated_amount_in: None,
+        };
+
+        let normalized = normalize_route(
+            &request,
+            &parse_address(&request.token_in).unwrap(),
+            &parse_address(&request.token_out).unwrap(),
+            &BigUint::from(100u32),
+            &Chain::Ethereum.native_token().address,
+            false,
+            &allowlist(),
+        )
+        .unwrap();
+
+        assert_eq!(route_backend_usage(&normalized), (false, false, true));
     }
 
     #[test]
@@ -393,6 +446,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -459,6 +513,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = Bytes::from_str("0x0000000000000000000000000000000000000001").unwrap();
@@ -531,6 +586,7 @@ mod tests {
                 },
             ],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -594,6 +650,7 @@ mod tests {
                 ],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -649,6 +706,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -701,6 +759,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();
@@ -762,6 +821,7 @@ mod tests {
                 }],
             }],
             request_id: None,
+            estimated_amount_in: None,
         };
 
         let token_in = parse_address(&request.token_in).unwrap();

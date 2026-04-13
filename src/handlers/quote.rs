@@ -20,6 +20,7 @@ use crate::{
             QuoteFailure, QuoteFailureKind, QuotePartialKind, QuoteResult, QuoteResultQuality,
             QuoteStatus,
         },
+        protocol,
         state::AppState,
     },
     services::quotes::{get_amounts_out, QuoteComputation},
@@ -96,6 +97,7 @@ async fn build_request_guard_timeout_result(
 ) -> QuoteResult {
     let block_number = state.current_block().await;
     let vm_block_number = state.current_vm_block().await;
+    let rfq_block_number = state.current_rfq_block().await;
     let total_pools = state.total_pools().await;
     let timeout_ms = request_timeout.as_millis() as u64;
 
@@ -118,6 +120,7 @@ async fn build_request_guard_timeout_result(
         meta: simulate_timeout_meta(
             block_number,
             vm_block_number,
+            rfq_block_number,
             Some(total_pools),
             request.auction_id.clone(),
             format!("Simulate request timed out after {}ms", timeout_ms),
@@ -178,102 +181,131 @@ struct CompletionEvent<'a> {
     top_response: &'a TopResponseSummary<'a>,
 }
 
+macro_rules! log_completion_event {
+    ($event:expr, $token_in:expr, $token_out:expr, $simulation_runs:expr) => {
+        if $event.timed_out {
+            tracing::event!(
+                tracing::Level::WARN,
+                scope = $event.scope,
+                request_id = $event.request.request_id.as_str(),
+                auction_id = $event.request.auction_id.as_deref(),
+                latency_ms = $event.latency_ms,
+                quote_status = quote_status_label($event.computation.meta.status),
+                quote_result_quality = quote_result_quality_label($event.computation.meta.result_quality),
+                partial_kind = $event.computation.meta.partial_kind.map(quote_partial_kind_label),
+                vm_unavailable = $event.computation.meta.vm_unavailable,
+                rfq_unavailable = $event.computation.meta.rfq_unavailable,
+                responses = $event.computation.responses.len(),
+                failures = $event.computation.meta.failures.len(),
+                pool_results = $event.computation.meta.pool_results.len(),
+                scheduled_native_pools = $event.computation.metrics.scheduled_native_pools,
+                scheduled_vm_pools = $event.computation.metrics.scheduled_vm_pools,
+                scheduled_rfq_pools = $event.computation.metrics.scheduled_rfq_pools,
+                simulation_runs = $simulation_runs,
+                skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
+                skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
+                skipped_native_concurrency = $event.computation.metrics.skipped_native_concurrency,
+                skipped_vm_concurrency = $event.computation.metrics.skipped_vm_concurrency,
+                skipped_rfq_concurrency = $event.computation.metrics.skipped_rfq_concurrency,
+                skipped_native_deadline = $event.computation.metrics.skipped_native_deadline,
+                skipped_vm_deadline = $event.computation.metrics.skipped_vm_deadline,
+                skipped_rfq_deadline = $event.computation.metrics.skipped_rfq_deadline,
+                vm_completed_pools = $event.computation.metrics.vm_completed_pools,
+                rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
+                vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
+                rfq_median_first_gas = $event.computation.metrics.rfq_median_first_gas,
+                vm_low_first_gas_count = $event.computation.metrics.vm_low_first_gas_count,
+                rfq_low_first_gas_count = $event.computation.metrics.rfq_low_first_gas_count,
+                vm_low_first_gas_ratio = $event.computation.metrics.vm_low_first_gas_ratio,
+                rfq_low_first_gas_ratio = $event.computation.metrics.rfq_low_first_gas_ratio,
+                vm_low_first_gas_samples = ?$event.computation.metrics.vm_low_first_gas_samples,
+                rfq_low_first_gas_samples = ?$event.computation.metrics.rfq_low_first_gas_samples,
+                token_in = $token_in.as_ref(),
+                token_out = $token_out.as_ref(),
+                amounts = $event.request.amounts.len(),
+                top_pool = $event.top_response.pool,
+                top_pool_name = $event.top_response.pool_name,
+                top_pool_address = $event.top_response.pool_address,
+                top_amount_out = $event.top_response.amount_out,
+                top_gas_used = $event.top_response.gas_used,
+                failure_kinds = ?$event.failure_summary.kind_counts,
+                failure_protocols = ?$event.failure_summary.protocol_counts,
+                failure_pool_kinds = ?$event.failure_summary.pool_kind_counts,
+                failure_samples = ?$event.failure_summary.samples,
+                outcome_kinds = ?$event.pool_outcome_summary.kind_counts,
+                outcome_protocols = ?$event.pool_outcome_summary.protocol_counts,
+                outcome_samples = ?$event.pool_outcome_summary.samples,
+                "{}",
+                $event.message
+            );
+        } else {
+            tracing::event!(
+                tracing::Level::INFO,
+                scope = $event.scope,
+                request_id = $event.request.request_id.as_str(),
+                auction_id = $event.request.auction_id.as_deref(),
+                latency_ms = $event.latency_ms,
+                quote_status = quote_status_label($event.computation.meta.status),
+                quote_result_quality = quote_result_quality_label($event.computation.meta.result_quality),
+                partial_kind = $event.computation.meta.partial_kind.map(quote_partial_kind_label),
+                vm_unavailable = $event.computation.meta.vm_unavailable,
+                rfq_unavailable = $event.computation.meta.rfq_unavailable,
+                responses = $event.computation.responses.len(),
+                failures = $event.computation.meta.failures.len(),
+                pool_results = $event.computation.meta.pool_results.len(),
+                scheduled_native_pools = $event.computation.metrics.scheduled_native_pools,
+                scheduled_vm_pools = $event.computation.metrics.scheduled_vm_pools,
+                scheduled_rfq_pools = $event.computation.metrics.scheduled_rfq_pools,
+                simulation_runs = $simulation_runs,
+                skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
+                skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
+                skipped_native_concurrency = $event.computation.metrics.skipped_native_concurrency,
+                skipped_vm_concurrency = $event.computation.metrics.skipped_vm_concurrency,
+                skipped_rfq_concurrency = $event.computation.metrics.skipped_rfq_concurrency,
+                skipped_native_deadline = $event.computation.metrics.skipped_native_deadline,
+                skipped_vm_deadline = $event.computation.metrics.skipped_vm_deadline,
+                skipped_rfq_deadline = $event.computation.metrics.skipped_rfq_deadline,
+                vm_completed_pools = $event.computation.metrics.vm_completed_pools,
+                rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
+                vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
+                rfq_median_first_gas = $event.computation.metrics.rfq_median_first_gas,
+                vm_low_first_gas_count = $event.computation.metrics.vm_low_first_gas_count,
+                rfq_low_first_gas_count = $event.computation.metrics.rfq_low_first_gas_count,
+                vm_low_first_gas_ratio = $event.computation.metrics.vm_low_first_gas_ratio,
+                rfq_low_first_gas_ratio = $event.computation.metrics.rfq_low_first_gas_ratio,
+                vm_low_first_gas_samples = ?$event.computation.metrics.vm_low_first_gas_samples,
+                rfq_low_first_gas_samples = ?$event.computation.metrics.rfq_low_first_gas_samples,
+                token_in = $token_in.as_ref(),
+                token_out = $token_out.as_ref(),
+                amounts = $event.request.amounts.len(),
+                top_pool = $event.top_response.pool,
+                top_pool_name = $event.top_response.pool_name,
+                top_pool_address = $event.top_response.pool_address,
+                top_amount_out = $event.top_response.amount_out,
+                top_gas_used = $event.top_response.gas_used,
+                failure_kinds = ?$event.failure_summary.kind_counts,
+                failure_protocols = ?$event.failure_summary.protocol_counts,
+                failure_pool_kinds = ?$event.failure_summary.pool_kind_counts,
+                failure_samples = ?$event.failure_summary.samples,
+                outcome_kinds = ?$event.pool_outcome_summary.kind_counts,
+                outcome_protocols = ?$event.pool_outcome_summary.protocol_counts,
+                outcome_samples = ?$event.pool_outcome_summary.samples,
+                "{}",
+                $event.message
+            );
+        }
+    };
+}
+
 fn emit_completion_event(event: CompletionEvent<'_>) {
     // Canonicalize address tokens so CloudWatch queries compare one stable representation.
     let token_in = canonicalize_token_for_log(event.request.token_in.as_str());
     let token_out = canonicalize_token_for_log(event.request.token_out.as_str());
+    let simulation_runs = event.computation.metrics.scheduled_native_pools
+        + event.computation.metrics.scheduled_vm_pools
+        + event.computation.metrics.scheduled_rfq_pools;
 
-    if event.timed_out {
-        tracing::event!(
-            tracing::Level::WARN,
-            scope = event.scope,
-            request_id = event.request.request_id.as_str(),
-            auction_id = event.request.auction_id.as_deref(),
-            latency_ms = event.latency_ms,
-            quote_status = quote_status_label(event.computation.meta.status),
-            quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
-            partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
-            vm_unavailable = event.computation.meta.vm_unavailable,
-            responses = event.computation.responses.len(),
-            failures = event.computation.meta.failures.len(),
-            pool_results = event.computation.meta.pool_results.len(),
-            scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
-            scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
-            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
-            skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
-            skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
-            skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
-            skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
-            skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
-            vm_completed_pools = event.computation.metrics.vm_completed_pools,
-            vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
-            vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
-            vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
-            vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
-            token_in = token_in.as_ref(),
-            token_out = token_out.as_ref(),
-            amounts = event.request.amounts.len(),
-            top_pool = event.top_response.pool,
-            top_pool_name = event.top_response.pool_name,
-            top_pool_address = event.top_response.pool_address,
-            top_amount_out = event.top_response.amount_out,
-            top_gas_used = event.top_response.gas_used,
-            failure_kinds = ?event.failure_summary.kind_counts,
-            failure_protocols = ?event.failure_summary.protocol_counts,
-            failure_pool_kinds = ?event.failure_summary.pool_kind_counts,
-            failure_samples = ?event.failure_summary.samples,
-            outcome_kinds = ?event.pool_outcome_summary.kind_counts,
-            outcome_protocols = ?event.pool_outcome_summary.protocol_counts,
-            outcome_samples = ?event.pool_outcome_summary.samples,
-            "{}",
-            event.message
-        );
-    } else {
-        tracing::event!(
-            tracing::Level::INFO,
-            scope = event.scope,
-            request_id = event.request.request_id.as_str(),
-            auction_id = event.request.auction_id.as_deref(),
-            latency_ms = event.latency_ms,
-            quote_status = quote_status_label(event.computation.meta.status),
-            quote_result_quality = quote_result_quality_label(event.computation.meta.result_quality),
-            partial_kind = event.computation.meta.partial_kind.map(quote_partial_kind_label),
-            vm_unavailable = event.computation.meta.vm_unavailable,
-            responses = event.computation.responses.len(),
-            failures = event.computation.meta.failures.len(),
-            pool_results = event.computation.meta.pool_results.len(),
-            scheduled_native_pools = event.computation.metrics.scheduled_native_pools,
-            scheduled_vm_pools = event.computation.metrics.scheduled_vm_pools,
-            simulation_runs = event.computation.metrics.scheduled_native_pools + event.computation.metrics.scheduled_vm_pools,
-            skipped_vm_unavailable = event.computation.metrics.skipped_vm_unavailable,
-            skipped_native_concurrency = event.computation.metrics.skipped_native_concurrency,
-            skipped_vm_concurrency = event.computation.metrics.skipped_vm_concurrency,
-            skipped_native_deadline = event.computation.metrics.skipped_native_deadline,
-            skipped_vm_deadline = event.computation.metrics.skipped_vm_deadline,
-            vm_completed_pools = event.computation.metrics.vm_completed_pools,
-            vm_median_first_gas = event.computation.metrics.vm_median_first_gas,
-            vm_low_first_gas_count = event.computation.metrics.vm_low_first_gas_count,
-            vm_low_first_gas_ratio = event.computation.metrics.vm_low_first_gas_ratio,
-            vm_low_first_gas_samples = ?event.computation.metrics.vm_low_first_gas_samples,
-            token_in = token_in.as_ref(),
-            token_out = token_out.as_ref(),
-            amounts = event.request.amounts.len(),
-            top_pool = event.top_response.pool,
-            top_pool_name = event.top_response.pool_name,
-            top_pool_address = event.top_response.pool_address,
-            top_amount_out = event.top_response.amount_out,
-            top_gas_used = event.top_response.gas_used,
-            failure_kinds = ?event.failure_summary.kind_counts,
-            failure_protocols = ?event.failure_summary.protocol_counts,
-            failure_pool_kinds = ?event.failure_summary.pool_kind_counts,
-            failure_samples = ?event.failure_summary.samples,
-            outcome_kinds = ?event.pool_outcome_summary.kind_counts,
-            outcome_protocols = ?event.pool_outcome_summary.protocol_counts,
-            outcome_samples = ?event.pool_outcome_summary.samples,
-            "{}",
-            event.message
-        );
-    }
+    log_completion_event!(&event, token_in, token_out, simulation_runs);
 }
 
 fn canonicalize_token_for_log(token: &str) -> Cow<'_, str> {
@@ -375,11 +407,7 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
 
         if let Some(protocol) = failure.protocol.as_deref() {
             *protocol_counts.entry(protocol.to_string()).or_insert(0) += 1;
-            let pool_kind = if protocol.starts_with("vm:") {
-                "vm"
-            } else {
-                "native"
-            };
+            let pool_kind = classify_protocol_pool_kind(protocol);
             *pool_kind_counts.entry(pool_kind.to_string()).or_insert(0) += 1;
         } else {
             *pool_kind_counts.entry("unknown".to_string()).or_insert(0) += 1;
@@ -404,6 +432,16 @@ fn summarize_failures(failures: &[QuoteFailure]) -> FailureSummary {
         protocol_counts: protocol_counts.into_iter().collect(),
         pool_kind_counts: pool_kind_counts.into_iter().collect(),
         samples,
+    }
+}
+
+fn classify_protocol_pool_kind(protocol: &str) -> &'static str {
+    if protocol.starts_with("vm:") {
+        protocol::VM
+    } else if protocol.starts_with("rfq:") {
+        protocol::RFQ
+    } else {
+        protocol::NATIVE
     }
 }
 
@@ -569,9 +607,38 @@ mod tests {
         );
         assert_eq!(
             summary.pool_kind_counts,
-            vec![("native".to_string(), 2), ("vm".to_string(), 2)]
+            vec![
+                (protocol::NATIVE.to_string(), 2),
+                (protocol::VM.to_string(), 2),
+            ]
         );
         assert_eq!(summary.samples.len(), 4);
+    }
+
+    #[test]
+    fn rfq_failures_are_bucketed_separately_from_native() {
+        let failures = vec![
+            make_failure(QuoteFailureKind::Simulator, Some("rfq:hashflow")),
+            make_failure(QuoteFailureKind::Timeout, Some("rfq:bebop")),
+            make_failure(QuoteFailureKind::Overflow, Some("uniswap_v3")),
+        ];
+        let summary = summarize_failures(&failures);
+
+        assert_eq!(
+            summary.protocol_counts,
+            vec![
+                ("rfq:bebop".to_string(), 1),
+                ("rfq:hashflow".to_string(), 1),
+                ("uniswap_v3".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            summary.pool_kind_counts,
+            vec![
+                (protocol::NATIVE.to_string(), 1),
+                (protocol::RFQ.to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -656,6 +723,7 @@ mod tests {
         let meta = simulate_timeout_meta(
             12,
             Some(11),
+            Some(12),
             Some(42),
             Some("auction-1".to_string()),
             "Simulate request timed out after 1500ms".to_string(),

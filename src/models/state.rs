@@ -32,22 +32,29 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
+    pub rfq_state_store: Arc<StateStore>,
     pub native_stream_health: Arc<StreamHealth>,
     pub vm_stream_health: Arc<StreamHealth>,
+    pub rfq_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
+    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub enable_vm_pools: bool,
+    pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
     pub quote_timeout: Duration,
     pub pool_timeout_native: Duration,
     pub pool_timeout_vm: Duration,
+    pub pool_timeout_rfq: Duration,
     pub request_timeout: Duration,
     pub native_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_semaphore: Arc<Semaphore>,
+    pub rfq_sim_semaphore: Arc<Semaphore>,
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
+    pub rfq_sim_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +82,27 @@ pub enum VmReadiness {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RfqReadiness {
+    Disabled,
+    WarmingUp,
+    Rebuilding,
+    Ready,
+    Stale,
+}
+
 impl VmReadiness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::WarmingUp | Self::Stale => "warming_up",
+            Self::Rebuilding => "rebuilding",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+impl RfqReadiness {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -95,6 +122,10 @@ pub enum EncodeAvailability {
     VmWarmingUp,
     VmRebuilding,
     VmStale,
+    RfqDisabled,
+    RfqWarmingUp,
+    RfqRebuilding,
+    RfqStale,
 }
 
 impl EncodeAvailability {
@@ -104,13 +135,21 @@ impl EncodeAvailability {
             Self::NativeWarmingUp => Some("Encode unavailable: native state warming up"),
             Self::NativeStale => Some("Encode unavailable: native state stale"),
             Self::VmDisabled => Some("Encode unavailable: VM pools disabled for requested route"),
+            Self::RfqDisabled => Some("Encode unavailable: RFQ pools disabled for requested route"),
             Self::VmWarmingUp => {
                 Some("Encode unavailable: VM state warming up for requested route")
+            }
+            Self::RfqWarmingUp => {
+                Some("Encode unavailable: RFQ state warming up for requested route")
             }
             Self::VmRebuilding => {
                 Some("Encode unavailable: VM state rebuilding for requested route")
             }
+            Self::RfqRebuilding => {
+                Some("Encode unavailable: RFQ state rebuilding for requested route")
+            }
             Self::VmStale => Some("Encode unavailable: VM state stale for requested route"),
+            Self::RfqStale => Some("Encode unavailable: RFQ state stale for requested route"),
         }
     }
 }
@@ -127,10 +166,18 @@ impl AppState {
         Some(self.vm_state_store.current_block().await)
     }
 
+    pub async fn current_rfq_block(&self) -> Option<u64> {
+        if !self.rfq_ready().await {
+            return None;
+        }
+        Some(self.rfq_state_store.current_block().await)
+    }
+
     pub async fn total_pools(&self) -> usize {
         let native = self.native_state_store.total_states().await;
         let vm = self.vm_state_store.total_states().await;
-        native + vm
+        let rfq = self.rfq_state_store.total_states().await;
+        native + vm + rfq
     }
 
     pub fn is_ready(&self) -> bool {
@@ -147,6 +194,10 @@ impl AppState {
 
     pub async fn vm_update_age_ms(&self) -> Option<u64> {
         self.vm_stream_health.last_update_age_ms().await
+    }
+
+    pub async fn rfq_update_age_ms(&self) -> Option<u64> {
+        self.rfq_stream_health.last_update_age_ms().await
     }
 
     pub async fn native_readiness(&self) -> NativeReadiness {
@@ -181,10 +232,31 @@ impl AppState {
         }
     }
 
+    pub async fn rfq_readiness(&self) -> RfqReadiness {
+        if !self.enable_rfq_pools {
+            return RfqReadiness::Disabled;
+        }
+
+        if self.rfq_rebuilding().await {
+            return RfqReadiness::Rebuilding;
+        }
+
+        if !self.rfq_state_store.is_ready() {
+            return RfqReadiness::WarmingUp;
+        }
+
+        if is_update_stale(self.rfq_update_age_ms().await, self.readiness_stale_ms()) {
+            RfqReadiness::Stale
+        } else {
+            RfqReadiness::Ready
+        }
+    }
+
     pub(crate) async fn encode_availability(
         &self,
         uses_native: bool,
         uses_vm: bool,
+        uses_rfq: bool,
     ) -> EncodeAvailability {
         if uses_native {
             match self.native_readiness().await {
@@ -194,17 +266,27 @@ impl AppState {
             }
         }
 
-        if !uses_vm {
-            return EncodeAvailability::Ready;
+        if uses_vm {
+            match self.vm_readiness().await {
+                VmReadiness::Disabled => return EncodeAvailability::VmDisabled,
+                VmReadiness::WarmingUp => return EncodeAvailability::VmWarmingUp,
+                VmReadiness::Rebuilding => return EncodeAvailability::VmRebuilding,
+                VmReadiness::Ready => {}
+                VmReadiness::Stale => return EncodeAvailability::VmStale,
+            }
         }
 
-        match self.vm_readiness().await {
-            VmReadiness::Disabled => EncodeAvailability::VmDisabled,
-            VmReadiness::WarmingUp => EncodeAvailability::VmWarmingUp,
-            VmReadiness::Rebuilding => EncodeAvailability::VmRebuilding,
-            VmReadiness::Ready => EncodeAvailability::Ready,
-            VmReadiness::Stale => EncodeAvailability::VmStale,
+        if uses_rfq {
+            match self.rfq_readiness().await {
+                RfqReadiness::Disabled => return EncodeAvailability::RfqDisabled,
+                RfqReadiness::WarmingUp => return EncodeAvailability::RfqWarmingUp,
+                RfqReadiness::Rebuilding => return EncodeAvailability::RfqRebuilding,
+                RfqReadiness::Ready => {}
+                RfqReadiness::Stale => return EncodeAvailability::RfqStale,
+            }
         }
+
+        EncodeAvailability::Ready
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
@@ -223,6 +305,10 @@ impl AppState {
         self.pool_timeout_vm
     }
 
+    pub fn pool_timeout_rfq(&self) -> Duration {
+        self.pool_timeout_rfq
+    }
+
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -234,16 +320,42 @@ impl AppState {
         Arc::clone(&self.vm_sim_semaphore)
     }
 
-    pub async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
-        if let Some(entry) = self.native_state_store.pool_by_id(id).await {
-            return Some(entry);
+    pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.rfq_sim_semaphore)
+    }
+
+    pub async fn pool_by_id(&self, id: &str) -> Result<Option<PoolEntry>, EncodeAvailability> {
+        if self.native_state_store.has_pool(id).await {
+            return match self.native_readiness().await {
+                NativeReadiness::Ready => Ok(self.native_state_store.pool_by_id(id).await),
+                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
+                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
+            };
         }
 
-        if !self.vm_ready().await {
-            return None;
+        // Route hints can miss VM/RFQ backends, so encode lookup needs the actual backend
+        // readiness here to distinguish "unavailable" from "pool not found".
+        if self.vm_state_store.has_pool(id).await {
+            return match self.vm_readiness().await {
+                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
+                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
+                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
+                VmReadiness::Ready => Ok(self.vm_state_store.pool_by_id(id).await),
+                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
+            };
         }
 
-        self.vm_state_store.pool_by_id(id).await
+        if self.rfq_state_store.has_pool(id).await {
+            return match self.rfq_readiness().await {
+                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
+                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
+                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
+                RfqReadiness::Ready => Ok(self.rfq_state_store.pool_by_id(id).await),
+                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
+            };
+        }
+
+        Ok(None)
     }
 
     pub async fn vm_ready(&self) -> bool {
@@ -256,16 +368,38 @@ impl AppState {
         self.vm_state_store.is_ready()
     }
 
+    pub async fn rfq_ready(&self) -> bool {
+        if !self.enable_rfq_pools {
+            return false;
+        }
+        if self.rfq_rebuilding().await {
+            return false;
+        }
+        self.rfq_state_store.is_ready()
+    }
+
     pub async fn vm_rebuilding(&self) -> bool {
         self.vm_stream.read().await.rebuilding
+    }
+
+    pub async fn rfq_rebuilding(&self) -> bool {
+        self.rfq_stream.read().await.rebuilding
     }
 
     pub async fn vm_block(&self) -> u64 {
         self.vm_state_store.current_block().await
     }
 
+    pub async fn rfq_block(&self) -> u64 {
+        self.rfq_state_store.current_block().await
+    }
+
     pub async fn vm_pools(&self) -> usize {
         self.vm_state_store.total_states().await
+    }
+
+    pub async fn rfq_pools(&self) -> usize {
+        self.rfq_state_store.total_states().await
     }
 }
 
@@ -277,6 +411,14 @@ fn is_update_stale(last_update_age_ms: Option<u64>, readiness_stale_ms: u64) -> 
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStreamStatus {
+    pub rebuilding: bool,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RfqStreamStatus {
     pub rebuilding: bool,
     pub restart_count: u64,
     pub last_error: Option<String>,
@@ -994,40 +1136,62 @@ mod tests {
         Update::new(1, states, new_pairs)
     }
 
-    fn build_test_app_state(
+    struct TestAppStateStores {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
+    }
+
+    struct PoolFlags {
         enable_vm_pools: bool,
-        native_sim_concurrency: usize,
-        vm_sim_concurrency: usize,
+        enable_rfq_pools: bool,
+    }
+
+    struct SimConcurrency {
+        native: usize,
+        vm: usize,
+        rfq: usize,
+    }
+
+    fn build_test_app_state(
+        stores: TestAppStateStores,
+        flags: PoolFlags,
+        concurrency: SimConcurrency,
     ) -> AppState {
         AppState {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
-            tokens: token_store,
-            native_state_store,
-            vm_state_store,
+            tokens: stores.token_store,
+            native_state_store: stores.native_state_store,
+            vm_state_store: stores.vm_state_store,
+            rfq_state_store: stores.rfq_state_store,
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            enable_vm_pools,
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+            enable_vm_pools: flags.enable_vm_pools,
+            enable_rfq_pools: flags.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+            native_sim_semaphore: Arc::new(Semaphore::new(concurrency.native)),
+            vm_sim_semaphore: Arc::new(Semaphore::new(concurrency.vm)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(concurrency.rfq)),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency,
-            vm_sim_concurrency,
+            native_sim_concurrency: concurrency.native,
+            vm_sim_concurrency: concurrency.vm,
+            rfq_sim_concurrency: concurrency.rfq,
         }
     }
 
-    async fn build_readiness_test_state(enable_vm_pools: bool) -> AppState {
+    async fn build_readiness_test_state(enable_vm_pools: bool, enable_rfq_pools: bool) -> AppState {
         let token_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
@@ -1037,6 +1201,7 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let native_component = mk_component(
             28,
             "uniswap_v2",
@@ -1052,12 +1217,21 @@ mod tests {
             .await;
 
         build_test_app_state(
-            token_store,
-            native_state_store,
-            vm_state_store,
-            enable_vm_pools,
-            1,
-            1,
+            TestAppStateStores {
+                token_store,
+                native_state_store,
+                vm_state_store,
+                rfq_state_store,
+            },
+            PoolFlags {
+                enable_vm_pools,
+                enable_rfq_pools,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         )
     }
 
@@ -1073,14 +1247,31 @@ mod tests {
             ));
             let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
             let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-            build_test_app_state(token_store, native_state_store, vm_state_store, false, 1, 1)
+            let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+            build_test_app_state(
+                TestAppStateStores {
+                    token_store,
+                    native_state_store,
+                    vm_state_store,
+                    rfq_state_store,
+                },
+                PoolFlags {
+                    enable_vm_pools: false,
+                    enable_rfq_pools: false,
+                },
+                SimConcurrency {
+                    native: 1,
+                    vm: 1,
+                    rfq: 1,
+                },
+            )
         };
         assert_eq!(
             warming_up_state.native_readiness().await,
             NativeReadiness::WarmingUp
         );
 
-        let mut ready_state = build_readiness_test_state(false).await;
+        let mut ready_state = build_readiness_test_state(false, false).await;
         ready_state.native_stream_health.record_update(1).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Ready);
 
@@ -1089,17 +1280,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vm_readiness_distinguishes_disabled_warming_up_rebuilding_ready_and_stale() {
-        let disabled_state = build_readiness_test_state(false).await;
+    async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_rebuilding_ready_and_stale() {
+        let disabled_state = build_readiness_test_state(false, false).await;
         assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
+        assert_eq!(disabled_state.rfq_readiness().await, RfqReadiness::Disabled);
 
-        let mut state = build_readiness_test_state(true).await;
+        let mut state = build_readiness_test_state(true, true).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::WarmingUp);
 
         let vm_component = mk_component(
             31,
             "vm:curve",
             "curve_pool",
+            vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+        );
+        let rfq_component = mk_component(
+            31,
+            "rfq:hashflow",
+            "hashflow",
             vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
         );
         state
@@ -1110,18 +1309,36 @@ mod tests {
                 Box::new(DummySim),
             )]))
             .await;
+        state
+            .rfq_state_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                rfq_component,
+                Box::new(DummySim),
+            )]))
+            .await;
         state.vm_stream_health.record_update(1).await;
+        state.rfq_stream_health.record_update(1).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
 
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;
         }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = true;
+        }
         assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
 
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
+        }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = false;
         }
         state.readiness_stale = Duration::ZERO;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
@@ -1129,27 +1346,27 @@ mod tests {
 
     #[tokio::test]
     async fn encode_availability_gates_backends_by_route_shape() {
-        let native_ready_vm_disabled = build_readiness_test_state(false).await;
-        native_ready_vm_disabled
+        let native_ready_vm_and_rfq_disabled = build_readiness_test_state(false, false).await;
+        native_ready_vm_and_rfq_disabled
             .native_stream_health
             .record_update(1)
             .await;
 
         assert_eq!(
-            native_ready_vm_disabled
-                .encode_availability(true, false)
+            native_ready_vm_and_rfq_disabled
+                .encode_availability(true, false, false)
                 .await,
             EncodeAvailability::Ready
         );
         assert_eq!(
-            native_ready_vm_disabled
-                .encode_availability(false, true)
+            native_ready_vm_and_rfq_disabled
+                .encode_availability(false, true, false)
                 .await,
             EncodeAvailability::VmDisabled
         );
         assert_eq!(
-            native_ready_vm_disabled
-                .encode_availability(true, true)
+            native_ready_vm_and_rfq_disabled
+                .encode_availability(true, true, false)
                 .await,
             EncodeAvailability::VmDisabled
         );
@@ -1163,13 +1380,23 @@ mod tests {
         ));
         let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let native_warming_vm_ready = build_test_app_state(
-            token_store,
-            native_state_store,
-            Arc::clone(&vm_state_store),
-            true,
-            1,
-            1,
+            TestAppStateStores {
+                token_store,
+                native_state_store,
+                vm_state_store: Arc::clone(&vm_state_store),
+                rfq_state_store: Arc::clone(&rfq_state_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         );
         vm_state_store
             .apply_update(mk_update(vec![(
@@ -1190,22 +1417,107 @@ mod tests {
 
         assert_eq!(
             native_warming_vm_ready
-                .encode_availability(true, false)
+                .encode_availability(true, false, false)
                 .await,
             EncodeAvailability::NativeWarmingUp
         );
         assert_eq!(
             native_warming_vm_ready
-                .encode_availability(false, true)
+                .encode_availability(false, true, false)
                 .await,
             EncodeAvailability::Ready
         );
         assert_eq!(
             native_warming_vm_ready
-                .encode_availability(true, true)
+                .encode_availability(true, true, false)
                 .await,
             EncodeAvailability::NativeWarmingUp
         );
+    }
+
+    #[tokio::test]
+    async fn pool_by_id_only_exposes_encode_ready_vm_and_rfq_entries() {
+        let mut state = build_readiness_test_state(true, true).await;
+
+        state
+            .vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    36,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state
+            .rfq_state_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                mk_component(
+                    37,
+                    "rfq:hashflow",
+                    "hashflow_pool",
+                    vec![mk_token(36, "TKNA"), mk_token(37, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        state.vm_stream_health.record_update(1).await;
+        state.rfq_stream_health.record_update(1).await;
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
+        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
+        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = true;
+        }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = true;
+        }
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
+        assert!(matches!(
+            state.pool_by_id("pool-vm").await,
+            Err(EncodeAvailability::VmRebuilding)
+        ));
+        assert!(matches!(
+            state.pool_by_id("pool-rfq").await,
+            Err(EncodeAvailability::RfqRebuilding)
+        ));
+
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.rebuilding = false;
+        }
+        {
+            let mut rfq_status = state.rfq_stream.write().await;
+            rfq_status.rebuilding = false;
+        }
+
+        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
+        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
+
+        state.readiness_stale = Duration::ZERO;
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
+        assert!(matches!(
+            state.pool_by_id("pool-vm").await,
+            Err(EncodeAvailability::VmStale)
+        ));
+        assert!(matches!(
+            state.pool_by_id("pool-rfq").await,
+            Err(EncodeAvailability::RfqStale)
+        ));
     }
 
     #[test]
@@ -1526,6 +1838,7 @@ mod tests {
         ));
         let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         let token_a = mk_token(7, "TKNA");
         let token_b = mk_token(8, "TKNB");
@@ -1554,12 +1867,21 @@ mod tests {
             .await;
 
         let app_state = build_test_app_state(
-            Arc::clone(&token_store),
-            Arc::clone(&native_store),
-            Arc::clone(&vm_store),
-            true,
-            1,
-            1,
+            TestAppStateStores {
+                token_store: Arc::clone(&token_store),
+                native_state_store: Arc::clone(&native_store),
+                vm_state_store: Arc::clone(&vm_store),
+                rfq_state_store: Arc::clone(&rfq_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
         );
 
         assert_eq!(app_state.total_pools().await, 2);
@@ -1577,6 +1899,7 @@ mod tests {
         ));
         let native_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
         let vm_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+        let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         native_store
             .apply_update(mk_update(vec![(
@@ -1603,7 +1926,24 @@ mod tests {
             )]))
             .await;
 
-        let app_state = build_test_app_state(token_store, native_store, vm_store, true, 1, 1);
+        let app_state = build_test_app_state(
+            TestAppStateStores {
+                token_store: Arc::clone(&token_store),
+                native_state_store: Arc::clone(&native_store),
+                vm_state_store: Arc::clone(&vm_store),
+                rfq_state_store: Arc::clone(&rfq_store),
+            },
+            PoolFlags {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+            },
+            SimConcurrency {
+                native: 1,
+                vm: 1,
+                rfq: 1,
+            },
+        );
+
         app_state.native_stream_health.record_update(1).await;
         app_state.vm_stream_health.record_update(1).await;
         {
@@ -1613,7 +1953,7 @@ mod tests {
 
         assert_eq!(app_state.vm_readiness().await, VmReadiness::Rebuilding);
         assert_eq!(
-            app_state.encode_availability(false, true).await,
+            app_state.encode_availability(false, true, false).await,
             EncodeAvailability::VmRebuilding
         );
     }
