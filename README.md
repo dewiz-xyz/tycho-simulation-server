@@ -74,8 +74,8 @@ cp .env.example .env
 cargo run -p apps --bin dsolver-simulator-service --release
 ```
 
-Use explicit package-plus-bin selection for local runs and builds. The workspace no longer relies on
-Cargo `default-run` or `default-members`.
+Use the explicit `-p ... --bin ...` form for local runs and builds so it's always clear which
+workspace binary you're targeting.
 
 Required runtime inputs:
 
