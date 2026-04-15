@@ -905,6 +905,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
+name = "apps"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 1.5.4",
+ "anyhow",
+ "axum 0.7.9",
+ "chrono",
+ "futures 0.3.31",
+ "jemalloc-ctl",
+ "jemallocator",
+ "num-bigint",
+ "num-traits",
+ "reqwest",
+ "rpc",
+ "runtime",
+ "serde",
+ "serde_json",
+ "simulator-core",
+ "tokio",
+ "tower",
+ "tycho-simulation",
+ "typetag",
+]
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2445,38 +2470,6 @@ name = "dotenv"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
-
-[[package]]
-name = "dsolver-simulator"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives 1.5.4",
- "alloy-sol-types",
- "anyhow",
- "axum 0.7.9",
- "chrono",
- "csv",
- "dotenv",
- "futures 0.3.31",
- "jemalloc-ctl",
- "jemallocator",
- "num-bigint",
- "num-traits",
- "rand 0.8.5",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-subscriber 0.3.22",
- "tycho-common 0.152.4",
- "tycho-execution",
- "tycho-simulation",
- "typetag",
-]
 
 [[package]]
 name = "dunce"
@@ -5098,6 +5091,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpc"
+version = "0.1.0"
+dependencies = [
+ "axum 0.7.9",
+ "chrono",
+ "num-bigint",
+ "num-traits",
+ "runtime",
+ "serde",
+ "serde_json",
+ "simulator-core",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tycho-simulation",
+ "typetag",
+]
+
+[[package]]
 name = "rug"
 version = "1.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5142,6 +5155,37 @@ name = "ruint-macro"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
+
+[[package]]
+name = "runtime"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 1.5.4",
+ "alloy-sol-types",
+ "anyhow",
+ "axum 0.7.9",
+ "chrono",
+ "csv",
+ "dotenv",
+ "futures 0.3.31",
+ "jemalloc-ctl",
+ "num-bigint",
+ "num-traits",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "simulator-core",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "tycho-common 0.152.4",
+ "tycho-execution",
+ "tycho-simulation",
+ "typetag",
+]
 
 [[package]]
 name = "rusb"
@@ -5672,6 +5716,16 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "simulator-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tycho-simulation",
 ]
 
 [[package]]

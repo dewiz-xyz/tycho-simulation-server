@@ -1,37 +1,33 @@
-use dsolver_simulator::models::rfq::hashflow::read_hashflow_csv;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dsolver_simulator::models::rfq::bebop::BebopResponse;
 use tokio::sync::Semaphore;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
 };
 use tycho_simulation::utils::load_all_tokens;
 
-use dsolver_simulator::api::create_router;
-use dsolver_simulator::config::{
+use crate::config::{
     hosted_bebop_url, hosted_hashflow_filename, hosted_tycho_url, init_logging, load_config,
+    AppConfig, MemoryConfig,
 };
-use dsolver_simulator::handlers::stream::{
+use crate::memory::maybe_log_memory_snapshot;
+use crate::models::rfq::bebop::BebopResponse;
+use crate::models::rfq::hashflow::read_hashflow_csv;
+use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use crate::models::stream_health::StreamHealth;
+use crate::models::tokens::TokenStore;
+use crate::services::stream_builder::{
+    build_native_stream, build_rfq_stream, build_vm_stream, RFQConfig,
+};
+use crate::stream::{
     supervise_native_stream, supervise_rfq_stream, supervise_vm_stream, RfqStreamControls,
     StreamSupervisorConfig, VmStreamControls,
 };
-use dsolver_simulator::memory::maybe_log_memory_snapshot;
-use dsolver_simulator::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
-use dsolver_simulator::models::stream_health::StreamHealth;
-use dsolver_simulator::models::tokens::TokenStore;
-use dsolver_simulator::services::stream_builder::{
-    build_native_stream, build_rfq_stream, build_vm_stream, RFQConfig,
-};
-
-#[global_allocator]
-static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 struct RfqStreamDeps<'a> {
     resources: &'a StreamResources,
@@ -40,8 +36,12 @@ struct RfqStreamDeps<'a> {
     hashflow_tokens: Arc<TokenStore>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub struct SimulatorServiceParts {
+    pub config: AppConfig,
+    pub app_state: AppState,
+}
+
+pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> {
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
@@ -108,10 +108,7 @@ async fn main() -> anyhow::Result<()> {
         rfq_config,
     );
 
-    let app = create_router(app_state);
-    serve(app, &config).await?;
-
-    Ok(())
+    Ok(SimulatorServiceParts { config, app_state })
 }
 
 struct StreamResources {
@@ -125,7 +122,7 @@ struct StreamResources {
     rfq_stream: Arc<tokio::sync::RwLock<RfqStreamStatus>>,
 }
 
-fn log_memory_config(memory: dsolver_simulator::config::MemoryConfig) {
+fn log_memory_config(memory: MemoryConfig) {
     info!(
         event = "memory_config",
         purge_enabled = memory.purge_enabled,
@@ -138,7 +135,7 @@ fn log_memory_config(memory: dsolver_simulator::config::MemoryConfig) {
     maybe_log_memory_snapshot("service", "startup", None, memory, true);
 }
 
-fn spawn_memory_snapshot_task(memory_cfg: dsolver_simulator::config::MemoryConfig) {
+fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
     if !memory_cfg.snapshots_enabled {
         return;
     }
@@ -155,10 +152,7 @@ fn spawn_memory_snapshot_task(memory_cfg: dsolver_simulator::config::MemoryConfi
     });
 }
 
-async fn load_token_store(
-    config: &dsolver_simulator::config::AppConfig,
-    tycho_url: &str,
-) -> anyhow::Result<Arc<TokenStore>> {
+async fn load_token_store(config: &AppConfig, tycho_url: &str) -> anyhow::Result<Arc<TokenStore>> {
     let chain = config.chain_profile.chain;
     let all_tokens = load_all_tokens(
         tycho_url,
@@ -182,7 +176,7 @@ async fn load_token_store(
 }
 
 async fn load_bebop_token_store(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     tycho_url: &str,
     bebop_url: &str,
     chain: Chain,
@@ -224,7 +218,7 @@ async fn load_bebop_tokens(
 }
 
 fn load_hashflow_token_store(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     tycho_url: &str,
     hashflow_filename: &str,
     chain: Chain,
@@ -238,7 +232,7 @@ fn load_hashflow_token_store(
 fn new_token_store(
     tokens: HashMap<Bytes, Token>,
     tycho_url: &str,
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
 ) -> Arc<TokenStore> {
     Arc::new(TokenStore::new(
         tokens,
@@ -273,7 +267,7 @@ fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
 }
 
 fn build_app_state(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     tokens: Arc<TokenStore>,
     resources: &StreamResources,
 ) -> AppState {
@@ -328,7 +322,7 @@ fn build_app_state(
     }
 }
 
-fn log_erc4626_capability(config: &dsolver_simulator::config::AppConfig) {
+fn log_erc4626_capability(config: &AppConfig) {
     if config.rpc_url.is_some() {
         info!("ERC4626 deposits enabled: RPC_URL is configured");
     } else {
@@ -336,9 +330,7 @@ fn log_erc4626_capability(config: &dsolver_simulator::config::AppConfig) {
     }
 }
 
-fn build_supervisor_config(
-    config: &dsolver_simulator::config::AppConfig,
-) -> StreamSupervisorConfig {
+fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
         readiness_stale: Duration::from_secs(config.readiness_stale_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
@@ -353,7 +345,7 @@ fn build_supervisor_config(
         memory: config.memory,
     }
 }
-fn log_concurrency_config(config: &dsolver_simulator::config::AppConfig) {
+fn log_concurrency_config(config: &AppConfig) {
     let effective_vm_enabled =
         config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
     let effective_rfq_enabled =
@@ -371,7 +363,7 @@ fn log_concurrency_config(config: &dsolver_simulator::config::AppConfig) {
 }
 
 fn spawn_native_stream_task(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: Arc<TokenStore>,
@@ -419,7 +411,7 @@ fn spawn_native_stream_task(
 }
 
 fn spawn_vm_stream_task(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: Arc<TokenStore>,
@@ -490,7 +482,7 @@ fn spawn_vm_stream_task(
 }
 
 fn spawn_rfq_stream_task(
-    config: &dsolver_simulator::config::AppConfig,
+    config: &AppConfig,
     supervisor_cfg: &StreamSupervisorConfig,
     tokens: Arc<TokenStore>,
     deps: RfqStreamDeps<'_>,
@@ -559,29 +551,6 @@ fn spawn_rfq_stream_task(
     debug!("RFQ stream supervisor task spawned");
 }
 
-async fn serve(
-    app: axum::Router,
-    config: &dsolver_simulator::config::AppConfig,
-) -> anyhow::Result<()> {
-    let addr = SocketAddr::from((config.host, config.port));
-    info!("Starting HTTP server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|error| {
-            error!("Failed to bind to address: {}", error);
-            error
-        })?;
-    info!("Server listening on {}", addr);
-
-    axum::serve(listener, app.into_make_service())
-        .await
-        .map_err(|error| {
-            error!("Server error: {}", error);
-            anyhow::anyhow!("Failed to start server: {}", error)
-        })
-}
-
 #[expect(
     clippy::panic,
     reason = "invalid startup concurrency is a hard configuration invariant"
@@ -611,8 +580,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use dsolver_simulator::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
-    use dsolver_simulator::models::tokens::TokenStore;
+    use crate::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
+    use crate::models::tokens::TokenStore;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
     use super::{build_app_state, create_stream_resources};
