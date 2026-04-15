@@ -5,9 +5,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake git && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
-
 COPY . .
-RUN cargo build --release
+
+RUN cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
 
 
 FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
@@ -15,11 +15,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ca-certificates openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/dsolver-simulator-service /usr/local/bin/dsolver-simulator-service
-COPY --from=builder /app/hashflow_supported_tokens.csv /app/hashflow_supported_tokens.csv
-ENV HASHFLOW_FILENAME_CSV=/app/hashflow_supported_tokens.csv
+COPY --from=builder /app/target/release/dsolver-tycho-broadcaster-service /usr/local/bin/dsolver-tycho-broadcaster-service
 
 RUN useradd -m appuser
 USER appuser
 
-ENTRYPOINT ["dsolver-simulator-service"]
+ENTRYPOINT ["dsolver-tycho-broadcaster-service"]

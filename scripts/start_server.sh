@@ -123,8 +123,7 @@ fi
 
 (
   cd "$repo"
-  # `cargo run --release` intentionally relies on Cargo.toml's default-run.
-  nohup cargo run --release > "$log_file" 2>&1 &
+  nohup cargo run -p apps --bin dsolver-simulator-service --release > "$log_file" 2>&1 &
   echo $! > "$pid_file"
 )
 

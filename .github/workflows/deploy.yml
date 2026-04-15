@@ -1,4 +1,4 @@
-name: Build & Push Docker Image
+name: Build & Push Simulator Image
 
 on:
   push:
@@ -83,6 +83,7 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile.simulator-service
           platforms: linux/amd64
           push: true
           tags: |
