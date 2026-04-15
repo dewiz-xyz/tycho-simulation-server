@@ -1,6 +1,7 @@
 # Protocol feeds (what this server subscribes to)
 
-The service subscribes to chain-specific Tycho exchanges at startup (see `src/config/mod.rs` and `src/services/stream_builder.rs`).
+The service subscribes to chain-specific Tycho exchanges at startup (see
+`crates/runtime/src/config/mod.rs` and `crates/runtime/src/services/stream_builder.rs`).
 
 ## Native feeds by chain
 

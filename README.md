@@ -71,10 +71,11 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 
 ```bash
 cp .env.example .env
-cargo run --release
+cargo run -p apps --bin dsolver-simulator-service --release
 ```
 
-`cargo run --release` starts `dsolver-simulator-service` via the repo's Cargo `default-run`.
+Use explicit package-plus-bin selection for local runs and builds. The workspace no longer relies on
+Cargo `default-run` or `default-members`.
 
 Required runtime inputs:
 
@@ -88,9 +89,10 @@ Common optional inputs:
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds (defaults to `false`)
 - `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY` only when `ENABLE_RFQ_POOLS=true`
 - `HOST` and `PORT` to change the bind address
-- timeout, concurrency, and stream-health knobs from `src/config/mod.rs`
+- timeout, concurrency, and stream-health knobs from `crates/runtime/src/config/mod.rs`
 
-`src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example` is an example setup, not the source of truth for every default.
+`crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
+is an example setup, not the source of truth for every default.
 
 ## API Surface
 
@@ -191,16 +193,24 @@ CI-equivalent commands:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run
-cargo build --release
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace
+cargo build -p apps --bin dsolver-simulator-service --release
+cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
 ```
 
 Local analysis harness:
 
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --stop
-cargo run --bin sim-analysis -- --chain-id 8453 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
+```
+
+Container builds:
+
+```bash
+docker build -f Dockerfile.simulator-service -t dsolver-simulator-service .
+docker build -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
 ```
 
 Useful helpers:
@@ -208,7 +218,7 @@ Useful helpers:
 - `scripts/start_server.sh` to start the server with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
 - `scripts/stop_server.sh` to stop a server started by the repo helper
-- `cargo run --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
+- `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
 The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
