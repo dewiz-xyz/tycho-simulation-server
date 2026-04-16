@@ -310,6 +310,7 @@ fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
 mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
+        path::PathBuf,
         str::FromStr,
         sync::Arc,
         time::Duration,
@@ -319,9 +320,7 @@ mod tests {
         decode_skip_state_failures, merge_missing_tokens, register_native_protocol,
         register_vm_protocol, rfq_decoder_tokens, StreamDecodePolicy,
     };
-    use crate::config::{
-        BASE_NATIVE_PROTOCOLS, BASE_VM_PROTOCOLS, ETHEREUM_NATIVE_PROTOCOLS, ETHEREUM_VM_PROTOCOLS,
-    };
+    use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
     use tycho_simulation::{
         evm::stream::ProtocolStreamBuilder,
         tycho_client::feed::component_tracker::ComponentFilter,
@@ -344,8 +343,22 @@ mod tests {
         ComponentFilter::with_tvl_range(0.0, 1.0)
     }
 
-    fn unique_protocols<'a>(left: &'a [&'a str], right: &'a [&'a str]) -> BTreeSet<&'a str> {
-        left.iter().chain(right.iter()).copied().collect()
+    fn manifest_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../")
+            .join(MANIFEST_PATH)
+    }
+
+    fn chain_protocols(chain_id: u64) -> (Vec<String>, Vec<String>) {
+        let registries = load_manifest_registries(&manifest_path())
+            .unwrap_or_else(|err| panic!("test manifest must load: {err}"));
+        let resolved = resolve_chain_config(&registries, chain_id, None)
+            .unwrap_or_else(|err| panic!("test manifest must resolve chain {chain_id}: {err}"));
+
+        (
+            resolved.chain_profile.native_protocols,
+            resolved.chain_profile.vm_protocols,
+        )
     }
 
     fn test_token(address: &str, symbol: &str) -> Token {
@@ -414,10 +427,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_profile_native_protocols_all_register_successfully() {
+    fn manifest_native_protocols_all_register_successfully() {
         let filter = test_filter();
+        let (ethereum_native_protocols, _) = chain_protocols(1);
+        let (base_native_protocols, _) = chain_protocols(8453);
 
-        for protocol in unique_protocols(ETHEREUM_NATIVE_PROTOCOLS, BASE_NATIVE_PROTOCOLS) {
+        for protocol in ethereum_native_protocols
+            .iter()
+            .chain(base_native_protocols.iter())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+        {
             let result = register_native_protocol(test_builder(), protocol, &filter);
             assert!(
                 result.is_ok(),
@@ -427,10 +447,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_profile_vm_protocols_all_register_successfully() {
+    fn manifest_vm_protocols_all_register_successfully() {
         let filter = test_filter();
+        let (_, ethereum_vm_protocols) = chain_protocols(1);
+        let (_, base_vm_protocols) = chain_protocols(8453);
 
-        for protocol in unique_protocols(ETHEREUM_VM_PROTOCOLS, BASE_VM_PROTOCOLS) {
+        for protocol in ethereum_vm_protocols
+            .iter()
+            .chain(base_vm_protocols.iter())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+        {
             let result = register_vm_protocol(test_builder(), protocol, &filter);
             assert!(
                 result.is_ok(),

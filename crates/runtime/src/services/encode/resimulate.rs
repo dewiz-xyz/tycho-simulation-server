@@ -179,6 +179,7 @@ impl<'a> RouteResimulator<'a> {
     ) -> Result<ResimulatedSwapInternal, EncodeError> {
         let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
         ensure_erc4626_swap_supported(
+            self.state,
             &pool_entry.component,
             &allocated.pool.component_id,
             &allocated.token_in,
@@ -511,6 +512,7 @@ fn validate_native_request_tokens(
 }
 
 fn ensure_erc4626_swap_supported(
+    state: &AppState,
     component: &ProtocolComponent,
     pool_id: &str,
     token_in: &Bytes,
@@ -520,7 +522,13 @@ fn ensure_erc4626_swap_supported(
     if !component_is_erc4626(component) {
         return Ok(());
     }
-    if component_direction_supported(component, token_in, token_out, erc4626_deposits_enabled) {
+    if component_direction_supported(
+        component,
+        token_in,
+        token_out,
+        erc4626_deposits_enabled,
+        &state.erc4626_pair_policies,
+    ) {
         return Ok(());
     }
 
@@ -536,6 +544,7 @@ fn ensure_erc4626_swap_supported(
         token_in,
         token_out,
         erc4626_deposits_enabled,
+        &state.erc4626_pair_policies,
     )))
 }
 

@@ -54,6 +54,7 @@ pub async fn encode_route(
         &amount_in,
         &native_address,
         state.erc4626_deposits_enabled,
+        &state.erc4626_pair_policies,
         allowlist,
     )?;
     let (uses_native, uses_vm, uses_rfq) = normalize::route_backend_usage(&normalized);

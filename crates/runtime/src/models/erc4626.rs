@@ -2,89 +2,52 @@ use tycho_simulation::{protocol::models::ProtocolComponent, tycho_common::Bytes}
 
 use super::protocol::ProtocolKind;
 
-struct SupportedErc4626Pair {
-    asset_symbol: &'static str,
-    share_symbol: &'static str,
-    asset: &'static str,
-    share: &'static str,
-    allow_asset_to_share: bool,
-    allow_share_to_asset: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Erc4626PairPolicy {
+    pub asset_symbol: String,
+    pub share_symbol: String,
+    pub asset: Bytes,
+    pub share: Bytes,
+    pub allow_asset_to_share: bool,
+    pub allow_share_to_asset: bool,
 }
 
-impl SupportedErc4626Pair {
+impl Erc4626PairPolicy {
     fn supports_direction(
         &self,
         token_in: &Bytes,
         token_out: &Bytes,
         deposits_enabled: bool,
     ) -> bool {
-        let token_in = token_in.to_string();
-        let token_out = token_out.to_string();
         (deposits_enabled
             && self.allow_asset_to_share
-            && token_in.eq_ignore_ascii_case(self.asset)
-            && token_out.eq_ignore_ascii_case(self.share))
-            || (self.allow_share_to_asset
-                && token_in.eq_ignore_ascii_case(self.share)
-                && token_out.eq_ignore_ascii_case(self.asset))
+            && token_in == &self.asset
+            && token_out == &self.share)
+            || (self.allow_share_to_asset && token_in == &self.share && token_out == &self.asset)
     }
 
     fn component_matches(&self, component: &ProtocolComponent) -> bool {
-        component.id.to_string().eq_ignore_ascii_case(self.share)
+        component.id == self.share
             && component.tokens.len() == 2
             && component
                 .tokens
                 .iter()
-                .any(|token| token.address.to_string().eq_ignore_ascii_case(self.asset))
+                .any(|token| token.address == self.asset)
             && component
                 .tokens
                 .iter()
-                .any(|token| token.address.to_string().eq_ignore_ascii_case(self.share))
+                .any(|token| token.address == self.share)
     }
 
     fn direction_label(&self, token_in: &Bytes, token_out: &Bytes) -> Option<String> {
-        if token_in.to_string().eq_ignore_ascii_case(self.asset)
-            && token_out.to_string().eq_ignore_ascii_case(self.share)
-        {
+        if token_in == &self.asset && token_out == &self.share {
             return Some(format!("{} -> {}", self.asset_symbol, self.share_symbol));
         }
-        if token_in.to_string().eq_ignore_ascii_case(self.share)
-            && token_out.to_string().eq_ignore_ascii_case(self.asset)
-        {
+        if token_in == &self.share && token_out == &self.asset {
             return Some(format!("{} -> {}", self.share_symbol, self.asset_symbol));
         }
         None
     }
-}
-
-fn supported_pairs() -> &'static [SupportedErc4626Pair] {
-    const SUPPORTED: &[SupportedErc4626Pair] = &[
-        SupportedErc4626Pair {
-            asset_symbol: "USDS",
-            share_symbol: "sUSDS",
-            asset: "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
-            share: "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
-            allow_asset_to_share: true,
-            allow_share_to_asset: true,
-        },
-        SupportedErc4626Pair {
-            asset_symbol: "USDC",
-            share_symbol: "sUSDC",
-            asset: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-            share: "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE",
-            allow_asset_to_share: true,
-            allow_share_to_asset: true,
-        },
-        SupportedErc4626Pair {
-            asset_symbol: "PYUSD",
-            share_symbol: "spPYUSD",
-            asset: "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8",
-            share: "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
-            allow_asset_to_share: true,
-            allow_share_to_asset: true,
-        },
-    ];
-    SUPPORTED
 }
 
 fn normalize_protocol_id(protocol: &str) -> String {
@@ -107,9 +70,10 @@ pub(crate) fn request_direction_supported(
     token_in: &Bytes,
     token_out: &Bytes,
     deposits_enabled: bool,
+    pair_policies: &[Erc4626PairPolicy],
 ) -> bool {
     !is_erc4626_protocol(protocol)
-        || supported_pairs()
+        || pair_policies
             .iter()
             .any(|pair| pair.supports_direction(token_in, token_out, deposits_enabled))
 }
@@ -119,9 +83,10 @@ pub(crate) fn component_direction_supported(
     token_in: &Bytes,
     token_out: &Bytes,
     deposits_enabled: bool,
+    pair_policies: &[Erc4626PairPolicy],
 ) -> bool {
     !component_is_erc4626(component)
-        || supported_pairs().iter().any(|pair| {
+        || pair_policies.iter().any(|pair| {
             pair.supports_direction(token_in, token_out, deposits_enabled)
                 && pair.component_matches(component)
         })
@@ -131,20 +96,24 @@ pub(crate) fn unsupported_direction_message(
     token_in: &Bytes,
     token_out: &Bytes,
     deposits_enabled: bool,
+    pair_policies: &[Erc4626PairPolicy],
 ) -> String {
-    let requested = supported_pairs()
+    let requested = pair_policies
         .iter()
         .find_map(|pair| pair.direction_label(token_in, token_out))
         .unwrap_or_else(|| format!("{token_in} -> {token_out}"));
-    let supported = supported_direction_labels(deposits_enabled).join(", ");
+    let supported = supported_direction_labels(deposits_enabled, pair_policies).join(", ");
     format!(
         "ERC4626 direction {requested} is not currently supported by this server; supported directions are [{supported}]"
     )
 }
 
-pub(crate) fn supported_direction_labels(deposits_enabled: bool) -> Vec<String> {
+pub(crate) fn supported_direction_labels(
+    deposits_enabled: bool,
+    pair_policies: &[Erc4626PairPolicy],
+) -> Vec<String> {
     let mut directions = Vec::new();
-    for pair in supported_pairs() {
+    for pair in pair_policies {
         if deposits_enabled && pair.allow_asset_to_share {
             directions.push(format!("{} -> {}", pair.asset_symbol, pair.share_symbol));
         }
@@ -168,6 +137,35 @@ mod tests {
     use tycho_simulation::tycho_common::models::{token::Token, Chain};
 
     use super::*;
+
+    fn pair_policies() -> Vec<Erc4626PairPolicy> {
+        vec![
+            Erc4626PairPolicy {
+                asset_symbol: "USDS".to_string(),
+                share_symbol: "sUSDS".to_string(),
+                asset: Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap(),
+                share: Bytes::from_str("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+            Erc4626PairPolicy {
+                asset_symbol: "USDC".to_string(),
+                share_symbol: "sUSDC".to_string(),
+                asset: Bytes::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
+                share: Bytes::from_str("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+            Erc4626PairPolicy {
+                asset_symbol: "PYUSD".to_string(),
+                share_symbol: "spPYUSD".to_string(),
+                asset: Bytes::from_str("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8").unwrap(),
+                share: Bytes::from_str("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+        ]
+    }
 
     fn token(address: &str, symbol: &str, decimals: u32) -> Token {
         Token::new(
@@ -202,6 +200,7 @@ mod tests {
 
     #[test]
     fn supports_all_allowlisted_request_directions() {
+        let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
                 "erc4626",
@@ -239,12 +238,14 @@ mod tests {
                 &Bytes::from_str(token_in).unwrap(),
                 &Bytes::from_str(token_out).unwrap(),
                 true,
+                &pair_policies,
             ));
         }
     }
 
     #[test]
     fn disables_allowlisted_deposit_directions_without_rpc_capability() {
+        let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
                 "erc4626",
@@ -267,12 +268,14 @@ mod tests {
                 &Bytes::from_str(token_in).unwrap(),
                 &Bytes::from_str(token_out).unwrap(),
                 false,
+                &pair_policies,
             ));
         }
     }
 
     #[test]
     fn keeps_allowlisted_redeem_directions_without_rpc_capability() {
+        let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
                 "erc4626",
@@ -295,12 +298,14 @@ mod tests {
                 &Bytes::from_str(token_in).unwrap(),
                 &Bytes::from_str(token_out).unwrap(),
                 false,
+                &pair_policies,
             ));
         }
     }
 
     #[test]
     fn rejects_non_allowlisted_request_directions() {
+        let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
                 "erc4626",
@@ -323,12 +328,14 @@ mod tests {
                 &Bytes::from_str(token_in).unwrap(),
                 &Bytes::from_str(token_out).unwrap(),
                 true,
+                &pair_policies,
             ));
         }
     }
 
     #[test]
     fn component_support_requires_matching_share_token() {
+        let pair_policies = pair_policies();
         let usds = token("0xdC035D45d973E3EC169d2276DDab16f1e407384F", "USDS", 18);
         let susds = token("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd", "sUSDS", 18);
         let wrong_share = token("0x9d39a5de30e57443bff2a8307a4256c8797a3497", "sUSDe", 18);
@@ -346,6 +353,7 @@ mod tests {
             &token_in,
             &token_out,
             true,
+            &pair_policies,
         ));
 
         let unsupported_component = component(
@@ -359,11 +367,13 @@ mod tests {
             &token_in,
             &token_out,
             true,
+            &pair_policies,
         ));
     }
 
     #[test]
     fn recognizes_erc4626_component_by_protocol_type_name() {
+        let pair_policies = pair_policies();
         let usds = token("0xdC035D45d973E3EC169d2276DDab16f1e407384F", "USDS", 18);
         let susds = token("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd", "sUSDS", 18);
         let token_in = usds.address.clone();
@@ -378,17 +388,25 @@ mod tests {
 
         assert!(component_is_erc4626(&component));
         assert!(component_direction_supported(
-            &component, &token_in, &token_out, true,
+            &component,
+            &token_in,
+            &token_out,
+            true,
+            &pair_policies,
         ));
         assert!(!component_direction_supported(
-            &component, &token_in, &token_out, false,
+            &component,
+            &token_in,
+            &token_out,
+            false,
+            &pair_policies,
         ));
     }
 
     #[test]
     fn supported_direction_labels_reflect_deposit_capability() {
         assert_eq!(
-            supported_direction_labels(false),
+            supported_direction_labels(false, &pair_policies()),
             vec![
                 "sUSDS -> USDS".to_string(),
                 "sUSDC -> USDC".to_string(),

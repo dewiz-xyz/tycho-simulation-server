@@ -11,6 +11,7 @@ use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::Bytes;
 
 use crate::config::SlippageConfig;
+use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
 use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
@@ -94,6 +95,35 @@ pub(super) fn test_state_stores(
     )
 }
 
+fn erc4626_pair_policies() -> Vec<Erc4626PairPolicy> {
+    vec![
+        Erc4626PairPolicy {
+            asset_symbol: "USDS".to_string(),
+            share_symbol: "sUSDS".to_string(),
+            asset: fixture_bytes("0xdC035D45d973E3EC169d2276DDab16f1e407384F"),
+            share: fixture_bytes("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+        Erc4626PairPolicy {
+            asset_symbol: "USDC".to_string(),
+            share_symbol: "sUSDC".to_string(),
+            asset: fixture_bytes("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            share: fixture_bytes("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+        Erc4626PairPolicy {
+            asset_symbol: "PYUSD".to_string(),
+            share_symbol: "spPYUSD".to_string(),
+            asset: fixture_bytes("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
+            share: fixture_bytes("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+    ]
+}
+
 pub(super) struct TestAppStateConfig {
     pub(super) enable_vm_pools: bool,
     pub(super) enable_rfq_pools: bool,
@@ -152,6 +182,7 @@ pub(super) fn test_app_state(
         rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
+        erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
         vm_sim_concurrency: 1,
