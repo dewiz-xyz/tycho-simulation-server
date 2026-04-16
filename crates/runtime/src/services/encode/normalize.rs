@@ -5,6 +5,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::models::erc4626::{
     is_erc4626_protocol, request_direction_supported, unsupported_direction_message,
+    Erc4626PairPolicy,
 };
 use crate::models::messages::{HopDraft, PoolSwapDraft, RouteEncodeRequest, SegmentDraft};
 
@@ -18,6 +19,10 @@ use super::request::{format_native_protocol_allowlist, is_native_protocol_allowl
 use super::wire::parse_address;
 use super::EncodeError;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route normalization validates independent request, token, and policy inputs together"
+)]
 pub(super) fn normalize_route(
     request: &RouteEncodeRequest,
     request_token_in: &Bytes,
@@ -25,6 +30,7 @@ pub(super) fn normalize_route(
     total_amount_in: &BigUint,
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
+    erc4626_pair_policies: &[Erc4626PairPolicy],
     native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
@@ -55,6 +61,7 @@ pub(super) fn normalize_route(
                     hop,
                     native_address,
                     erc4626_deposits_enabled,
+                    erc4626_pair_policies,
                     native_token_protocol_allowlist,
                 )
             })
@@ -165,6 +172,7 @@ fn normalize_hop(
     hop: &HopDraft,
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
+    erc4626_pair_policies: &[Erc4626PairPolicy],
     native_token_protocol_allowlist: &[String],
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
@@ -188,7 +196,15 @@ fn normalize_hop(
     let swaps = hop
         .swaps
         .iter()
-        .map(|swap| normalize_swap(swap, &token_in, &token_out, erc4626_deposits_enabled))
+        .map(|swap| {
+            normalize_swap(
+                swap,
+                &token_in,
+                &token_out,
+                erc4626_deposits_enabled,
+                erc4626_pair_policies,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(NormalizedHopInternal {
@@ -203,6 +219,7 @@ fn normalize_swap(
     hop_token_in: &Bytes,
     hop_token_out: &Bytes,
     erc4626_deposits_enabled: bool,
+    erc4626_pair_policies: &[Erc4626PairPolicy],
 ) -> Result<NormalizedSwapDraftInternal, EncodeError> {
     let token_in = parse_address(&swap.token_in)?;
     let token_out = parse_address(&swap.token_out)?;
@@ -216,7 +233,13 @@ fn normalize_swap(
             "swap tokenOut does not match hop tokenOut",
         ));
     }
-    validate_erc4626_swap_supported(swap, &token_in, &token_out, erc4626_deposits_enabled)?;
+    validate_erc4626_swap_supported(
+        swap,
+        &token_in,
+        &token_out,
+        erc4626_deposits_enabled,
+        erc4626_pair_policies,
+    )?;
 
     if swap.split_bps > BPS_DENOMINATOR {
         return Err(EncodeError::invalid("swap splitBps must be <= 10000"));
@@ -235,6 +258,7 @@ fn validate_erc4626_swap_supported(
     token_in: &Bytes,
     token_out: &Bytes,
     erc4626_deposits_enabled: bool,
+    erc4626_pair_policies: &[Erc4626PairPolicy],
 ) -> Result<(), EncodeError> {
     if !is_erc4626_protocol(&swap.pool.protocol) {
         return Ok(());
@@ -244,6 +268,7 @@ fn validate_erc4626_swap_supported(
         token_in,
         token_out,
         erc4626_deposits_enabled,
+        erc4626_pair_policies,
     ) {
         return Ok(());
     }
@@ -259,6 +284,7 @@ fn validate_erc4626_swap_supported(
         token_in,
         token_out,
         erc4626_deposits_enabled,
+        erc4626_pair_policies,
     )))
 }
 
@@ -285,6 +311,7 @@ mod tests {
     use tycho_simulation::tycho_common::models::Chain;
 
     use super::*;
+    use crate::models::erc4626::Erc4626PairPolicy;
     use crate::models::messages::PoolRef;
     use crate::models::messages::{PoolSwapDraft, SwapKind};
     use crate::services::encode::fixtures::pool_ref;
@@ -292,6 +319,35 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         vec!["rocketpool".to_string()]
+    }
+
+    fn erc4626_pair_policies() -> Vec<Erc4626PairPolicy> {
+        vec![
+            Erc4626PairPolicy {
+                asset_symbol: "USDS".to_string(),
+                share_symbol: "sUSDS".to_string(),
+                asset: Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap(),
+                share: Bytes::from_str("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+            Erc4626PairPolicy {
+                asset_symbol: "USDC".to_string(),
+                share_symbol: "sUSDC".to_string(),
+                asset: Bytes::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
+                share: Bytes::from_str("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+            Erc4626PairPolicy {
+                asset_symbol: "PYUSD".to_string(),
+                share_symbol: "spPYUSD".to_string(),
+                asset: Bytes::from_str("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8").unwrap(),
+                share: Bytes::from_str("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354").unwrap(),
+                allow_asset_to_share: true,
+                allow_share_to_asset: true,
+            },
+        ]
     }
 
     #[test]
@@ -350,6 +406,7 @@ mod tests {
             &BigUint::from(100u32),
             &Chain::Ethereum.native_token().address,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         )
         .unwrap();
@@ -397,6 +454,7 @@ mod tests {
             &BigUint::from(100u32),
             &Chain::Ethereum.native_token().address,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         )
         .unwrap();
@@ -461,6 +519,7 @@ mod tests {
             &amount_in,
             &native_address,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         )
         .unwrap();
@@ -528,6 +587,7 @@ mod tests {
             &amount_in,
             &native,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         ) {
             Ok(_) => panic!("Expected segment share rounding to zero to be rejected"),
@@ -601,6 +661,7 @@ mod tests {
             &amount_in,
             &native_address,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         ) {
             Err(err) => assert_eq!(
@@ -664,6 +725,7 @@ mod tests {
             &amount_in,
             &native,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         ) {
             Err(err) => assert_eq!(
@@ -720,6 +782,7 @@ mod tests {
             &amount_in,
             &native,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         )
         .expect("rocketpool native route should normalize");
@@ -774,6 +837,7 @@ mod tests {
             &amount_in,
             &native,
             false,
+            &erc4626_pair_policies(),
             &allowlist(),
         ) {
             Ok(_) => panic!("allowlisted deposit should be rejected when deposits are disabled"),
@@ -836,6 +900,7 @@ mod tests {
             &amount_in,
             &native,
             true,
+            &erc4626_pair_policies(),
             &allowlist(),
         )
         .expect("allowlisted deposit should normalize when deposits are enabled");

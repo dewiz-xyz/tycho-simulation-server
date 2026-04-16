@@ -16,7 +16,10 @@ use tycho_simulation::{
 
 use crate::config::SlippageConfig;
 
-use super::{protocol::ProtocolKind, stream_health::StreamHealth, tokens::TokenStore};
+use super::{
+    erc4626::Erc4626PairPolicy, protocol::ProtocolKind, stream_health::StreamHealth,
+    tokens::TokenStore,
+};
 
 const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
@@ -51,6 +54,7 @@ pub struct AppState {
     pub rfq_sim_semaphore: Arc<Semaphore>,
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
+    pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
@@ -1184,6 +1188,7 @@ mod tests {
             rfq_sim_semaphore: Arc::new(Semaphore::new(concurrency.rfq)),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
+            erc4626_pair_policies: Arc::new(Vec::new()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: concurrency.native,
             vm_sim_concurrency: concurrency.vm,

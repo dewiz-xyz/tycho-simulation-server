@@ -10,21 +10,11 @@ Start the dsolver-simulator-service from a repo checkout.
 Options:
   --repo             Path to repo root (default: current directory)
   --log-file         Log file path (default: <repo>/logs/tycho-sim-server.log)
-  --chain-id         Runtime chain id (1 or 8453). Overrides CHAIN_ID from env/.env.
+  --chain-id         Runtime chain id from simulator-manifest.toml. Overrides CHAIN_ID from env/.env.
   --env              Export KEY=VALUE before starting (repeatable)
   --enable-vm-pools  Shortcut for --env ENABLE_VM_POOLS=true
   -h, --help         Show this help
 USAGE
-}
-
-validate_chain_id() {
-  case "$1" in
-    1|8453) ;;
-    *)
-      echo "Error: unsupported chain id '$1'. Supported values: 1 (Ethereum), 8453 (Base)." >&2
-      return 1
-      ;;
-  esac
 }
 
 repo="."
@@ -114,7 +104,6 @@ if [[ -z "${CHAIN_ID:-}" ]]; then
   echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
   exit 2
 fi
-validate_chain_id "$CHAIN_ID"
 
 if [[ -z "$log_file" ]]; then
   mkdir -p "$repo/logs"

@@ -630,6 +630,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
+        erc4626_pair_policies: Arc::new(Vec::new()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 4,

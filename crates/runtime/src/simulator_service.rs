@@ -11,10 +11,7 @@ use tycho_simulation::tycho_common::{
 };
 use tycho_simulation::utils::load_all_tokens;
 
-use crate::config::{
-    hosted_bebop_url, hosted_hashflow_filename, hosted_tycho_url, init_logging, load_config,
-    AppConfig, MemoryConfig,
-};
+use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::rfq::bebop::BebopResponse;
 use crate::models::rfq::hashflow::read_hashflow_csv;
@@ -45,7 +42,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
-    let tycho_url = hosted_tycho_url(chain).map_err(anyhow::Error::msg)?;
+    let tycho_url = config.tycho_url.clone();
     let effective_rfq_enabled =
         config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
@@ -59,11 +56,10 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
 
     if effective_rfq_enabled {
         // RFQ enabled means RFQ bootstrap must succeed.
-        let bebop_url = hosted_bebop_url(chain).map_err(anyhow::Error::msg)?;
-        let hashflow_filename = hosted_hashflow_filename(chain).map_err(anyhow::Error::msg)?;
-        bebop_tokens = load_bebop_token_store(&config, &tycho_url, &bebop_url, chain).await?;
+        bebop_tokens =
+            load_bebop_token_store(&config, &tycho_url, &config.bebop_url, chain).await?;
         hashflow_tokens =
-            load_hashflow_token_store(&config, &tycho_url, &hashflow_filename, chain)?;
+            load_hashflow_token_store(&config, &tycho_url, &config.hashflow_filename, chain)?;
     } else {
         bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
         hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
@@ -315,6 +311,7 @@ fn build_app_state(
         rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
         slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
+        erc4626_pair_policies: Arc::clone(&config.erc4626_pair_policies),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
         native_sim_concurrency,
         vm_sim_concurrency,
@@ -593,9 +590,13 @@ mod tests {
         rpc_url: Option<&str>,
     ) -> AppConfig {
         let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
+        let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
 
         AppConfig {
             chain_profile,
+            tycho_url: "http://localhost:4242".to_string(),
+            bebop_url: "https://example.com/bebop".to_string(),
+            hashflow_filename: "./hashflow.csv".to_string(),
             api_key: "test-api-key".to_string(),
             rpc_url: rpc_url.map(str::to_string),
             tvl_threshold: 100.0,
@@ -614,6 +615,7 @@ mod tests {
             global_vm_sim_concurrency: 4,
             global_rfq_sim_concurrency: 4,
             reset_allowance_tokens,
+            erc4626_pair_policies,
             stream_stale_secs: 120,
             stream_missing_block_burst: 3,
             stream_missing_block_window_secs: 60,
@@ -662,6 +664,7 @@ mod tests {
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
+            erc4626_pair_policies: Vec::new(),
         }
     }
 
@@ -680,6 +683,7 @@ mod tests {
             rfq_protocols: vec!["rfq:hashflow".to_string()],
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
+            erc4626_pair_policies: Vec::new(),
         }
     }
 

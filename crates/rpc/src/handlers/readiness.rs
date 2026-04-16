@@ -265,6 +265,7 @@ mod tests {
             rfq_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
+            erc4626_pair_policies: Arc::new(Vec::new()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,

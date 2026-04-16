@@ -13,6 +13,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
+use runtime::models::erc4626::Erc4626PairPolicy;
 use runtime::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -219,6 +220,46 @@ impl ProtocolSim for SlowAmountSim {
 
 fn make_token(address: &Bytes, symbol: &str, chain: Chain) -> Token {
     Token::new(address, symbol, 18, 0, &[], chain, 100)
+}
+
+#[expect(
+    clippy::panic,
+    reason = "integration test fixtures should fail immediately on invalid literal addresses"
+)]
+fn test_address(value: &str) -> Bytes {
+    match Bytes::from_str(value) {
+        Ok(address) => address,
+        Err(err) => panic!("test address must parse: {err}"),
+    }
+}
+
+fn erc4626_pair_policies() -> Vec<Erc4626PairPolicy> {
+    vec![
+        Erc4626PairPolicy {
+            asset_symbol: "USDS".to_string(),
+            share_symbol: "sUSDS".to_string(),
+            asset: test_address("0xdC035D45d973E3EC169d2276DDab16f1e407384F"),
+            share: test_address("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+        Erc4626PairPolicy {
+            asset_symbol: "USDC".to_string(),
+            share_symbol: "sUSDC".to_string(),
+            asset: test_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            share: test_address("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+        Erc4626PairPolicy {
+            asset_symbol: "PYUSD".to_string(),
+            share_symbol: "spPYUSD".to_string(),
+            asset: test_address("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
+            share: test_address("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"),
+            allow_asset_to_share: true,
+            allow_share_to_asset: true,
+        },
+    ]
 }
 
 fn parse_bytes(value: &str) -> Result<Bytes> {
@@ -556,6 +597,7 @@ async fn build_app_state_and_request(
         rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
+        erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
@@ -657,6 +699,7 @@ async fn setup_timeout_app(
         rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
+        erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
         vm_sim_concurrency: 1,
@@ -1417,6 +1460,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
+        erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
