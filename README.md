@@ -62,7 +62,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Runtime | Axum + Tokio |
 | Binary | `dsolver-simulator-service` |
 | Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
-| Supported chains | Ethereum (`1`), Base (`8453`) |
+| Supported chains | Defined in `simulator-manifest.toml` |
 | Required inputs | `TYCHO_API_KEY`, `CHAIN_ID` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
@@ -80,7 +80,7 @@ workspace binary you're targeting.
 Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
-- `CHAIN_ID` for chain selection (`1` Ethereum, `8453` Base)
+- `CHAIN_ID` for chain selection from `simulator-manifest.toml`
 
 Common optional inputs:
 
