@@ -7,25 +7,25 @@ This repo ships a reporting-first Rust CLI for local DSolver Simulator analysis.
 Ethereum:
 
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
 ```
 
 Base:
 
 ```bash
-cargo run --bin sim-analysis -- --chain-id 8453 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 Keep the server running after the analysis:
 
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1
+cargo run -p apps --bin sim-analysis -- --chain-id 1
 ```
 
 Disable baseline comparison for a one-off run:
 
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --baseline none --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ```
 
 ## What the analyzer does

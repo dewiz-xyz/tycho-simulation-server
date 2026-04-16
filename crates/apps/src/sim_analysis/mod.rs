@@ -18,9 +18,10 @@ use serde_json::{json, Value};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::models::messages::{
+use simulator_core::models::messages::{
     AmountOutRequest, AmountOutResponse, EncodeErrorResponse, HopDraft, InteractionKind, PoolRef,
-    PoolSwapDraft, QuoteResult, RouteEncodeRequest, RouteEncodeResponse, SegmentDraft, SwapKind,
+    PoolSwapDraft, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeRequest,
+    RouteEncodeResponse, SegmentDraft, SwapKind,
 };
 
 use self::presets::{
@@ -990,18 +991,17 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
 
     let status_label = Some(enum_to_string(quote.meta.status));
     let result_quality = Some(enum_to_string(quote.meta.result_quality));
-    let classification = if quote.meta.status == crate::models::messages::QuoteStatus::Ready
-        && quote.meta.result_quality == crate::models::messages::QuoteResultQuality::Complete
+    let classification = if quote.meta.status == QuoteStatus::Ready
+        && quote.meta.result_quality == QuoteResultQuality::Complete
         && quote.meta.failures.is_empty()
         && !quote.meta.vm_unavailable
         && !quote.meta.rfq_unavailable
         && !quote.data.is_empty()
     {
         ObservationClass::Healthy
-    } else if quote.meta.status == crate::models::messages::QuoteStatus::Ready
-        || quote.meta.result_quality
-            == crate::models::messages::QuoteResultQuality::RequestLevelFailure
-        || quote.meta.result_quality == crate::models::messages::QuoteResultQuality::NoResults
+    } else if quote.meta.status == QuoteStatus::Ready
+        || quote.meta.result_quality == QuoteResultQuality::RequestLevelFailure
+        || quote.meta.result_quality == QuoteResultQuality::NoResults
     {
         ObservationClass::Degraded
     } else {
@@ -1836,7 +1836,7 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 fn print_help() {
     println!(
-        "Usage: cargo run --bin sim-analysis -- --chain-id <1|8453> [options]\n\
+        "Usage: cargo run -p apps --bin sim-analysis -- --chain-id <1|8453> [options]\n\
          \n\
          Options:\n\
            --repo <path>        Repo root (default: .)\n\
@@ -1914,14 +1914,14 @@ mod tests {
         protocol_from_pool_name, sanitize_filename, select_best_pool, startup_bind_config,
         BaselineMode, CliArgs, HttpJsonResponse, ObservationClass, ScriptPaths,
     };
-    use crate::models::messages::{
-        AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
-        QuoteResultQuality, QuoteStatus,
-    };
     use crate::sim_analysis::presets::balanced_profile;
     use reqwest::Client;
     use reqwest::StatusCode;
     use serde_json::json;
+    use simulator_core::models::messages::{
+        AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
+        QuoteResultQuality, QuoteStatus,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

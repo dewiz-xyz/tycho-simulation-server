@@ -116,11 +116,7 @@ pub(super) fn log_resimulation_amounts(
     }
 }
 
-pub(crate) fn log_success(
-    request: &RouteEncodeRequest,
-    computation: &EncodeComputation,
-    latency_ms: u64,
-) {
+pub fn log_success(request: &RouteEncodeRequest, computation: &EncodeComputation, latency_ms: u64) {
     let summary = summarize_request(request);
     info!(
         scope = "handler_complete",
@@ -149,7 +145,7 @@ pub(crate) fn log_success(
     );
 }
 
-pub(crate) fn log_received(request: &RouteEncodeRequest) {
+pub fn log_received(request: &RouteEncodeRequest) {
     let summary = summarize_request(request);
     info!(
         request_id = summary.request_id.as_deref(),
@@ -165,7 +161,7 @@ pub(crate) fn log_received(request: &RouteEncodeRequest) {
     );
 }
 
-pub(crate) fn log_failure(
+pub fn log_failure(
     request: &RouteEncodeRequest,
     status_code: StatusCode,
     kind: EncodeErrorKind,
@@ -199,7 +195,7 @@ pub(crate) fn log_failure(
     );
 }
 
-pub(crate) fn log_handler_timeout(request: &RouteEncodeRequest, timeout_ms: u64, latency_ms: u64) {
+pub fn log_handler_timeout(request: &RouteEncodeRequest, timeout_ms: u64, latency_ms: u64) {
     let summary = summarize_request(request);
     let error = format!("Encode request timed out after {timeout_ms}ms");
     warn!(

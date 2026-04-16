@@ -6,7 +6,7 @@ mod model;
 mod normalize;
 mod request;
 mod resimulate;
-pub(crate) mod response;
+pub mod response;
 mod tycho_swaps;
 mod wire;
 
@@ -16,7 +16,7 @@ mod fixtures;
 mod mocks;
 
 pub use error::{EncodeError, EncodeErrorKind};
-pub(crate) use response::{log_failure, log_handler_timeout, log_received, log_success};
+pub use response::{log_failure, log_handler_timeout, log_received, log_success};
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;

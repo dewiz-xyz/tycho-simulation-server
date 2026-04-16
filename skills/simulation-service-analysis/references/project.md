@@ -3,7 +3,7 @@
 ## What this service does
 - DSolver Simulator is a fast simulation API for DeFi swaps and routing, built on Tycho state.
 - Rust Axum service that ingests Tycho protocol streams, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation and route encoding.
-- Main binary: `dsolver-simulator-service` (see `src/main.rs`).
+- Main binary: `dsolver-simulator-service` (see `crates/apps/src/bin/dsolver-simulator-service.rs`).
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
@@ -12,9 +12,8 @@
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the server:
   ```bash
-  cargo run --release
+  cargo run -p apps --bin dsolver-simulator-service --release
   ```
-- `cargo run --release` resolves to `dsolver-simulator-service` via Cargo `default-run`.
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness
@@ -30,8 +29,8 @@
 
 ## Local analysis workflow (recommended)
 - Run the reporting-first analyzer:
-  - `cargo run --bin sim-analysis -- --chain-id 1 --stop`
-  - `cargo run --bin sim-analysis -- --chain-id 8453 --stop`
+  - `cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop`
+  - `cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop`
 - The analyzer starts or reuses the local server, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` and `/encode` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
@@ -44,10 +43,11 @@
 - The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so the agent can investigate.
 
 ## Useful commands
-- Format: `cargo fmt`
-- Lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Test: `cargo nextest run`
-- Build: `cargo build --release`
+- Format: `cargo fmt --all`
+- Lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- Test: `cargo nextest run --workspace`
+- Build simulator: `cargo build -p apps --bin dsolver-simulator-service --release`
+- Build broadcaster: `cargo build -p apps --bin dsolver-tycho-broadcaster-service --release`
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
