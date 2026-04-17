@@ -1,5 +1,3 @@
-version = 1
-
 # Declare protocols once up top, then let each chain opt into the ones it actually wants.
 [[protocols]]
 id = "uniswap_v2"

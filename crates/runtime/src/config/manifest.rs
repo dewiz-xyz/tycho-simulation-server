@@ -9,7 +9,6 @@ use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 use crate::models::erc4626::Erc4626PairPolicy;
 
-pub(crate) const MANIFEST_VERSION: u32 = 1;
 pub(crate) const MANIFEST_PATH: &str = "simulator-manifest.toml";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +75,6 @@ struct RoutePolicyRegistryEntry {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawManifest {
-    version: u32,
     protocols: Vec<RawProtocol>,
     route_policies: Vec<RawRoutePolicy>,
     chains: Vec<RawChain>,
@@ -132,7 +130,6 @@ pub(crate) fn load_manifest_registries(path: &Path) -> Result<ManifestRegistries
 pub(crate) fn parse_manifest_registries(contents: &str) -> Result<ManifestRegistries> {
     let manifest: RawManifest =
         toml::from_str(contents).context("failed to parse simulator-manifest.toml")?;
-    validate_manifest_version(manifest.version)?;
 
     // Build the registries in dependency order so validation can stay strict and local.
     let protocols = validate_protocols(&manifest.protocols)?;
@@ -207,13 +204,6 @@ fn supported_runtime_chains() -> [Chain; 7] {
     ]
 }
 
-fn validate_manifest_version(version: u32) -> Result<()> {
-    if version != MANIFEST_VERSION {
-        bail!("unsupported manifest version {version}; expected {MANIFEST_VERSION}");
-    }
-    Ok(())
-}
-
 fn validate_protocols(protocols: &[RawProtocol]) -> Result<HashMap<String, BackendKind>> {
     let mut protocols_by_id = HashMap::new();
 
@@ -245,6 +235,8 @@ fn validate_route_policies(
             bail!("duplicate route-policy id {policy_id}");
         }
 
+        let mut native_token_protocol_allowlist =
+            Vec::with_capacity(policy.native_token_protocol_allowlist.len());
         for protocol_id in &policy.native_token_protocol_allowlist {
             let protocol_id = required_string(
                 &format!("route_policies[{policy_id}].native_token_protocol_allowlist"),
@@ -256,6 +248,7 @@ fn validate_route_policies(
             if *backend != BackendKind::Native {
                 bail!("route policy {policy_id} allowlists non-native protocol {protocol_id}");
             }
+            native_token_protocol_allowlist.push(protocol_id.to_string());
         }
 
         let mut reset_allowance_tokens = HashSet::new();
@@ -311,7 +304,7 @@ fn validate_route_policies(
         registry.insert(
             policy_id.to_string(),
             RoutePolicyRegistryEntry {
-                native_token_protocol_allowlist: policy.native_token_protocol_allowlist.clone(),
+                native_token_protocol_allowlist,
                 reset_allowance_tokens,
                 erc4626_pair_policies,
             },
@@ -358,19 +351,19 @@ fn validate_chains(
             );
         }
 
-        validate_backend_protocol_refs(
+        let native_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Native,
             &chain.native_protocols,
             protocols,
         )?;
-        validate_backend_protocol_refs(
+        let vm_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Vm,
             &chain.vm_protocols,
             protocols,
         )?;
-        validate_backend_protocol_refs(
+        let rfq_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Rfq,
             &chain.rfq_protocols,
@@ -384,9 +377,9 @@ fn validate_chains(
                 tycho_url: tycho_url.to_string(),
                 bebop_url: bebop_url.to_string(),
                 hashflow_filename: hashflow_filename.to_string(),
-                native_protocols: chain.native_protocols.clone(),
-                vm_protocols: chain.vm_protocols.clone(),
-                rfq_protocols: chain.rfq_protocols.clone(),
+                native_protocols,
+                vm_protocols,
+                rfq_protocols,
                 route_policy_id: route_policy_id.to_string(),
             },
         );
@@ -400,8 +393,9 @@ fn validate_backend_protocol_refs(
     backend: BackendKind,
     protocol_ids: &[String],
     protocols: &HashMap<String, BackendKind>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
+    let mut normalized_protocol_ids = Vec::with_capacity(protocol_ids.len());
     // Chains can only point at globally declared protocols for the matching backend. That keeps a
     // typo or copy/paste mixup from silently turning into a weird runtime config.
     for protocol_id in protocol_ids {
@@ -425,8 +419,9 @@ fn validate_backend_protocol_refs(
                 declared_backend.label()
             );
         }
+        normalized_protocol_ids.push(protocol_id.to_string());
     }
-    Ok(())
+    Ok(normalized_protocol_ids)
 }
 
 fn required_string<'a>(field: &str, value: &'a str) -> Result<&'a str> {
