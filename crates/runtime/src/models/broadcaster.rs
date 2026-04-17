@@ -236,8 +236,7 @@ impl BroadcasterSnapshotCache {
                     continue;
                 };
                 let state_offset = backend_emit_state.entry(*backend).or_insert(0);
-                if *state_offset >= partition.states.len()
-                    && (*state_offset > 0 || total_chunks > 0)
+                if *state_offset >= partition.states.len() && (*state_offset > 0 || chunk_index > 0)
                 {
                     continue;
                 }
@@ -502,12 +501,12 @@ mod tests {
         count_snapshot_chunks, BroadcasterPartitionState, BroadcasterReadiness,
         BroadcasterSnapshotCache, BroadcasterSubscriberSnapshot, BroadcasterUpstreamState,
     };
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
-    use simulator_core::broadcaster::BroadcasterStateEntry;
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterPayload, BroadcasterProtocolSyncStatus,
-        BroadcasterProtocolSyncStatusKind,
+        BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolSyncStatus,
+        BroadcasterProtocolSyncStatusKind, BroadcasterStateEntry, BroadcasterSubscriptionEvent,
+        BroadcasterSubscriptionTracker,
     };
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -657,6 +656,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_exports_empty_backend_partition_in_first_snapshot_chunk() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        );
+        cache.apply_update(&mixed_update()).await?;
+        cache.apply_update(&vm_sync_only_update()).await?;
+
+        let export = cache.export_snapshot(1).await?;
+        let Some(BroadcasterPayload::SnapshotChunk(chunk)) = export
+            .payloads
+            .iter()
+            .find(|payload| matches!(payload, BroadcasterPayload::SnapshotChunk(_)))
+        else {
+            return Err(anyhow!("expected snapshot_chunk payload"));
+        };
+
+        let Some(vm_partition) = chunk
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Vm)
+        else {
+            return Err(anyhow!("expected vm snapshot partition"));
+        };
+        assert!(vm_partition.states.is_empty());
+        assert_eq!(vm_partition.block_number, 11);
+        assert_eq!(
+            vm_partition.sync_statuses["vm:curve"].kind,
+            BroadcasterProtocolSyncStatusKind::Ready
+        );
+
+        let mut tracker = BroadcasterSubscriptionTracker::new();
+        let mut observed_events = Vec::new();
+        for (message_seq, payload) in export.payloads.iter().cloned().enumerate() {
+            let envelope =
+                BroadcasterEnvelope::new(export.stream_id.clone(), message_seq as u64 + 1, payload);
+            observed_events.push(tracker.observe(&envelope)?);
+        }
+        assert_eq!(
+            observed_events,
+            vec![
+                BroadcasterSubscriptionEvent::SnapshotStarted {
+                    snapshot_id: "chain-1-snapshot-1".to_string(),
+                },
+                BroadcasterSubscriptionEvent::SnapshotChunkAccepted {
+                    snapshot_id: "chain-1-snapshot-1".to_string(),
+                    chunk_index: 0,
+                },
+                BroadcasterSubscriptionEvent::SnapshotCompleted {
+                    snapshot_id: "chain-1-snapshot-1".to_string(),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cache_resets_generation_on_reset() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         cache.apply_update(&native_only_update()).await?;
@@ -756,6 +813,18 @@ mod tests {
             "uniswap_v2".to_string(),
             SynchronizerState::Ready(block_header(10, 1)),
         )]))
+    }
+
+    fn vm_sync_only_update() -> Update {
+        Update::new(11, HashMap::new(), HashMap::new())
+            .set_removed_pairs(HashMap::from([(
+                "vm-1".to_string(),
+                vm_component("vm-1", "vm:curve"),
+            )]))
+            .set_sync_states(HashMap::from([(
+                "vm:curve".to_string(),
+                SynchronizerState::Ready(block_header(11, 3)),
+            )]))
     }
 
     fn native_component(_id: &str, protocol: &str) -> ProtocolComponent {
