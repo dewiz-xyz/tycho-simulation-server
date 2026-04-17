@@ -1,0 +1,117 @@
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use runtime::models::broadcaster::{
+    BroadcasterBackendStatus, BroadcasterSnapshotStatus, BroadcasterStatusSnapshot,
+    BroadcasterSubscriberSnapshot, BroadcasterUpstreamSnapshot,
+};
+use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterStatusPayload {
+    pub status: &'static str,
+    pub chain_id: u64,
+    pub upstream: BroadcasterUpstreamPayload,
+    pub snapshot: BroadcasterSnapshotPayload,
+    pub subscribers: BroadcasterSubscribersPayload,
+    pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
+}
+
+impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
+    fn from(snapshot: BroadcasterStatusSnapshot) -> Self {
+        Self {
+            status: snapshot.readiness.as_str(),
+            chain_id: snapshot.chain_id,
+            upstream: snapshot.upstream.into(),
+            snapshot: snapshot.snapshot.into(),
+            subscribers: snapshot.subscribers.into(),
+            backends: snapshot
+                .backends
+                .into_iter()
+                .map(|(backend, status)| (backend, status.into()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterUpstreamPayload {
+    pub connected: bool,
+    pub restart_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_disconnect_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_age_ms: Option<u64>,
+}
+
+impl From<BroadcasterUpstreamSnapshot> for BroadcasterUpstreamPayload {
+    fn from(snapshot: BroadcasterUpstreamSnapshot) -> Self {
+        Self {
+            connected: snapshot.connected,
+            restart_count: snapshot.restart_count,
+            last_error: snapshot.last_error,
+            last_disconnect_reason: snapshot.last_disconnect_reason,
+            last_update_age_ms: snapshot.last_update_age_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterSnapshotPayload {
+    pub ready: bool,
+    pub stream_id: String,
+    pub snapshot_id: String,
+    pub configured_backends: Vec<BroadcasterBackend>,
+    pub total_states: usize,
+    pub chunk_size: usize,
+}
+
+impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
+    fn from(snapshot: BroadcasterSnapshotStatus) -> Self {
+        Self {
+            ready: snapshot.ready,
+            stream_id: snapshot.stream_id,
+            snapshot_id: snapshot.snapshot_id,
+            configured_backends: snapshot.configured_backends,
+            total_states: snapshot.total_states,
+            chunk_size: snapshot.chunk_size,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterSubscribersPayload {
+    pub active: usize,
+    pub lag_disconnects: u64,
+}
+
+impl From<BroadcasterSubscriberSnapshot> for BroadcasterSubscribersPayload {
+    fn from(snapshot: BroadcasterSubscriberSnapshot) -> Self {
+        Self {
+            active: snapshot.active,
+            lag_disconnects: snapshot.lag_disconnects,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterBackendPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    pub pool_count: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+}
+
+impl From<BroadcasterBackendStatus> for BroadcasterBackendPayload {
+    fn from(status: BroadcasterBackendStatus) -> Self {
+        Self {
+            block_number: status.block_number,
+            pool_count: status.pool_count,
+            sync_statuses: status.sync_statuses,
+        }
+    }
+}

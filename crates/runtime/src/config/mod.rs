@@ -124,6 +124,71 @@ pub fn load_config() -> AppConfig {
     }
 }
 
+pub fn load_broadcaster_config() -> BroadcasterConfig {
+    dotenv::dotenv().ok();
+
+    let chain_id: u64 = match require_env("CHAIN_ID").parse() {
+        Ok(chain_id) => chain_id,
+        Err(_) => {
+            eprintln!("CHAIN_ID must be a valid u64");
+            std::process::exit(2);
+        }
+    };
+    let registries = match load_manifest_registries(std::path::Path::new(MANIFEST_PATH)) {
+        Ok(registries) => registries,
+        Err(message) => {
+            eprintln!("Failed to load simulator-manifest.toml: {message}");
+            std::process::exit(2);
+        }
+    };
+    let network = load_network_config();
+    let timeouts = load_timeout_config();
+    let resolved_chain = match resolve_chain_config(&registries, chain_id, None) {
+        Ok(chain) => chain,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let stream = load_stream_config();
+    let memory = MemoryConfig::from_env();
+    let tuning = load_broadcaster_tuning();
+    let chain_profile = ChainProfile {
+        chain: resolved_chain.chain_profile.chain,
+        native_protocols: resolved_chain.chain_profile.native_protocols,
+        vm_protocols: resolved_chain.chain_profile.vm_protocols,
+        rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
+        native_token_protocol_allowlist: resolved_chain
+            .chain_profile
+            .native_token_protocol_allowlist,
+        reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
+        erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
+    };
+
+    BroadcasterConfig {
+        chain_profile,
+        tycho_url: resolved_chain.tycho_url,
+        api_key: network.api_key,
+        tvl_threshold: network.tvl_threshold,
+        tvl_keep_threshold: network.tvl_keep_threshold,
+        port: network.port,
+        host: network.host,
+        token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
+        stream_stale_secs: stream.stream_stale_secs,
+        stream_missing_block_burst: stream.stream_missing_block_burst,
+        stream_missing_block_window_secs: stream.stream_missing_block_window_secs,
+        stream_error_burst: stream.stream_error_burst,
+        stream_error_window_secs: stream.stream_error_window_secs,
+        resync_grace_secs: stream.resync_grace_secs,
+        stream_restart_backoff_min_ms: stream.stream_restart_backoff_min_ms,
+        stream_restart_backoff_max_ms: stream.stream_restart_backoff_max_ms,
+        stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
+        readiness_stale_secs: stream.readiness_stale_secs,
+        memory,
+        tuning,
+    }
+}
+
 fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile) -> bool {
     enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
 }
@@ -202,6 +267,13 @@ struct StreamConfig {
     stream_restart_backoff_max_ms: u64,
     stream_restart_backoff_jitter_pct: f64,
     readiness_stale_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BroadcasterTuning {
+    pub snapshot_chunk_size: usize,
+    pub subscriber_buffer_capacity: usize,
+    pub heartbeat_interval_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +445,32 @@ fn load_stream_config() -> StreamConfig {
     }
 }
 
+fn load_broadcaster_tuning() -> BroadcasterTuning {
+    let snapshot_chunk_size = parse_env_or_default("BROADCASTER_SNAPSHOT_CHUNK_SIZE", "500");
+    let subscriber_buffer_capacity =
+        parse_env_or_default("BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY", "128");
+    let heartbeat_interval_secs = parse_env_or_default("BROADCASTER_HEARTBEAT_INTERVAL_SECS", "5");
+
+    assert!(
+        snapshot_chunk_size > 0,
+        "BROADCASTER_SNAPSHOT_CHUNK_SIZE must be > 0"
+    );
+    assert!(
+        subscriber_buffer_capacity > 0,
+        "BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY must be > 0"
+    );
+    assert!(
+        heartbeat_interval_secs > 0,
+        "BROADCASTER_HEARTBEAT_INTERVAL_SECS must be > 0"
+    );
+
+    BroadcasterTuning {
+        snapshot_chunk_size,
+        subscriber_buffer_capacity,
+        heartbeat_interval_secs,
+    }
+}
+
 fn load_slippage_config() -> SlippageConfig {
     let defaults = SlippageConfig::default();
     let config = SlippageConfig {
@@ -449,6 +547,30 @@ pub struct AppConfig {
     pub hashflow_key: String,
 }
 
+#[derive(Clone)]
+pub struct BroadcasterConfig {
+    pub chain_profile: ChainProfile,
+    pub tycho_url: String,
+    pub api_key: String,
+    pub tvl_threshold: f64,
+    pub tvl_keep_threshold: f64,
+    pub port: u16,
+    pub host: IpAddr,
+    pub token_refresh_timeout_ms: u64,
+    pub stream_stale_secs: u64,
+    pub stream_missing_block_burst: u64,
+    pub stream_missing_block_window_secs: u64,
+    pub stream_error_burst: u64,
+    pub stream_error_window_secs: u64,
+    pub resync_grace_secs: u64,
+    pub stream_restart_backoff_min_ms: u64,
+    pub stream_restart_backoff_max_ms: u64,
+    pub stream_restart_backoff_jitter_pct: f64,
+    pub readiness_stale_secs: u64,
+    pub memory: MemoryConfig,
+    pub tuning: BroadcasterTuning,
+}
+
 fn env_or_default(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -523,9 +645,20 @@ mod tests {
         "CUMULATIVE_DEGRADATION_COEFFICIENT_BPS",
         "SATURATION_RAMP_START_SLIPPAGE_BPS",
     ];
+    const BROADCASTER_TUNING_ENV_KEYS: [&str; 3] = [
+        "BROADCASTER_SNAPSHOT_CHUNK_SIZE",
+        "BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY",
+        "BROADCASTER_HEARTBEAT_INTERVAL_SECS",
+    ];
 
     fn clear_slippage_env() {
         for key in SLIPPAGE_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn clear_broadcaster_tuning_env() {
+        for key in BROADCASTER_TUNING_ENV_KEYS {
             std::env::remove_var(key);
         }
     }
@@ -881,5 +1014,38 @@ route_policy = " default "
         );
 
         clear_slippage_env();
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_uses_phase_four_defaults() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+
+        let tuning = load_broadcaster_tuning();
+
+        assert_eq!(tuning.snapshot_chunk_size, 500);
+        assert_eq!(tuning.subscriber_buffer_capacity, 128);
+        assert_eq!(tuning.heartbeat_interval_secs, 5);
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_reads_env_overrides() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+        std::env::set_var("BROADCASTER_SNAPSHOT_CHUNK_SIZE", "64");
+        std::env::set_var("BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY", "32");
+        std::env::set_var("BROADCASTER_HEARTBEAT_INTERVAL_SECS", "9");
+
+        let tuning = load_broadcaster_tuning();
+
+        assert_eq!(tuning.snapshot_chunk_size, 64);
+        assert_eq!(tuning.subscriber_buffer_capacity, 32);
+        assert_eq!(tuning.heartbeat_interval_secs, 9);
+
+        clear_broadcaster_tuning_env();
     }
 }
