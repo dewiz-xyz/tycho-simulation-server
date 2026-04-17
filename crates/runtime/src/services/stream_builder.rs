@@ -49,6 +49,7 @@ use crate::models::tokens::TokenStore;
 enum StreamDecodePolicy {
     Native,
     Vm,
+    Broadcaster,
 }
 
 pub async fn build_native_stream(
@@ -163,12 +164,60 @@ pub async fn build_vm_stream(
     }))
 }
 
+pub async fn build_broadcaster_stream(
+    tycho_url: &str,
+    api_key: &str,
+    tvl_add_threshold: f64,
+    tvl_keep_threshold: f64,
+    tokens: Arc<TokenStore>,
+    chain: Chain,
+    protocols: &BroadcasterProtocols,
+) -> Result<
+    impl futures::Stream<
+            Item = Result<
+                tycho_simulation::protocol::models::Update,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
+> {
+    let (mut builder, tvl_filter) = base_builder(
+        tycho_url,
+        api_key,
+        tvl_add_threshold,
+        tvl_keep_threshold,
+        decode_skip_state_failures(StreamDecodePolicy::Broadcaster),
+        chain,
+    );
+
+    for protocol in &protocols.native {
+        builder = register_native_protocol(builder, protocol, &tvl_filter)?;
+    }
+
+    for protocol in &protocols.vm {
+        builder = register_vm_protocol(builder, protocol, &tvl_filter)?;
+    }
+
+    let snapshot = tokens.snapshot().await;
+    let stream = builder.set_tokens(snapshot).await.build().await?;
+
+    Ok(stream.map(|item| {
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
+    }))
+}
+
 #[derive(Clone)]
 pub struct RFQConfig {
     pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BroadcasterProtocols {
+    pub native: Vec<String>,
+    pub vm: Vec<String>,
 }
 
 pub async fn build_rfq_stream(
@@ -299,7 +348,10 @@ fn base_builder(
 }
 
 fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    matches!(policy, StreamDecodePolicy::Native | StreamDecodePolicy::Vm)
+    matches!(
+        policy,
+        StreamDecodePolicy::Native | StreamDecodePolicy::Vm | StreamDecodePolicy::Broadcaster
+    )
 }
 
 #[cfg(test)]
@@ -317,8 +369,9 @@ mod tests {
     };
 
     use super::{
-        decode_skip_state_failures, merge_missing_tokens, register_native_protocol,
-        register_vm_protocol, rfq_decoder_tokens, StreamDecodePolicy,
+        build_broadcaster_stream, decode_skip_state_failures, merge_missing_tokens,
+        register_native_protocol, register_vm_protocol, rfq_decoder_tokens, BroadcasterProtocols,
+        StreamDecodePolicy,
     };
     use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
     use tycho_simulation::{
@@ -403,6 +456,11 @@ mod tests {
     }
 
     #[test]
+    fn broadcaster_stream_keeps_decode_skip_enabled() {
+        assert!(decode_skip_state_failures(StreamDecodePolicy::Broadcaster));
+    }
+
+    #[test]
     fn unknown_native_protocol_returns_error() {
         let builder = test_builder();
         let filter = test_filter();
@@ -424,6 +482,33 @@ mod tests {
             unreachable!("expected error for unknown VM protocol");
         };
         assert!(err.to_string().contains("Unknown VM protocol"));
+    }
+
+    #[tokio::test]
+    async fn broadcaster_stream_rejects_unknown_native_protocol() {
+        let tokens = test_token_store([test_token(
+            "0x0000000000000000000000000000000000000001",
+            "TKNA",
+        )]);
+        let result = build_broadcaster_stream(
+            "localhost",
+            "key",
+            1.0,
+            1.0,
+            tokens,
+            Chain::Ethereum,
+            &BroadcasterProtocols {
+                native: vec!["unknown_protocol".to_string()],
+                vm: Vec::new(),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let Err(err) = result else {
+            unreachable!("expected unknown broadcaster protocol to fail");
+        };
+        assert!(err.to_string().contains("Unknown native protocol"));
     }
 
     #[test]

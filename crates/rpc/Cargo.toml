@@ -8,7 +8,8 @@ repository.workspace = true
 description = "DSolver simulator RPC shell and HTTP transport adapters."
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+futures.workspace = true
 num-bigint.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,8 +21,10 @@ simulator_core = { package = "simulator-core", path = "../simulator-core" }
 runtime = { path = "../runtime" }
 
 [dev-dependencies]
+anyhow.workspace = true
 chrono.workspace = true
 num-traits.workspace = true
+tokio-tungstenite = "0.24.0"
 tycho-simulation.workspace = true
 typetag.workspace = true
 
