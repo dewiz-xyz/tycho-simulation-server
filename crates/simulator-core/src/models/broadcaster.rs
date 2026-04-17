@@ -214,7 +214,6 @@ impl BroadcasterSnapshotEnd {
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterUpdateMessage {
     #[serde(
-        default,
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_unique_update_partitions"
     )]
@@ -2102,6 +2101,23 @@ mod tests {
             BroadcasterSubscriptionEvent::UpdateAccepted
         );
         Ok(())
+    }
+
+    #[test]
+    fn serde_rejects_update_without_partitions() {
+        let serde_error = serde_json::from_value::<BroadcasterEnvelope>(serde_json::json!({
+            "stream_id": "stream-1",
+            "message_seq": 1,
+            "kind": "update"
+        }))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+
+        assert!(
+            serde_error.contains("missing field `partitions`"),
+            "serde should reject updates that omit partitions"
+        );
     }
 
     #[test]
