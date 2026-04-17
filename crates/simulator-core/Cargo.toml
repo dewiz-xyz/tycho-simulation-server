@@ -13,7 +13,10 @@ tycho-simulation.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+num-bigint.workspace = true
 serde_json.workspace = true
+typetag.workspace = true
 
 [lints]
 workspace = true

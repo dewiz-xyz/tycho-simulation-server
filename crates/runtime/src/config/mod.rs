@@ -615,8 +615,6 @@ mod tests {
     #[test]
     fn parse_manifest_rejects_duplicate_protocol_ids() {
         let manifest = r#"
-version = 1
-
 [[protocols]]
 id = "uniswap_v2"
 backend = "native"
@@ -651,8 +649,6 @@ route_policy = "default"
     #[test]
     fn parse_manifest_rejects_unknown_route_policy_references() {
         let manifest = r#"
-version = 1
-
 [[protocols]]
 id = "uniswap_v2"
 backend = "native"
@@ -683,8 +679,6 @@ route_policy = "missing"
     #[test]
     fn parse_manifest_rejects_unsupported_chain_ids() {
         let manifest = r#"
-version = 1
-
 [[protocols]]
 id = "uniswap_v2"
 backend = "native"
@@ -717,8 +711,6 @@ route_policy = "default"
     #[test]
     fn parse_manifest_rejects_erc4626_pairs_without_enabled_directions() {
         let manifest = r#"
-version = 1
-
 [[protocols]]
 id = "erc4626"
 backend = "native"
@@ -752,6 +744,55 @@ route_policy = "default"
         };
 
         assert!(err.to_string().contains("no enabled directions"));
+    }
+
+    #[test]
+    fn parse_manifest_stores_trimmed_registry_values() {
+        let manifest = r#"
+[[protocols]]
+id = " uniswap_v2 "
+backend = "native"
+
+[[protocols]]
+id = " rfq:bebop "
+backend = "rfq"
+
+[[route_policies]]
+id = " default "
+native_token_protocol_allowlist = [" uniswap_v2 "]
+reset_allowance_tokens = []
+
+[[chains]]
+chain_id = 1
+tycho_url = " tycho "
+bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
+hashflow_filename = " ./hashflow.csv "
+native_protocols = [" uniswap_v2 "]
+vm_protocols = []
+rfq_protocols = [" rfq:bebop "]
+route_policy = " default "
+"#;
+
+        let Ok(registries) = manifest::parse_manifest_registries(manifest) else {
+            unreachable!("expected manifest with padded strings to parse");
+        };
+        let Ok(chain) = resolve_chain_config(&registries, 1, None) else {
+            unreachable!("expected ethereum manifest entry");
+        };
+
+        assert_eq!(chain.tycho_url, "tycho");
+        assert_eq!(
+            chain.bebop_url,
+            "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
+        );
+        assert_eq!(chain.hashflow_filename, "./hashflow.csv");
+        assert_eq!(chain.chain_profile.native_protocols, vec!["uniswap_v2"]);
+        assert!(chain.chain_profile.vm_protocols.is_empty());
+        assert_eq!(chain.chain_profile.rfq_protocols, vec!["rfq:bebop"]);
+        assert_eq!(
+            chain.chain_profile.native_token_protocol_allowlist,
+            vec!["uniswap_v2"]
+        );
     }
 
     #[test]
