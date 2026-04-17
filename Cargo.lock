@@ -5733,9 +5733,12 @@ name = "simulator-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "num-bigint",
  "serde",
  "serde_json",
  "tycho-simulation",
+ "typetag",
 ]
 
 [[package]]
