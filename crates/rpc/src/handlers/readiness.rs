@@ -73,9 +73,7 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
     let vm_last_update_age_ms = state.vm_update_age_ms().await;
     let rfq_last_update_age_ms = state.rfq_update_age_ms().await;
     let native_status = native_readiness.label();
-    let service_is_ready = matches!(native_readiness, NativeReadiness::Ready)
-        || matches!(vm_readiness, VmReadiness::Ready)
-        || matches!(rfq_readiness, RfqReadiness::Ready);
+    let service_is_ready = matches!(native_readiness, NativeReadiness::Ready);
     let status = if service_is_ready {
         "ready"
     } else {
@@ -125,7 +123,9 @@ mod tests {
 
     use super::{status, StatusPayload};
     use crate::config::SlippageConfig;
-    use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+    use crate::models::state::{
+        AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+    };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use axum::{extract::State, http::StatusCode, Json};
@@ -244,6 +244,7 @@ mod tests {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
+            broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             vm_state_store: Arc::new(StateStore::new(token_store.clone())),
             rfq_state_store: Arc::new(StateStore::new(token_store)),
@@ -289,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_is_ready_when_vm_is_ready_even_if_native_is_not() {
+    async fn status_stays_unavailable_when_vm_is_ready_but_native_is_not() {
         let state = test_state(true, true);
         let vm_component = ProtocolComponent::new(
             address(4),
@@ -325,8 +326,8 @@ mod tests {
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
-        assert_eq!(status_code, StatusCode::OK);
-        assert_eq!(payload.status, "ready");
+        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(payload.status, "warming_up");
         assert_eq!(payload.native_status, "warming_up");
         assert_eq!(payload.vm_status, "ready");
         assert!(payload.rfq_enabled);

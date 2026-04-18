@@ -13,7 +13,9 @@ use tycho_simulation::tycho_common::Bytes;
 use crate::config::SlippageConfig;
 use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
-use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use crate::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
 
@@ -161,6 +163,7 @@ pub(super) fn test_app_state(
         chain: Chain::Ethereum,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
+        broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,

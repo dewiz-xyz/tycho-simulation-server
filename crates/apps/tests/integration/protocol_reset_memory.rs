@@ -10,7 +10,9 @@ use jemalloc_ctl as jemalloc;
 use jemallocator::Jemalloc;
 use num_bigint::BigUint;
 use runtime::config::{MemoryConfig, SlippageConfig};
-use runtime::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use runtime::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use runtime::services::quotes::get_amounts_out;
@@ -609,6 +611,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         chain: Chain::Ethereum,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&token_store),
+        broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),

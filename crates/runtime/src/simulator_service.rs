@@ -15,16 +15,16 @@ use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::rfq::bebop::BebopResponse;
 use crate::models::rfq::hashflow::read_hashflow_csv;
-use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use crate::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
-use crate::services::stream_builder::{
-    build_native_stream, build_rfq_stream, build_vm_stream, RFQConfig,
+use crate::services::broadcaster_subscription::{
+    supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
 };
-use crate::stream::{
-    supervise_native_stream, supervise_rfq_stream, supervise_vm_stream, RfqStreamControls,
-    StreamSupervisorConfig, VmStreamControls,
-};
+use crate::services::stream_builder::{build_rfq_stream, RFQConfig};
+use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
 
 struct RfqStreamDeps<'a> {
     resources: &'a StreamResources,
@@ -70,21 +70,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     let supervisor_cfg = build_supervisor_config(&config);
 
     log_concurrency_config(&config);
-    spawn_native_stream_task(
-        &config,
-        &tycho_url,
-        &supervisor_cfg,
-        Arc::clone(&tokens),
-        &stream_resources,
-    );
-    spawn_vm_stream_task(
-        &config,
-        &tycho_url,
-        &supervisor_cfg,
-        Arc::clone(&tokens),
-        &stream_resources,
-        &app_state,
-    );
+    spawn_broadcaster_subscription_task(&config, &supervisor_cfg, &stream_resources, &app_state);
     let rfq_config = RFQConfig {
         bebop_user: config.bebop_user.clone(),
         bebop_key: config.bebop_key.clone(),
@@ -290,6 +276,7 @@ fn build_app_state(
             config.chain_profile.native_token_protocol_allowlist.clone(),
         ),
         tokens,
+        broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
         rfq_state_store: Arc::clone(&resources.rfq_state_store),
@@ -359,123 +346,31 @@ fn log_concurrency_config(config: &AppConfig) {
     );
 }
 
-fn spawn_native_stream_task(
+fn spawn_broadcaster_subscription_task(
     config: &AppConfig,
-    tycho_url: &str,
     supervisor_cfg: &StreamSupervisorConfig,
-    tokens: Arc<TokenStore>,
-    resources: &StreamResources,
-) {
-    let chain = config.chain_profile.chain;
-    let native_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = tokens;
-    let state_store_bg = Arc::clone(&resources.native_state_store);
-    let health_bg = Arc::clone(&resources.native_stream_health);
-    let tycho_url = tycho_url.to_string();
-    let api_key = config.api_key.clone();
-    let tvl_threshold = config.tvl_threshold;
-    let tvl_keep_threshold = config.tvl_keep_threshold;
-    let native_protocols = config.chain_profile.native_protocols.clone();
-
-    tokio::spawn(async move {
-        info!("Starting native protocol stream supervisor...");
-        supervise_native_stream(
-            move || {
-                let tokens = Arc::clone(&tokens_bg);
-                let tycho_url = tycho_url.clone();
-                let api_key = api_key.clone();
-                let protocols = native_protocols.clone();
-                async move {
-                    build_native_stream(
-                        &tycho_url,
-                        &api_key,
-                        tvl_threshold,
-                        tvl_keep_threshold,
-                        tokens,
-                        chain,
-                        &protocols,
-                    )
-                    .await
-                }
-            },
-            state_store_bg,
-            health_bg,
-            native_supervisor_cfg,
-        )
-        .await;
-    });
-    debug!("Native stream supervisor task spawned");
-}
-
-fn spawn_vm_stream_task(
-    config: &AppConfig,
-    tycho_url: &str,
-    supervisor_cfg: &StreamSupervisorConfig,
-    tokens: Arc<TokenStore>,
     resources: &StreamResources,
     app_state: &AppState,
 ) {
-    let chain = config.chain_profile.chain;
-    let effective_vm_enabled =
-        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
-    if !effective_vm_enabled {
-        if !config.enable_vm_pools {
-            info!("VM pool feeds disabled");
-        } else {
-            info!(
-                chain = %chain,
-                "VM pool feeds enabled but no VM protocols configured for this chain; skipping VM stream"
-            );
-        }
-        return;
-    }
-
-    let vm_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = tokens;
-    let state_store_bg = Arc::clone(&resources.vm_state_store);
-    let health_bg = Arc::clone(&resources.vm_stream_health);
-    let vm_stream_bg = Arc::clone(&resources.vm_stream);
-    let vm_semaphore_bg = app_state.vm_sim_semaphore();
-    let tycho_url = tycho_url.to_string();
-    let api_key = config.api_key.clone();
-    let tvl_threshold = config.tvl_threshold;
-    let tvl_keep_threshold = config.tvl_keep_threshold;
-    let vm_protocols = config.chain_profile.vm_protocols.clone();
-    let vm_sim_concurrency = vm_sim_concurrency_u32(config.global_vm_sim_concurrency);
+    let broadcaster_supervisor_cfg = supervisor_cfg.clone();
+    let ws_url = config.tycho_broadcaster_ws_url.clone();
+    let controls = BroadcasterSubscriptionControls {
+        broadcaster_subscription: app_state.broadcaster_subscription.clone(),
+        native_state_store: Arc::clone(&resources.native_state_store),
+        vm_state_store: Arc::clone(&resources.vm_state_store),
+        native_stream_health: Arc::clone(&resources.native_stream_health),
+        vm_stream_health: Arc::clone(&resources.vm_stream_health),
+        vm_stream: Arc::clone(&resources.vm_stream),
+        vm_sim_semaphore: app_state.vm_sim_semaphore(),
+        vm_sim_concurrency: vm_sim_concurrency_u32(app_state.vm_sim_concurrency),
+        enable_vm_pools: app_state.enable_vm_pools,
+    };
 
     tokio::spawn(async move {
-        info!("Starting VM protocol stream supervisor...");
-        supervise_vm_stream(
-            move || {
-                let tokens = Arc::clone(&tokens_bg);
-                let tycho_url = tycho_url.clone();
-                let api_key = api_key.clone();
-                let protocols = vm_protocols.clone();
-                async move {
-                    build_vm_stream(
-                        &tycho_url,
-                        &api_key,
-                        tvl_threshold,
-                        tvl_keep_threshold,
-                        tokens,
-                        chain,
-                        &protocols,
-                    )
-                    .await
-                }
-            },
-            state_store_bg,
-            health_bg,
-            vm_supervisor_cfg,
-            VmStreamControls {
-                vm_stream: vm_stream_bg,
-                vm_sim_semaphore: vm_semaphore_bg,
-                vm_sim_concurrency,
-            },
-        )
-        .await;
+        info!("Starting broadcaster subscription supervisor...");
+        supervise_broadcaster_subscription(ws_url, broadcaster_supervisor_cfg, controls).await;
     });
-    debug!("VM stream supervisor task spawned");
+    debug!("Broadcaster subscription supervisor task spawned");
 }
 
 fn spawn_rfq_stream_task(
@@ -595,6 +490,7 @@ mod tests {
         AppConfig {
             chain_profile,
             tycho_url: "http://localhost:4242".to_string(),
+            tycho_broadcaster_ws_url: "ws://127.0.0.1:3001/ws".to_string(),
             bebop_url: "https://example.com/bebop".to_string(),
             hashflow_filename: "./hashflow.csv".to_string(),
             api_key: "test-api-key".to_string(),

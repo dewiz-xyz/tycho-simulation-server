@@ -84,6 +84,7 @@ pub fn load_config() -> AppConfig {
     AppConfig {
         chain_profile,
         tycho_url: resolved_chain.tycho_url,
+        tycho_broadcaster_ws_url: require_trimmed_env("TYCHO_BROADCASTER_WS_URL"),
         bebop_url: resolved_chain.bebop_url,
         hashflow_filename: resolved_chain.hashflow_filename,
         api_key: network.api_key,
@@ -508,6 +509,7 @@ fn load_slippage_config() -> SlippageConfig {
 pub struct AppConfig {
     pub chain_profile: ChainProfile,
     pub tycho_url: String,
+    pub tycho_broadcaster_ws_url: String,
     pub bebop_url: String,
     pub hashflow_filename: String,
     pub api_key: String,
@@ -615,6 +617,13 @@ fn require_env(key: &str) -> String {
     }
 }
 
+fn require_trimmed_env(key: &str) -> String {
+    let value = require_env(key);
+    let trimmed = value.trim();
+    assert!(!trimmed.is_empty(), "{key} must not be empty");
+    trimmed.to_string()
+}
+
 #[expect(
     clippy::panic,
     reason = "startup config remains fail-fast on invalid env"
@@ -632,7 +641,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -663,8 +676,92 @@ mod tests {
         }
     }
 
+    const CONFIG_TEST_ENV_KEYS: [&str; 4] = [
+        "CHAIN_ID",
+        "ENABLE_RFQ_POOLS",
+        "TYCHO_API_KEY",
+        "TYCHO_BROADCASTER_WS_URL",
+    ];
+
     fn manifest_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../simulator-manifest.toml")
+    }
+
+    fn unique_test_dir_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| unreachable!("system clock should be after unix epoch"))
+            .as_nanos();
+        format!("{prefix}-{}-{nanos}", std::process::id())
+    }
+
+    fn copy_manifest_to(dir: &Path) {
+        let target = dir.join(MANIFEST_PATH);
+        fs::copy(manifest_path(), &target)
+            .unwrap_or_else(|_| unreachable!("expected manifest copy into isolated test dir"));
+    }
+
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(message) => (*message).to_string(),
+                Err(_) => "<non-string panic>".to_string(),
+            },
+        }
+    }
+
+    fn with_isolated_config_env<T>(
+        broadcaster_ws_url: Option<&str>,
+        test: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved_env: Vec<_> = CONFIG_TEST_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        let original_dir = std::env::current_dir()
+            .unwrap_or_else(|_| unreachable!("expected current working directory during tests"));
+        let isolated_dir = std::env::temp_dir().join(unique_test_dir_name("runtime-config-test"));
+        fs::create_dir_all(&isolated_dir)
+            .unwrap_or_else(|_| unreachable!("expected isolated test dir creation to succeed"));
+        copy_manifest_to(&isolated_dir);
+
+        std::env::set_var("CHAIN_ID", "1");
+        std::env::set_var("ENABLE_RFQ_POOLS", "false");
+        std::env::set_var("TYCHO_API_KEY", "test-api-key");
+        match broadcaster_ws_url {
+            Some(value) => std::env::set_var("TYCHO_BROADCASTER_WS_URL", value),
+            None => std::env::remove_var("TYCHO_BROADCASTER_WS_URL"),
+        }
+        std::env::set_current_dir(&isolated_dir)
+            .unwrap_or_else(|_| unreachable!("expected isolated cwd switch to succeed"));
+
+        let result = test();
+
+        std::env::set_current_dir(&original_dir)
+            .unwrap_or_else(|_| unreachable!("expected cwd restore to succeed"));
+        for (key, value) in saved_env {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(&isolated_dir);
+        result
+    }
+
+    fn load_config_panic_message(broadcaster_ws_url: Option<&str>) -> String {
+        with_isolated_config_env(broadcaster_ws_url, || {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = load_config();
+            })) {
+                Ok(_) => unreachable!("load_config should fail fast for invalid broadcaster url"),
+                Err(panic) => panic_message(panic),
+            }
+        })
     }
 
     fn load_test_registries() -> manifest::ManifestRegistries {
@@ -1047,5 +1144,19 @@ route_policy = " default "
         assert_eq!(tuning.heartbeat_interval_secs, 9);
 
         clear_broadcaster_tuning_env();
+    }
+
+    #[test]
+    fn load_config_fails_fast_when_tycho_broadcaster_ws_url_missing() {
+        let message = load_config_panic_message(None);
+
+        assert!(message.contains("TYCHO_BROADCASTER_WS_URL must be set"));
+    }
+
+    #[test]
+    fn load_config_fails_fast_when_tycho_broadcaster_ws_url_blank() {
+        let message = load_config_panic_message(Some("   "));
+
+        assert!(message.contains("TYCHO_BROADCASTER_WS_URL must not be empty"));
     }
 }

@@ -14,7 +14,9 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
-use runtime::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use runtime::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use simulator_core::models::messages::{
@@ -576,6 +578,7 @@ async fn build_app_state_and_request(
         chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
+        broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -678,6 +681,7 @@ async fn setup_timeout_app(
         chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
+        broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
@@ -1439,6 +1443,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         chain: Chain::Ethereum,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
+        broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
