@@ -39,7 +39,7 @@
   <a href="#docs-map">Docs</a>
 </p>
 
-DSolver Simulator is a Rust service for DeFi quote simulation and route encoding. It ingests Tycho protocol streams, maintains an in-memory view of pool state, and exposes fast HTTP endpoints for quoting, route settlement encoding, and readiness checks.
+DSolver Simulator is a Rust service for DeFi quote simulation and route encoding. It subscribes to the internal Tycho broadcaster for native and VM state, maintains an in-memory view of pool state, and exposes fast HTTP endpoints for quoting, route settlement encoding, and readiness checks.
 
 ## What It Is
 
@@ -49,7 +49,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 
 ## Why Teams Use It
 
-- Continuous ingestion of native and optional VM-backed Tycho pool state.
+- Continuous ingestion of native and optional VM-backed pool state through the internal broadcaster service.
 - Structured `/simulate` responses that distinguish usable quotes, partial coverage, warmup states, and request-level failures.
 - `/encode` route resimulation before calldata generation, so settlement interactions are built from the same runtime view used for quoting.
 - Reporting-first local analysis tooling for readiness, latency, sampled evidence, and quick regression investigation.
@@ -63,7 +63,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Binary | `dsolver-simulator-service` |
 | Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
 | Supported chains | Defined in `simulator-manifest.toml` |
-| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID` |
+| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_WS_URL` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
@@ -71,6 +71,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 
 ```bash
 cp .env.example .env
+PORT=3001 cargo run -p apps --bin dsolver-tycho-broadcaster-service --release
 cargo run -p apps --bin dsolver-simulator-service --release
 ```
 
@@ -81,6 +82,7 @@ Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
+- `TYCHO_BROADCASTER_WS_URL` pointing at the broadcaster websocket, for example `ws://127.0.0.1:3001/ws`
 
 Common optional inputs:
 
@@ -165,8 +167,8 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 `GET /status` is the readiness source of truth:
 
 - `200 OK` with `status="ready"` when the service is healthy
-- `503 Service Unavailable` with `status="warming_up"` while no backend is ready yet
-- `native_status="ready"` when native state is ready and not stale
+- `503 Service Unavailable` with `status="warming_up"` while native readiness is not ready
+- `native_status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
 - `native_status="warming_up"` while initial native state is still loading or native updates are stale
 
 `vm_status` and `rfq_status` are one of:
