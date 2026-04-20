@@ -38,7 +38,7 @@ pub(crate) const ETHEREUM_NATIVE_PROTOCOLS: &[&str] = &[
     "erc4626",
 ];
 pub(crate) const ETHEREUM_VM_PROTOCOLS: &[&str] = &["vm:curve", "vm:balancer_v2", "vm:maverick_v2"];
-pub(crate) const ETHEREUM_RFQ_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow"];
+pub(crate) const ETHEREUM_RFQ_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow", "rfq:liquorice"];
 pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
     "uniswap_v2",
     "uniswap_v3",
@@ -62,6 +62,14 @@ pub fn get_default_bebop_url(chain: &Chain) -> Option<String> {
 pub fn get_default_hashflow_filename(chain: &Chain) -> Option<String> {
     match chain {
         Chain::Ethereum | Chain::Base => Some("./hashflow_supported_tokens.csv".to_string()),
+        _ => None,
+    }
+}
+
+/// Get the default Liquorice filename for the given chain.
+pub fn get_default_liquorice_filename(chain: &Chain) -> Option<String> {
+    match chain {
+        Chain::Ethereum => Some("./liquorice_supported_tokens.csv".to_string()),
         _ => None,
     }
 }
@@ -136,7 +144,8 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(rfq_enabled);
+    let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
         chain_profile,
@@ -174,6 +183,8 @@ pub fn load_config() -> AppConfig {
         bebop_user,
         hashflow_key,
         hashflow_user,
+        liquorice_key,
+        liquorice_user,
     }
 }
 
@@ -181,41 +192,76 @@ fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile)
     enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
 }
 
-fn load_rfq_credentials(rfq_enabled: bool) -> (String, String, String, String) {
-    if !rfq_enabled {
-        return (String::new(), String::new(), String::new(), String::new());
+fn load_rfq_credentials(
+    rfq_enabled: bool,
+    rfq_protocols: &[String],
+) -> (String, String, String, String, String, String) {
+    match try_load_rfq_credentials(rfq_enabled, rfq_protocols) {
+        Ok(credentials) => credentials,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn try_load_rfq_credentials(
+    rfq_enabled: bool,
+    rfq_protocols: &[String],
+) -> Result<(String, String, String, String, String, String), String> {
+    if !rfq_enabled || rfq_protocols.is_empty() {
+        return Ok((
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
     }
 
-    let bebop_user = match env::var("BEBOP_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let bebop_key = match env::var("BEBOP_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let hashflow_user = match env::var("HASHFLOW_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let hashflow_key = match env::var("HASHFLOW_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
+    let (bebop_user, bebop_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:bebop"),
+        "BEBOP_USER",
+        "BEBOP_KEY",
+    )?;
+    let (hashflow_user, hashflow_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:hashflow"),
+        "HASHFLOW_USER",
+        "HASHFLOW_KEY",
+    )?;
+    let (liquorice_user, liquorice_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:liquorice"),
+        "LIQUORICE_USER",
+        "LIQUORICE_KEY",
+    )?;
 
-    (bebop_user, bebop_key, hashflow_user, hashflow_key)
+    Ok((
+        bebop_user,
+        bebop_key,
+        hashflow_user,
+        hashflow_key,
+        liquorice_user,
+        liquorice_key,
+    ))
+}
+
+fn load_provider_credentials(
+    enabled: bool,
+    user_key: &str,
+    auth_key: &str,
+) -> Result<(String, String), String> {
+    if !enabled {
+        return Ok((String::new(), String::new()));
+    }
+
+    let user = env::var(user_key).map_err(|message| message.to_string())?;
+    let key = env::var(auth_key).map_err(|message| message.to_string())?;
+    Ok((user, key))
+}
+
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
 }
 
 struct NetworkConfig {
@@ -300,8 +346,20 @@ pub fn hosted_hashflow_filename(chain: Chain) -> Result<String, String> {
         return Ok(filename);
     }
 
-    get_default_hashflow_filename(&chain)
-        .ok_or_else(|| format!("No default Hashflow URL configured for supported chain {chain}"))
+    get_default_hashflow_filename(&chain).ok_or_else(|| {
+        format!("No default Hashflow filename configured for supported chain {chain}")
+    })
+}
+
+/// Resolve the hosted Liquorice token filename for a supported runtime chain.
+pub fn hosted_liquorice_filename(chain: Chain) -> Result<String, String> {
+    if let Some(filename) = optional_trimmed_env("LIQUORICE_FILENAME_CSV") {
+        return Ok(filename);
+    }
+
+    get_default_liquorice_filename(&chain).ok_or_else(|| {
+        format!("No default Liquorice filename configured for supported chain {chain}")
+    })
 }
 
 fn load_network_config() -> NetworkConfig {
@@ -518,6 +576,8 @@ pub struct AppConfig {
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
+    pub liquorice_user: String,
+    pub liquorice_key: String,
 }
 
 const ETHEREUM_CHAIN_ID: u64 = 1;
@@ -613,6 +673,19 @@ mod tests {
         }
     }
 
+    fn clear_rfq_env() {
+        for key in [
+            "BEBOP_USER",
+            "BEBOP_KEY",
+            "HASHFLOW_USER",
+            "HASHFLOW_KEY",
+            "LIQUORICE_USER",
+            "LIQUORICE_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn resolve_ethereum_profile() {
         let Ok(profile) = resolve_chain_profile(1) else {
@@ -624,6 +697,7 @@ mod tests {
         assert!(profile.native_protocols.contains(&"erc4626".to_string()));
         assert!(profile.vm_protocols.contains(&"vm:curve".to_string()));
         assert!(profile.rfq_protocols.contains(&"rfq:bebop".to_string()));
+        assert!(profile.rfq_protocols.contains(&"rfq:liquorice".to_string()));
         assert!(profile
             .native_token_protocol_allowlist
             .contains(&"rocketpool".to_string()));
@@ -725,6 +799,29 @@ mod tests {
     }
 
     #[test]
+    fn hosted_liquorice_filename_uses_ethereum_default() {
+        let Ok(filename) = hosted_liquorice_filename(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Liquorice filename");
+        };
+        assert_eq!(filename, "./liquorice_supported_tokens.csv");
+    }
+
+    #[test]
+    fn hosted_liquorice_filename_prefers_env_override() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("LIQUORICE_FILENAME_CSV", "/tmp/liquorice.csv");
+
+        let Ok(filename) = hosted_liquorice_filename(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Liquorice filename");
+        };
+
+        std::env::remove_var("LIQUORICE_FILENAME_CSV");
+        assert_eq!(filename, "/tmp/liquorice.csv");
+    }
+
+    #[test]
     fn rfq_effectively_enabled_requires_flag_and_protocols() {
         let ethereum = ethereum_profile();
         let base = base_profile();
@@ -737,12 +834,41 @@ mod tests {
 
     #[test]
     fn load_rfq_credentials_skips_env_when_disabled() {
-        let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(false);
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+            load_rfq_credentials(false, &[]);
 
         assert!(bebop_user.is_empty());
         assert!(bebop_key.is_empty());
         assert!(hashflow_user.is_empty());
         assert!(hashflow_key.is_empty());
+        assert!(liquorice_user.is_empty());
+        assert!(liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn load_rfq_credentials_only_reads_enabled_protocols() -> Result<(), String> {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_rfq_env();
+        std::env::set_var("HASHFLOW_USER", "hashflow-user");
+        std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+
+        let protocols = vec!["rfq:hashflow".to_string()];
+        let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+            try_load_rfq_credentials(true, &protocols)?;
+
+        clear_rfq_env();
+        assert!(bebop_user.is_empty());
+        assert!(bebop_key.is_empty());
+        assert_eq!(hashflow_user, "hashflow-user");
+        assert_eq!(hashflow_key, "hashflow-key");
+        assert!(liquorice_user.is_empty());
+        assert!(liquorice_key.is_empty());
+        Ok(())
     }
 
     #[test]

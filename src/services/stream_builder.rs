@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use crate::models::tokens::TokenStore;
 use anyhow::{bail, Result};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -33,6 +34,7 @@ use tycho_simulation::{
         protocols::{
             bebop::{client_builder::BebopClientBuilder, state::BebopState},
             hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+            liquorice::{client_builder::LiquoriceClientBuilder, state::LiquoriceState},
         },
         stream::RFQStreamBuilder,
     },
@@ -42,8 +44,6 @@ use tycho_simulation::{
         Bytes,
     },
 };
-
-use crate::models::tokens::TokenStore;
 
 #[derive(Clone, Copy)]
 enum StreamDecodePolicy {
@@ -169,15 +169,23 @@ pub struct RFQConfig {
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
+    pub liquorice_user: String,
+    pub liquorice_key: String,
+}
+
+#[derive(Clone)]
+pub struct RFQTokenStores {
+    pub tokens: Arc<TokenStore>,
+    pub bebop: Arc<TokenStore>,
+    pub hashflow: Arc<TokenStore>,
+    pub liquorice: Arc<TokenStore>,
 }
 
 pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
-    tokens: Arc<TokenStore>,
+    token_stores: RFQTokenStores,
     chain: Chain,
     protocols: &[String],
-    bebop_tokens: Arc<TokenStore>,
-    hashflow_tokens: Arc<TokenStore>,
     rfq_config: RFQConfig,
 ) -> Result<
     impl futures::Stream<
@@ -194,7 +202,7 @@ pub async fn build_rfq_stream(
         info!("Setting up Bebop RFQ client...\n");
         let (user, key) = (rfq_config.bebop_user.clone(), rfq_config.bebop_key.clone());
         let mut rfq_tokens_bebop = HashSet::new();
-        for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
+        for bebop_token_addr in token_stores.bebop.snapshot().await.keys().clone() {
             rfq_tokens_bebop.insert(bebop_token_addr.clone());
         }
         let bebop_client = BebopClientBuilder::new(chain, user, key)
@@ -207,9 +215,12 @@ pub async fn build_rfq_stream(
 
     if rfq_protocol_enabled(protocols, "rfq:hashflow") {
         info!("Setting up Hashflow RFQ client...\n");
-        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+        let (user, key) = (
+            rfq_config.hashflow_user.clone(),
+            rfq_config.hashflow_key.clone(),
+        );
         let mut rfq_tokens_hashflow = HashSet::new();
-        for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
+        for hashflow_token_addr in token_stores.hashflow.snapshot().await.keys() {
             rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
         }
         let hashflow_client = HashflowClientBuilder::new(chain, user, key)
@@ -222,10 +233,36 @@ pub async fn build_rfq_stream(
             rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
     }
 
+    if rfq_protocol_enabled(protocols, "rfq:liquorice") {
+        info!("Setting up Liquorice RFQ client...\n");
+        let (user, key) = (
+            rfq_config.liquorice_user.clone(),
+            rfq_config.liquorice_key.clone(),
+        );
+        let mut rfq_tokens_liquorice = HashSet::new();
+        for liquorice_token_addr in token_stores.liquorice.snapshot().await.keys() {
+            rfq_tokens_liquorice.insert(liquorice_token_addr.clone());
+        }
+        let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
+            .tokens(rfq_tokens_liquorice)
+            .tvl_threshold(tvl_add_threshold)
+            .poll_time(Duration::from_secs(5))
+            .build()
+            .map_err(|err| anyhow::anyhow!("failed to create Liquorice RFQ client: {err}"))?;
+        rfq_builder =
+            rfq_builder.add_client::<LiquoriceState>("liquorice", Box::new(liquorice_client));
+    }
+
     info!("Building RFQ Stream...\n");
     let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
 
-    let decoder_tokens = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+    let decoder_tokens = rfq_decoder_tokens(
+        &token_stores.tokens,
+        &token_stores.bebop,
+        &token_stores.hashflow,
+        &token_stores.liquorice,
+    )
+    .await;
     rfq_builder = rfq_builder.set_tokens(decoder_tokens).await;
     tokio::spawn(rfq_builder.build(tx));
     info!("Connected to RFQs! Streaming live price levels...\n");
@@ -243,10 +280,12 @@ async fn rfq_decoder_tokens(
     tokens: &TokenStore,
     bebop_tokens: &TokenStore,
     hashflow_tokens: &TokenStore,
+    liquorice_tokens: &TokenStore,
 ) -> HashMap<Bytes, Token> {
     let mut snapshot = tokens.snapshot().await;
     merge_missing_tokens(&mut snapshot, bebop_tokens.snapshot().await);
     merge_missing_tokens(&mut snapshot, hashflow_tokens.snapshot().await);
+    merge_missing_tokens(&mut snapshot, liquorice_tokens.snapshot().await);
     snapshot
 }
 
@@ -372,10 +411,15 @@ mod tests {
 
     #[test]
     fn rfq_protocol_enabled_matches_exact_protocol_name() {
-        let protocols = vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()];
+        let protocols = vec![
+            "rfq:bebop".to_string(),
+            "rfq:hashflow".to_string(),
+            "rfq:liquorice".to_string(),
+        ];
 
         assert!(super::rfq_protocol_enabled(&protocols, "rfq:bebop"));
         assert!(super::rfq_protocol_enabled(&protocols, "rfq:hashflow"));
+        assert!(super::rfq_protocol_enabled(&protocols, "rfq:liquorice"));
         assert!(!super::rfq_protocol_enabled(&protocols, "rfq:other"));
     }
 
@@ -459,16 +503,20 @@ mod tests {
         let base = test_token("0x0000000000000000000000000000000000000001", "BASE");
         let bebop_only = test_token("0x0000000000000000000000000000000000000002", "BEBOP");
         let hashflow_only = test_token("0x0000000000000000000000000000000000000003", "HASH");
+        let liquorice_only = test_token("0x0000000000000000000000000000000000000004", "LIQ");
 
         let tokens = test_token_store(vec![base.clone()]);
         let bebop_tokens = test_token_store(vec![bebop_only.clone()]);
         let hashflow_tokens = test_token_store(vec![hashflow_only.clone()]);
+        let liquorice_tokens = test_token_store(vec![liquorice_only.clone()]);
 
-        let merged = rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens).await;
+        let merged =
+            rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens, &liquorice_tokens).await;
 
-        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.len(), 4);
         assert!(merged.contains_key(&base.address));
         assert!(merged.contains_key(&bebop_only.address));
         assert!(merged.contains_key(&hashflow_only.address));
+        assert!(merged.contains_key(&liquorice_only.address));
     }
 }

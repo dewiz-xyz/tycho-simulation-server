@@ -825,7 +825,7 @@ impl QuoteRequestRunner {
         let quote_deadline = Instant::now() + self.quote_timeout;
         let expected_len = amounts_in.len();
         let mut candidates = self.load_candidate_sets(pair).await;
-        candidates.rfq_candidates = filter_hashflow_directional_rfq_candidates(
+        candidates.rfq_candidates = filter_directional_rfq_candidates(
             candidates.rfq_candidates,
             &token_in_ref,
             &token_out_ref,
@@ -1379,7 +1379,7 @@ fn simulation_tokens_for_pool(
     )
 }
 
-fn filter_hashflow_directional_rfq_candidates(
+fn filter_directional_rfq_candidates(
     candidates: Vec<CandidatePool>,
     request_token_in: &Token,
     request_token_out: &Token,
@@ -1387,12 +1387,15 @@ fn filter_hashflow_directional_rfq_candidates(
     candidates
         .into_iter()
         .filter(|(pool_id, _, component)| {
-            if !is_hashflow_component(component.as_ref()) {
+            if !is_directional_rfq_component(component.as_ref()) {
                 return true;
             }
 
-            if hashflow_candidate_matches_direction(request_token_in, request_token_out, component)
-            {
+            if directional_rfq_candidate_matches_direction(
+                request_token_in,
+                request_token_out,
+                component,
+            ) {
                 return true;
             }
 
@@ -1407,7 +1410,7 @@ fn filter_hashflow_directional_rfq_candidates(
                 .get(1)
                 .map(|token| token.address.to_string());
             debug!(
-                scope = "hashflow_direction_filter",
+                scope = "directional_rfq_filter",
                 pool_id = %pool_id,
                 protocol = component.protocol_system.as_str(),
                 requested_token_in = %request_token_in.address,
@@ -1416,14 +1419,14 @@ fn filter_hashflow_directional_rfq_candidates(
                 simulation_token_out = %sim_token_out.address,
                 expected_token_in = ?expected_token_in,
                 expected_token_out = ?expected_token_out,
-                "Skipping Hashflow RFQ candidate whose stored direction does not match request"
+                "Skipping directional RFQ candidate whose stored direction does not match request"
             );
             false
         })
         .collect()
 }
 
-fn hashflow_candidate_matches_direction(
+fn directional_rfq_candidate_matches_direction(
     request_token_in: &Token,
     request_token_out: &Token,
     component: &ProtocolComponent,
@@ -1435,12 +1438,9 @@ fn hashflow_candidate_matches_direction(
         return false;
     };
 
-    // TODO: Keep this directional gate until upstream Hashflow support grows a
-    // proper two-sided quote path. Tycho explicitly chose not to swap
-    // directions during Hashflow simulation here:
-    // https://github.com/propeller-heads/tycho-simulation/commit/d09bfe62ba4e333949f194d9497bd7557e59037f
-    // Hashflow pools are directional, so only keep candidates whose ordered pool
-    // tokens line up with the remapped simulation direction for this request.
+    // Some RFQ integrations store directional pools instead of symmetric pairs.
+    // Keep those candidates only when the ordered pool tokens line up with the
+    // remapped simulation direction for this request.
     let (sim_token_in, sim_token_out) =
         simulation_tokens_for_pool(request_token_in, request_token_out, component);
 
@@ -1503,8 +1503,14 @@ fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolCompo
     request_token.clone()
 }
 
-fn is_hashflow_component(component: &ProtocolComponent) -> bool {
-    component.protocol_system == "rfq:hashflow" || component.protocol_type_name == "hashflow_pool"
+fn is_directional_rfq_component(component: &ProtocolComponent) -> bool {
+    matches!(
+        (
+            component.protocol_system.as_str(),
+            component.protocol_type_name.as_str()
+        ),
+        ("rfq:hashflow", _) | (_, "hashflow_pool") | ("rfq:liquorice", _) | (_, "liquorice_pool")
+    )
 }
 
 fn is_direct_native_wrapped_pair(
@@ -4259,6 +4265,93 @@ mod tests {
         assert_eq!(bebop_quote_calls.load(Ordering::SeqCst), 2);
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(computation.responses[0].pool, "rfq-bebop");
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(computation.meta.failures.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_filters_wrong_direction_liquorice_candidate_before_simulation() {
+        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let token_in =
+            Bytes::from_str("0x0000000000000000000000000000000000000107").expect("valid address");
+        let token_out = wrapped_native.clone();
+
+        let token_in_meta = make_token_with_decimals(&token_in, "USDC", 6);
+        let token_out_meta = make_token_with_decimals(&token_out, "WETH", 18);
+        let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(Arc::clone(&token_store));
+        prime_ready_native_store(&native_state_store).await;
+
+        let liquorice_limit_calls = Arc::new(AtomicUsize::new(0));
+        let liquorice_quote_calls = Arc::new(AtomicUsize::new(0));
+        let bebop_limit_calls = Arc::new(AtomicUsize::new(0));
+        let bebop_quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut rfq_states = HashMap::new();
+        let mut rfq_pairs = HashMap::new();
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-liquorice-reversed",
+            "0x0000000000000000000000000000000000000108",
+            "rfq:liquorice",
+            "liquorice_pool",
+            vec![token_out_meta.clone(), token_in_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_out.clone(),
+                expected_buy: token_in.clone(),
+                limit_calls: Arc::clone(&liquorice_limit_calls),
+                quote_calls: Arc::clone(&liquorice_quote_calls),
+            }),
+        );
+        insert_pool_state(
+            &mut rfq_states,
+            &mut rfq_pairs,
+            "rfq-bebop-liquorice-filter",
+            "0x0000000000000000000000000000000000000109",
+            "rfq:bebop",
+            "bebop_pool",
+            vec![token_in_meta.clone(), token_out_meta.clone()],
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in.clone(),
+                expected_buy: token_out.clone(),
+                limit_calls: Arc::clone(&bebop_limit_calls),
+                quote_calls: Arc::clone(&bebop_quote_calls),
+            }),
+        );
+        rfq_state_store
+            .apply_update(Update::new(2, rfq_states, rfq_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            token_store,
+            Arc::clone(&native_state_store),
+            Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
+            TestAppStateConfig {
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = make_amount_out_request(
+            "req-rfq-liquorice-direction-filter",
+            &token_in.to_string(),
+            &token_out.to_string(),
+            &["2"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert_eq!(computation.meta.matching_pools, 1);
+        assert_eq!(computation.meta.candidate_pools, 1);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 1);
+        assert_eq!(liquorice_limit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(liquorice_quote_calls.load(Ordering::SeqCst), 0);
+        assert!(bebop_limit_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(bebop_quote_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "rfq-bebop-liquorice-filter");
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
         assert!(computation.meta.failures.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));

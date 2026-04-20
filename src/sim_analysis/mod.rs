@@ -1274,6 +1274,7 @@ fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
         "erc4626" | "ERC4626" => Some("erc4626"),
         "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some("rfq:hashflow"),
         "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some("rfq:bebop"),
+        "rfq:liquorice" | "Liquorice" | "liquorice" | "liquorice_pool" => Some("rfq:liquorice"),
         "vm:curve" | "Curve" => Some("vm:curve"),
         "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
         "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
@@ -2571,8 +2572,13 @@ mod tests {
             "rfq:hashflow"
         );
         assert_eq!(protocol_from_pool_name("Bebop::WETH/USDC"), "rfq:bebop");
+        assert_eq!(
+            protocol_from_pool_name("Liquorice::WETH/USDC"),
+            "rfq:liquorice"
+        );
         assert_eq!(protocol_from_pool_name("hashflow_pool"), "rfq:hashflow");
         assert_eq!(protocol_from_pool_name("bebop_pool"), "rfq:bebop");
+        assert_eq!(protocol_from_pool_name("liquorice_pool"), "rfq:liquorice");
     }
 
     #[test]
