@@ -66,10 +66,12 @@ pub fn get_default_hashflow_filename(chain: &Chain) -> Option<String> {
     }
 }
 
-/// Get the default Liquorice filename for the given chain.
-pub fn get_default_liquorice_filename(chain: &Chain) -> Option<String> {
+/// Get the default Liquorice URL for the given chain.
+pub fn get_default_liquorice_url(chain: &Chain) -> Option<String> {
     match chain {
-        Chain::Ethereum => Some("./liquorice_supported_tokens.csv".to_string()),
+        Chain::Ethereum | Chain::Arbitrum => {
+            Some("https://api.liquorice.tech/v1/solver/supported-tokens".to_string())
+        }
         _ => None,
     }
 }
@@ -336,6 +338,10 @@ pub fn hosted_tycho_url(chain: Chain) -> Result<String, String> {
 
 /// Resolve the hosted Bebop endpoint for a supported runtime chain.
 pub fn hosted_bebop_url(chain: Chain) -> Result<String, String> {
+    if let Some(url) = optional_trimmed_env("BEBOP_URL") {
+        return Ok(url);
+    }
+
     get_default_bebop_url(&chain)
         .ok_or_else(|| format!("No default Bebop URL configured for supported chain {chain}"))
 }
@@ -351,15 +357,14 @@ pub fn hosted_hashflow_filename(chain: Chain) -> Result<String, String> {
     })
 }
 
-/// Resolve the hosted Liquorice token filename for a supported runtime chain.
-pub fn hosted_liquorice_filename(chain: Chain) -> Result<String, String> {
-    if let Some(filename) = optional_trimmed_env("LIQUORICE_FILENAME_CSV") {
-        return Ok(filename);
+/// Resolve the hosted Liquorice supported-tokens endpoint for a supported runtime chain.
+pub fn hosted_liquorice_url(chain: Chain) -> Result<String, String> {
+    if let Some(url) = optional_trimmed_env("LIQUORICE_URL") {
+        return Ok(url);
     }
 
-    get_default_liquorice_filename(&chain).ok_or_else(|| {
-        format!("No default Liquorice filename configured for supported chain {chain}")
-    })
+    get_default_liquorice_url(&chain)
+        .ok_or_else(|| format!("No default Liquorice URL configured for supported chain {chain}"))
 }
 
 fn load_network_config() -> NetworkConfig {
@@ -686,6 +691,12 @@ mod tests {
         }
     }
 
+    fn clear_hosted_url_env() {
+        for key in ["BEBOP_URL", "HASHFLOW_FILENAME_CSV", "LIQUORICE_URL"] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn resolve_ethereum_profile() {
         let Ok(profile) = resolve_chain_profile(1) else {
@@ -753,6 +764,10 @@ mod tests {
 
     #[test]
     fn hosted_bebop_url_uses_ethereum_default() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
         let Ok(url) = hosted_bebop_url(Chain::Ethereum) else {
             unreachable!("expected ethereum hosted Bebop URL");
         };
@@ -761,6 +776,10 @@ mod tests {
 
     #[test]
     fn hosted_bebop_url_uses_base_default() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
         let Ok(url) = hosted_bebop_url(Chain::Base) else {
             unreachable!("expected base hosted Bebop URL");
         };
@@ -768,7 +787,27 @@ mod tests {
     }
 
     #[test]
+    fn hosted_bebop_url_prefers_env_override() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
+        std::env::set_var("BEBOP_URL", "http://localhost/bebop-tokens");
+
+        let Ok(url) = hosted_bebop_url(Chain::Base) else {
+            unreachable!("expected base hosted Bebop URL");
+        };
+
+        std::env::remove_var("BEBOP_URL");
+        assert_eq!(url, "http://localhost/bebop-tokens");
+    }
+
+    #[test]
     fn hosted_hashflow_filename_uses_ethereum_default() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
         let Ok(filename) = hosted_hashflow_filename(Chain::Ethereum) else {
             unreachable!("expected ethereum hosted Hashflow filename");
         };
@@ -777,6 +816,10 @@ mod tests {
 
     #[test]
     fn hosted_hashflow_filename_uses_base_default() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
         let Ok(filename) = hosted_hashflow_filename(Chain::Base) else {
             unreachable!("expected base hosted Hashflow filename");
         };
@@ -788,6 +831,7 @@ mod tests {
         let _guard = ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
         std::env::set_var("HASHFLOW_FILENAME_CSV", "/tmp/hashflow.csv");
 
         let Ok(filename) = hosted_hashflow_filename(Chain::Base) else {
@@ -799,26 +843,55 @@ mod tests {
     }
 
     #[test]
-    fn hosted_liquorice_filename_uses_ethereum_default() {
-        let Ok(filename) = hosted_liquorice_filename(Chain::Ethereum) else {
-            unreachable!("expected ethereum hosted Liquorice filename");
-        };
-        assert_eq!(filename, "./liquorice_supported_tokens.csv");
-    }
-
-    #[test]
-    fn hosted_liquorice_filename_prefers_env_override() {
+    fn hosted_liquorice_url_uses_ethereum_default() {
         let _guard = ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("LIQUORICE_FILENAME_CSV", "/tmp/liquorice.csv");
+        clear_hosted_url_env();
+        let Ok(url) = hosted_liquorice_url(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Liquorice URL");
+        };
+        assert_eq!(url, "https://api.liquorice.tech/v1/solver/supported-tokens");
+    }
 
-        let Ok(filename) = hosted_liquorice_filename(Chain::Ethereum) else {
-            unreachable!("expected ethereum hosted Liquorice filename");
+    #[test]
+    fn hosted_liquorice_url_uses_arbitrum_default() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
+        let Ok(url) = hosted_liquorice_url(Chain::Arbitrum) else {
+            unreachable!("expected arbitrum hosted Liquorice URL");
+        };
+        assert_eq!(url, "https://api.liquorice.tech/v1/solver/supported-tokens");
+    }
+
+    #[test]
+    fn hosted_liquorice_url_rejects_base_without_override() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
+        let Err(err) = hosted_liquorice_url(Chain::Base) else {
+            unreachable!("expected base Liquorice URL lookup to fail");
+        };
+        assert!(err.contains("No default Liquorice URL configured"));
+    }
+
+    #[test]
+    fn hosted_liquorice_url_prefers_env_override() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_hosted_url_env();
+        std::env::set_var("LIQUORICE_URL", "http://localhost/liquorice-tokens");
+
+        let Ok(url) = hosted_liquorice_url(Chain::Ethereum) else {
+            unreachable!("expected ethereum hosted Liquorice URL");
         };
 
-        std::env::remove_var("LIQUORICE_FILENAME_CSV");
-        assert_eq!(filename, "/tmp/liquorice.csv");
+        std::env::remove_var("LIQUORICE_URL");
+        assert_eq!(url, "http://localhost/liquorice-tokens");
     }
 
     #[test]

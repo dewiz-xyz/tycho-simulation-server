@@ -87,6 +87,8 @@ Common optional inputs:
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds (defaults to `false`)
 - `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY` only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
+- `BEBOP_URL` to override the Bebop supported-tokens endpoint
+- `LIQUORICE_URL` to override the Liquorice supported-tokens endpoint on supported Liquorice chains
 - `HOST` and `PORT` to change the bind address
 - timeout, concurrency, and stream-health knobs from `src/config/mod.rs`
 

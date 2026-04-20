@@ -1,5 +1,5 @@
 use dsolver_simulator::models::rfq::hashflow::read_hashflow_csv;
-use dsolver_simulator::models::rfq::liquorice::read_liquorice_csv;
+use dsolver_simulator::models::rfq::liquorice::TokenLiquorice;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use tycho_simulation::utils::load_all_tokens;
 
 use dsolver_simulator::api::create_router;
 use dsolver_simulator::config::{
-    hosted_bebop_url, hosted_hashflow_filename, hosted_liquorice_filename, hosted_tycho_url,
+    hosted_bebop_url, hosted_hashflow_filename, hosted_liquorice_url, hosted_tycho_url,
     init_logging, load_config,
 };
 use dsolver_simulator::handlers::stream::{
@@ -79,9 +79,8 @@ async fn main() -> anyhow::Result<()> {
             };
         liquorice_tokens =
             if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:liquorice") {
-                let liquorice_filename =
-                    hosted_liquorice_filename(chain).map_err(anyhow::Error::msg)?;
-                load_liquorice_token_store(&config, &tycho_url, &liquorice_filename, chain)?
+                let liquorice_url = hosted_liquorice_url(chain).map_err(anyhow::Error::msg)?;
+                load_liquorice_token_store(&config, &tycho_url, &liquorice_url, chain).await?
             } else {
                 new_token_store(HashMap::new(), &tycho_url, &config)
             };
@@ -260,16 +259,54 @@ fn load_hashflow_token_store(
     Ok(new_token_store(hashflow_tokens, tycho_url, config))
 }
 
-fn load_liquorice_token_store(
+async fn load_liquorice_token_store(
     config: &dsolver_simulator::config::AppConfig,
     tycho_url: &str,
-    liquorice_filename: &str,
+    liquorice_url: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
-    let liquorice_tokens = read_liquorice_csv(liquorice_filename, chain)
-        .map_err(|error| anyhow::anyhow!("Failed to read Liquorice CSV: {}", error))?;
+    let client = Client::new();
+    let liquorice_tokens = load_liquorice_tokens(
+        &client,
+        liquorice_url,
+        chain,
+        &config.liquorice_user,
+        &config.liquorice_key,
+    )
+    .await?;
     info!("all_liquorice_tokens: {:?}", liquorice_tokens);
     Ok(new_token_store(liquorice_tokens, tycho_url, config))
+}
+
+async fn load_liquorice_tokens(
+    client: &Client,
+    liquorice_url: &str,
+    chain: Chain,
+    solver: &str,
+    authorization: &str,
+) -> anyhow::Result<HashMap<Bytes, Token>> {
+    let chain_id = chain.id().to_string();
+    let response: Vec<TokenLiquorice> = client
+        .get(liquorice_url)
+        .query(&[("chainId", chain_id)])
+        .header("accept", "application/json")
+        .header("solver", solver)
+        .header("authorization", authorization)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    response
+        .into_iter()
+        .map(|token| {
+            token
+                .to_tycho_token(chain)
+                .map(|new| (new.address.clone(), new))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| anyhow::anyhow!("Failed to parse Liquorice token: {}", error))
 }
 
 fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
