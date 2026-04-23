@@ -374,6 +374,7 @@ fn spawn_native_broadcaster_subscription_task(
     spawn_backend_broadcaster_subscription_task(
         "native",
         config.tycho_broadcaster_ws_url.clone(),
+        config.chain_profile.chain.id(),
         supervisor_cfg.clone(),
         controls,
     );
@@ -396,6 +397,7 @@ fn spawn_vm_broadcaster_subscription_task(
     spawn_backend_broadcaster_subscription_task(
         "vm",
         config.tycho_broadcaster_ws_url.clone(),
+        config.chain_profile.chain.id(),
         supervisor_cfg.clone(),
         controls,
     );
@@ -404,12 +406,14 @@ fn spawn_vm_broadcaster_subscription_task(
 fn spawn_backend_broadcaster_subscription_task(
     backend: &'static str,
     ws_url: String,
+    expected_chain_id: u64,
     supervisor_cfg: StreamSupervisorConfig,
     controls: BroadcasterSubscriptionControls,
 ) {
     tokio::spawn(async move {
         info!(backend, "Starting broadcaster subscription supervisor...");
-        supervise_broadcaster_subscription(ws_url, supervisor_cfg, controls).await;
+        supervise_broadcaster_subscription(ws_url, expected_chain_id, supervisor_cfg, controls)
+            .await;
     });
     debug!(backend, "Broadcaster subscription supervisor task spawned");
 }

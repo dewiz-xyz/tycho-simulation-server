@@ -87,6 +87,7 @@ impl BroadcasterSubscriptionControls {
 
 pub async fn supervise_broadcaster_subscription(
     ws_url: String,
+    expected_chain_id: u64,
     cfg: StreamSupervisorConfig,
     controls: BroadcasterSubscriptionControls,
 ) {
@@ -122,8 +123,14 @@ pub async fn supervise_broadcaster_subscription(
             backend = controls.backend_label(),
             "Connected to broadcaster subscription"
         );
-        let (exit, next_vm_rebuild) =
-            process_broadcaster_subscription(stream, &controls, &cfg, vm_rebuild).await;
+        let (exit, next_vm_rebuild) = process_broadcaster_subscription(
+            stream,
+            expected_chain_id,
+            &controls,
+            &cfg,
+            vm_rebuild,
+        )
+        .await;
         vm_rebuild =
             handle_subscription_reset(&controls, exit.last_error.clone(), next_vm_rebuild).await;
 
@@ -142,6 +149,7 @@ pub async fn supervise_broadcaster_subscription(
 }
 
 struct BroadcasterSubscriptionProcessor {
+    expected_chain_id: u64,
     controls: BroadcasterSubscriptionControls,
     tracker: BroadcasterSubscriptionTracker,
     bootstrap_block: Option<u64>,
@@ -150,10 +158,12 @@ struct BroadcasterSubscriptionProcessor {
 
 impl BroadcasterSubscriptionProcessor {
     fn new(
+        expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
         vm_rebuild: Option<VmSubscriptionRebuildState>,
     ) -> Self {
         Self {
+            expected_chain_id,
             controls,
             tracker: BroadcasterSubscriptionTracker::new(),
             bootstrap_block: None,
@@ -169,6 +179,10 @@ impl BroadcasterSubscriptionProcessor {
     }
 
     async fn observe(&mut self, envelope: BroadcasterEnvelope) -> Result<()> {
+        if let BroadcasterPayload::SnapshotStart(start) = &envelope.payload {
+            self.ensure_snapshot_chain_id(start.chain_id)?;
+        }
+
         self.tracker
             .observe(&envelope)
             .map_err(|error| anyhow!("invalid broadcaster envelope: {error}"))?;
@@ -213,6 +227,18 @@ impl BroadcasterSubscriptionProcessor {
             }
         }
 
+        Ok(())
+    }
+
+    fn ensure_snapshot_chain_id(&self, chain_id: u64) -> Result<()> {
+        if chain_id != self.expected_chain_id {
+            return Err(anyhow!(
+                "broadcaster chain id mismatch for {} subscription: expected {}, got {}",
+                self.controls.backend_label(),
+                self.expected_chain_id,
+                chain_id
+            ));
+        }
         Ok(())
     }
 
@@ -272,11 +298,13 @@ impl BroadcasterSubscriptionProcessor {
 
 async fn process_broadcaster_subscription(
     mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
+    expected_chain_id: u64,
     controls: &BroadcasterSubscriptionControls,
     cfg: &StreamSupervisorConfig,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 ) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
-    let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), vm_rebuild);
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(expected_chain_id, controls.clone(), vm_rebuild);
 
     loop {
         let next_timeout = if processor.bootstrap_complete() {
@@ -680,12 +708,16 @@ mod tests {
     }
 
     fn snapshot_start_envelope() -> Result<BroadcasterEnvelope> {
+        snapshot_start_envelope_for_chain(Chain::Ethereum.id())
+    }
+
+    fn snapshot_start_envelope_for_chain(chain_id: u64) -> Result<BroadcasterEnvelope> {
         Ok(BroadcasterEnvelope::new(
             "stream-1",
             1,
             BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
                 "snapshot-1",
-                1,
+                chain_id,
                 vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
                 1,
             )?),
@@ -772,8 +804,10 @@ mod tests {
     #[tokio::test]
     async fn snapshot_bootstrap_populates_native_and_vm_separately() -> Result<()> {
         let controls = TestControls::new();
-        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
-        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+        let mut native_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        let mut vm_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
 
         native_processor.observe(snapshot_start_envelope()?).await?;
         native_processor.observe(snapshot_chunk_envelope()?).await?;
@@ -818,10 +852,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_start_rejects_unexpected_chain_id_before_applying_state() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+
+        let result = processor
+            .observe(snapshot_start_envelope_for_chain(Chain::Base.id())?)
+            .await;
+        let Err(error) = result else {
+            unreachable!("mismatched broadcaster chain id should be rejected");
+        };
+
+        assert!(error
+            .to_string()
+            .contains("broadcaster chain id mismatch for native subscription"));
+        let snapshot = controls.native_subscription.snapshot().await;
+        assert!(!snapshot.connected);
+        assert!(!snapshot.bootstrap_complete);
+        assert_eq!(controls.native_state_store.current_block().await, 0);
+        assert!(!controls.native_state_store.is_ready());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_refreshes_backend_blocks_without_new_state() -> Result<()> {
         let controls = TestControls::new();
-        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
-        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+        let mut native_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        let mut vm_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
 
         bootstrap(&mut native_processor).await?;
         bootstrap(&mut vm_processor).await?;
@@ -838,8 +898,10 @@ mod tests {
     #[tokio::test]
     async fn live_update_keeps_native_and_vm_partitioned() -> Result<()> {
         let controls = TestControls::new();
-        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
-        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+        let mut native_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        let mut vm_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
 
         bootstrap(&mut native_processor).await?;
         bootstrap(&mut vm_processor).await?;
@@ -856,8 +918,10 @@ mod tests {
     #[tokio::test]
     async fn native_subscription_reset_does_not_wait_on_vm_permits() -> Result<()> {
         let controls = TestControls::new();
-        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
-        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+        let mut native_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        let mut vm_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
 
         controls.native_stream_health.mark_started().await;
         controls.vm_stream_health.mark_started().await;
@@ -916,7 +980,8 @@ mod tests {
     #[tokio::test]
     async fn vm_subscription_reset_finishes_rebuild_after_bootstrap() -> Result<()> {
         let controls = TestControls::new();
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
 
         controls.vm_stream_health.mark_started().await;
         bootstrap(&mut processor).await?;
@@ -960,7 +1025,8 @@ mod tests {
         assert!(vm_stream.rebuild_started_at.is_some());
         drop(vm_stream);
 
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.vm(), vm_rebuild);
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), vm_rebuild);
         bootstrap(&mut processor).await?;
 
         let vm_stream = controls.vm_stream.read().await;
@@ -972,7 +1038,8 @@ mod tests {
     #[tokio::test]
     async fn native_processor_ignores_vm_partitions() -> Result<()> {
         let controls = TestControls::new();
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
 
         controls.native_stream_health.mark_started().await;
 
