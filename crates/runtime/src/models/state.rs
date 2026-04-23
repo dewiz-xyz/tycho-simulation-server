@@ -44,6 +44,7 @@ pub struct AppState {
     pub rfq_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
+    pub configured_backends: ConfiguredBackends,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
@@ -62,6 +63,13 @@ pub struct AppState {
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
     pub rfq_sim_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfiguredBackends {
+    // Native is always configured; only optional manifest-backed backends live here.
+    pub vm: bool,
+    pub rfq: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,7 +173,8 @@ impl NativeReadiness {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ready => "ready",
-            Self::WarmingUp | Self::Stale => "warming_up",
+            Self::WarmingUp => "warming_up",
+            Self::Stale => "stale",
         }
     }
 }
@@ -192,9 +201,10 @@ impl VmReadiness {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::WarmingUp | Self::Stale => "warming_up",
+            Self::WarmingUp => "warming_up",
             Self::Rebuilding => "rebuilding",
             Self::Ready => "ready",
+            Self::Stale => "stale",
         }
     }
 }
@@ -203,11 +213,122 @@ impl RfqReadiness {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::WarmingUp | Self::Stale => "warming_up",
+            Self::WarmingUp => "warming_up",
             Self::Rebuilding => "rebuilding",
             Self::Ready => "ready",
+            Self::Stale => "stale",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorServiceStatus {
+    Ready,
+    WarmingUp,
+    Stale,
+}
+
+impl SimulatorServiceStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::WarmingUp => "warming_up",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SimulatorBackendKind {
+    Native,
+    Vm,
+    Rfq,
+}
+
+impl SimulatorBackendKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Vm => "vm",
+            Self::Rfq => "rfq",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorBackendReadiness {
+    Disabled,
+    WarmingUp,
+    Rebuilding,
+    Ready,
+    Stale,
+}
+
+impl SimulatorBackendReadiness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::WarmingUp => "warming_up",
+            Self::Rebuilding => "rebuilding",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorReadinessReason {
+    DisabledByConfig,
+    BroadcasterDisconnected,
+    SnapshotBootstrapping,
+    StateWarmingUp,
+    Rebuilding,
+    Stale,
+}
+
+impl SimulatorReadinessReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DisabledByConfig => "disabled_by_config",
+            Self::BroadcasterDisconnected => "broadcaster_disconnected",
+            Self::SnapshotBootstrapping => "snapshot_bootstrapping",
+            Self::StateWarmingUp => "state_warming_up",
+            Self::Rebuilding => "rebuilding",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorStatusSnapshot {
+    pub status: SimulatorServiceStatus,
+    pub chain_id: u64,
+    pub backends: Vec<SimulatorBackendStatusSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorBackendStatusSnapshot {
+    pub kind: SimulatorBackendKind,
+    pub enabled: bool,
+    pub readiness: SimulatorBackendReadiness,
+    pub reason: Option<SimulatorReadinessReason>,
+    pub block_number: u64,
+    pub pool_count: usize,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+    pub rebuild_duration_ms: Option<u64>,
+    pub last_update_age_ms: Option<u64>,
+    pub subscription: Option<SimulatorBackendSubscriptionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorBackendSubscriptionSnapshot {
+    pub connected: bool,
+    pub bootstrap_complete: bool,
+    pub stream_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +383,164 @@ impl AppState {
         subscription.connected && subscription.bootstrap_complete
     }
 
+    pub async fn status_snapshot(&self) -> SimulatorStatusSnapshot {
+        let native = self.native_status_snapshot().await;
+        let status = match native.readiness {
+            SimulatorBackendReadiness::Ready => SimulatorServiceStatus::Ready,
+            SimulatorBackendReadiness::Stale => SimulatorServiceStatus::Stale,
+            _ => SimulatorServiceStatus::WarmingUp,
+        };
+        let mut backends = vec![native];
+
+        if self.configured_backends.vm {
+            backends.push(self.vm_status_snapshot().await);
+        }
+        if self.configured_backends.rfq {
+            backends.push(self.rfq_status_snapshot().await);
+        }
+
+        SimulatorStatusSnapshot {
+            status,
+            chain_id: self.chain.id(),
+            backends,
+        }
+    }
+
+    async fn native_status_snapshot(&self) -> SimulatorBackendStatusSnapshot {
+        let subscription = self.native_broadcaster_subscription.snapshot().await;
+        let subscription_reason = subscription_readiness_reason(&subscription);
+        let last_update_age_ms = self.native_update_age_ms().await;
+        let stream_restart_count = self.native_stream_health.restart_count().await;
+        let stream_last_error = self.native_stream_health.last_error().await;
+        let readiness = if subscription_reason.is_some() || !self.native_state_store.is_ready() {
+            SimulatorBackendReadiness::WarmingUp
+        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+            SimulatorBackendReadiness::Stale
+        } else {
+            SimulatorBackendReadiness::Ready
+        };
+        let reason = match readiness {
+            SimulatorBackendReadiness::WarmingUp => {
+                subscription_reason.or(Some(SimulatorReadinessReason::StateWarmingUp))
+            }
+            SimulatorBackendReadiness::Stale => Some(SimulatorReadinessReason::Stale),
+            SimulatorBackendReadiness::Ready
+            | SimulatorBackendReadiness::Disabled
+            | SimulatorBackendReadiness::Rebuilding => None,
+        };
+
+        SimulatorBackendStatusSnapshot {
+            kind: SimulatorBackendKind::Native,
+            enabled: true,
+            readiness,
+            reason,
+            block_number: self.current_block().await,
+            pool_count: self.native_state_store.total_states().await,
+            restart_count: subscription
+                .restart_count
+                .saturating_add(stream_restart_count),
+            last_error: subscription.last_error.clone().or(stream_last_error),
+            rebuild_duration_ms: None,
+            last_update_age_ms,
+            subscription: Some(subscription.into()),
+        }
+    }
+
+    async fn vm_status_snapshot(&self) -> SimulatorBackendStatusSnapshot {
+        let subscription = self.vm_broadcaster_subscription.snapshot().await;
+        let subscription_reason = subscription_readiness_reason(&subscription);
+        let stream_status = self.vm_stream.read().await.clone();
+        let last_update_age_ms = self.vm_update_age_ms().await;
+        let readiness = if !self.enable_vm_pools {
+            SimulatorBackendReadiness::Disabled
+        } else if stream_status.rebuilding {
+            SimulatorBackendReadiness::Rebuilding
+        } else if subscription_reason.is_some() || !self.vm_state_store.is_ready() {
+            SimulatorBackendReadiness::WarmingUp
+        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+            SimulatorBackendReadiness::Stale
+        } else {
+            SimulatorBackendReadiness::Ready
+        };
+        let reason = match readiness {
+            SimulatorBackendReadiness::Disabled => Some(SimulatorReadinessReason::DisabledByConfig),
+            SimulatorBackendReadiness::Rebuilding => Some(SimulatorReadinessReason::Rebuilding),
+            SimulatorBackendReadiness::WarmingUp => {
+                subscription_reason.or(Some(SimulatorReadinessReason::StateWarmingUp))
+            }
+            SimulatorBackendReadiness::Stale => Some(SimulatorReadinessReason::Stale),
+            SimulatorBackendReadiness::Ready => None,
+        };
+
+        SimulatorBackendStatusSnapshot {
+            kind: SimulatorBackendKind::Vm,
+            enabled: self.enable_vm_pools,
+            readiness,
+            reason,
+            block_number: self.vm_block().await,
+            pool_count: self.vm_pools().await,
+            restart_count: subscription
+                .restart_count
+                .saturating_add(stream_status.restart_count),
+            last_error: subscription
+                .last_error
+                .clone()
+                .or_else(|| stream_status.last_error.clone()),
+            rebuild_duration_ms: if matches!(readiness, SimulatorBackendReadiness::Rebuilding) {
+                stream_status
+                    .rebuild_started_at
+                    .map(|instant| instant.elapsed().as_millis() as u64)
+            } else {
+                None
+            },
+            last_update_age_ms,
+            subscription: self.enable_vm_pools.then_some(subscription.into()),
+        }
+    }
+
+    async fn rfq_status_snapshot(&self) -> SimulatorBackendStatusSnapshot {
+        let stream_status = self.rfq_stream.read().await.clone();
+        let last_update_age_ms = self.rfq_update_age_ms().await;
+        let readiness = if !self.enable_rfq_pools {
+            SimulatorBackendReadiness::Disabled
+        } else if stream_status.rebuilding {
+            SimulatorBackendReadiness::Rebuilding
+        } else if !self.rfq_state_store.is_ready() {
+            SimulatorBackendReadiness::WarmingUp
+        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+            SimulatorBackendReadiness::Stale
+        } else {
+            SimulatorBackendReadiness::Ready
+        };
+        let reason = match readiness {
+            SimulatorBackendReadiness::Disabled => Some(SimulatorReadinessReason::DisabledByConfig),
+            SimulatorBackendReadiness::Rebuilding => Some(SimulatorReadinessReason::Rebuilding),
+            SimulatorBackendReadiness::WarmingUp => Some(SimulatorReadinessReason::StateWarmingUp),
+            SimulatorBackendReadiness::Stale => Some(SimulatorReadinessReason::Stale),
+            SimulatorBackendReadiness::Ready => None,
+        };
+
+        SimulatorBackendStatusSnapshot {
+            kind: SimulatorBackendKind::Rfq,
+            enabled: self.enable_rfq_pools,
+            readiness,
+            reason,
+            block_number: self.rfq_block().await,
+            pool_count: self.rfq_pools().await,
+            restart_count: stream_status.restart_count,
+            last_error: stream_status.last_error.clone(),
+            rebuild_duration_ms: if matches!(readiness, SimulatorBackendReadiness::Rebuilding) {
+                stream_status
+                    .rebuild_started_at
+                    .map(|instant| instant.elapsed().as_millis() as u64)
+            } else {
+                None
+            },
+            last_update_age_ms,
+            subscription: None,
+        }
+    }
+
     pub async fn current_block(&self) -> u64 {
         self.native_state_store.current_block().await
     }
@@ -288,13 +567,7 @@ impl AppState {
     }
 
     pub async fn is_ready(&self) -> bool {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return false;
-        }
-        if !self.native_state_store.is_ready() {
-            return false;
-        }
-        !is_update_stale(self.native_update_age_ms().await, self.readiness_stale_ms())
+        matches!(self.native_readiness().await, NativeReadiness::Ready)
     }
 
     pub fn readiness_stale_ms(&self) -> u64 {
@@ -498,26 +771,11 @@ impl AppState {
     }
 
     pub async fn vm_ready(&self) -> bool {
-        if !self.enable_vm_pools {
-            return false;
-        }
-        if self.vm_rebuilding().await {
-            return false;
-        }
-        if !self.vm_broadcaster_bootstrap_ready().await {
-            return false;
-        }
-        self.vm_state_store.is_ready()
+        matches!(self.vm_readiness().await, VmReadiness::Ready)
     }
 
     pub async fn rfq_ready(&self) -> bool {
-        if !self.enable_rfq_pools {
-            return false;
-        }
-        if self.rfq_rebuilding().await {
-            return false;
-        }
-        self.rfq_state_store.is_ready()
+        matches!(self.rfq_readiness().await, RfqReadiness::Ready)
     }
 
     pub async fn vm_rebuilding(&self) -> bool {
@@ -549,6 +807,31 @@ fn is_update_stale(last_update_age_ms: Option<u64>, readiness_stale_ms: u64) -> 
     last_update_age_ms
         .map(|age| age >= readiness_stale_ms)
         .unwrap_or(false)
+}
+
+fn subscription_readiness_reason(
+    subscription: &BroadcasterSubscriptionSnapshot,
+) -> Option<SimulatorReadinessReason> {
+    if !subscription.connected {
+        Some(SimulatorReadinessReason::BroadcasterDisconnected)
+    } else if !subscription.bootstrap_complete {
+        Some(SimulatorReadinessReason::SnapshotBootstrapping)
+    } else {
+        None
+    }
+}
+
+impl From<BroadcasterSubscriptionSnapshot> for SimulatorBackendSubscriptionSnapshot {
+    fn from(snapshot: BroadcasterSubscriptionSnapshot) -> Self {
+        Self {
+            connected: snapshot.connected,
+            bootstrap_complete: snapshot.bootstrap_complete,
+            stream_id: snapshot.stream_id,
+            snapshot_id: snapshot.snapshot_id,
+            restart_count: snapshot.restart_count,
+            last_error: snapshot.last_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1315,6 +1598,10 @@ mod tests {
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+            configured_backends: ConfiguredBackends {
+                vm: flags.enable_vm_pools,
+                rfq: flags.enable_rfq_pools,
+            },
             enable_vm_pools: flags.enable_vm_pools,
             enable_rfq_pools: flags.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),

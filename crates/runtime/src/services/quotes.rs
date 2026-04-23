@@ -2702,7 +2702,8 @@ mod tests {
     use tycho_simulation::tycho_common::Bytes;
 
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
+        VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -3175,6 +3176,10 @@ mod tests {
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+            configured_backends: ConfiguredBackends {
+                vm: config.enable_vm_pools,
+                rfq: config.enable_rfq_pools,
+            },
             enable_vm_pools: config.enable_vm_pools,
             enable_rfq_pools: config.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),

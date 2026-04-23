@@ -14,6 +14,16 @@ pub enum SessionCloseReason {
     Shutdown,
 }
 
+impl SessionCloseReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Lagged => "lagged",
+            Self::GenerationReset => "generation_reset",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 pub struct BroadcasterSessionRegistration {
     pub session_id: u64,
     pub stream_id: String,
@@ -27,6 +37,7 @@ pub struct BroadcasterSubscriberRegistry {
     buffer_capacity: usize,
     next_session_id: Arc<AtomicU64>,
     lag_disconnects: Arc<AtomicU64>,
+    last_error: Arc<Mutex<Option<String>>>,
     inner: Arc<Mutex<HashMap<u64, SubscriberHandle>>>,
 }
 
@@ -42,6 +53,7 @@ impl BroadcasterSubscriberRegistry {
             buffer_capacity,
             next_session_id: Arc::new(AtomicU64::new(1)),
             lag_disconnects: Arc::new(AtomicU64::new(0)),
+            last_error: Arc::new(Mutex::new(None)),
             inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -74,6 +86,7 @@ impl BroadcasterSubscriberRegistry {
     pub async fn broadcast(&self, payload: BroadcasterPayload) {
         let mut lagged = Vec::new();
         let mut closed = Vec::new();
+        let mut last_error = None;
         let mut guard = self.inner.lock().await;
 
         for (session_id, handle) in guard.iter_mut() {
@@ -84,9 +97,16 @@ impl BroadcasterSubscriberRegistry {
                     if let Some(close_tx) = handle.close_tx.take() {
                         let _ = close_tx.send(SessionCloseReason::Lagged);
                     }
+                    last_error = Some(format!(
+                        "subscriber {session_id} disconnected: {}",
+                        SessionCloseReason::Lagged.label()
+                    ));
                     lagged.push(*session_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    last_error = Some(format!(
+                        "subscriber {session_id} disconnected: channel_closed"
+                    ));
                     closed.push(*session_id);
                 }
             }
@@ -94,6 +114,11 @@ impl BroadcasterSubscriberRegistry {
 
         for session_id in lagged.into_iter().chain(closed) {
             guard.remove(&session_id);
+        }
+        drop(guard);
+
+        if let Some(last_error) = last_error {
+            self.record_last_error(last_error).await;
         }
     }
 
@@ -109,13 +134,22 @@ impl BroadcasterSubscriberRegistry {
             }
         }
         guard.clear();
+        drop(guard);
+
+        self.record_last_error(format!("all subscribers disconnected: {}", reason.label()))
+            .await;
     }
 
     pub async fn snapshot(&self) -> BroadcasterSubscriberSnapshot {
         BroadcasterSubscriberSnapshot {
             active: self.inner.lock().await.len(),
             lag_disconnects: self.lag_disconnects.load(Ordering::Relaxed),
+            last_error: self.last_error.lock().await.clone(),
         }
+    }
+
+    async fn record_last_error(&self, message: String) {
+        *self.last_error.lock().await = Some(message);
     }
 }
 
@@ -166,6 +200,10 @@ mod tests {
         let snapshot = registry.snapshot().await;
         assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.lag_disconnects, 1);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("subscriber 1 disconnected: lagged")
+        );
         Ok(())
     }
 
@@ -180,7 +218,12 @@ mod tests {
 
         let reason = session.close_receiver.await?;
         assert_eq!(reason, SessionCloseReason::GenerationReset);
-        assert_eq!(registry.snapshot().await.active, 0);
+        let snapshot = registry.snapshot().await;
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("all subscribers disconnected: generation_reset")
+        );
         Ok(())
     }
 }

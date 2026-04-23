@@ -59,10 +59,11 @@ pub struct BroadcasterSnapshotStatus {
     pub chunk_size: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BroadcasterSubscriberSnapshot {
     pub active: usize,
     pub lag_disconnects: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]

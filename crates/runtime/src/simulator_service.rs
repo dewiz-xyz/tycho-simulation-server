@@ -264,12 +264,12 @@ fn build_app_state(
     let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
     let pool_timeout_rfq = Duration::from_millis(config.pool_timeout_rfq_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
+    let configured_vm_pools = !config.chain_profile.vm_protocols.is_empty();
+    let configured_rfq_pools = !config.chain_profile.rfq_protocols.is_empty();
     // VM is only effective when enabled and the selected chain exposes VM protocols.
-    let effective_vm_enabled =
-        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+    let effective_vm_enabled = config.enable_vm_pools && configured_vm_pools;
     // RFQ is only effective when enabled and the selected chain exposes RFQ protocols.
-    let effective_rfq_enabled =
-        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
+    let effective_rfq_enabled = config.enable_rfq_pools && configured_rfq_pools;
 
     AppState {
         chain,
@@ -287,6 +287,10 @@ fn build_app_state(
         rfq_stream_health: Arc::clone(&resources.rfq_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
         rfq_stream: Arc::clone(&resources.rfq_stream),
+        configured_backends: crate::models::state::ConfiguredBackends {
+            vm: configured_vm_pools,
+            rfq: configured_rfq_pools,
+        },
         enable_vm_pools: effective_vm_enabled,
         enable_rfq_pools: effective_rfq_enabled,
         readiness_stale,

@@ -14,7 +14,8 @@ use crate::config::SlippageConfig;
 use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
 use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
+    VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -173,6 +174,10 @@ pub(super) fn test_app_state(
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
         rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
+        configured_backends: ConfiguredBackends {
+            vm: config.enable_vm_pools,
+            rfq: config.enable_rfq_pools,
+        },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),

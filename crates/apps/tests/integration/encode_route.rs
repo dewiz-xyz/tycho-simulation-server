@@ -15,7 +15,8 @@ use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
+    VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -598,6 +599,10 @@ async fn build_app_state_and_request(
         rfq_stream_health,
         vm_stream,
         rfq_stream,
+        configured_backends: ConfiguredBackends {
+            vm: config.enable_vm_pools,
+            rfq: config.enable_rfq_pools,
+        },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
@@ -702,6 +707,10 @@ async fn setup_timeout_app(
         rfq_stream_health,
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+        configured_backends: ConfiguredBackends {
+            vm: false,
+            rfq: false,
+        },
         enable_vm_pools: false,
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
@@ -1491,6 +1500,10 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+        configured_backends: ConfiguredBackends {
+            vm: false,
+            rfq: false,
+        },
         enable_vm_pools: false,
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
