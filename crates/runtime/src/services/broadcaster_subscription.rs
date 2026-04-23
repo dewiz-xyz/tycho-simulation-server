@@ -29,16 +29,60 @@ use crate::models::stream_health::StreamHealth;
 use crate::stream::StreamSupervisorConfig;
 
 #[derive(Clone)]
-pub struct BroadcasterSubscriptionControls {
+pub enum BroadcasterSubscriptionControls {
+    Native(NativeBroadcasterSubscriptionControls),
+    Vm(VmBroadcasterSubscriptionControls),
+}
+
+#[derive(Clone)]
+pub struct NativeBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
-    pub native_state_store: Arc<StateStore>,
-    pub vm_state_store: Arc<StateStore>,
-    pub native_stream_health: Arc<StreamHealth>,
-    pub vm_stream_health: Arc<StreamHealth>,
+    pub state_store: Arc<StateStore>,
+    pub stream_health: Arc<StreamHealth>,
+}
+
+#[derive(Clone)]
+pub struct VmBroadcasterSubscriptionControls {
+    pub broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub state_store: Arc<StateStore>,
+    pub stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub vm_sim_semaphore: Arc<Semaphore>,
     pub vm_sim_concurrency: u32,
-    pub enable_vm_pools: bool,
+}
+
+impl BroadcasterSubscriptionControls {
+    fn backend(&self) -> BroadcasterBackend {
+        match self {
+            Self::Native(_) => BroadcasterBackend::Native,
+            Self::Vm(_) => BroadcasterBackend::Vm,
+        }
+    }
+
+    fn backend_label(&self) -> &'static str {
+        self.backend().as_str()
+    }
+
+    fn broadcaster_subscription(&self) -> &BroadcasterSubscriptionStatus {
+        match self {
+            Self::Native(controls) => &controls.broadcaster_subscription,
+            Self::Vm(controls) => &controls.broadcaster_subscription,
+        }
+    }
+
+    fn state_store(&self) -> &Arc<StateStore> {
+        match self {
+            Self::Native(controls) => &controls.state_store,
+            Self::Vm(controls) => &controls.state_store,
+        }
+    }
+
+    fn stream_health(&self) -> &Arc<StreamHealth> {
+        match self {
+            Self::Native(controls) => &controls.stream_health,
+            Self::Vm(controls) => &controls.stream_health,
+        }
+    }
 }
 
 pub async fn supervise_broadcaster_subscription(
@@ -52,11 +96,8 @@ pub async fn supervise_broadcaster_subscription(
     loop {
         let stream = match connect_async(ws_url.as_str()).await {
             Ok((stream, _response)) => {
-                controls.broadcaster_subscription.mark_connected().await;
-                controls.native_stream_health.mark_started().await;
-                if controls.enable_vm_pools {
-                    controls.vm_stream_health.mark_started().await;
-                }
+                controls.broadcaster_subscription().mark_connected().await;
+                controls.stream_health().mark_started().await;
                 stream
             }
             Err(error) => {
@@ -65,6 +106,7 @@ pub async fn supervise_broadcaster_subscription(
                     handle_subscription_reset(&controls, Some(message.clone()), vm_rebuild).await;
                 warn!(
                     event = "broadcaster_subscription_connect_failed",
+                    backend = controls.backend_label(),
                     error = %message,
                     "Failed to connect to broadcaster subscription"
                 );
@@ -75,7 +117,11 @@ pub async fn supervise_broadcaster_subscription(
             }
         };
 
-        info!(ws_url, "Connected to broadcaster subscription");
+        info!(
+            ws_url,
+            backend = controls.backend_label(),
+            "Connected to broadcaster subscription"
+        );
         let (exit, next_vm_rebuild) =
             process_broadcaster_subscription(stream, &controls, &cfg, vm_rebuild).await;
         vm_rebuild =
@@ -84,6 +130,7 @@ pub async fn supervise_broadcaster_subscription(
         let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
         warn!(
             event = "broadcaster_subscription_restart",
+            backend = controls.backend_label(),
             reason = exit.reason,
             backoff_ms,
             last_error = exit.last_error.as_deref(),
@@ -97,7 +144,7 @@ pub async fn supervise_broadcaster_subscription(
 struct BroadcasterSubscriptionProcessor {
     controls: BroadcasterSubscriptionControls,
     tracker: BroadcasterSubscriptionTracker,
-    bootstrap_blocks: HashMap<BroadcasterBackend, u64>,
+    bootstrap_block: Option<u64>,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 }
 
@@ -109,7 +156,7 @@ impl BroadcasterSubscriptionProcessor {
         Self {
             controls,
             tracker: BroadcasterSubscriptionTracker::new(),
-            bootstrap_blocks: HashMap::new(),
+            bootstrap_block: None,
             vm_rebuild,
         }
     }
@@ -128,35 +175,40 @@ impl BroadcasterSubscriptionProcessor {
 
         match envelope.payload {
             BroadcasterPayload::SnapshotStart(start) => {
-                self.bootstrap_blocks.clear();
+                self.bootstrap_block = None;
                 self.controls
-                    .broadcaster_subscription
+                    .broadcaster_subscription()
                     .mark_snapshot_started(envelope.stream_id, start.snapshot_id)
                     .await;
             }
             BroadcasterPayload::SnapshotChunk(chunk) => {
                 for partition in chunk.partitions {
-                    self.bootstrap_blocks
-                        .insert(partition.backend, partition.block_number);
-                    self.apply_snapshot_partition(partition).await;
+                    if partition.backend == self.controls.backend() {
+                        self.bootstrap_block = Some(partition.block_number);
+                        self.apply_snapshot_partition(partition).await;
+                    }
                 }
             }
             BroadcasterPayload::SnapshotEnd(_end) => {
                 self.refresh_bootstrap_health().await;
                 self.controls
-                    .broadcaster_subscription
+                    .broadcaster_subscription()
                     .mark_bootstrap_complete()
                     .await;
                 self.finish_vm_rebuild().await;
             }
             BroadcasterPayload::Update(update) => {
                 for partition in update.partitions {
-                    self.apply_live_update_partition(partition).await;
+                    if partition.backend == self.controls.backend() {
+                        self.apply_live_update_partition(partition).await;
+                    }
                 }
             }
             BroadcasterPayload::Heartbeat(heartbeat) => {
                 for head in heartbeat.backend_heads {
-                    self.apply_heartbeat(head).await;
+                    if head.backend == self.controls.backend() {
+                        self.apply_heartbeat(head).await;
+                    }
                 }
             }
         }
@@ -171,67 +223,51 @@ impl BroadcasterSubscriptionProcessor {
 
         drop(rebuild.guard);
 
-        let mut vm_stream = self.controls.vm_stream.write().await;
-        vm_stream.rebuilding = false;
-        vm_stream.rebuild_started_at = None;
+        if let BroadcasterSubscriptionControls::Vm(controls) = &self.controls {
+            let mut vm_stream = controls.vm_stream.write().await;
+            vm_stream.rebuilding = false;
+            vm_stream.rebuild_started_at = None;
+        }
     }
 
     async fn apply_snapshot_partition(&self, partition: BroadcasterSnapshotPartition) {
-        if let Some(target) = self.target(partition.backend) {
-            let update = snapshot_partition_update(partition);
-            target.store.apply_update(update).await;
-        }
+        let update = snapshot_partition_update(partition);
+        self.controls.state_store().apply_update(update).await;
     }
 
     async fn apply_live_update_partition(&self, partition: BroadcasterUpdatePartition) {
-        if let Some(target) = self.target(partition.backend) {
-            let block_number = partition.block_number;
-            let update = live_partition_update(partition);
-            target.store.apply_update(update).await;
-            target.health.record_update(block_number).await;
-        }
+        let block_number = partition.block_number;
+        let update = live_partition_update(partition);
+        self.controls.state_store().apply_update(update).await;
+        self.controls
+            .stream_health()
+            .record_update(block_number)
+            .await;
     }
 
     async fn apply_heartbeat(&self, head: BroadcasterBackendHead) {
-        if let Some(target) = self.target(head.backend) {
-            target
-                .store
-                .apply_update(Update::new(
-                    head.block_number,
-                    HashMap::new(),
-                    HashMap::new(),
-                ))
-                .await;
-            target.health.record_update(head.block_number).await;
-        }
+        self.controls
+            .state_store()
+            .apply_update(Update::new(
+                head.block_number,
+                HashMap::new(),
+                HashMap::new(),
+            ))
+            .await;
+        self.controls
+            .stream_health()
+            .record_update(head.block_number)
+            .await;
     }
 
     async fn refresh_bootstrap_health(&self) {
-        for (backend, block_number) in &self.bootstrap_blocks {
-            if let Some(target) = self.target(*backend) {
-                target.health.record_update(*block_number).await;
-            }
+        if let Some(block_number) = self.bootstrap_block {
+            self.controls
+                .stream_health()
+                .record_update(block_number)
+                .await;
         }
     }
-
-    fn target(&self, backend: BroadcasterBackend) -> Option<BackendTarget<'_>> {
-        match backend {
-            BroadcasterBackend::Native => Some(BackendTarget {
-                store: &self.controls.native_state_store,
-                health: &self.controls.native_stream_health,
-            }),
-            BroadcasterBackend::Vm if self.controls.enable_vm_pools => Some(BackendTarget {
-                store: &self.controls.vm_state_store,
-                health: &self.controls.vm_stream_health,
-            }),
-            BroadcasterBackend::Vm => None,
-        }
-    }
-}
-
-struct BackendTarget<'a> {
-    store: &'a Arc<StateStore>,
-    health: &'a Arc<StreamHealth>,
 }
 
 async fn process_broadcaster_subscription(
@@ -314,33 +350,27 @@ async fn handle_subscription_reset(
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 ) -> Option<VmSubscriptionRebuildState> {
     controls
-        .broadcaster_subscription
+        .broadcaster_subscription()
         .mark_disconnected(last_error.clone())
         .await;
-    controls.native_state_store.reset().await;
-    controls.vm_state_store.reset().await;
-    controls.native_stream_health.increment_restart().await;
-    controls.native_stream_health.reset_bursts().await;
+    controls.state_store().reset().await;
+    controls.stream_health().increment_restart().await;
+    controls.stream_health().reset_bursts().await;
     controls
-        .native_stream_health
-        .set_last_error(last_error.clone())
-        .await;
-    controls.vm_stream_health.increment_restart().await;
-    controls.vm_stream_health.reset_bursts().await;
-    controls
-        .vm_stream_health
+        .stream_health()
         .set_last_error(last_error.clone())
         .await;
 
-    let mut vm_stream = controls.vm_stream.write().await;
-    vm_stream.last_error = last_error;
-    drop(vm_stream);
-
-    if !controls.enable_vm_pools {
-        return None;
+    match controls {
+        BroadcasterSubscriptionControls::Native(_) => None,
+        BroadcasterSubscriptionControls::Vm(vm_controls) => {
+            {
+                let mut vm_stream = vm_controls.vm_stream.write().await;
+                vm_stream.last_error = last_error;
+            }
+            Some(begin_or_continue_vm_rebuild(vm_controls, vm_rebuild).await)
+        }
     }
-
-    Some(begin_or_continue_vm_rebuild(controls, vm_rebuild).await)
 }
 
 struct VmSubscriptionRebuildState {
@@ -352,7 +382,7 @@ struct VmSubscriptionRebuildState {
     reason = "the VM rebuild semaphore should remain available for the process lifetime"
 )]
 async fn begin_or_continue_vm_rebuild(
-    controls: &BroadcasterSubscriptionControls,
+    controls: &VmBroadcasterSubscriptionControls,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 ) -> VmSubscriptionRebuildState {
     {
@@ -475,7 +505,8 @@ mod tests {
 
     use super::{
         handle_subscription_reset, BroadcasterSubscriptionControls,
-        BroadcasterSubscriptionProcessor,
+        BroadcasterSubscriptionProcessor, NativeBroadcasterSubscriptionControls,
+        VmBroadcasterSubscriptionControls,
     };
     use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
@@ -551,26 +582,64 @@ mod tests {
         }
     }
 
-    fn controls(enable_vm_pools: bool) -> BroadcasterSubscriptionControls {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
+    struct TestControls {
+        native_subscription: BroadcasterSubscriptionStatus,
+        vm_subscription: BroadcasterSubscriptionStatus,
+        native_state_store: Arc<StateStore>,
+        vm_state_store: Arc<StateStore>,
+        native_stream_health: Arc<StreamHealth>,
+        vm_stream_health: Arc<StreamHealth>,
+        vm_stream: Arc<RwLock<VmStreamStatus>>,
+        vm_sim_semaphore: Arc<tokio::sync::Semaphore>,
+    }
 
-        BroadcasterSubscriptionControls {
-            broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
-            native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-            vm_state_store: Arc::new(StateStore::new(token_store)),
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            vm_sim_concurrency: 1,
-            enable_vm_pools,
+    impl TestControls {
+        fn new() -> Self {
+            let token_store = Arc::new(TokenStore::new(
+                HashMap::new(),
+                "http://localhost".to_string(),
+                "test".to_string(),
+                Chain::Ethereum,
+                Duration::from_millis(10),
+            ));
+
+            Self {
+                native_subscription: BroadcasterSubscriptionStatus::default(),
+                vm_subscription: BroadcasterSubscriptionStatus::default(),
+                native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
+                vm_state_store: Arc::new(StateStore::new(token_store)),
+                native_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream_health: Arc::new(StreamHealth::new()),
+                vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+                vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            }
         }
+
+        fn native(&self) -> BroadcasterSubscriptionControls {
+            BroadcasterSubscriptionControls::Native(NativeBroadcasterSubscriptionControls {
+                broadcaster_subscription: self.native_subscription.clone(),
+                state_store: Arc::clone(&self.native_state_store),
+                stream_health: Arc::clone(&self.native_stream_health),
+            })
+        }
+
+        fn vm(&self) -> BroadcasterSubscriptionControls {
+            BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
+                broadcaster_subscription: self.vm_subscription.clone(),
+                state_store: Arc::clone(&self.vm_state_store),
+                stream_health: Arc::clone(&self.vm_stream_health),
+                vm_stream: Arc::clone(&self.vm_stream),
+                vm_sim_semaphore: Arc::clone(&self.vm_sim_semaphore),
+                vm_sim_concurrency: 1,
+            })
+        }
+    }
+
+    async fn bootstrap(processor: &mut BroadcasterSubscriptionProcessor) -> Result<()> {
+        processor.observe(snapshot_start_envelope()?).await?;
+        processor.observe(snapshot_chunk_envelope()?).await?;
+        processor.observe(snapshot_end_envelope()).await?;
+        Ok(())
     }
 
     fn native_component() -> ProtocolComponent {
@@ -702,27 +771,37 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_bootstrap_populates_native_and_vm_separately() -> Result<()> {
-        let controls = controls(true);
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), None);
+        let controls = TestControls::new();
+        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
+        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
 
-        processor.observe(snapshot_start_envelope()?).await?;
-        processor.observe(snapshot_chunk_envelope()?).await?;
+        native_processor.observe(snapshot_start_envelope()?).await?;
+        native_processor.observe(snapshot_chunk_envelope()?).await?;
+        vm_processor.observe(snapshot_start_envelope()?).await?;
+        vm_processor.observe(snapshot_chunk_envelope()?).await?;
 
         assert!(controls.native_state_store.has_pool("pool-native").await);
+        assert!(!controls.native_state_store.has_pool("pool-vm").await);
+        assert!(!controls.vm_state_store.has_pool("pool-native").await);
         assert!(controls.vm_state_store.has_pool("pool-vm").await);
         assert!(
             !controls
-                .broadcaster_subscription
+                .native_subscription
                 .snapshot()
                 .await
                 .bootstrap_complete
         );
+        assert!(!controls.vm_subscription.snapshot().await.bootstrap_complete);
 
-        processor.observe(snapshot_end_envelope()).await?;
+        native_processor.observe(snapshot_end_envelope()).await?;
+        vm_processor.observe(snapshot_end_envelope()).await?;
 
-        let snapshot = controls.broadcaster_subscription.snapshot().await;
-        assert!(snapshot.connected);
-        assert!(snapshot.bootstrap_complete);
+        let native_snapshot = controls.native_subscription.snapshot().await;
+        assert!(native_snapshot.connected);
+        assert!(native_snapshot.bootstrap_complete);
+        let vm_snapshot = controls.vm_subscription.snapshot().await;
+        assert!(vm_snapshot.connected);
+        assert!(vm_snapshot.bootstrap_complete);
         assert_eq!(controls.native_state_store.current_block().await, 10);
         assert_eq!(controls.vm_state_store.current_block().await, 11);
         assert!(controls
@@ -740,13 +819,14 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_refreshes_backend_blocks_without_new_state() -> Result<()> {
-        let controls = controls(true);
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), None);
+        let controls = TestControls::new();
+        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
+        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
 
-        processor.observe(snapshot_start_envelope()?).await?;
-        processor.observe(snapshot_chunk_envelope()?).await?;
-        processor.observe(snapshot_end_envelope()).await?;
-        processor.observe(heartbeat_envelope()?).await?;
+        bootstrap(&mut native_processor).await?;
+        bootstrap(&mut vm_processor).await?;
+        native_processor.observe(heartbeat_envelope()?).await?;
+        vm_processor.observe(heartbeat_envelope()?).await?;
 
         assert_eq!(controls.native_state_store.current_block().await, 14);
         assert_eq!(controls.vm_state_store.current_block().await, 15);
@@ -757,13 +837,14 @@ mod tests {
 
     #[tokio::test]
     async fn live_update_keeps_native_and_vm_partitioned() -> Result<()> {
-        let controls = controls(true);
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), None);
+        let controls = TestControls::new();
+        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
+        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
 
-        processor.observe(snapshot_start_envelope()?).await?;
-        processor.observe(snapshot_chunk_envelope()?).await?;
-        processor.observe(snapshot_end_envelope()).await?;
-        processor.observe(update_envelope()?).await?;
+        bootstrap(&mut native_processor).await?;
+        bootstrap(&mut vm_processor).await?;
+        native_processor.observe(update_envelope()?).await?;
+        vm_processor.observe(update_envelope()?).await?;
 
         assert_eq!(controls.native_state_store.current_block().await, 12);
         assert_eq!(controls.vm_state_store.current_block().await, 11);
@@ -773,61 +854,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_reset_clears_ingest_and_bootstrap_state() -> Result<()> {
-        let controls = controls(true);
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), None);
+    async fn native_subscription_reset_does_not_wait_on_vm_permits() -> Result<()> {
+        let controls = TestControls::new();
+        let mut native_processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
+        let mut vm_processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
 
-        controls.broadcaster_subscription.mark_connected().await;
         controls.native_stream_health.mark_started().await;
         controls.vm_stream_health.mark_started().await;
 
-        processor.observe(snapshot_start_envelope()?).await?;
-        processor.observe(snapshot_chunk_envelope()?).await?;
-        processor.observe(snapshot_end_envelope()).await?;
+        bootstrap(&mut native_processor).await?;
+        bootstrap(&mut vm_processor).await?;
+        let vm_permit = Arc::clone(&controls.vm_sim_semaphore)
+            .acquire_owned()
+            .await?;
 
-        let vm_rebuild =
-            handle_subscription_reset(&controls, Some("broadcaster dropped".to_string()), None)
-                .await;
+        let native_controls = controls.native();
+        let reset = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle_subscription_reset(
+                &native_controls,
+                Some("native broadcaster dropped".to_string()),
+                None,
+            ),
+        )
+        .await?;
+        drop(vm_permit);
 
-        let broadcaster_snapshot = controls.broadcaster_subscription.snapshot().await;
+        assert!(reset.is_none());
+        let broadcaster_snapshot = controls.native_subscription.snapshot().await;
         assert!(!broadcaster_snapshot.connected);
         assert!(!broadcaster_snapshot.bootstrap_complete);
         assert_eq!(broadcaster_snapshot.snapshot_id, None);
         assert_eq!(broadcaster_snapshot.restart_count, 1);
         assert_eq!(
             broadcaster_snapshot.last_error.as_deref(),
-            Some("broadcaster dropped")
+            Some("native broadcaster dropped")
         );
 
         assert_eq!(controls.native_state_store.current_block().await, 0);
-        assert_eq!(controls.vm_state_store.current_block().await, 0);
         assert!(!controls.native_state_store.has_pool("pool-native").await);
-        assert!(!controls.vm_state_store.has_pool("pool-vm").await);
         assert!(!controls.native_state_store.is_ready());
-        assert!(!controls.vm_state_store.is_ready());
+        assert_eq!(controls.vm_state_store.current_block().await, 11);
+        assert!(controls.vm_state_store.has_pool("pool-vm").await);
+        assert!(controls.vm_state_store.is_ready());
 
         assert_eq!(controls.native_stream_health.restart_count().await, 1);
-        assert_eq!(controls.vm_stream_health.restart_count().await, 1);
+        assert_eq!(controls.vm_stream_health.restart_count().await, 0);
         assert_eq!(
             controls.native_stream_health.last_error().await.as_deref(),
-            Some("broadcaster dropped")
+            Some("native broadcaster dropped")
         );
+
+        let vm_stream = controls.vm_stream.read().await;
+        assert!(!vm_stream.rebuilding);
+        assert_eq!(vm_stream.restart_count, 0);
+        assert!(vm_stream.last_error.is_none());
+        assert!(vm_stream.rebuild_started_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vm_subscription_reset_finishes_rebuild_after_bootstrap() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor = BroadcasterSubscriptionProcessor::new(controls.vm(), None);
+
+        controls.vm_stream_health.mark_started().await;
+        bootstrap(&mut processor).await?;
+
+        let vm_controls = controls.vm();
+        let vm_rebuild = handle_subscription_reset(
+            &vm_controls,
+            Some("vm broadcaster dropped".to_string()),
+            None,
+        )
+        .await;
+        assert!(vm_rebuild.is_some());
+
+        let broadcaster_snapshot = controls.vm_subscription.snapshot().await;
+        assert!(!broadcaster_snapshot.connected);
+        assert!(!broadcaster_snapshot.bootstrap_complete);
+        assert_eq!(broadcaster_snapshot.snapshot_id, None);
+        assert_eq!(broadcaster_snapshot.restart_count, 1);
+        assert_eq!(
+            broadcaster_snapshot.last_error.as_deref(),
+            Some("vm broadcaster dropped")
+        );
+
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert!(!controls.vm_state_store.has_pool("pool-vm").await);
+        assert!(!controls.vm_state_store.is_ready());
+
+        assert_eq!(controls.vm_stream_health.restart_count().await, 1);
         assert_eq!(
             controls.vm_stream_health.last_error().await.as_deref(),
-            Some("broadcaster dropped")
+            Some("vm broadcaster dropped")
         );
 
         let vm_stream = controls.vm_stream.read().await;
         assert!(vm_stream.rebuilding);
         assert_eq!(vm_stream.restart_count, 1);
-        assert_eq!(vm_stream.last_error.as_deref(), Some("broadcaster dropped"));
+        assert_eq!(
+            vm_stream.last_error.as_deref(),
+            Some("vm broadcaster dropped")
+        );
         assert!(vm_stream.rebuild_started_at.is_some());
         drop(vm_stream);
 
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), vm_rebuild);
-        processor.observe(snapshot_start_envelope()?).await?;
-        processor.observe(snapshot_chunk_envelope()?).await?;
-        processor.observe(snapshot_end_envelope()).await?;
+        let mut processor = BroadcasterSubscriptionProcessor::new(controls.vm(), vm_rebuild);
+        bootstrap(&mut processor).await?;
 
         let vm_stream = controls.vm_stream.read().await;
         assert!(!vm_stream.rebuilding);
@@ -836,11 +970,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vm_partitions_are_ignored_when_vm_pools_are_disabled() -> Result<()> {
-        let controls = controls(false);
-        let mut processor = BroadcasterSubscriptionProcessor::new(controls.clone(), None);
+    async fn native_processor_ignores_vm_partitions() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor = BroadcasterSubscriptionProcessor::new(controls.native(), None);
 
-        controls.broadcaster_subscription.mark_connected().await;
         controls.native_stream_health.mark_started().await;
 
         processor.observe(snapshot_start_envelope()?).await?;
@@ -853,22 +986,16 @@ mod tests {
 
         processor.observe(snapshot_end_envelope()).await?;
 
-        let broadcaster_snapshot = controls.broadcaster_subscription.snapshot().await;
+        let broadcaster_snapshot = controls.native_subscription.snapshot().await;
         assert!(processor.bootstrap_complete());
         assert!(broadcaster_snapshot.bootstrap_complete);
         assert!(broadcaster_snapshot.connected);
         assert_eq!(controls.native_stream_health.last_block().await, 10);
-        assert_eq!(controls.vm_stream_health.last_block().await, 0);
         assert!(controls
             .native_stream_health
             .last_update_age_ms()
             .await
             .is_some());
-        assert!(controls
-            .vm_stream_health
-            .last_update_age_ms()
-            .await
-            .is_none());
         Ok(())
     }
 }

@@ -34,7 +34,8 @@ pub struct AppState {
     pub chain: Chain,
     pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
-    pub broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
     pub rfq_state_store: Arc<StateStore>,
@@ -251,8 +252,13 @@ impl EncodeAvailability {
 }
 
 impl AppState {
-    async fn broadcaster_bootstrap_ready(&self) -> bool {
-        let subscription = self.broadcaster_subscription.snapshot().await;
+    async fn native_broadcaster_bootstrap_ready(&self) -> bool {
+        let subscription = self.native_broadcaster_subscription.snapshot().await;
+        subscription.connected && subscription.bootstrap_complete
+    }
+
+    async fn vm_broadcaster_bootstrap_ready(&self) -> bool {
+        let subscription = self.vm_broadcaster_subscription.snapshot().await;
         subscription.connected && subscription.bootstrap_complete
     }
 
@@ -282,7 +288,7 @@ impl AppState {
     }
 
     pub async fn is_ready(&self) -> bool {
-        if !self.broadcaster_bootstrap_ready().await {
+        if !self.native_broadcaster_bootstrap_ready().await {
             return false;
         }
         if !self.native_state_store.is_ready() {
@@ -308,7 +314,7 @@ impl AppState {
     }
 
     pub async fn native_readiness(&self) -> NativeReadiness {
-        if !self.broadcaster_bootstrap_ready().await {
+        if !self.native_broadcaster_bootstrap_ready().await {
             return NativeReadiness::WarmingUp;
         }
 
@@ -332,7 +338,7 @@ impl AppState {
             return VmReadiness::Rebuilding;
         }
 
-        if !self.broadcaster_bootstrap_ready().await {
+        if !self.vm_broadcaster_bootstrap_ready().await {
             return VmReadiness::WarmingUp;
         }
 
@@ -498,7 +504,7 @@ impl AppState {
         if self.vm_rebuilding().await {
             return false;
         }
-        if !self.broadcaster_bootstrap_ready().await {
+        if !self.vm_broadcaster_bootstrap_ready().await {
             return false;
         }
         self.vm_state_store.is_ready()
@@ -1299,7 +1305,8 @@ mod tests {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: stores.token_store,
-            broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store: stores.native_state_store,
             vm_state_store: stores.vm_state_store,
             rfq_state_store: stores.rfq_state_store,
@@ -1423,23 +1430,26 @@ mod tests {
         state.native_stream_health.record_update(1).await;
         assert!(state.is_ready().await);
 
-        state.broadcaster_subscription.mark_disconnected(None).await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
         assert!(!state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
 
-        state.broadcaster_subscription.mark_connected().await;
+        state.native_broadcaster_subscription.mark_connected().await;
         assert!(!state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
 
         state
-            .broadcaster_subscription
+            .native_broadcaster_subscription
             .mark_snapshot_started("stream-2", "snapshot-2")
             .await;
         assert!(!state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
 
         state
-            .broadcaster_subscription
+            .native_broadcaster_subscription
             .mark_bootstrap_complete()
             .await;
         assert!(state.is_ready().await);
@@ -1512,9 +1522,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vm_readiness_requires_completed_broadcaster_bootstrap() {
+    async fn vm_readiness_uses_vm_local_broadcaster_bootstrap() {
         let state = build_readiness_test_state(true, false).await;
-        state.broadcaster_subscription.mark_disconnected(None).await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
+        state
+            .vm_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
 
         state
             .vm_state_store
@@ -1536,21 +1553,22 @@ mod tests {
             EncodeAvailability::VmWarmingUp
         );
 
-        state.broadcaster_subscription.mark_connected().await;
+        state.vm_broadcaster_subscription.mark_connected().await;
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
 
         state
-            .broadcaster_subscription
+            .vm_broadcaster_subscription
             .mark_snapshot_started("stream-2", "snapshot-2")
             .await;
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
 
         state
-            .broadcaster_subscription
+            .vm_broadcaster_subscription
             .mark_bootstrap_complete()
             .await;
         state.vm_stream_health.record_update(1).await;
 
+        assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
         assert_eq!(
             state.encode_availability(false, true, false).await,

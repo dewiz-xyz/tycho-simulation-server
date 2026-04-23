@@ -22,6 +22,7 @@ use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
 use crate::services::broadcaster_subscription::{
     supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
+    NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
 };
 use crate::services::stream_builder::{build_rfq_stream, RFQConfig};
 use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
@@ -276,7 +277,8 @@ fn build_app_state(
             config.chain_profile.native_token_protocol_allowlist.clone(),
         ),
         tokens,
-        broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+        native_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+        vm_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
         rfq_state_store: Arc::clone(&resources.rfq_state_store),
@@ -352,25 +354,64 @@ fn spawn_broadcaster_subscription_task(
     resources: &StreamResources,
     app_state: &AppState,
 ) {
-    let broadcaster_supervisor_cfg = supervisor_cfg.clone();
-    let ws_url = config.tycho_broadcaster_ws_url.clone();
-    let controls = BroadcasterSubscriptionControls {
-        broadcaster_subscription: app_state.broadcaster_subscription.clone(),
-        native_state_store: Arc::clone(&resources.native_state_store),
-        vm_state_store: Arc::clone(&resources.vm_state_store),
-        native_stream_health: Arc::clone(&resources.native_stream_health),
-        vm_stream_health: Arc::clone(&resources.vm_stream_health),
+    spawn_native_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+    if app_state.enable_vm_pools {
+        spawn_vm_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+    }
+}
+
+fn spawn_native_broadcaster_subscription_task(
+    config: &AppConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    resources: &StreamResources,
+    app_state: &AppState,
+) {
+    let controls = BroadcasterSubscriptionControls::Native(NativeBroadcasterSubscriptionControls {
+        broadcaster_subscription: app_state.native_broadcaster_subscription.clone(),
+        state_store: Arc::clone(&resources.native_state_store),
+        stream_health: Arc::clone(&resources.native_stream_health),
+    });
+    spawn_backend_broadcaster_subscription_task(
+        "native",
+        config.tycho_broadcaster_ws_url.clone(),
+        supervisor_cfg.clone(),
+        controls,
+    );
+}
+
+fn spawn_vm_broadcaster_subscription_task(
+    config: &AppConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    resources: &StreamResources,
+    app_state: &AppState,
+) {
+    let controls = BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
+        broadcaster_subscription: app_state.vm_broadcaster_subscription.clone(),
+        state_store: Arc::clone(&resources.vm_state_store),
+        stream_health: Arc::clone(&resources.vm_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
         vm_sim_semaphore: app_state.vm_sim_semaphore(),
         vm_sim_concurrency: vm_sim_concurrency_u32(app_state.vm_sim_concurrency),
-        enable_vm_pools: app_state.enable_vm_pools,
-    };
-
-    tokio::spawn(async move {
-        info!("Starting broadcaster subscription supervisor...");
-        supervise_broadcaster_subscription(ws_url, broadcaster_supervisor_cfg, controls).await;
     });
-    debug!("Broadcaster subscription supervisor task spawned");
+    spawn_backend_broadcaster_subscription_task(
+        "vm",
+        config.tycho_broadcaster_ws_url.clone(),
+        supervisor_cfg.clone(),
+        controls,
+    );
+}
+
+fn spawn_backend_broadcaster_subscription_task(
+    backend: &'static str,
+    ws_url: String,
+    supervisor_cfg: StreamSupervisorConfig,
+    controls: BroadcasterSubscriptionControls,
+) {
+    tokio::spawn(async move {
+        info!(backend, "Starting broadcaster subscription supervisor...");
+        supervise_broadcaster_subscription(ws_url, supervisor_cfg, controls).await;
+    });
+    debug!(backend, "Broadcaster subscription supervisor task spawned");
 }
 
 fn spawn_rfq_stream_task(
