@@ -687,7 +687,7 @@ impl QuoteRequestRunner {
     }
 
     async fn ensure_ready(&mut self) -> Result<(), RequestExit> {
-        if self.state.is_ready() {
+        if self.state.is_ready().await {
             return Ok(());
         }
         let ready = self.state.wait_for_readiness(self.readiness_wait).await;
@@ -2701,7 +2701,9 @@ mod tests {
     };
     use tycho_simulation::tycho_common::Bytes;
 
-    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
+    use crate::models::state::{
+        BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+    };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
 
@@ -3163,6 +3165,8 @@ mod tests {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: token_store,
+            native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store,
             vm_state_store,
             rfq_state_store,
@@ -3388,6 +3392,70 @@ mod tests {
             .await;
     }
 
+    async fn install_basic_native_quote_pool(
+        fixture: &BasicQuoteFixture,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-basic-ready",
+            "0x0000000000000000000000000000000000000020",
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            fixture.pair_tokens(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in,
+                expected_buy: token_out,
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        (limit_calls, quote_calls)
+    }
+
+    async fn install_basic_vm_quote_pool(
+        fixture: &BasicQuoteFixture,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
+        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
+        let limit_calls = Arc::new(AtomicUsize::new(0));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-basic-vm-ready",
+            "0x0000000000000000000000000000000000000021",
+            "vm:curve",
+            "curve_pool",
+            fixture.pair_tokens(),
+            Box::new(StrictPairTokenSim {
+                expected_sell: token_in,
+                expected_buy: token_out,
+                limit_calls: Arc::clone(&limit_calls),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+        );
+        fixture
+            .vm_state_store
+            .apply_update(Update::new(2, states, new_pairs))
+            .await;
+
+        (limit_calls, quote_calls)
+    }
+
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct StrictPairTokenSim {
         expected_sell: Bytes,
@@ -3522,6 +3590,153 @@ mod tests {
                 "Direct native/wrapped quotes are unsupported"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_returns_warming_up_until_broadcaster_bootstrap_completes() {
+        let fixture = BasicQuoteFixture::new();
+        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        app_state
+            .native_broadcaster_subscription
+            .mark_connected()
+            .await;
+
+        let warming_up = get_amounts_out(
+            app_state.clone(),
+            fixture.request("req-broadcaster-bootstrap-warming", &["2"]),
+            None,
+        )
+        .await;
+
+        assert!(warming_up.responses.is_empty());
+        assert!(matches!(warming_up.meta.status, QuoteStatus::WarmingUp));
+        assert_eq!(warming_up.meta.failures.len(), 1);
+        assert!(matches!(
+            warming_up.meta.failures[0].kind,
+            QuoteFailureKind::WarmUp
+        ));
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 0);
+
+        app_state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete()
+            .await;
+
+        let ready = get_amounts_out(
+            app_state,
+            fixture.request("req-broadcaster-bootstrap-ready", &["2"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(ready.responses.len(), 1);
+        assert_eq!(ready.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(matches!(ready.meta.status, QuoteStatus::Ready));
+        assert!(ready.meta.failures.is_empty());
+        assert_eq!(ready.meta.matching_pools, 1);
+        assert_eq!(ready.meta.candidate_pools, 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_waits_for_broadcaster_bootstrap_before_returning_ready() {
+        let fixture = BasicQuoteFixture::new();
+        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        app_state
+            .native_broadcaster_subscription
+            .mark_connected()
+            .await;
+
+        let bootstrap_state = app_state.clone();
+        let bootstrap_task = tokio::spawn(async move {
+            sleep(Duration::from_millis(60)).await;
+            bootstrap_state
+                .native_broadcaster_subscription
+                .mark_bootstrap_complete()
+                .await;
+        });
+
+        let ready = get_amounts_out(
+            app_state,
+            fixture.request("req-broadcaster-bootstrap-awaits-ready", &["2"]),
+            None,
+        )
+        .await;
+
+        bootstrap_task
+            .await
+            .expect("bootstrap task should complete");
+
+        assert_eq!(ready.responses.len(), 1);
+        assert_eq!(ready.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(matches!(ready.meta.status, QuoteStatus::Ready));
+        assert!(ready.meta.failures.is_empty());
+        assert_eq!(ready.meta.matching_pools, 1);
+        assert_eq!(ready.meta.candidate_pools, 1);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_native_only_ignores_vm_rebuild_permits() {
+        let fixture = BasicQuoteFixture::new();
+        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
+        let (vm_limit_calls, vm_quote_calls) = install_basic_vm_quote_pool(&fixture).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                vm_sim_concurrency: 1,
+                ..TestAppStateConfig::default()
+            },
+        );
+        {
+            let mut vm_status = app_state.vm_stream.write().await;
+            vm_status.rebuilding = true;
+        }
+        let vm_permit = Arc::clone(&app_state.vm_sim_semaphore)
+            .acquire_owned()
+            .await
+            .expect("vm permit should be available");
+
+        let computation = tokio::time::timeout(
+            Duration::from_millis(100),
+            get_amounts_out(
+                app_state,
+                fixture.request("req-native-ignores-vm-rebuild", &["2"]),
+                None,
+            ),
+        )
+        .await
+        .expect("native quote should not wait on held VM permits");
+
+        drop(vm_permit);
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(computation.metrics.skipped_vm_unavailable);
+        assert_eq!(computation.metrics.scheduled_native_pools, 1);
+        assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+        assert_eq!(computation.metrics.skipped_vm_concurrency, 0);
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(vm_limit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

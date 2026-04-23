@@ -5184,6 +5184,7 @@ dependencies = [
  "simulator-core",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.24.0",
  "tokio-util",
  "toml",
  "tracing",

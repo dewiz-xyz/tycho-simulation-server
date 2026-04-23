@@ -23,6 +23,7 @@ use super::{
 
 const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+const READINESS_POLL_INTERVAL_MS: u64 = 50;
 
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
@@ -33,6 +34,8 @@ pub struct AppState {
     pub chain: Chain,
     pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
+    pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
     pub rfq_state_store: Arc<StateStore>,
@@ -59,6 +62,96 @@ pub struct AppState {
     pub native_sim_concurrency: usize,
     pub vm_sim_concurrency: usize,
     pub rfq_sim_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BroadcasterSubscriptionStatus {
+    inner: Arc<RwLock<BroadcasterSubscriptionStatusData>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BroadcasterSubscriptionStatusData {
+    connected: bool,
+    bootstrap_complete: bool,
+    stream_id: Option<String>,
+    snapshot_id: Option<String>,
+    restart_count: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BroadcasterSubscriptionSnapshot {
+    pub connected: bool,
+    pub bootstrap_complete: bool,
+    pub stream_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub restart_count: u64,
+    pub last_error: Option<String>,
+}
+
+impl BroadcasterSubscriptionStatus {
+    pub async fn mark_connected(&self) {
+        let mut guard = self.inner.write().await;
+        guard.connected = true;
+        guard.bootstrap_complete = false;
+        guard.stream_id = None;
+        guard.snapshot_id = None;
+        guard.last_error = None;
+    }
+
+    pub async fn mark_snapshot_started(
+        &self,
+        stream_id: impl Into<String>,
+        snapshot_id: impl Into<String>,
+    ) {
+        let mut guard = self.inner.write().await;
+        guard.connected = true;
+        guard.bootstrap_complete = false;
+        guard.stream_id = Some(stream_id.into());
+        guard.snapshot_id = Some(snapshot_id.into());
+        guard.last_error = None;
+    }
+
+    pub async fn mark_bootstrap_complete(&self) {
+        let mut guard = self.inner.write().await;
+        guard.connected = true;
+        guard.bootstrap_complete = true;
+        guard.last_error = None;
+    }
+
+    pub async fn mark_disconnected(&self, last_error: Option<String>) {
+        let mut guard = self.inner.write().await;
+        guard.connected = false;
+        guard.bootstrap_complete = false;
+        guard.snapshot_id = None;
+        guard.restart_count = guard.restart_count.saturating_add(1);
+        guard.last_error = last_error;
+    }
+
+    pub async fn snapshot(&self) -> BroadcasterSubscriptionSnapshot {
+        let guard = self.inner.read().await;
+        BroadcasterSubscriptionSnapshot {
+            connected: guard.connected,
+            bootstrap_complete: guard.bootstrap_complete,
+            stream_id: guard.stream_id.clone(),
+            snapshot_id: guard.snapshot_id.clone(),
+            restart_count: guard.restart_count,
+            last_error: guard.last_error.clone(),
+        }
+    }
+
+    pub fn ready_for_test() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BroadcasterSubscriptionStatusData {
+                connected: true,
+                bootstrap_complete: true,
+                stream_id: Some("stream-test".to_string()),
+                snapshot_id: Some("snapshot-test".to_string()),
+                restart_count: 0,
+                last_error: None,
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +252,16 @@ impl EncodeAvailability {
 }
 
 impl AppState {
+    async fn native_broadcaster_bootstrap_ready(&self) -> bool {
+        let subscription = self.native_broadcaster_subscription.snapshot().await;
+        subscription.connected && subscription.bootstrap_complete
+    }
+
+    async fn vm_broadcaster_bootstrap_ready(&self) -> bool {
+        let subscription = self.vm_broadcaster_subscription.snapshot().await;
+        subscription.connected && subscription.bootstrap_complete
+    }
+
     pub async fn current_block(&self) -> u64 {
         self.native_state_store.current_block().await
     }
@@ -184,8 +287,14 @@ impl AppState {
         native + vm + rfq
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.native_state_store.is_ready()
+    pub async fn is_ready(&self) -> bool {
+        if !self.native_broadcaster_bootstrap_ready().await {
+            return false;
+        }
+        if !self.native_state_store.is_ready() {
+            return false;
+        }
+        !is_update_stale(self.native_update_age_ms().await, self.readiness_stale_ms())
     }
 
     pub fn readiness_stale_ms(&self) -> u64 {
@@ -205,7 +314,11 @@ impl AppState {
     }
 
     pub async fn native_readiness(&self) -> NativeReadiness {
-        if !self.is_ready() {
+        if !self.native_broadcaster_bootstrap_ready().await {
+            return NativeReadiness::WarmingUp;
+        }
+
+        if !self.native_state_store.is_ready() {
             return NativeReadiness::WarmingUp;
         }
 
@@ -223,6 +336,10 @@ impl AppState {
 
         if self.vm_rebuilding().await {
             return VmReadiness::Rebuilding;
+        }
+
+        if !self.vm_broadcaster_bootstrap_ready().await {
+            return VmReadiness::WarmingUp;
         }
 
         if !self.vm_state_store.is_ready() {
@@ -294,7 +411,25 @@ impl AppState {
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
-        self.native_state_store.wait_until_ready(wait).await
+        if self.is_ready().await {
+            return true;
+        }
+
+        let deadline = Instant::now() + wait;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return self.is_ready().await;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_for = remaining.min(Duration::from_millis(READINESS_POLL_INTERVAL_MS));
+            tokio::time::sleep(sleep_for).await;
+
+            if self.is_ready().await {
+                return true;
+            }
+        }
     }
 
     pub fn quote_timeout(&self) -> Duration {
@@ -367,6 +502,9 @@ impl AppState {
             return false;
         }
         if self.vm_rebuilding().await {
+            return false;
+        }
+        if !self.vm_broadcaster_bootstrap_ready().await {
             return false;
         }
         self.vm_state_store.is_ready()
@@ -1167,6 +1305,8 @@ mod tests {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: stores.token_store,
+            native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store: stores.native_state_store,
             vm_state_store: stores.vm_state_store,
             rfq_state_store: stores.rfq_state_store,
@@ -1285,6 +1425,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_readiness_requires_connected_bootstrapped_broadcaster_subscription() {
+        let state = build_readiness_test_state(false, false).await;
+        state.native_stream_health.record_update(1).await;
+        assert!(state.is_ready().await);
+
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
+        assert!(!state.is_ready().await);
+        assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
+
+        state.native_broadcaster_subscription.mark_connected().await;
+        assert!(!state.is_ready().await);
+        assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
+
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-2", "snapshot-2")
+            .await;
+        assert!(!state.is_ready().await);
+        assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
+
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete()
+            .await;
+        assert!(state.is_ready().await);
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
     async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_rebuilding_ready_and_stale() {
         let disabled_state = build_readiness_test_state(false, false).await;
         assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
@@ -1347,6 +1519,61 @@ mod tests {
         }
         state.readiness_stale = Duration::ZERO;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+    }
+
+    #[tokio::test]
+    async fn vm_readiness_uses_vm_local_broadcaster_bootstrap() {
+        let state = build_readiness_test_state(true, false).await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
+        state
+            .vm_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
+
+        state
+            .vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    41,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+
+        assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+        assert_eq!(
+            state.encode_availability(false, true, false).await,
+            EncodeAvailability::VmWarmingUp
+        );
+
+        state.vm_broadcaster_subscription.mark_connected().await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+
+        state
+            .vm_broadcaster_subscription
+            .mark_snapshot_started("stream-2", "snapshot-2")
+            .await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+
+        state
+            .vm_broadcaster_subscription
+            .mark_bootstrap_complete()
+            .await;
+        state.vm_stream_health.record_update(1).await;
+
+        assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert_eq!(
+            state.encode_availability(false, true, false).await,
+            EncodeAvailability::Ready
+        );
     }
 
     #[tokio::test]

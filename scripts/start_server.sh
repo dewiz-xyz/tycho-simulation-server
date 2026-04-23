@@ -86,6 +86,10 @@ if [[ -z "${TYCHO_API_KEY:-}" ]]; then
   echo "Warning: TYCHO_API_KEY not set; server may fail to start." >&2
 fi
 
+if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
+  echo "Warning: TYCHO_BROADCASTER_WS_URL not set; simulator startup will fail without it." >&2
+fi
+
 if [[ -z "${RUST_LOG:-}" ]]; then
   export RUST_LOG=info
 fi

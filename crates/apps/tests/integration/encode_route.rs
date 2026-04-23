@@ -14,7 +14,9 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
-use runtime::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
+use runtime::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+};
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use simulator_core::models::messages::{
@@ -344,6 +346,7 @@ struct EncodeFixtureConfig<'a> {
     mark_native_healthy: bool,
     mark_vm_healthy: bool,
     mark_rfq_healthy: bool,
+    vm_broadcaster_bootstrap_complete: bool,
     vm_rebuilding: bool,
     rfq_rebuilding: bool,
     request_id: &'a str,
@@ -372,6 +375,7 @@ impl Default for EncodeFixtureConfig<'_> {
             mark_native_healthy: true,
             mark_vm_healthy: true,
             mark_rfq_healthy: true,
+            vm_broadcaster_bootstrap_complete: true,
             vm_rebuilding: false,
             rfq_rebuilding: false,
             request_id: "req-1",
@@ -572,10 +576,20 @@ async fn build_app_state_and_request(
         ..RfqStreamStatus::default()
     }));
 
+    let vm_broadcaster_subscription = if config.vm_broadcaster_bootstrap_complete {
+        BroadcasterSubscriptionStatus::ready_for_test()
+    } else {
+        let status = BroadcasterSubscriptionStatus::default();
+        status.mark_connected().await;
+        status
+    };
+
     let state = AppState {
         chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
+        native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        vm_broadcaster_subscription,
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -678,6 +692,8 @@ async fn setup_timeout_app(
         chain: config.chain,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
+        native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
@@ -922,6 +938,31 @@ async fn encode_route_native_only_succeeds_when_vm_is_unavailable() -> Result<()
 }
 
 #[tokio::test]
+async fn encode_route_native_only_succeeds_while_vm_rebuilding_permits_are_held() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        enable_vm_pools: true,
+        vm_rebuilding: true,
+        request_id: "req-native-ignores-vm-rebuild",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    let vm_permit = Arc::clone(&state.vm_sim_semaphore).acquire_owned().await?;
+    let app = create_router(state);
+
+    let (status, body) = post_encode(app, &request).await?;
+    drop(vm_permit);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn encode_route_rejects_vm_route_when_vm_is_disabled() -> Result<()> {
     let config = EncodeFixtureConfig {
         request_pool_protocol: "vm:maverick_v2",
@@ -950,8 +991,9 @@ async fn encode_route_rejects_vm_route_when_vm_is_warming_up() -> Result<()> {
         request_pool_protocol: "vm:maverick_v2",
         component_protocol_system: "vm:maverick_v2",
         component_protocol_type_name: "maverick_v2",
-        vm_pool: false,
+        vm_pool: true,
         enable_vm_pools: true,
+        vm_broadcaster_bootstrap_complete: false,
         request_id: "req-vm-warming-up",
         ..EncodeFixtureConfig::default()
     };
@@ -1439,6 +1481,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         chain: Chain::Ethereum,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
+        native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
