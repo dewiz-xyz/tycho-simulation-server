@@ -9,13 +9,13 @@ metadata:
 
 ## Quick start
 
-1. Confirm the repo root (expect `Cargo.toml` and `src/`).
+1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
-   RFQ feeds default to off. For RFQ analysis on Ethereum or Base, set `ENABLE_RFQ_POOLS=true` and also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum runs need `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`. Base runs need the Bebop and Hashflow pairs.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
-   cargo run --bin sim-analysis -- --chain-id 1 --stop
+   cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
    ```
 5. Read:
    - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/summary.md`
@@ -31,7 +31,7 @@ metadata:
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
-- Top-level `/status.status` is service health; `native_status` carries native readiness separately.
+- Top-level `/status.status` is service health; nested `backends.*.status` carries backend readiness.
 
 ## Behavior model
 
@@ -43,17 +43,17 @@ metadata:
 
 Base run:
 ```bash
-cargo run --bin sim-analysis -- --chain-id 8453 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 Keep the server running:
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1
+cargo run -p apps --bin sim-analysis -- --chain-id 1
 ```
 
 Disable baseline comparison:
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --baseline none --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ```
 
 Manual VM-ready wait when you want to confirm the service itself before rerunning the analyzer:
@@ -75,12 +75,12 @@ scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --r
 
 Write to a custom directory:
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
 ```
 
 Target a different local base URL:
 ```bash
-cargo run --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --stop
+cargo run -p apps --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --stop
 ```
 
 ## Investigation flow

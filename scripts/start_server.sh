@@ -10,21 +10,11 @@ Start the dsolver-simulator-service from a repo checkout.
 Options:
   --repo             Path to repo root (default: current directory)
   --log-file         Log file path (default: <repo>/logs/tycho-sim-server.log)
-  --chain-id         Runtime chain id (1 or 8453). Overrides CHAIN_ID from env/.env.
+  --chain-id         Runtime chain id from simulator-manifest.toml. Overrides CHAIN_ID from env/.env.
   --env              Export KEY=VALUE before starting (repeatable)
   --enable-vm-pools  Shortcut for --env ENABLE_VM_POOLS=true
   -h, --help         Show this help
 USAGE
-}
-
-validate_chain_id() {
-  case "$1" in
-    1|8453) ;;
-    *)
-      echo "Error: unsupported chain id '$1'. Supported values: 1 (Ethereum), 8453 (Base)." >&2
-      return 1
-      ;;
-  esac
 }
 
 repo="."
@@ -96,6 +86,10 @@ if [[ -z "${TYCHO_API_KEY:-}" ]]; then
   echo "Warning: TYCHO_API_KEY not set; server may fail to start." >&2
 fi
 
+if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
+  echo "Warning: TYCHO_BROADCASTER_WS_URL not set; simulator startup will fail without it." >&2
+fi
+
 if [[ -z "${RUST_LOG:-}" ]]; then
   export RUST_LOG=info
 fi
@@ -114,7 +108,6 @@ if [[ -z "${CHAIN_ID:-}" ]]; then
   echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
   exit 2
 fi
-validate_chain_id "$CHAIN_ID"
 
 if [[ -z "$log_file" ]]; then
   mkdir -p "$repo/logs"
@@ -123,8 +116,7 @@ fi
 
 (
   cd "$repo"
-  # `cargo run --release` intentionally relies on Cargo.toml's default-run.
-  nohup cargo run --release > "$log_file" 2>&1 &
+  nohup cargo run -p apps --bin dsolver-simulator-service --release > "$log_file" 2>&1 &
   echo $! > "$pid_file"
 )
 

@@ -1,6 +1,7 @@
 # Protocol feeds (what this server subscribes to)
 
-The service subscribes to chain-specific Tycho exchanges at startup (see `src/config/mod.rs` and `src/services/stream_builder.rs`).
+The service subscribes to chain-specific Tycho exchanges at startup (see
+`crates/runtime/src/config/mod.rs` and `crates/runtime/src/services/stream_builder.rs`).
 
 ## Native feeds by chain
 
@@ -39,6 +40,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 ### Ethereum (`CHAIN_ID=1`)
 - `rfq:bebop`
 - `rfq:hashflow`
+- `rfq:liquorice`
 
 ### Base (`CHAIN_ID=8453`)
 - `rfq:bebop`
@@ -47,13 +49,13 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 ## Effective VM enablement
 
 - Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
-- This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
+- This means Base omits `backends.vm` even if `ENABLE_VM_POOLS=true`.
 - The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
 
 ## Effective RFQ enablement
 
 - Runtime RFQ state is `effective_rfq_enabled = ENABLE_RFQ_POOLS && rfq_protocols_not_empty`.
-- Enabling RFQ analysis on Ethereum or Base also requires `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+- Enabling RFQ analysis requires credentials for the providers on that chain. Ethereum uses `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`. Base uses the Bebop and Hashflow pairs.
 - The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
 
 ## Notes that affect local analysis

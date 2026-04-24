@@ -101,16 +101,19 @@ The current classification logic is:
 Service health and native readiness:
 
 - `status="ready"` with HTTP `200` means the service is healthy
-- `status="warming_up"` with HTTP `503` means no backend is ready yet
-- `native_status="ready"` means native state is ready and recent enough
-- `native_status="warming_up"` means initial native state is still loading or native updates are stale
+- `status="warming_up"` with HTTP `503` means native state is still loading
+- `status="stale"` with HTTP `503` means native state was ready before but is now stale
+- `backends.native.status="ready"` means native state is ready and recent enough
+- `backends.native.status="warming_up"` means the native subscriber, snapshot bootstrap, or state store is still loading
+- `backends.native.status="stale"` means native updates are past the readiness freshness window
 
 VM readiness:
 
-- `vm_status="disabled"` when VM pools are turned off
-- `vm_status="warming_up"` while VM state is still loading
-- `vm_status="rebuilding"` during VM rebuilds
-- `vm_status="ready"` when VM state is usable
+- `backends.vm.status="disabled"` when VM pools are configured but turned off
+- `backends.vm.status="warming_up"` while VM subscriber bootstrap or VM state is still loading
+- `backends.vm.status="rebuilding"` during VM rebuilds
+- `backends.vm.status="stale"` when VM updates are past the readiness freshness window
+- `backends.vm.status="ready"` when VM state is usable
 
 Quote-path implications:
 
@@ -242,7 +245,7 @@ Operational guidance:
 
 Repo analysis workflow:
 
-- `cargo run --bin sim-analysis -- ...` is intentionally reporting-first and summarizes healthy, degraded, and errored outcomes instead of acting like a strict branch gate
+- `cargo run -p apps --bin sim-analysis -- ...` is intentionally reporting-first and summarizes healthy, degraded, and errored outcomes instead of acting like a strict branch gate
 - the analyzer still evaluates `result_quality`, `partial_kind`, `meta.failures`, and protocol visibility rather than looking only at HTTP status or `meta.status`
 - saved artifacts under `logs/simulation-reports/` make it easier to compare local runs and investigate odd protocol-specific behavior without hard-coding business assertions
 

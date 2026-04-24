@@ -3,25 +3,24 @@
 ## What this service does
 - DSolver Simulator is a fast simulation API for DeFi swaps and routing, built on Tycho state.
 - Rust Axum service that ingests Tycho protocol streams, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation and route encoding.
-- Main binary: `dsolver-simulator-service` (see `src/main.rs`).
+- Main binary: `dsolver-simulator-service` (see `crates/apps/src/bin/dsolver-simulator-service.rs`).
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
-- RFQ feeds default to off. For Ethereum runs with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum runs need `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`. Base runs need the Bebop and Hashflow pairs.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the server:
   ```bash
-  cargo run --release
+  cargo run -p apps --bin dsolver-simulator-service --release
   ```
-- `cargo run --release` resolves to `dsolver-simulator-service` via Cargo `default-run`.
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness
 - `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "native_status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }` when the service is healthy
-  - `503 Service Unavailable` with `{ "status": "warming_up", "native_status": "...", ... }` while no backend is ready yet
-- `native_status` carries native readiness; `vm_status` and `rfq_status` keep backend-specific readiness separate.
+  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "backends": { "native": { "status": "ready", ... } } }` when the service is healthy
+  - `503 Service Unavailable` with nested backend status details while native readiness is not ready.
+- `backends.native.status` carries native readiness; `backends.vm.status` and `backends.rfq.status` keep backend-specific readiness separate when those backends are configured.
 - Cold starts can take several minutes (3–5+ mins; VM or RFQ pools can take up to roughly 10 minutes on a fresh warmup).
 - `scripts/wait_ready.sh --expect-chain-id <id>` is still the manual guard if you want the native readiness gate directly.
 - When VM pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id <id> --require-vm-ready --timeout 600`.
@@ -30,8 +29,8 @@
 
 ## Local analysis workflow (recommended)
 - Run the reporting-first analyzer:
-  - `cargo run --bin sim-analysis -- --chain-id 1 --stop`
-  - `cargo run --bin sim-analysis -- --chain-id 8453 --stop`
+  - `cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop`
+  - `cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop`
 - The analyzer starts or reuses the local server, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` and `/encode` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
@@ -44,10 +43,11 @@
 - The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so the agent can investigate.
 
 ## Useful commands
-- Format: `cargo fmt`
-- Lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Test: `cargo nextest run`
-- Build: `cargo build --release`
+- Format: `cargo fmt --all`
+- Lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- Test: `cargo nextest run --workspace`
+- Build simulator: `cargo build -p apps --bin dsolver-simulator-service --release`
+- Build broadcaster: `cargo build -p apps --bin dsolver-tycho-broadcaster-service --release`
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
