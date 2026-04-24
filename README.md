@@ -100,7 +100,7 @@ is an example setup, not the source of truth for every default.
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
-- `GET /status` reports overall service health plus `native_status`, VM readiness, RFQ readiness, block progress, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
+- `GET /status` reports overall service health plus nested backend readiness, block progress, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
 
 `/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
@@ -168,14 +168,16 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 
 - `200 OK` with `status="ready"` when the service is healthy
 - `503 Service Unavailable` with `status="warming_up"` while native readiness is not ready
-- `native_status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
-- `native_status="warming_up"` while initial native state is still loading or native updates are stale
+- `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
+- `backends.native.status="warming_up"` while initial native state is still loading
+- `backends.native.status="stale"` when native updates are past the readiness freshness window
 
-`vm_status` and `rfq_status` are one of:
+`backends.vm.status` and `backends.rfq.status` are one of:
 
 - `disabled`
 - `warming_up`
 - `rebuilding`
+- `stale`
 - `ready`
 
 Timeout behavior differs by endpoint:

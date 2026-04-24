@@ -1,117 +1,105 @@
+use std::collections::BTreeMap;
+
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
-use crate::models::state::{AppState, NativeReadiness, RfqReadiness, VmReadiness};
+use crate::models::state::{
+    AppState, SimulatorBackendStatusSnapshot, SimulatorBackendSubscriptionSnapshot,
+    SimulatorReadinessReason, SimulatorServiceStatus, SimulatorStatusSnapshot,
+};
 
 #[derive(Serialize)]
 pub struct StatusPayload {
     status: &'static str,
     chain_id: u64,
-    block: u64,
-    pools: usize,
-    native_status: &'static str,
-    vm_enabled: bool,
-    vm_status: &'static str,
-    vm_block: u64,
-    vm_pools: usize,
-    vm_restarts: u64,
+    backends: BTreeMap<&'static str, BackendStatusPayload>,
+}
+
+impl From<SimulatorStatusSnapshot> for StatusPayload {
+    fn from(snapshot: SimulatorStatusSnapshot) -> Self {
+        Self {
+            status: snapshot.status.label(),
+            chain_id: snapshot.chain_id,
+            backends: snapshot
+                .backends
+                .into_iter()
+                .map(|backend| (backend.kind.label(), backend.into()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BackendStatusPayload {
+    enabled: bool,
+    status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    vm_last_error: Option<String>,
+    reason: Option<&'static str>,
+    block_number: u64,
+    pool_count: usize,
+    restart_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    vm_rebuild_duration_ms: Option<u64>,
+    last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    vm_last_update_age_ms: Option<u64>,
-    rfq_enabled: bool,
-    rfq_status: &'static str,
-    rfq_block: u64,
-    rfq_pools: usize,
-    rfq_restarts: u64,
+    rebuild_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rfq_last_error: Option<String>,
+    last_update_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rfq_rebuild_duration_ms: Option<u64>,
+    subscription: Option<BackendSubscriptionPayload>,
+}
+
+impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
+    fn from(snapshot: SimulatorBackendStatusSnapshot) -> Self {
+        Self {
+            enabled: snapshot.enabled,
+            status: snapshot.readiness.label(),
+            reason: snapshot.reason.map(SimulatorReadinessReason::label),
+            block_number: snapshot.block_number,
+            pool_count: snapshot.pool_count,
+            restart_count: snapshot.restart_count,
+            last_error: snapshot.last_error,
+            rebuild_duration_ms: snapshot.rebuild_duration_ms,
+            last_update_age_ms: snapshot.last_update_age_ms,
+            subscription: snapshot.subscription.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BackendSubscriptionPayload {
+    connected: bool,
+    bootstrap_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rfq_last_update_age_ms: Option<u64>,
+    stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    restart_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+impl From<SimulatorBackendSubscriptionSnapshot> for BackendSubscriptionPayload {
+    fn from(snapshot: SimulatorBackendSubscriptionSnapshot) -> Self {
+        Self {
+            connected: snapshot.connected,
+            bootstrap_complete: snapshot.bootstrap_complete,
+            stream_id: snapshot.stream_id,
+            snapshot_id: snapshot.snapshot_id,
+            restart_count: snapshot.restart_count,
+            last_error: snapshot.last_error,
+        }
+    }
 }
 
 pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
-    let block = state.current_block().await;
-    let pools = state.total_pools().await;
-    let native_readiness = state.native_readiness().await;
-
-    let vm_enabled = state.enable_vm_pools;
-    let rfq_enabled = state.enable_rfq_pools;
-    let vm_status_snapshot = state.vm_stream.read().await.clone();
-    let rfq_status_snapshot = state.rfq_stream.read().await.clone();
-    let vm_readiness = state.vm_readiness().await;
-    let rfq_readiness = state.rfq_readiness().await;
-    let vm_status = vm_readiness.label();
-    let rfq_status = rfq_readiness.label();
-
-    let vm_block = state.vm_block().await;
-    let rfq_block = state.rfq_block().await;
-    let vm_pools = state.vm_pools().await;
-    let rfq_pools = state.rfq_pools().await;
-    let vm_restarts = vm_status_snapshot.restart_count;
-    let rfq_restarts = rfq_status_snapshot.restart_count;
-    let vm_last_error = vm_status_snapshot.last_error.clone();
-    let rfq_last_error = rfq_status_snapshot.last_error.clone();
-    let vm_rebuild_duration_ms = if matches!(vm_readiness, VmReadiness::Rebuilding) {
-        vm_status_snapshot
-            .rebuild_started_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    } else {
-        None
-    };
-    let rfq_rebuild_duration_ms = if matches!(rfq_readiness, RfqReadiness::Rebuilding) {
-        rfq_status_snapshot
-            .rebuild_started_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    } else {
-        None
-    };
-    let vm_last_update_age_ms = state.vm_update_age_ms().await;
-    let rfq_last_update_age_ms = state.rfq_update_age_ms().await;
-    let native_status = native_readiness.label();
-    let service_is_ready = matches!(native_readiness, NativeReadiness::Ready);
-    let status = if service_is_ready {
-        "ready"
-    } else {
-        "warming_up"
-    };
-
-    let status_code = if service_is_ready {
+    let snapshot = state.status_snapshot().await;
+    let status_code = if snapshot.status == SimulatorServiceStatus::Ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (
-        status_code,
-        Json(StatusPayload {
-            status,
-            chain_id: state.chain.id(),
-            block,
-            pools,
-            native_status,
-            vm_enabled,
-            vm_status,
-            vm_block,
-            vm_pools,
-            vm_restarts,
-            vm_last_error,
-            vm_rebuild_duration_ms,
-            vm_last_update_age_ms,
-            rfq_enabled,
-            rfq_status,
-            rfq_block,
-            rfq_pools,
-            rfq_restarts,
-            rfq_last_error,
-            rfq_rebuild_duration_ms,
-            rfq_last_update_age_ms,
-        }),
-    )
+    (status_code, Json(snapshot.into()))
 }
 
 #[cfg(test)]
@@ -124,7 +112,8 @@ mod tests {
     use super::{status, StatusPayload};
     use crate::config::SlippageConfig;
     use crate::models::state::{
-        AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+        AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
+        VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -254,6 +243,10 @@ mod tests {
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
             rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+            configured_backends: ConfiguredBackends {
+                vm: enable_vm_pools,
+                rfq: enable_rfq_pools,
+            },
             enable_vm_pools,
             enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
@@ -286,8 +279,9 @@ mod tests {
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
         assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(payload.status, "warming_up");
-        assert_eq!(payload.native_status, "warming_up");
+        assert_eq!(payload.status, "stale");
+        assert_eq!(payload.backends["native"].status, "stale");
+        assert_eq!(payload.backends["native"].reason, Some("stale"));
     }
 
     #[tokio::test]
@@ -329,9 +323,25 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(payload.status, "warming_up");
-        assert_eq!(payload.native_status, "warming_up");
-        assert_eq!(payload.vm_status, "ready");
-        assert!(payload.rfq_enabled);
-        assert_eq!(payload.rfq_status, "rebuilding");
+        assert_eq!(payload.backends["native"].status, "warming_up");
+        assert_eq!(payload.backends["native"].reason, Some("state_warming_up"));
+        assert_eq!(payload.backends["vm"].status, "ready");
+        assert!(payload.backends["rfq"].enabled);
+        assert_eq!(payload.backends["rfq"].status, "rebuilding");
+        assert_eq!(payload.backends["rfq"].reason, Some("rebuilding"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_configured_disabled_backends_and_omits_unconfigured() {
+        let mut state = test_state(false, false);
+        state.configured_backends.vm = true;
+
+        let (_status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+
+        assert!(payload.backends.contains_key("native"));
+        assert!(!payload.backends["vm"].enabled);
+        assert_eq!(payload.backends["vm"].status, "disabled");
+        assert_eq!(payload.backends["vm"].reason, Some("disabled_by_config"));
+        assert!(!payload.backends.contains_key("rfq"));
     }
 }

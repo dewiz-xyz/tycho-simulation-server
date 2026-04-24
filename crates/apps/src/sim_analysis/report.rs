@@ -8,27 +8,78 @@ const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visib
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSnapshot {
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_status: Option<String>,
     pub chain_id: u64,
-    pub block: Option<u64>,
-    pub pools: Option<u64>,
-    pub vm_enabled: bool,
-    pub vm_status: Option<String>,
-    pub vm_block: Option<u64>,
-    pub vm_pools: Option<u64>,
-    pub vm_restarts: Option<u64>,
-    pub vm_last_error: Option<String>,
-    pub vm_rebuild_duration_ms: Option<u64>,
-    pub vm_last_update_age_ms: Option<u64>,
-    pub rfq_enabled: bool,
-    pub rfq_status: Option<String>,
-    pub rfq_block: Option<u64>,
-    pub rfq_pools: Option<u64>,
-    pub rfq_restarts: Option<u64>,
-    pub rfq_last_error: Option<String>,
-    pub rfq_rebuild_duration_ms: Option<u64>,
-    pub rfq_last_update_age_ms: Option<u64>,
+    pub backends: BTreeMap<String, ReadinessBackendSnapshot>,
+}
+
+impl ReadinessSnapshot {
+    pub fn backend(&self, kind: &str) -> Option<&ReadinessBackendSnapshot> {
+        self.backends.get(kind)
+    }
+
+    pub fn native_status(&self) -> Option<&str> {
+        self.backend("native")
+            .map(|backend| backend.status.as_str())
+    }
+
+    pub fn native_block_number(&self) -> Option<u64> {
+        self.backend("native")
+            .and_then(|backend| backend.block_number)
+    }
+
+    pub fn native_pool_count(&self) -> Option<u64> {
+        self.backend("native")
+            .and_then(|backend| backend.pool_count)
+    }
+
+    pub fn backend_enabled(&self, kind: &str) -> bool {
+        self.backend(kind)
+            .map(|backend| backend.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn backend_status(&self, kind: &str) -> Option<&str> {
+        self.backend(kind).map(|backend| backend.status.as_str())
+    }
+
+    pub fn backend_pool_count(&self, kind: &str) -> Option<u64> {
+        self.backend(kind).and_then(|backend| backend.pool_count)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReadinessBackendSnapshot {
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<ReadinessSubscriptionSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReadinessSubscriptionSnapshot {
+    pub connected: bool,
+    pub bootstrap_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    pub restart_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -163,28 +214,28 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
             severity: "investigate".to_string(),
             title: "Initial service health was not ready".to_string(),
             detail: format!(
-                "The analyzer began with /status={} and native_status={}. The run still proceeded, but overall service health looked unstable at the start.",
+                "The analyzer began with /status={} and native={}. The run still proceeded, but overall service health looked unstable at the start.",
                 report.readiness.initial.status,
-                display_status(report.readiness.initial.native_status.as_deref())
+                display_status(report.readiness.initial.native_status())
             ),
         });
     }
 
-    if let Some(native_status) = report.readiness.initial.native_status.as_deref() {
+    if let Some(native_status) = report.readiness.initial.native_status() {
         if native_status != "ready" {
             findings.push(Finding {
                 severity: "investigate".to_string(),
                 title: "Initial native readiness was not ready".to_string(),
                 detail: format!(
-                    "The analyzer saw native_status={} at the start of the run.",
+                    "The analyzer saw native={} at the start of the run.",
                     native_status
                 ),
             });
         }
     }
 
-    if report.readiness.initial.vm_enabled
-        && report.readiness.initial.vm_status.as_deref() != Some("ready")
+    if report.readiness.initial.backend_enabled("vm")
+        && report.readiness.initial.backend_status("vm") != Some("ready")
     {
         findings.push(Finding {
             severity: "attention".to_string(),
@@ -194,20 +245,19 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
                 report
                     .readiness
                     .initial
-                    .vm_status
-                    .as_deref()
+                    .backend_status("vm")
                     .unwrap_or("unknown"),
                 report
                     .readiness
                     .initial
-                    .vm_pools
+                    .backend_pool_count("vm")
                     .map_or_else(|| "unknown".to_string(), |value| value.to_string())
             ),
         });
     }
 
-    if report.readiness.initial.rfq_enabled
-        && report.readiness.initial.rfq_status.as_deref() != Some("ready")
+    if report.readiness.initial.backend_enabled("rfq")
+        && report.readiness.initial.backend_status("rfq") != Some("ready")
     {
         findings.push(Finding {
             severity: "attention".to_string(),
@@ -217,13 +267,12 @@ fn add_readiness_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) 
                 report
                     .readiness
                     .initial
-                    .rfq_status
-                    .as_deref()
+                    .backend_status("rfq")
                     .unwrap_or("unknown"),
                 report
                     .readiness
                     .initial
-                    .rfq_pools
+                    .backend_pool_count("rfq")
                     .map_or_else(|| "unknown".to_string(), |value| value.to_string())
             ),
         });
@@ -420,14 +469,20 @@ fn append_readiness_section(lines: &mut Vec<String>, report: &AnalysisReport) {
 
 fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &ReadinessSnapshot) {
     lines.push(format!(
-        "- {}: status={} native_status={} block={} pools={} vm_status={} rfq_status={}",
+        "- {}: status={} native={} block={} pools={} vm={} rfq={}",
         label,
         snapshot.status,
-        display_status(snapshot.native_status.as_deref()),
-        fmt_optional_u64(snapshot.block),
-        fmt_optional_u64(snapshot.pools),
-        readiness_component_status(snapshot.vm_enabled, snapshot.vm_status.as_deref()),
-        readiness_component_status(snapshot.rfq_enabled, snapshot.rfq_status.as_deref())
+        display_status(snapshot.native_status()),
+        fmt_optional_u64(snapshot.native_block_number()),
+        fmt_optional_u64(snapshot.native_pool_count()),
+        readiness_component_status(
+            snapshot.backend_enabled("vm"),
+            snapshot.backend_status("vm")
+        ),
+        readiness_component_status(
+            snapshot.backend_enabled("rfq"),
+            snapshot.backend_status("rfq")
+        )
     ));
 }
 
@@ -497,7 +552,7 @@ mod tests {
         build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSummary,
         ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
-    use super::{ReadinessSnapshot, RunMetadata, ScenarioReport};
+    use super::{ReadinessBackendSnapshot, ReadinessSnapshot, RunMetadata, ScenarioReport};
     use std::collections::BTreeMap;
 
     fn scenario(label: &str, degraded_count: usize, error_count: usize) -> ScenarioReport {
@@ -518,9 +573,29 @@ mod tests {
         }
     }
 
+    fn readiness_backend(
+        enabled: bool,
+        status: &str,
+        block_number: Option<u64>,
+        pool_count: Option<u64>,
+    ) -> ReadinessBackendSnapshot {
+        ReadinessBackendSnapshot {
+            enabled,
+            status: status.to_string(),
+            reason: None,
+            block_number,
+            pool_count,
+            restart_count: Some(0),
+            last_error: None,
+            rebuild_duration_ms: None,
+            last_update_age_ms: None,
+            subscription: None,
+        }
+    }
+
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 3,
+            schema_version: 4,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
@@ -536,26 +611,11 @@ mod tests {
             readiness: ReadinessReport {
                 initial: ReadinessSnapshot {
                     status: "ready".to_string(),
-                    native_status: Some("ready".to_string()),
                     chain_id: 1,
-                    block: Some(1),
-                    pools: Some(10),
-                    vm_enabled: false,
-                    vm_status: Some("disabled".to_string()),
-                    vm_block: None,
-                    vm_pools: None,
-                    vm_restarts: None,
-                    vm_last_error: None,
-                    vm_rebuild_duration_ms: None,
-                    vm_last_update_age_ms: None,
-                    rfq_enabled: false,
-                    rfq_status: None,
-                    rfq_block: None,
-                    rfq_pools: None,
-                    rfq_restarts: None,
-                    rfq_last_error: None,
-                    rfq_rebuild_duration_ms: None,
-                    rfq_last_update_age_ms: None,
+                    backends: BTreeMap::from([(
+                        "native".to_string(),
+                        readiness_backend(true, "ready", Some(1), Some(10)),
+                    )]),
                 },
                 final_state: None,
             },
@@ -592,11 +652,11 @@ mod tests {
     #[test]
     fn build_findings_marks_rfq_not_ready() {
         let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
-        analysis.readiness.initial.rfq_enabled = true;
-        analysis.readiness.initial.rfq_status = Some("warming_up".to_string());
-        analysis.readiness.initial.rfq_pools = Some(0);
+        analysis.readiness.initial.backends.insert(
+            "rfq".to_string(),
+            readiness_backend(true, "warming_up", Some(0), Some(0)),
+        );
         analysis.readiness.initial.status = "warming_up".to_string();
-        analysis.readiness.initial.native_status = Some("ready".to_string());
 
         let findings = build_findings(&analysis);
 
@@ -629,22 +689,37 @@ mod tests {
     #[test]
     fn render_summary_includes_rfq_status() {
         let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
-        analysis.readiness.initial.rfq_enabled = true;
-        analysis.readiness.initial.rfq_status = Some("ready".to_string());
-        analysis.readiness.initial.native_status = Some("warming_up".to_string());
-        analysis.readiness.final_state = Some(ReadinessSnapshot {
-            native_status: Some("ready".to_string()),
-            rfq_enabled: true,
-            rfq_status: Some("rebuilding".to_string()),
-            status: "ready".to_string(),
-            ..analysis.readiness.initial.clone()
-        });
+        analysis.readiness.initial.backends.insert(
+            "rfq".to_string(),
+            readiness_backend(true, "ready", Some(1), Some(1)),
+        );
+        analysis
+            .readiness
+            .initial
+            .backends
+            .entry("native".to_string())
+            .or_insert_with(|| readiness_backend(true, "ready", Some(1), Some(10)))
+            .status = "warming_up".to_string();
+
+        let mut final_state = analysis.readiness.initial.clone();
+        final_state.status = "ready".to_string();
+        final_state
+            .backends
+            .entry("native".to_string())
+            .or_insert_with(|| readiness_backend(true, "ready", Some(1), Some(10)))
+            .status = "ready".to_string();
+        final_state
+            .backends
+            .entry("rfq".to_string())
+            .or_insert_with(|| readiness_backend(true, "ready", Some(1), Some(1)))
+            .status = "rebuilding".to_string();
+        analysis.readiness.final_state = Some(final_state);
 
         let summary = render_summary(&analysis);
 
-        assert!(summary.contains("status=ready native_status=warming_up"));
-        assert!(summary.contains("vm_status=disabled rfq_status=ready"));
-        assert!(summary.contains("native_status=ready"));
-        assert!(summary.contains("vm_status=disabled rfq_status=rebuilding"));
+        assert!(summary.contains("status=ready native=warming_up"));
+        assert!(summary.contains("vm=disabled rfq=ready"));
+        assert!(summary.contains("native=ready"));
+        assert!(summary.contains("vm=disabled rfq=rebuilding"));
     }
 }

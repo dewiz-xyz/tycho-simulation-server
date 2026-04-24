@@ -31,7 +31,7 @@ metadata:
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
-- Top-level `/status.status` is service health; `native_status` carries native readiness separately.
+- Top-level `/status.status` is service health; nested `backends.*.status` carries backend readiness.
 
 ## Behavior model
 

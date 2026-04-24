@@ -86,6 +86,8 @@ impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
 pub struct BroadcasterSubscribersPayload {
     pub active: usize,
     pub lag_disconnects: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl From<BroadcasterSubscriberSnapshot> for BroadcasterSubscribersPayload {
@@ -93,6 +95,7 @@ impl From<BroadcasterSubscriberSnapshot> for BroadcasterSubscribersPayload {
         Self {
             active: snapshot.active,
             lag_disconnects: snapshot.lag_disconnects,
+            last_error: snapshot.last_error,
         }
     }
 }

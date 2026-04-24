@@ -48,7 +48,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see
 ## Effective VM enablement
 
 - Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
-- This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
+- This means Base omits `backends.vm` even if `ENABLE_VM_POOLS=true`.
 - The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
 
 ## Effective RFQ enablement

@@ -18,9 +18,9 @@
 
 ## Readiness
 - `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "native_status": "ready", "chain_id": <u64>, "block": <u64>, "pools": <usize>, ... }` when the service is healthy
-  - `503 Service Unavailable` with `{ "status": "warming_up", "native_status": "...", ... }` while no backend is ready yet
-- `native_status` carries native readiness; `vm_status` and `rfq_status` keep backend-specific readiness separate.
+  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "backends": { "native": { "status": "ready", ... } } }` when the service is healthy
+  - `503 Service Unavailable` with nested backend status details while native readiness is not ready.
+- `backends.native.status` carries native readiness; `backends.vm.status` and `backends.rfq.status` keep backend-specific readiness separate when those backends are configured.
 - Cold starts can take several minutes (3–5+ mins; VM or RFQ pools can take up to roughly 10 minutes on a fresh warmup).
 - `scripts/wait_ready.sh --expect-chain-id <id>` is still the manual guard if you want the native readiness gate directly.
 - When VM pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id <id> --require-vm-ready --timeout 600`.

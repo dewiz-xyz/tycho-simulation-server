@@ -11,7 +11,8 @@ use jemallocator::Jemalloc;
 use num_bigint::BigUint;
 use runtime::config::{MemoryConfig, SlippageConfig};
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
+    VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -621,6 +622,10 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
         rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+        configured_backends: ConfiguredBackends {
+            vm: true,
+            rfq: true,
+        },
         enable_vm_pools: true,
         enable_rfq_pools: true,
         readiness_stale: Duration::from_secs(120),

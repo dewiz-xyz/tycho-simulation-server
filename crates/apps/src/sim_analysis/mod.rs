@@ -40,7 +40,7 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 3;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 4;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
@@ -277,7 +277,10 @@ async fn analyze_run(
         &lifecycle.initial_readiness,
     )?;
 
-    let profile = balanced_profile(args.chain_id, lifecycle.initial_readiness.vm_enabled)?;
+    let profile = balanced_profile(
+        args.chain_id,
+        lifecycle.initial_readiness.backend_enabled("vm"),
+    )?;
     let mut scenarios = Vec::new();
 
     for scenario in &profile.simulate_scenarios {
@@ -416,8 +419,10 @@ async fn ensure_server_ready(
                 .context("failed to fetch readiness after native wait")?;
         }
 
-        let require_vm = snapshot.vm_enabled && snapshot.vm_status.as_deref() != Some("ready");
-        let require_rfq = snapshot.rfq_enabled && snapshot.rfq_status.as_deref() != Some("ready");
+        let require_vm =
+            snapshot.backend_enabled("vm") && snapshot.backend_status("vm") != Some("ready");
+        let require_rfq =
+            snapshot.backend_enabled("rfq") && snapshot.backend_status("rfq") != Some("ready");
 
         if require_vm || require_rfq {
             let wait_label = readiness_wait_label(require_vm, require_rfq);
@@ -1431,9 +1436,9 @@ async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: 
                     return Ok(());
                 }
                 last_observation = format!(
-                    "status={} native_status={}",
+                    "status={} native={}",
                     snapshot.status,
-                    snapshot.native_status.as_deref().unwrap_or("unknown")
+                    snapshot.native_status().unwrap_or("unknown")
                 );
                 saw_observation = true;
             }
@@ -1461,11 +1466,7 @@ async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: 
 }
 
 fn snapshot_native_ready(snapshot: &ReadinessSnapshot) -> bool {
-    snapshot
-        .native_status
-        .as_deref()
-        .unwrap_or(snapshot.status.as_str())
-        == "ready"
+    snapshot.native_status().unwrap_or(snapshot.status.as_str()) == "ready"
 }
 
 fn build_wait_ready_args(
