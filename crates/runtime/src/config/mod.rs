@@ -854,7 +854,7 @@ mod tests {
             .chain_profile
             .rfq_protocols
             .contains(&"rfq:bebop".to_string()));
-        assert!(chain
+        assert!(!chain
             .chain_profile
             .rfq_protocols
             .contains(&"rfq:liquorice".to_string()));

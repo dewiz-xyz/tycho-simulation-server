@@ -128,7 +128,8 @@ native_protocols = [
     "erc4626",
 ]
 vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
-rfq_protocols = ["rfq:bebop", "rfq:hashflow", "rfq:liquorice"]
+# TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
+rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
 route_policy = "ethereum"
 
 [[chains]]
