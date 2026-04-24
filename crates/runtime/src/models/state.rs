@@ -436,9 +436,7 @@ impl AppState {
             reason,
             block_number: self.current_block().await,
             pool_count: self.native_state_store.total_states().await,
-            restart_count: subscription
-                .restart_count
-                .saturating_add(stream_restart_count),
+            restart_count: stream_restart_count,
             last_error: subscription.last_error.clone().or(stream_last_error),
             rebuild_duration_ms: None,
             last_update_age_ms,
@@ -479,9 +477,7 @@ impl AppState {
             reason,
             block_number: self.vm_block().await,
             pool_count: self.vm_pools().await,
-            restart_count: subscription
-                .restart_count
-                .saturating_add(stream_status.restart_count),
+            restart_count: stream_status.restart_count,
             last_error: subscription
                 .last_error
                 .clone()
@@ -1667,6 +1663,17 @@ mod tests {
         )
     }
 
+    fn backend_snapshot(
+        snapshot: &SimulatorStatusSnapshot,
+        kind: SimulatorBackendKind,
+    ) -> &SimulatorBackendStatusSnapshot {
+        snapshot
+            .backends
+            .iter()
+            .find(|backend| backend.kind == kind)
+            .unwrap_or_else(|| unreachable!("status snapshot must include {kind:?} backend"))
+    }
+
     #[tokio::test]
     async fn native_readiness_distinguishes_ready_stale_and_warming_up() {
         let warming_up_state = {
@@ -1741,6 +1748,54 @@ mod tests {
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn native_status_keeps_backend_and_subscription_restart_counts_separate() {
+        let state = build_readiness_test_state(false, false).await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(Some("native broadcaster dropped".to_string()))
+            .await;
+        state.native_stream_health.increment_restart().await;
+
+        let snapshot = state.status_snapshot().await;
+        let native = backend_snapshot(&snapshot, SimulatorBackendKind::Native);
+
+        assert_eq!(native.restart_count, 1);
+        assert_eq!(
+            native
+                .subscription
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("native status must include subscription"))
+                .restart_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_status_keeps_backend_and_subscription_restart_counts_separate() {
+        let state = build_readiness_test_state(true, false).await;
+        state
+            .vm_broadcaster_subscription
+            .mark_disconnected(Some("vm broadcaster dropped".to_string()))
+            .await;
+        {
+            let mut vm_status = state.vm_stream.write().await;
+            vm_status.restart_count = 1;
+        }
+
+        let snapshot = state.status_snapshot().await;
+        let vm = backend_snapshot(&snapshot, SimulatorBackendKind::Vm);
+
+        assert_eq!(vm.restart_count, 1);
+        assert_eq!(
+            vm.subscription
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("VM status must include subscription"))
+                .restart_count,
+            1
+        );
     }
 
     #[tokio::test]
