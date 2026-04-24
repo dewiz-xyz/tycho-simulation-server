@@ -79,7 +79,8 @@ pub fn load_config() -> AppConfig {
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(rfq_enabled);
+    let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
         chain_profile,
@@ -87,6 +88,7 @@ pub fn load_config() -> AppConfig {
         tycho_broadcaster_ws_url: require_trimmed_env("TYCHO_BROADCASTER_WS_URL"),
         bebop_url: resolved_chain.bebop_url,
         hashflow_filename: resolved_chain.hashflow_filename,
+        liquorice_url: resolved_chain.liquorice_url,
         api_key: network.api_key,
         rpc_url: network.rpc_url,
         tvl_threshold: network.tvl_threshold,
@@ -122,6 +124,8 @@ pub fn load_config() -> AppConfig {
         bebop_user,
         hashflow_key,
         hashflow_user,
+        liquorice_key,
+        liquorice_user,
     }
 }
 
@@ -194,41 +198,77 @@ fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile)
     enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
 }
 
-fn load_rfq_credentials(rfq_enabled: bool) -> (String, String, String, String) {
-    if !rfq_enabled {
-        return (String::new(), String::new(), String::new(), String::new());
+fn load_rfq_credentials(
+    rfq_enabled: bool,
+    rfq_protocols: &[String],
+) -> (String, String, String, String, String, String) {
+    match try_load_rfq_credentials(rfq_enabled, rfq_protocols) {
+        Ok(credentials) => credentials,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn try_load_rfq_credentials(
+    rfq_enabled: bool,
+    rfq_protocols: &[String],
+) -> Result<(String, String, String, String, String, String), String> {
+    if !rfq_enabled || rfq_protocols.is_empty() {
+        return Ok((
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
     }
 
-    let bebop_user = match env::var("BEBOP_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let bebop_key = match env::var("BEBOP_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let hashflow_user = match env::var("HASHFLOW_USER") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let hashflow_key = match env::var("HASHFLOW_KEY") {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
+    let (bebop_user, bebop_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:bebop"),
+        "BEBOP_USER",
+        "BEBOP_KEY",
+    )?;
+    let (hashflow_user, hashflow_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:hashflow"),
+        "HASHFLOW_USER",
+        "HASHFLOW_KEY",
+    )?;
+    let (liquorice_user, liquorice_key) = load_provider_credentials(
+        rfq_protocol_enabled(rfq_protocols, "rfq:liquorice"),
+        "LIQUORICE_USER",
+        "LIQUORICE_KEY",
+    )?;
 
-    (bebop_user, bebop_key, hashflow_user, hashflow_key)
+    Ok((
+        bebop_user,
+        bebop_key,
+        hashflow_user,
+        hashflow_key,
+        liquorice_user,
+        liquorice_key,
+    ))
+}
+
+fn load_provider_credentials(
+    enabled: bool,
+    user_key: &str,
+    auth_key: &str,
+) -> Result<(String, String), String> {
+    if !enabled {
+        return Ok((String::new(), String::new()));
+    }
+
+    let user = env::var(user_key).map_err(|message| format!("{user_key}: {message}"))?;
+    let key = env::var(auth_key).map_err(|message| format!("{auth_key}: {message}"))?;
+
+    Ok((user, key))
+}
+
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
 }
 
 struct NetworkConfig {
@@ -512,6 +552,7 @@ pub struct AppConfig {
     pub tycho_broadcaster_ws_url: String,
     pub bebop_url: String,
     pub hashflow_filename: String,
+    pub liquorice_url: Option<String>,
     pub api_key: String,
     pub rpc_url: Option<String>,
     pub tvl_threshold: f64,
@@ -547,6 +588,8 @@ pub struct AppConfig {
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
+    pub liquorice_user: String,
+    pub liquorice_key: String,
 }
 
 #[derive(Clone)]
@@ -663,6 +706,14 @@ mod tests {
         "BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY",
         "BROADCASTER_HEARTBEAT_INTERVAL_SECS",
     ];
+    const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
+        "BEBOP_USER",
+        "BEBOP_KEY",
+        "HASHFLOW_USER",
+        "HASHFLOW_KEY",
+        "LIQUORICE_USER",
+        "LIQUORICE_KEY",
+    ];
 
     fn clear_slippage_env() {
         for key in SLIPPAGE_ENV_KEYS {
@@ -672,6 +723,12 @@ mod tests {
 
     fn clear_broadcaster_tuning_env() {
         for key in BROADCASTER_TUNING_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn clear_rfq_credential_env() {
+        for key in RFQ_CREDENTIAL_ENV_KEYS {
             std::env::remove_var(key);
         }
     }
@@ -797,6 +854,14 @@ mod tests {
             .chain_profile
             .rfq_protocols
             .contains(&"rfq:bebop".to_string()));
+        assert!(!chain
+            .chain_profile
+            .rfq_protocols
+            .contains(&"rfq:liquorice".to_string()));
+        assert_eq!(
+            chain.liquorice_url.as_deref(),
+            Some("https://api.liquorice.tech/v1/solver/supported-tokens")
+        );
         assert!(chain
             .chain_profile
             .native_token_protocol_allowlist
@@ -823,6 +888,11 @@ mod tests {
             .chain_profile
             .rfq_protocols
             .contains(&"rfq:hashflow".to_string()));
+        assert!(!chain
+            .chain_profile
+            .rfq_protocols
+            .contains(&"rfq:liquorice".to_string()));
+        assert!(chain.liquorice_url.is_none());
         assert!(chain
             .chain_profile
             .native_token_protocol_allowlist
@@ -904,6 +974,36 @@ route_policy = "missing"
         };
 
         assert!(err.to_string().contains("unknown route policy"));
+    }
+
+    #[test]
+    fn parse_manifest_requires_liquorice_url_when_liquorice_enabled() {
+        let manifest = r#"
+[[protocols]]
+id = "rfq:liquorice"
+backend = "rfq"
+
+[[route_policies]]
+id = "default"
+native_token_protocol_allowlist = []
+reset_allowance_tokens = []
+
+[[chains]]
+chain_id = 1
+tycho_url = "tycho"
+bebop_url = "bebop"
+hashflow_filename = "./hashflow.csv"
+native_protocols = []
+vm_protocols = []
+rfq_protocols = ["rfq:liquorice"]
+route_policy = "default"
+"#;
+
+        let Err(err) = manifest::parse_manifest_registries(manifest) else {
+            unreachable!("expected missing Liquorice URL to fail");
+        };
+
+        assert!(err.to_string().contains("liquorice_url"));
     }
 
     #[test]
@@ -1061,12 +1161,54 @@ route_policy = " default "
 
     #[test]
     fn load_rfq_credentials_skips_env_when_disabled() {
-        let (bebop_user, bebop_key, hashflow_user, hashflow_key) = load_rfq_credentials(false);
+        let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+            load_rfq_credentials(false, &[]);
 
         assert!(bebop_user.is_empty());
         assert!(bebop_key.is_empty());
         assert!(hashflow_user.is_empty());
         assert!(hashflow_key.is_empty());
+        assert!(liquorice_user.is_empty());
+        assert!(liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn try_load_rfq_credentials_only_requires_enabled_providers() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_rfq_credential_env();
+        std::env::set_var("HASHFLOW_USER", "hashflow-user");
+        std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+
+        let Ok((bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key)) =
+            try_load_rfq_credentials(true, &["rfq:hashflow".to_string()])
+        else {
+            unreachable!("expected hashflow-only credentials to load");
+        };
+
+        assert!(bebop_user.is_empty());
+        assert!(bebop_key.is_empty());
+        assert_eq!(hashflow_user, "hashflow-user");
+        assert_eq!(hashflow_key, "hashflow-key");
+        assert!(liquorice_user.is_empty());
+        assert!(liquorice_key.is_empty());
+
+        clear_rfq_credential_env();
+    }
+
+    #[test]
+    fn try_load_rfq_credentials_requires_liquorice_when_enabled() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_rfq_credential_env();
+
+        let Err(err) = try_load_rfq_credentials(true, &["rfq:liquorice".to_string()]) else {
+            unreachable!("expected missing Liquorice credentials to fail");
+        };
+
+        assert!(err.contains("LIQUORICE_USER"));
     }
 
     #[test]

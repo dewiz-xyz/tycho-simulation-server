@@ -40,6 +40,7 @@ pub(crate) struct ResolvedChainConfig {
     pub(crate) tycho_url: String,
     pub(crate) bebop_url: String,
     pub(crate) hashflow_filename: String,
+    pub(crate) liquorice_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +60,7 @@ struct ChainRegistryEntry {
     tycho_url: String,
     bebop_url: String,
     hashflow_filename: String,
+    liquorice_url: Option<String>,
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
@@ -115,6 +117,8 @@ struct RawChain {
     tycho_url: String,
     bebop_url: String,
     hashflow_filename: String,
+    #[serde(default)]
+    liquorice_url: Option<String>,
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
@@ -182,6 +186,7 @@ pub(crate) fn resolve_chain_config(
         bebop_url: chain.bebop_url.clone(),
         hashflow_filename: hashflow_filename_override
             .unwrap_or_else(|| chain.hashflow_filename.clone()),
+        liquorice_url: chain.liquorice_url.clone(),
     })
 }
 
@@ -369,6 +374,8 @@ fn validate_chains(
             &chain.rfq_protocols,
             protocols,
         )?;
+        let liquorice_url =
+            validate_liquorice_url(chain.chain_id, &rfq_protocols, &chain.liquorice_url)?;
 
         registry.insert(
             chain.chain_id,
@@ -377,6 +384,7 @@ fn validate_chains(
                 tycho_url: tycho_url.to_string(),
                 bebop_url: bebop_url.to_string(),
                 hashflow_filename: hashflow_filename.to_string(),
+                liquorice_url,
                 native_protocols,
                 vm_protocols,
                 rfq_protocols,
@@ -422,6 +430,25 @@ fn validate_backend_protocol_refs(
         normalized_protocol_ids.push(protocol_id.to_string());
     }
     Ok(normalized_protocol_ids)
+}
+
+fn validate_liquorice_url(
+    chain_id: u64,
+    rfq_protocols: &[String],
+    raw_url: &Option<String>,
+) -> Result<Option<String>> {
+    let liquorice_enabled = rfq_protocols
+        .iter()
+        .any(|protocol| protocol == "rfq:liquorice");
+    match raw_url {
+        Some(url) => Ok(Some(
+            required_string(&format!("chains[{chain_id}].liquorice_url"), url)?.to_string(),
+        )),
+        None if liquorice_enabled => {
+            bail!("chain {chain_id} enables rfq:liquorice but does not define liquorice_url")
+        }
+        None => Ok(None),
+    }
 }
 
 fn required_string<'a>(field: &str, value: &'a str) -> Result<&'a str> {

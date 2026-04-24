@@ -1250,7 +1250,7 @@ fn backend_for_kind(kind: ProtocolKind) -> Option<BroadcasterBackend> {
         ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
             Some(BroadcasterBackend::Vm)
         }
-        ProtocolKind::Hashflow | ProtocolKind::Bebop => None,
+        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => None,
         _ => Some(BroadcasterBackend::Native),
     }
 }

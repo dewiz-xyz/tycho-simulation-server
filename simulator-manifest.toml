@@ -67,6 +67,10 @@ backend = "rfq"
 id = "rfq:hashflow"
 backend = "rfq"
 
+[[protocols]]
+id = "rfq:liquorice"
+backend = "rfq"
+
 # Route policies hold the routing nuances that do not belong in the plain chain protocol lists.
 [[route_policies]]
 id = "ethereum"
@@ -109,6 +113,7 @@ chain_id = 1
 tycho_url = "tycho-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"
+liquorice_url = "https://api.liquorice.tech/v1/solver/supported-tokens"
 native_protocols = [
     "uniswap_v2",
     "sushiswap_v2",
@@ -123,6 +128,7 @@ native_protocols = [
     "erc4626",
 ]
 vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
+# TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
 rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
 route_policy = "ethereum"
 

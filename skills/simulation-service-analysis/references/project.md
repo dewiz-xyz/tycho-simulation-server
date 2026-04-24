@@ -7,7 +7,7 @@
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
-- RFQ feeds default to off. For Ethereum runs with `ENABLE_RFQ_POOLS=true`, also set `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum runs need `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`. Base runs need the Bebop and Hashflow pairs.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the server:

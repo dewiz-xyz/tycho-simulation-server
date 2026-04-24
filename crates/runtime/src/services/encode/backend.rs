@@ -15,7 +15,9 @@ impl PoolBackend {
             Some(ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2) => {
                 Self::Vm
             }
-            Some(ProtocolKind::Hashflow | ProtocolKind::Bebop) => Self::Rfq,
+            Some(ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice) => {
+                Self::Rfq
+            }
             _ => Self::Native,
         }
     }
@@ -83,6 +85,7 @@ mod tests {
     fn from_component_recognizes_type_name_only_rfq_components() {
         assert!(PoolBackend::from_component(&protocol_component("", "hashflow_pool")).is_rfq());
         assert!(PoolBackend::from_component(&protocol_component("", "bebop_pool")).is_rfq());
+        assert!(PoolBackend::from_component(&protocol_component("", "liquorice_pool")).is_rfq());
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::rfq::bebop::BebopResponse;
 use crate::models::rfq::hashflow::read_hashflow_csv;
+use crate::models::rfq::liquorice::TokenLiquorice;
 use crate::models::state::{
     AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
 };
@@ -24,7 +25,7 @@ use crate::services::broadcaster_subscription::{
     supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
     NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
 };
-use crate::services::stream_builder::{build_rfq_stream, RFQConfig};
+use crate::services::stream_builder::{build_rfq_stream, RFQConfig, RFQTokenStores};
 use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
 
 struct RfqStreamDeps<'a> {
@@ -32,6 +33,7 @@ struct RfqStreamDeps<'a> {
     app_state: &'a AppState,
     bebop_tokens: Arc<TokenStore>,
     hashflow_tokens: Arc<TokenStore>,
+    liquorice_tokens: Arc<TokenStore>,
 }
 
 pub struct SimulatorServiceParts {
@@ -54,16 +56,34 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     let tokens = load_token_store(&config, &tycho_url).await?;
     let bebop_tokens: Arc<TokenStore>;
     let hashflow_tokens: Arc<TokenStore>;
+    let liquorice_tokens: Arc<TokenStore>;
 
     if effective_rfq_enabled {
         // RFQ enabled means RFQ bootstrap must succeed.
-        bebop_tokens =
-            load_bebop_token_store(&config, &tycho_url, &config.bebop_url, chain).await?;
+        bebop_tokens = if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:bebop") {
+            load_bebop_token_store(&config, &tycho_url, &config.bebop_url, chain).await?
+        } else {
+            new_token_store(HashMap::new(), &tycho_url, &config)
+        };
         hashflow_tokens =
-            load_hashflow_token_store(&config, &tycho_url, &config.hashflow_filename, chain)?;
+            if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:hashflow") {
+                load_hashflow_token_store(&config, &tycho_url, &config.hashflow_filename, chain)?
+            } else {
+                new_token_store(HashMap::new(), &tycho_url, &config)
+            };
+        liquorice_tokens =
+            if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:liquorice") {
+                let liquorice_url = config.liquorice_url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Liquorice RFQ enabled for {chain} without liquorice_url")
+                })?;
+                load_liquorice_token_store(&config, &tycho_url, liquorice_url, chain).await?
+            } else {
+                new_token_store(HashMap::new(), &tycho_url, &config)
+            };
     } else {
         bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
         hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
+        liquorice_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
     }
 
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
@@ -77,6 +97,8 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
         bebop_key: config.bebop_key.clone(),
         hashflow_user: config.hashflow_user.clone(),
         hashflow_key: config.hashflow_key.clone(),
+        liquorice_user: config.liquorice_user.clone(),
+        liquorice_key: config.liquorice_key.clone(),
     };
     spawn_rfq_stream_task(
         &config,
@@ -87,6 +109,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
             app_state: &app_state,
             bebop_tokens: Arc::clone(&bebop_tokens),
             hashflow_tokens: Arc::clone(&hashflow_tokens),
+            liquorice_tokens: Arc::clone(&liquorice_tokens),
         },
         rfq_config,
     );
@@ -210,6 +233,60 @@ fn load_hashflow_token_store(
         .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
     info!("all_hashflow_tokens: {:?}", hashflow_tokens);
     Ok(new_token_store(hashflow_tokens, tycho_url, config))
+}
+
+async fn load_liquorice_token_store(
+    config: &AppConfig,
+    tycho_url: &str,
+    liquorice_url: &str,
+    chain: Chain,
+) -> anyhow::Result<Arc<TokenStore>> {
+    let client = Client::new();
+    let liquorice_tokens = load_liquorice_tokens(
+        &client,
+        liquorice_url,
+        chain,
+        &config.liquorice_user,
+        &config.liquorice_key,
+    )
+    .await?;
+    info!("all_liquorice_tokens: {:?}", liquorice_tokens);
+    Ok(new_token_store(liquorice_tokens, tycho_url, config))
+}
+
+async fn load_liquorice_tokens(
+    client: &Client,
+    liquorice_url: &str,
+    chain: Chain,
+    solver: &str,
+    authorization: &str,
+) -> anyhow::Result<HashMap<Bytes, Token>> {
+    let chain_id = chain.id().to_string();
+    let response: Vec<TokenLiquorice> = client
+        .get(liquorice_url)
+        .query(&[("chainId", chain_id)])
+        .header("accept", "application/json")
+        .header("solver", solver)
+        .header("authorization", authorization)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    response
+        .into_iter()
+        .map(|token| {
+            token
+                .to_tycho_token(chain)
+                .map(|new| (new.address.clone(), new))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| anyhow::anyhow!("Failed to parse Liquorice token: {}", error))
+}
+
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
 }
 
 fn new_token_store(
@@ -448,6 +525,7 @@ fn spawn_rfq_stream_task(
     let tokens_bg = tokens;
     let bebop_tokens_bg = deps.bebop_tokens;
     let hashflow_tokens_bg = deps.hashflow_tokens;
+    let liquorice_tokens_bg = deps.liquorice_tokens;
     let state_store_bg = Arc::clone(&deps.resources.rfq_state_store);
     let health_bg = Arc::clone(&deps.resources.rfq_stream_health);
     let rfq_stream_bg = Arc::clone(&deps.resources.rfq_stream);
@@ -463,19 +541,18 @@ fn spawn_rfq_stream_task(
                 let tokens = Arc::clone(&tokens_bg);
                 let bebop_tokens = Arc::clone(&bebop_tokens_bg);
                 let hashflow_tokens = Arc::clone(&hashflow_tokens_bg);
+                let liquorice_tokens = Arc::clone(&liquorice_tokens_bg);
                 let protocols = rfq_protocols.clone();
                 let rfq_config = rfq_config.clone();
+                let token_stores = RFQTokenStores {
+                    tokens,
+                    bebop: bebop_tokens,
+                    hashflow: hashflow_tokens,
+                    liquorice: liquorice_tokens,
+                };
                 async move {
-                    build_rfq_stream(
-                        tvl_threshold,
-                        tokens,
-                        chain,
-                        &protocols,
-                        bebop_tokens,
-                        hashflow_tokens,
-                        rfq_config,
-                    )
-                    .await
+                    build_rfq_stream(tvl_threshold, token_stores, chain, &protocols, rfq_config)
+                        .await
                 }
             },
             state_store_bg,
@@ -542,6 +619,7 @@ mod tests {
             tycho_broadcaster_ws_url: "ws://127.0.0.1:3001/ws".to_string(),
             bebop_url: "https://example.com/bebop".to_string(),
             hashflow_filename: "./hashflow.csv".to_string(),
+            liquorice_url: Some("https://example.com/liquorice".to_string()),
             api_key: "test-api-key".to_string(),
             rpc_url: rpc_url.map(str::to_string),
             tvl_threshold: 100.0,
@@ -583,6 +661,8 @@ mod tests {
             bebop_key: "bebop-key".to_string(),
             hashflow_user: "hashflow-user".to_string(),
             hashflow_key: "hashflow-key".to_string(),
+            liquorice_user: "liquorice-user".to_string(),
+            liquorice_key: "liquorice-key".to_string(),
         }
     }
 
@@ -625,7 +705,7 @@ mod tests {
                 "rocketpool".to_string(),
             ],
             vm_protocols: vec!["vm:curve".to_string()],
-            rfq_protocols: vec!["rfq:hashflow".to_string()],
+            rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
