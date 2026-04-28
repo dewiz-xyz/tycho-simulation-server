@@ -62,12 +62,3 @@ jobs:
           echo "Dispatching release-please.yaml for immediate tagging"
           gh workflow run release-please.yaml --repo "$REPO" --ref master
 
-      - name: Dispatch release-deploy to build semver image
-        if: steps.merge.outputs.merged != '0'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          echo "Dispatching release-deploy.yaml to build image with semver tag"
-          gh workflow run release-deploy.yaml --repo "$REPO" --ref master
