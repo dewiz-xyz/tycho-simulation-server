@@ -8,7 +8,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
-use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -25,6 +24,8 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
+
+use super::blocking_simulation_executor::{BlockingSimulationError, BlockingSimulationExecutor};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -1954,53 +1955,54 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
     } = input;
     let failure_descriptor = descriptor.clone();
     let blocking_cancel_token = cancel_token.clone();
-    let sleep_duration = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(Duration::from_millis(0));
-    let handle = spawn_blocking(move || {
-        let _permit = permit;
-        BlockingPoolRunner {
-            descriptor,
-            pool_state,
-            token_in,
-            token_out,
-            amounts,
-            slippage,
-            expected_len,
-            deadline,
-            cancel_token: blocking_cancel_token,
-        }
-        .run()
-    });
-    tokio::pin!(handle);
-
-    tokio::select! {
-        res = handle.as_mut() => {
-            match res {
-                Ok(result) => Ok(result),
-                Err(join_err) => {
-                    let context = failure_context(&failure_descriptor);
-                    let descriptor = format_pool_descriptor(&context);
-                    let message = format!("{}: Quote computation panicked: {}", descriptor, join_err);
-                    Err(make_failure(QuoteFailureKind::Internal, message, Some(context)))
-                }
+    let result = BlockingSimulationExecutor::new()
+        .run_until(deadline, cancel_token, permit, move || {
+            BlockingPoolRunner {
+                descriptor,
+                pool_state,
+                token_in,
+                token_out,
+                amounts,
+                slippage,
+                expected_len,
+                deadline,
+                cancel_token: blocking_cancel_token,
             }
+            .run()
+        })
+        .await;
+
+    match result {
+        Ok(result) => Ok(result),
+        Err(BlockingSimulationError::Join(join_err)) => {
+            let context = failure_context(&failure_descriptor);
+            let descriptor = format_pool_descriptor(&context);
+            let message = format!("{}: Quote computation panicked: {}", descriptor, join_err);
+            Err(make_failure(
+                QuoteFailureKind::Internal,
+                message,
+                Some(context),
+            ))
         }
-        _ = cancel_token.cancelled() => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
+        Err(BlockingSimulationError::Cancelled) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation cancelled", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+            Err(make_failure(
+                QuoteFailureKind::Timeout,
+                message,
+                Some(context),
+            ))
         }
-        _ = sleep(sleep_duration) => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
+        Err(BlockingSimulationError::TimedOut) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation timed out", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+            Err(make_failure(
+                QuoteFailureKind::Timeout,
+                message,
+                Some(context),
+            ))
         }
     }
 }
