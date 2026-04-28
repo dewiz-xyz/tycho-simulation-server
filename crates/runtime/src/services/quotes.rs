@@ -3704,6 +3704,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_amounts_out_preserves_request_amount_order() {
+        let fixture = BasicQuoteFixture::new();
+        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+
+        let computation = get_amounts_out(
+            app_state,
+            fixture.request("req-preserve-amount-order", &["30", "10", "20"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["30".to_string(), "10".to_string(), "20".to_string()]
+        );
+        assert_eq!(
+            computation.responses[0].gas_used,
+            vec![21_000, 21_000, 21_000]
+        );
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::Complete
+        );
+        assert!(computation.meta.failures.is_empty());
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
     async fn get_amounts_out_native_only_ignores_vm_rebuild_permits() {
         let fixture = BasicQuoteFixture::new();
         let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
@@ -4780,6 +4817,38 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert!(computation.meta.vm_unavailable);
+    }
+
+    #[tokio::test]
+    async fn vm_and_rfq_unavailable_are_true_when_enabled_backends_are_not_ready() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let computation = get_amounts_out(
+            app_state,
+            fixture.request("req-enabled-backends-not-ready", &["1"]),
+            None,
+        )
+        .await;
+
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert!(computation.meta.vm_unavailable);
+        assert!(computation.meta.rfq_unavailable);
+        assert!(computation.metrics.skipped_vm_unavailable);
+        assert!(computation.metrics.skipped_rfq_unavailable);
+        assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 0);
     }
 
     #[tokio::test]
