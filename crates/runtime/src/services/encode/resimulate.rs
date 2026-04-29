@@ -243,15 +243,25 @@ impl<'a> RouteResimulator<'a> {
             return Ok(entry.clone());
         }
 
+        if let Some((uses_vm, uses_rfq)) = self
+            .state
+            .pool_rebuild_guard_requirements(pool_id)
+            .await
+            .map_err(availability_error)?
+        {
+            if (uses_vm || uses_rfq) && !self.rebuild_guard.blocks_rebuilds() {
+                self.rebuild_guard = self
+                    .state
+                    .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
+                    .await;
+            }
+        }
+
         let (pool_state, component) = self
             .state
             .pool_by_id(pool_id)
             .await
-            .map_err(|availability| {
-                EncodeError::unavailable(availability.availability_message().unwrap_or_else(|| {
-                    unreachable!("unready pool lookup must have an availability message")
-                }))
-            })?
+            .map_err(availability_error)?
             .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
         let entry = CachedPoolEntry {
             backend: PoolBackend::from_component(component.as_ref()),
@@ -267,6 +277,14 @@ impl<'a> RouteResimulator<'a> {
     ) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
         build_resimulated_segments(self.normalized, &mut self.segment_states)
     }
+}
+
+fn availability_error(availability: crate::models::state::EncodeAvailability) -> EncodeError {
+    EncodeError::unavailable(
+        availability.availability_message().unwrap_or_else(|| {
+            unreachable!("unready pool lookup must have an availability message")
+        }),
+    )
 }
 
 fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<SegmentSimState> {
@@ -738,6 +756,110 @@ mod tests {
         assert!(
             !resimulation_task.is_finished(),
             "resimulation should wait before loading VM pool state"
+        );
+
+        let mut replacement_states = HashMap::new();
+        replacement_states.insert(
+            "pool-vm".to_string(),
+            Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
+        );
+        vm_state_store
+            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .await;
+
+        drop(request_guard);
+        let resimulated =
+            match tokio::time::timeout(Duration::from_millis(500), resimulation_task).await {
+                Ok(join_result) => match join_result {
+                    Ok(resimulation) => match resimulation {
+                        Ok(resimulated) => resimulated,
+                        Err(err) => panic!("resimulation should succeed: {}", err.message()),
+                    },
+                    Err(err) => panic!("resimulation task should not panic: {err}"),
+                },
+                Err(err) => panic!("resimulation should finish after guard release: {err}"),
+            };
+
+        let swap = &resimulated.segments[0].hops[0].swaps[0];
+        assert_eq!(swap.expected_amount_out, BigUint::from(20u32));
+        assert_eq!(step_multiplier(swap.pool_state.as_ref()), 2);
+    }
+
+    #[tokio::test]
+    async fn resimulate_route_upgrades_rebuild_guard_for_resolved_vm_pool() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(Arc::clone(&tokens_store));
+
+        let component = component_with_protocol(
+            "0x0000000000000000000000000000000000000009",
+            "vm:curve",
+            "curve_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-vm".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-vm".to_string(), component);
+        vm_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            Arc::clone(&vm_state_store),
+            rfq_state_store,
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request_guard = app_state.simulation_rebuild_gate().write_owned().await;
+        let token_in_address = token_in.address.clone();
+        let token_out_address = token_out.address.clone();
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![NormalizedSwapDraftInternal {
+                        pool: pool_ref("pool-vm"),
+                        token_in: token_in.address,
+                        token_out: token_out.address,
+                        split_bps: 0,
+                    }],
+                }],
+            }],
+        };
+        let state_for_task = app_state.clone();
+        let resimulation_task = tokio::spawn(async move {
+            let guard = state_for_task
+                .acquire_simulation_rebuild_guard(false, false)
+                .await;
+            resimulate_route(
+                &state_for_task,
+                &normalized,
+                Chain::Ethereum,
+                &token_in_address,
+                &token_out_address,
+                &state_for_task.native_token_protocol_allowlist,
+                guard,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !resimulation_task.is_finished(),
+            "resimulation should upgrade the no-op route guard before loading VM state"
         );
 
         let mut replacement_states = HashMap::new();

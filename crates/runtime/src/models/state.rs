@@ -68,6 +68,12 @@ pub(crate) struct SimulationRebuildGuard {
     _read_guard: Option<OwnedRwLockReadGuard<()>>,
 }
 
+impl SimulationRebuildGuard {
+    pub(crate) const fn blocks_rebuilds(&self) -> bool {
+        self._read_guard.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BroadcasterSubscriptionStatus {
     inner: Arc<RwLock<BroadcasterSubscriptionStatusData>>,
@@ -718,6 +724,41 @@ impl AppState {
         Arc::new(SimulationRebuildGuard {
             _read_guard: read_guard,
         })
+    }
+
+    pub(crate) async fn pool_rebuild_guard_requirements(
+        &self,
+        id: &str,
+    ) -> Result<Option<(bool, bool)>, EncodeAvailability> {
+        if self.native_state_store.has_pool(id).await {
+            return match self.native_readiness().await {
+                NativeReadiness::Ready => Ok(Some((false, false))),
+                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
+                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
+            };
+        }
+
+        if self.vm_state_store.has_pool(id).await {
+            return match self.vm_readiness().await {
+                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
+                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
+                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
+                VmReadiness::Ready => Ok(Some((true, false))),
+                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
+            };
+        }
+
+        if self.rfq_state_store.has_pool(id).await {
+            return match self.rfq_readiness().await {
+                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
+                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
+                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
+                RfqReadiness::Ready => Ok(Some((false, true))),
+                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
+            };
+        }
+
+        Ok(None)
     }
 
     pub async fn pool_by_id(&self, id: &str) -> Result<Option<PoolEntry>, EncodeAvailability> {
