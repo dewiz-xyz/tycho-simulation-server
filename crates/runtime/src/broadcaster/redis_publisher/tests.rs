@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -25,7 +26,7 @@ use super::{
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
+    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry, BroadcasterUpdateMessage,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -146,11 +147,7 @@ async fn promotion_allocates_generation_and_appends_marker_before_live_updates()
     assert_eq!(marker.entry.stream_id, "chain-1-stream-1");
     assert_eq!(marker.entry.message_seq, 1);
     assert_eq!(marker.entry.kind, BroadcasterMessageKind::Progress);
-    let progress = progress_payload(&marker.entry)?;
-    assert!(
-        progress.handoff.is_none(),
-        "first promotion on an empty Redis stream should write a normal marker"
-    );
+    let _progress = progress_payload(&marker.entry)?;
 
     let update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -172,7 +169,7 @@ async fn promotion_allocates_generation_and_appends_marker_before_live_updates()
 }
 
 #[tokio::test]
-async fn promotion_after_existing_tail_writes_handoff_marker() -> Result<()> {
+async fn promotion_after_existing_tail_forces_new_generation_boundary() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
@@ -184,13 +181,6 @@ async fn promotion_after_existing_tail_writes_handoff_marker() -> Result<()> {
         .await?;
     old.publish_accepted_payload(BroadcasterPayload::Update(old_update))
         .await?;
-    let old_tail = writer
-        .appends()
-        .await
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("old writer should leave a Redis tail"))?;
-
     let boundary = new
         .promote(base_heads([BroadcasterBackend::Native]), "new_active")
         .await?;
@@ -204,11 +194,7 @@ async fn promotion_after_existing_tail_writes_handoff_marker() -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!("new promotion should append a marker"))?;
     assert_eq!(redis_entry_id(&marker.entry)?, "2-1");
-    let handoff = progress_payload(&marker.entry)?
-        .handoff
-        .ok_or_else(|| anyhow!("promotion marker should include handoff proof"))?;
-    assert_eq!(handoff.previous_stream_id, old_tail.entry.stream_id);
-    assert_eq!(handoff.previous_entry_id, redis_entry_id(&old_tail.entry)?);
+    assert_eq!(progress_payload(&marker.entry)?.reason, "new_active");
     Ok(())
 }
 
@@ -265,6 +251,40 @@ async fn second_promoted_writer_fences_old_writer_before_append() -> Result<()> 
     assert_eq!(
         appends.last().map(|append| append.entry.stream_id.as_str()),
         Some("chain-1-stream-2")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_writer_cannot_append_or_commit_recovery_transaction() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
+        .await?;
+    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
+        .await?;
+
+    let transaction = super::BroadcasterRecoveryTransaction {
+        recovery_id: "stale-recovery".to_string(),
+        target_state_version: 2,
+        backends: vec![BroadcasterBackend::Native],
+        replacement_json: "replacement".to_string(),
+        buffer_a: Vec::new(),
+    };
+    let Err(error) = old
+        .publish_recovery(transaction, &AtomicBool::new(false))
+        .await
+    else {
+        return Err(anyhow!("stale writer recovery must be fenced"));
+    };
+
+    assert!(format!("{error:#}").contains("stale Redis broadcaster writer"));
+    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(
+        writer.appends().await.len(),
+        2,
+        "the stale transaction must append neither RecoveryStart nor RecoveryCommit"
     );
     Ok(())
 }
@@ -335,30 +355,177 @@ async fn configured_writer_lease_ttl_is_used_for_all_fenced_writer_commands() ->
 }
 
 #[tokio::test]
-async fn retired_publisher_does_not_run_generation_reset() -> Result<()> {
+async fn recovery_transaction_appends_start_chunks_buffer_a_and_commit_contiguously() -> Result<()>
+{
     let writer = FakeRedisWriter::default();
-    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
         .await?;
-    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
+    let transaction = super::BroadcasterRecoveryTransaction {
+        recovery_id: "recovery-contiguous".to_string(),
+        target_state_version: 2,
+        backends: vec![BroadcasterBackend::Native],
+        replacement_json: "x".repeat(3_600_000),
+        buffer_a: vec![BroadcasterUpdateMessage::from_tycho_update(
+            &update(BroadcasterBackend::Native, 11, "native-buffer-a"),
+            &HashMap::new(),
+        )?],
+    };
+
+    let publication = publisher
+        .publish_recovery(transaction, &AtomicBool::new(false))
         .await?;
-    writer.expire_active_writer().await;
-    let _ = old.renew_lease().await;
+    let appends = writer.appends().await;
+    let recovery_entries = &appends[1..];
 
-    let _ = old
-        .reset_generation_boundary(
-            "shared broadcaster generation reset",
-            vec![BroadcasterBackend::Native],
-        )
-        .await;
-
-    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(publication.chunk_count, 2);
+    assert_eq!(publication.buffer_a_count, 1);
     assert_eq!(
-        writer.appends().await.len(),
-        2,
-        "retired publishers must not append reset markers"
+        recovery_entries
+            .iter()
+            .map(|append| append.entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            BroadcasterMessageKind::RecoveryStart,
+            BroadcasterMessageKind::RecoveryChunk,
+            BroadcasterMessageKind::RecoveryChunk,
+            BroadcasterMessageKind::RecoveryCatchUp,
+            BroadcasterMessageKind::RecoveryCommit,
+        ]
     );
+    assert_eq!(
+        recovery_entries
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6]
+    );
+    assert_eq!(publication.commit_entry_id, "1-6");
+    Ok(())
+}
+
+#[tokio::test]
+async fn identical_recovery_duplicate_is_accepted_after_lost_append_reply() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    writer.lose_next_append_replies(1).await;
+
+    publisher
+        .publish_recovery(
+            super::BroadcasterRecoveryTransaction {
+                recovery_id: "recovery-identical-duplicate".to_string(),
+                target_state_version: 2,
+                backends: vec![BroadcasterBackend::Native],
+                replacement_json: "replacement".to_string(),
+                buffer_a: Vec::new(),
+            },
+            &AtomicBool::new(false),
+        )
+        .await?;
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends
+            .iter()
+            .filter(|append| append.entry.kind == BroadcasterMessageKind::RecoveryStart)
+            .count(),
+        1,
+        "retrying the same deterministic entry must adopt the existing fields"
+    );
+    assert_eq!(writer.append_attempt_count().await, appends.len());
+    assert_eq!(
+        appends.last().map(|append| append.entry.kind),
+        Some(BroadcasterMessageKind::RecoveryCommit)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflicting_recovery_duplicate_is_rejected() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    writer.conflict_next_append_replies(1).await;
+
+    let Err(error) = publisher
+        .publish_recovery(
+            super::BroadcasterRecoveryTransaction {
+                recovery_id: "recovery-conflicting-duplicate".to_string(),
+                target_state_version: 2,
+                backends: vec![BroadcasterBackend::Native],
+                replacement_json: "replacement".to_string(),
+                buffer_a: Vec::new(),
+            },
+            &AtomicBool::new(false),
+        )
+        .await
+    else {
+        return Err(anyhow!(
+            "conflicting deterministic recovery entry must fail"
+        ));
+    };
+
+    assert!(format!("{error:#}").contains("conflicting Redis broadcaster entry"));
+    assert!(writer
+        .appends()
+        .await
+        .iter()
+        .all(|append| append.entry.kind != BroadcasterMessageKind::RecoveryCommit));
+    Ok(())
+}
+
+#[test]
+fn encoded_redis_entry_limits_accept_the_boundary_and_reject_the_next_payload() -> Result<()> {
+    for (kind, limit) in [
+        (
+            BroadcasterMessageKind::RecoveryChunk,
+            super::RECOVERY_REDIS_ENTRY_MAX_BYTES,
+        ),
+        (
+            BroadcasterMessageKind::Update,
+            super::LIVE_REDIS_ENTRY_MAX_BYTES,
+        ),
+    ] {
+        let config = publisher_config();
+        let mut entry = BroadcasterRedisStreamEntry {
+            schema_version: "1".to_string(),
+            chain_id: Chain::Ethereum.id(),
+            stream_id: "chain-1-stream-1".to_string(),
+            message_seq: 2,
+            kind,
+            snapshot_id: Some("chain-1-snapshot-1".to_string()),
+            backend_scope: "native".to_string(),
+            block_number: Some(1),
+            observed_timestamp_ms: None,
+            published_at_ms: 1,
+            payload_json: String::new(),
+        };
+        let mut low = 0usize;
+        let mut high = limit;
+        while low < high {
+            let candidate = low + (high - low).div_ceil(2);
+            entry.payload_json = "x".repeat(candidate);
+            if super::redis_entry_encoded_size(&config, &entry)? <= limit {
+                low = candidate;
+            } else {
+                high = candidate - 1;
+            }
+        }
+        entry.payload_json = "x".repeat(low);
+        let accepted = super::ensure_redis_entry_size(&config, &entry, limit)?;
+        entry.payload_json.push('x');
+        let rejected = super::redis_entry_encoded_size(&config, &entry)?;
+
+        assert!(accepted <= limit);
+        assert!(rejected > limit);
+        assert!(super::ensure_redis_entry_size(&config, &entry, limit).is_err());
+    }
     Ok(())
 }
 
@@ -382,46 +549,6 @@ async fn stale_active_writer_cannot_return_replay_boundary_after_new_promotion()
         writer.appends().await.len(),
         2,
         "replay-boundary fencing must not append Redis entries"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn stale_active_writer_cannot_reset_generation_or_repromote() -> Result<()> {
-    let writer = FakeRedisWriter::default();
-    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
-        .await?;
-    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
-        .await?;
-
-    let Err(error) = old
-        .reset_generation_boundary(
-            "shared broadcaster generation reset",
-            vec![BroadcasterBackend::Native],
-        )
-        .await
-    else {
-        return Err(anyhow!(
-            "stale old writer must not reset or re-promote a writer generation"
-        ));
-    };
-
-    assert!(format!("{error:#}").contains("stale Redis broadcaster writer"));
-    assert_eq!(old.status_snapshot().await.mode, "retired");
-    assert_eq!(
-        writer
-            .appends()
-            .await
-            .iter()
-            .map(|append| (append.entry.stream_id.clone(), append.entry.message_seq))
-            .collect::<Vec<_>>(),
-        vec![
-            ("chain-1-stream-1".to_string(), 1),
-            ("chain-1-stream-2".to_string(), 1)
-        ],
-        "stale reset must not append a new generation marker"
     );
     Ok(())
 }
@@ -609,7 +736,7 @@ async fn readiness_triggering_update_is_published_as_a_delta() -> Result<()> {
 }
 
 #[tokio::test]
-async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()> {
+async fn retry_exhaustion_marks_publisher_unhealthy() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
@@ -638,7 +765,6 @@ async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()>
 
     let failed_status = publisher.status_snapshot().await;
     assert!(!failed_status.healthy);
-    assert_eq!(failed_status.generation_reset_count, 0);
     assert_eq!(failed_status.retry_exhaustion_count, 1);
     assert_eq!(failed_status.stream_id, "chain-1-stream-1");
     assert!(failed_status.replay_boundary.is_none());
@@ -648,69 +774,6 @@ async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()>
         .unwrap_or("")
         .contains("planned append failure"));
 
-    writer.fail_next_appends(0).await;
-    let blocked_update = raw_cache
-        .apply_update(&update(BroadcasterBackend::Native, 12, "native-3"))
-        .await?;
-    let Err(error) = publisher
-        .publish_accepted_payload(BroadcasterPayload::Update(blocked_update))
-        .await
-    else {
-        return Err(anyhow!(
-            "publisher should stay unavailable until the shared generation reset"
-        ));
-    };
-    assert!(format!("{error:#}").contains("publisher is unhealthy"));
-    assert_eq!(
-        writer.appends().await.len(),
-        1,
-        "a blocked publisher must not append into a Redis-only generation"
-    );
-
-    publisher
-        .reset_generation_boundary(
-            "shared broadcaster generation reset",
-            vec![BroadcasterBackend::Native],
-        )
-        .await?;
-    let reset_status = publisher.status_snapshot().await;
-    assert!(reset_status.healthy);
-    assert_eq!(reset_status.generation_reset_count, 1);
-    assert_eq!(reset_status.retry_exhaustion_count, 1);
-    assert_eq!(reset_status.stream_id, "chain-1-stream-2");
-    assert!(reset_status.replay_boundary.is_some());
-    let appends_after_reset = writer.appends().await;
-    let reset_marker = appends_after_reset
-        .last()
-        .ok_or_else(|| anyhow!("generation reset should publish a Redis progress marker"))?;
-    assert_generation_reset_marker(&reset_marker.entry)?;
-
-    let recovered_update = raw_cache
-        .apply_update(&update(BroadcasterBackend::Native, 13, "native-4"))
-        .await?;
-    publisher
-        .publish_accepted_payload(BroadcasterPayload::Update(recovered_update))
-        .await?;
-
-    let recovered_status = publisher.status_snapshot().await;
-    assert!(recovered_status.healthy);
-    assert_eq!(recovered_status.stream_id, "chain-1-stream-2");
-    assert!(recovered_status.replay_boundary.is_some());
-    assert!(recovered_status.last_error.is_none());
-
-    let recovered_stream_entries = writer
-        .appends()
-        .await
-        .into_iter()
-        .filter(|append| append.entry.stream_id == recovered_status.stream_id)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        recovered_stream_entries
-            .iter()
-            .map(|append| append.entry.message_seq)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
     Ok(())
 }
 
@@ -741,7 +804,6 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
     let failed_status = publisher.status_snapshot().await;
     assert!(!failed_status.healthy);
     assert_eq!(failed_status.append_failure_count, 1);
-    assert_eq!(failed_status.generation_reset_count, 0);
     assert_eq!(failed_status.retry_exhaustion_count, 1);
     assert!(failed_status.replay_boundary.is_none());
     assert_eq!(writer.appends().await.len(), 1);
@@ -791,6 +853,7 @@ fn redis_entry_id_uses_generation_and_message_sequence() -> Result<()> {
         backend_scope: "native".to_string(),
         block_number: Some(11),
         observed_timestamp_ms: None,
+        published_at_ms: 1,
         payload_json: "{}".to_string(),
     };
 
@@ -799,7 +862,7 @@ fn redis_entry_id_uses_generation_and_message_sequence() -> Result<()> {
 }
 
 #[test]
-fn redis_progress_entry_carries_generation_reset_reason() -> Result<()> {
+fn redis_progress_entry_carries_writer_promotion_reason() -> Result<()> {
     let envelope = simulator_core::broadcaster::BroadcasterEnvelope::new(
         "chain-1-stream-2",
         1,
@@ -831,6 +894,7 @@ fn redis_xadd_recovery_requires_existing_entry_to_match_exact_fields() -> Result
         backend_scope: "native".to_string(),
         block_number: Some(12),
         observed_timestamp_ms: None,
+        published_at_ms: 1,
         payload_json: "{}".to_string(),
     };
     let entry_id = redis_entry_id(&entry)?;
@@ -873,26 +937,6 @@ fn progress_payload(entry: &BroadcasterRedisStreamEntry) -> Result<BroadcasterPr
     Ok(progress)
 }
 
-fn assert_no_progress_handoff(entry: &BroadcasterRedisStreamEntry, context: &str) -> Result<()> {
-    assert!(
-        progress_payload(entry)?.handoff.is_none(),
-        "{context} must stay normal progress markers"
-    );
-    Ok(())
-}
-
-fn assert_generation_reset_marker(entry: &BroadcasterRedisStreamEntry) -> Result<()> {
-    assert_eq!(entry.stream_id, "chain-1-stream-2");
-    assert_eq!(entry.message_seq, 1);
-    assert_eq!(entry.kind, BroadcasterMessageKind::Progress);
-    assert_eq!(entry.backend_scope, "native");
-    assert_no_progress_handoff(entry, "shared generation reset markers")?;
-    assert!(entry
-        .payload_json
-        .contains("shared broadcaster generation reset"));
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 struct CapturedAppend {
     entry: BroadcasterRedisStreamEntry,
@@ -926,6 +970,8 @@ struct FakeRedisWriterState {
     lease_expired: bool,
     lease_ttls: Vec<Duration>,
     fail_next_appends: usize,
+    lose_next_append_replies: usize,
+    conflict_next_append_replies: usize,
     append_delay: Option<Duration>,
     append_attempt_count: usize,
 }
@@ -933,6 +979,14 @@ struct FakeRedisWriterState {
 impl FakeRedisWriter {
     async fn fail_next_appends(&self, count: usize) {
         self.inner.lock().await.fail_next_appends = count;
+    }
+
+    async fn lose_next_append_replies(&self, count: usize) {
+        self.inner.lock().await.lose_next_append_replies = count;
+    }
+
+    async fn conflict_next_append_replies(&self, count: usize) {
+        self.inner.lock().await.conflict_next_append_replies = count;
     }
 
     async fn delay_appends(&self, delay: Duration) {
@@ -987,29 +1041,8 @@ impl RedisStreamWriter for FakeRedisWriter {
             guard.lease_expired = false;
             let generation = guard.active_generation;
             let entry_id = format!("{generation}-1");
-            let previous_tail = guard.appends.last().cloned();
-            let marker_fields =
-                if previous_tail.is_some() && !command.handoff_marker_fields.is_empty() {
-                    command.handoff_marker_fields
-                } else {
-                    command.normal_marker_fields
-                };
-            let previous_stream_id = previous_tail
-                .as_ref()
-                .map(|append| append.entry.stream_id.as_str())
-                .unwrap_or_default();
-            let previous_entry_id = previous_tail
-                .as_ref()
-                .map(|append| redis_entry_id(&append.entry))
-                .transpose()?
-                .unwrap_or_default();
             guard.appends.push(CapturedAppend {
-                entry: entry_from_fields(
-                    marker_fields,
-                    generation,
-                    previous_stream_id,
-                    &previous_entry_id,
-                )?,
+                entry: entry_from_fields(command.normal_marker_fields, generation)?,
             });
             Ok(super::RedisPromotionResult {
                 generation,
@@ -1042,9 +1075,31 @@ impl RedisStreamWriter for FakeRedisWriter {
                 return Err(anyhow!("planned append failure"));
             }
             let entry_id = redis_entry_id(command.entry)?;
+            if let Some(existing) = guard.appends.iter().find(|append| {
+                redis_entry_id(&append.entry).is_ok_and(|existing_id| existing_id == entry_id)
+            }) {
+                return if existing.entry == *command.entry {
+                    Ok(entry_id)
+                } else {
+                    Err(anyhow!(
+                        "conflicting Redis broadcaster entry already exists at {entry_id}"
+                    ))
+                };
+            }
+            if guard.conflict_next_append_replies > 0 {
+                guard.conflict_next_append_replies -= 1;
+                let mut conflicting = command.entry.clone();
+                conflicting.payload_json.push('x');
+                guard.appends.push(CapturedAppend { entry: conflicting });
+                return Err(anyhow!("planned lost append reply"));
+            }
             guard.appends.push(CapturedAppend {
                 entry: command.entry.clone(),
             });
+            if guard.lose_next_append_replies > 0 {
+                guard.lose_next_append_replies -= 1;
+                return Err(anyhow!("planned lost append reply"));
+            }
             Ok(entry_id)
         })
     }
@@ -1071,15 +1126,11 @@ impl RedisStreamWriter for FakeRedisWriter {
 fn entry_from_fields(
     fields: &[(String, String)],
     generation: u64,
-    previous_stream_id: &str,
-    previous_entry_id: &str,
 ) -> Result<BroadcasterRedisStreamEntry> {
     let mut value = serde_json::Map::new();
     for (field, field_value) in fields {
-        let field_value = field_value
-            .replace(super::GENERATION_PLACEHOLDER, &generation.to_string())
-            .replace(super::PREVIOUS_STREAM_ID_PLACEHOLDER, previous_stream_id)
-            .replace(super::PREVIOUS_ENTRY_ID_PLACEHOLDER, previous_entry_id);
+        let field_value =
+            field_value.replace(super::GENERATION_PLACEHOLDER, &generation.to_string());
         value.insert(field.clone(), serde_json::Value::String(field_value));
     }
     serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
