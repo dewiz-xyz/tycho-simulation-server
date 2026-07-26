@@ -341,6 +341,9 @@ start_broadcaster_if_local() {
     echo "Broadcaster URL is not loopback http://; assuming broadcaster is externally managed."
     return 0
   fi
+  if [[ -z "${TYCHO_API_KEY:-}" ]]; then
+    echo "Warning: TYCHO_API_KEY is not set; the local broadcaster may fail to start." >&2
+  fi
 
   local broadcaster_pid_file="$repo/.tycho-broadcaster-service.pid"
   local broadcaster_metadata_file="$repo/.tycho-broadcaster-service.meta"
@@ -359,18 +362,13 @@ start_broadcaster_if_local() {
         write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"
       fi
       echo "Broadcaster service already running (pid $broadcaster_pid)."
+      wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
       return 0
     fi
     if [[ "$status_state" == "chain-mismatch" ]]; then
       echo "Broadcaster already responding at $status_url for chain_id=$actual_chain, expected CHAIN_ID=$CHAIN_ID." >&2
       return 1
     fi
-    if [[ "$status_state" == "redis-unhealthy" ]]; then
-      echo "Broadcaster service is running but Redis publisher is unhealthy; waiting for recovery."
-      wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
-      return 0
-    fi
-
     if broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"; then
       echo "Broadcaster service already running (pid $broadcaster_pid)."
       wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
@@ -392,18 +390,13 @@ start_broadcaster_if_local() {
   read -r status_state status_code actual_chain <<<"$status_check"
   if [[ "$status_state" == "ok" ]]; then
     echo "Broadcaster already responding at $status_url (HTTP $status_code)."
+    wait_for_broadcaster_http "$status_url" "" "$broadcaster_log_file"
     return 0
   fi
   if [[ "$status_state" == "chain-mismatch" ]]; then
     echo "Broadcaster already responding at $status_url for chain_id=$actual_chain, expected CHAIN_ID=$CHAIN_ID." >&2
     return 1
   fi
-  if [[ "$status_state" == "redis-unhealthy" ]]; then
-    echo "Broadcaster already responding at $status_url but Redis publisher is unhealthy; waiting for recovery."
-    wait_for_broadcaster_http "$status_url" "" "$broadcaster_log_file"
-    return 0
-  fi
-
   mkdir -p "$repo/logs"
 
   (
@@ -434,7 +427,7 @@ wait_for_broadcaster_http() {
     read -r status_state status_code actual_chain <<<"$status_check"
     if [[ "$status_state" == "ok" ]]; then
       echo "Broadcaster HTTP is responding at $status_url (HTTP $status_code)."
-      return 0
+      break
     fi
     if [[ "$status_state" == "chain-mismatch" ]]; then
       echo "Broadcaster HTTP at $status_url reports chain_id=$actual_chain, expected CHAIN_ID=$CHAIN_ID. See $log_file." >&2
@@ -455,6 +448,40 @@ wait_for_broadcaster_http() {
     now="$(date +%s)"
     if ((now - start_time >= local_broadcaster_start_timeout)); then
       echo "Timed out waiting for broadcaster HTTP at $status_url. See $log_file." >&2
+      return 1
+    fi
+
+    sleep 2
+  done
+
+  local ready_url="${status_url%/status}/ready"
+  while true; do
+    local ready_check ready_state ready_code ready_chain
+    ready_check="$(broadcaster_ready_check "$ready_url" "$CHAIN_ID")"
+    read -r ready_state ready_code ready_chain <<<"$ready_check"
+    if [[ "$ready_state" == "ok" ]]; then
+      echo "Broadcaster is ready at $ready_url (HTTP $ready_code)."
+      return 0
+    fi
+    if [[ "$ready_state" == "chain-mismatch" ]]; then
+      echo "Broadcaster readiness at $ready_url reports chain_id=$ready_chain, expected CHAIN_ID=$CHAIN_ID. See $log_file." >&2
+      return 1
+    fi
+
+    if [[ -n "$pid_file" ]]; then
+      local pid
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if ! pid_is_running "$pid"; then
+        echo "Broadcaster service exited before readiness. See $log_file." >&2
+        rm -f "$pid_file"
+        return 1
+      fi
+    fi
+
+    local now
+    now="$(date +%s)"
+    if ((now - start_time >= local_broadcaster_start_timeout)); then
+      echo "Timed out waiting for broadcaster readiness at $ready_url. See $log_file." >&2
       return 1
     fi
 
@@ -502,10 +529,47 @@ if (
     actual_chain_id = payload["chain_id"]
     if actual_chain_id != expected_chain_id:
         print(f"chain-mismatch {http_code} {actual_chain_id}")
-    elif payload["status"] == "redis_publisher_unhealthy":
-        print(f"redis-unhealthy {http_code}")
-    else:
+    elif http_code == "200":
         print(f"ok {http_code}")
+PY
+}
+
+broadcaster_ready_check() {
+  local ready_url="$1"
+  local expected_chain_id="$2"
+  local response http_code body
+
+  response="$(curl -sS --max-time 2 -w $'\n%{http_code}' "$ready_url" 2>/dev/null || true)"
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [[ -z "$http_code" || "$http_code" == "000" ]]; then
+    return 0
+  fi
+
+  BROADCASTER_STATUS_BODY="$body" python3 - "$http_code" "$expected_chain_id" <<'PY'
+import json
+import os
+import sys
+
+http_code = sys.argv[1]
+expected_chain_id = int(sys.argv[2])
+
+try:
+    payload = json.loads(os.environ["BROADCASTER_STATUS_BODY"])
+except (json.JSONDecodeError, ValueError):
+    raise SystemExit(0)
+
+if not isinstance(payload, dict) or not isinstance(payload.get("chain_id"), int):
+    raise SystemExit(0)
+
+actual_chain_id = payload["chain_id"]
+if actual_chain_id != expected_chain_id:
+    print(f"chain-mismatch {http_code} {actual_chain_id}")
+elif http_code == "200" and payload.get("status") == "ready":
+    print(f"ok {http_code}")
+else:
+    print(f"unready {http_code}")
 PY
 }
 
@@ -570,10 +634,6 @@ if [[ -f "$repo/.env" ]]; then
   set +a
 else
   echo "Warning: .env not found; ensure TYCHO_API_KEY is set." >&2
-fi
-
-if [[ -z "${TYCHO_API_KEY:-}" ]]; then
-  echo "Warning: TYCHO_API_KEY not set; server may fail to start." >&2
 fi
 
 if [[ -z "${RUST_LOG:-}" ]]; then

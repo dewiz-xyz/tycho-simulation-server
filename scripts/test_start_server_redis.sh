@@ -124,11 +124,18 @@ curl() {
   printf '%s\n%s' "$TEST_STATUS_BODY" "$TEST_STATUS_CODE"
 }
 
-TEST_STATUS_CODE=503
+TEST_STATUS_CODE=200
 TEST_STATUS_BODY='{"status":"redis_publisher_unhealthy","chain_id":8453,"upstream":{},"snapshot":{},"snapshot_sessions":{},"backends":{},"redis_publisher":{"healthy":false}}'
 status_check="$(broadcaster_status_check "http://127.0.0.1:3001/status" "8453")"
-[[ "$status_check" == "redis-unhealthy 503" ]] || {
-  echo "expected redis-unhealthy status check, got $status_check" >&2
+[[ "$status_check" == "ok 200" ]] || {
+  echo "expected liveness status check, got $status_check" >&2
+  exit 1
+}
+
+TEST_STATUS_CODE=503
+ready_check="$(broadcaster_ready_check "http://127.0.0.1:3001/ready" "8453")"
+[[ "$ready_check" == "unready 503" ]] || {
+  echo "expected unready readiness check, got $ready_check" >&2
   exit 1
 }
 

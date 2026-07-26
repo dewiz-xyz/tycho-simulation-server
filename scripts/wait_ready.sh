@@ -3,15 +3,15 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: wait_ready.sh [--url <status_url>] [--timeout <seconds>] [--interval <seconds>] [--expect-chain-id <id>] [--require-vm-ready] [--require-vm-pools-min <count>] [--require-rfq-ready] [--require-rfq-pools-min <count>]
+Usage: wait_ready.sh [--url <ready_url>] [--timeout <seconds>] [--interval <seconds>] [--expect-chain-id <id>] [--require-vm-ready] [--require-vm-pools-min <count>] [--require-rfq-ready] [--require-rfq-pools-min <count>]
 
-Poll the /status endpoint until native readiness is ready or times out.
+Poll the /ready endpoint until native readiness is ready or times out.
 
 Options:
-  --url                  Status URL (default: http://localhost:3000/status)
+  --url                  Readiness URL (default: http://localhost:3000/ready)
   --timeout              Timeout in seconds (default: 180)
   --interval             Poll interval in seconds (default: 2)
-  --expect-chain-id      Require /status.chain_id to match this chain id
+  --expect-chain-id      Require /ready.chain_id to match this chain id
   --require-vm-ready     Require backends.vm.status=ready before succeeding
   --require-vm-pools-min Minimum backends.vm.pool_count required when --require-vm-ready is set (default: 1)
   --require-rfq-ready    Require backends.rfq.status=ready before succeeding
@@ -20,7 +20,7 @@ Options:
 USAGE
 }
 
-url="http://localhost:3000/status"
+url="http://localhost:3000/ready"
 timeout=180
 interval=2
 expect_chain_id=""

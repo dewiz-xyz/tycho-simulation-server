@@ -318,6 +318,10 @@ if [[ -z "${BROADCASTER_REDIS_STREAM_KEY:-}" ]]; then
   echo "BROADCASTER_REDIS_STREAM_KEY is required." >&2
   exit 2
 fi
+if [[ "${BROADCASTER_REDIS_MAXLEN:-5000}" != "5000" ]]; then
+  echo "BROADCASTER_REDIS_MAXLEN must be 5000 for the shared broadcaster retention contract." >&2
+  exit 2
+fi
 
 if [[ -z "$status_url" ]]; then
   status_url="$(derive_status_url)"
@@ -385,5 +389,6 @@ echo "Broadcaster status URL: $status_url"
 echo "Simulator status URL: $simulator_status_url"
 echo "Redis stream key: $BROADCASTER_REDIS_STREAM_KEY"
 echo "Redis stream entries: $stream_len"
+echo "Redis retention target: ${BROADCASTER_REDIS_MAXLEN:-5000}"
 echo "Replay boundary checkpoint: $boundary_entry_id"
 echo "Simulator replay backends: $checked_backends"
