@@ -49,6 +49,19 @@ impl StreamHealth {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(block: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            inner: Arc::new(RwLock::new(StreamHealthData {
+                started_at: Some(now),
+                last_update_at: Some(now),
+                last_block: block,
+                ..StreamHealthData::default()
+            })),
+        }
+    }
+
     pub async fn mark_started(&self) {
         let mut guard = self.inner.write().await;
         let now = Instant::now();
@@ -57,10 +70,24 @@ impl StreamHealth {
         guard.last_block = 0;
     }
 
+    pub async fn mark_started_preserving_head(&self) {
+        let mut guard = self.inner.write().await;
+        guard.started_at = Some(Instant::now());
+        guard.last_update_at = None;
+    }
+
     pub async fn record_update(&self, block: u64) {
         let mut guard = self.inner.write().await;
         guard.last_update_at = Some(Instant::now());
         guard.last_block = block;
+    }
+
+    pub async fn record_progress(&self, block: u64) {
+        let mut guard = self.inner.write().await;
+        if block > guard.last_block {
+            guard.last_update_at = Some(Instant::now());
+            guard.last_block = block;
+        }
     }
 
     pub async fn record_missing_block(&self, now: Instant, window: Duration) -> BurstUpdate {

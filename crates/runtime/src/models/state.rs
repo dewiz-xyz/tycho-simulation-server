@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
-use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{watch, Mutex, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
@@ -127,6 +126,7 @@ struct BroadcasterSubscriptionStatusData {
     redis_transport_status: RedisTransportStatus,
     redis_transport_retry_count: u64,
     redis_transport_last_error: Option<String>,
+    publisher_to_consumer_delay_ms: Option<u64>,
     restart_count: u64,
     last_error: Option<String>,
 }
@@ -144,6 +144,7 @@ pub struct BroadcasterSubscriptionSnapshot {
     pub redis_transport_status: RedisTransportStatus,
     pub redis_transport_retry_count: u64,
     pub redis_transport_last_error: Option<String>,
+    pub publisher_to_consumer_delay_ms: Option<u64>,
     pub restart_count: u64,
     pub last_error: Option<String>,
 }
@@ -162,6 +163,7 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_transport_status = RedisTransportStatus::Connecting;
         guard.redis_transport_retry_count = 0;
         guard.redis_transport_last_error = None;
+        guard.publisher_to_consumer_delay_ms = None;
         guard.last_error = None;
     }
 
@@ -182,6 +184,7 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_transport_status = RedisTransportStatus::Connecting;
         guard.redis_transport_retry_count = 0;
         guard.redis_transport_last_error = None;
+        guard.publisher_to_consumer_delay_ms = None;
         guard.last_error = None;
     }
 
@@ -199,21 +202,19 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_transport_status = RedisTransportStatus::Connected;
         guard.redis_transport_retry_count = 0;
         guard.redis_transport_last_error = None;
+        guard.publisher_to_consumer_delay_ms = None;
         guard.last_error = None;
     }
 
-    pub async fn mark_redis_generation_continued(&self, boundary: BroadcasterRedisReplayBoundary) {
+    pub async fn mark_recovery_started(&self) {
         let mut guard = self.inner.write().await;
         guard.connected = true;
-        guard.bootstrap_complete = true;
-        guard.stream_id = Some(boundary.stream_id.clone());
-        guard.snapshot_id = Some(boundary.snapshot_id.clone());
-        guard.redis_replay_checkpoint = Some(boundary.exclusive_entry_id());
-        guard.redis_replay_boundary = Some(boundary);
+        guard.bootstrap_complete = false;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
         guard.redis_transport_status = RedisTransportStatus::Connected;
         guard.redis_transport_last_error = None;
+        guard.publisher_to_consumer_delay_ms = None;
         guard.last_error = None;
     }
 
@@ -255,6 +256,14 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_transport_last_error = Some(error.into());
     }
 
+    pub async fn record_publisher_to_consumer_delay(&self, published_at_ms: u64) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
+        self.inner.write().await.publisher_to_consumer_delay_ms =
+            Some(now_ms.saturating_sub(published_at_ms));
+    }
+
     pub async fn mark_disconnected(&self, last_error: Option<String>) {
         let mut guard = self.inner.write().await;
         guard.connected = false;
@@ -268,6 +277,7 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_transport_status = RedisTransportStatus::Connecting;
         guard.redis_transport_retry_count = 0;
         guard.redis_transport_last_error = None;
+        guard.publisher_to_consumer_delay_ms = None;
         guard.restart_count = guard.restart_count.saturating_add(1);
         guard.last_error = last_error;
     }
@@ -286,6 +296,7 @@ impl BroadcasterSubscriptionStatus {
             redis_transport_status: guard.redis_transport_status,
             redis_transport_retry_count: guard.redis_transport_retry_count,
             redis_transport_last_error: guard.redis_transport_last_error.clone(),
+            publisher_to_consumer_delay_ms: guard.publisher_to_consumer_delay_ms,
             restart_count: guard.restart_count,
             last_error: guard.last_error.clone(),
         }
@@ -305,6 +316,7 @@ impl BroadcasterSubscriptionStatus {
                 redis_transport_status: RedisTransportStatus::Connected,
                 redis_transport_retry_count: 0,
                 redis_transport_last_error: None,
+                publisher_to_consumer_delay_ms: Some(0),
                 restart_count: 0,
                 last_error: None,
             })),
@@ -473,6 +485,7 @@ pub struct SimulatorBackendStatusSnapshot {
     pub last_error: Option<String>,
     pub rebuild_duration_ms: Option<u64>,
     pub last_update_age_ms: Option<u64>,
+    pub publisher_to_consumer_delay_ms: Option<u64>,
     pub subscription: Option<SimulatorBackendSubscriptionSnapshot>,
 }
 
@@ -604,6 +617,7 @@ impl AppState {
             last_error: subscription.last_error.clone().or(stream_last_error),
             rebuild_duration_ms: None,
             last_update_age_ms,
+            publisher_to_consumer_delay_ms: subscription.publisher_to_consumer_delay_ms,
             subscription: Some(subscription.into()),
         }
     }
@@ -655,6 +669,7 @@ impl AppState {
                 None
             },
             last_update_age_ms,
+            publisher_to_consumer_delay_ms: subscription.publisher_to_consumer_delay_ms,
             subscription: self.enable_vm_pools.then_some(subscription.into()),
         }
     }
@@ -698,6 +713,7 @@ impl AppState {
             last_error: subscription.last_error.clone(),
             rebuild_duration_ms: None,
             last_update_age_ms,
+            publisher_to_consumer_delay_ms: subscription.publisher_to_consumer_delay_ms,
             subscription: self.enable_rfq_pools.then_some(subscription.into()),
         }
     }
@@ -728,31 +744,7 @@ impl AppState {
     }
 
     pub async fn is_ready(&self) -> bool {
-        if !matches!(self.native_readiness().await, NativeReadiness::Ready) {
-            return false;
-        }
-
-        if self.enable_vm_pools
-            && self
-                .vm_broadcaster_subscription
-                .snapshot()
-                .await
-                .redis_gap_reason
-                .is_some()
-        {
-            return false;
-        }
-        if self.enable_rfq_pools
-            && self
-                .rfq_broadcaster_subscription
-                .snapshot()
-                .await
-                .redis_gap_reason
-                .is_some()
-        {
-            return false;
-        }
-        true
+        matches!(self.native_readiness().await, NativeReadiness::Ready)
     }
 
     pub fn readiness_stale_ms(&self) -> u64 {
@@ -1024,7 +1016,7 @@ impl AppState {
 fn is_update_stale(last_update_age_ms: Option<u64>, readiness_stale_ms: u64) -> bool {
     last_update_age_ms
         .map(|age| age >= readiness_stale_ms)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn subscription_readiness_reason(
@@ -1046,12 +1038,6 @@ fn subscription_readiness_reason(
 fn service_status_from_backends(
     backends: &[SimulatorBackendStatusSnapshot],
 ) -> SimulatorServiceStatus {
-    if backends.iter().any(|backend| {
-        backend.enabled && backend.reason == Some(SimulatorReadinessReason::RedisReplayGap)
-    }) {
-        return SimulatorServiceStatus::WarmingUp;
-    }
-
     match backends
         .first()
         .map(|backend| backend.readiness)
@@ -1092,47 +1078,71 @@ pub struct VmStreamStatus {
 }
 
 pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-type SharedPoolStates = Arc<RwLock<HashMap<String, PoolEntry>>>;
 
-#[derive(Clone, Default)]
-struct ProtocolShard {
-    states: SharedPoolStates,
+#[derive(Clone)]
+struct PublishedStateStore {
+    version: u64,
+    shards: HashMap<ProtocolKind, HashMap<String, PoolEntry>>,
+    id_to_kind: HashMap<String, ProtocolKind>,
+    token_index: HashMap<Bytes, HashSet<String>>,
+    tokens: HashMap<Bytes, Token>,
+    wrapped_native_token: Option<Bytes>,
+    block_number: u64,
+    ready: bool,
 }
 
-impl ProtocolShard {
-    async fn insert_new(
-        &self,
-        id: String,
-        state: Arc<dyn ProtocolSim>,
-        component: Arc<ProtocolComponent>,
-    ) {
-        let mut guard = self.states.write().await;
-        guard.insert(id, (state, component));
-    }
+impl PublishedStateStore {
+    fn empty(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
+        let mut shards = HashMap::new();
+        for kind in ProtocolKind::ALL {
+            shards.insert(kind, HashMap::new());
+        }
 
-    async fn update_state(&self, id: &str, state: Arc<dyn ProtocolSim>) -> bool {
-        let mut guard = self.states.write().await;
-        if let Some((existing_state, _)) = guard.get_mut(id) {
-            *existing_state = state;
-            true
-        } else {
-            false
+        Self {
+            version: 0,
+            shards,
+            id_to_kind: HashMap::new(),
+            token_index: HashMap::new(),
+            tokens,
+            wrapped_native_token,
+            block_number: 0,
+            ready: false,
         }
     }
+}
 
-    async fn remove(&self, id: &str) -> Option<PoolEntry> {
-        let mut guard = self.states.write().await;
-        guard.remove(id)
+#[derive(Clone)]
+pub(crate) struct PublishedStatePin {
+    state: Arc<PublishedStateStore>,
+}
+
+impl PublishedStatePin {
+    pub(crate) fn version(&self) -> u64 {
+        self.state.version
     }
 
-    async fn len(&self) -> usize {
-        let guard = self.states.read().await;
-        guard.len()
+    pub(crate) fn current_block(&self) -> u64 {
+        self.state.block_number
     }
 
-    async fn clear(&self) {
-        let mut guard = self.states.write().await;
-        *guard = HashMap::new();
+    pub(crate) fn total_states(&self) -> usize {
+        self.state.id_to_kind.len()
+    }
+
+    pub(crate) fn token(&self, address: &Bytes) -> Option<Token> {
+        self.state.tokens.get(address).cloned()
+    }
+
+    pub(crate) fn matching_pools_by_addresses(
+        &self,
+        token_in: &Bytes,
+        token_out: &Bytes,
+    ) -> Vec<(String, PoolEntry)> {
+        matching_pools_from_published(&self.state, token_in, token_out)
+    }
+
+    pub(crate) fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
+        pool_by_id_from_published(&self.state, id)
     }
 }
 
@@ -1161,12 +1171,6 @@ impl UpdateMetrics {
 }
 
 #[derive(Default)]
-struct TokenIndexChanges {
-    additions: Vec<(Bytes, String)>,
-    removals: Vec<(Bytes, String)>,
-}
-
-#[derive(Default)]
 struct UpdateAccumulator {
     new_pairs_count: usize,
     new_pairs_missing_state: usize,
@@ -1188,66 +1192,56 @@ impl UpdateAccumulator {
 
 pub struct StateStore {
     tokens: Arc<TokenStore>,
-    shards: HashMap<ProtocolKind, ProtocolShard>,
-    id_to_kind: RwLock<HashMap<String, ProtocolKind>>,
-    // Token -> pool id index to avoid scanning all pools on each quote.
-    token_index: RwLock<HashMap<Bytes, HashSet<String>>>,
-    block_number: RwLock<u64>,
-    ready: AtomicBool,
+    publish_tokens_to_store: bool,
+    published: RwLock<Arc<PublishedStateStore>>,
+    update_guard: Mutex<()>,
     ready_tx: watch::Sender<bool>,
 }
 
 impl StateStore {
     pub fn new(tokens: Arc<TokenStore>) -> Self {
-        let mut shards = HashMap::new();
-        for kind in ProtocolKind::ALL {
-            shards.insert(kind, ProtocolShard::default());
-        }
+        Self::new_with_token_publication(tokens, true)
+    }
+
+    pub(crate) fn new_private(tokens: Arc<TokenStore>) -> Self {
+        Self::new_with_token_publication(tokens, false)
+    }
+
+    fn new_with_token_publication(tokens: Arc<TokenStore>, publish_tokens_to_store: bool) -> Self {
+        let initial_tokens = tokens.try_snapshot().unwrap_or_default();
+        let wrapped_native_token = tokens.wrapped_native_token();
         let (ready_tx, _) = watch::channel(false);
         StateStore {
             tokens,
-            shards,
-            id_to_kind: RwLock::new(HashMap::new()),
-            token_index: RwLock::new(HashMap::new()),
-            block_number: RwLock::new(0),
-            ready: AtomicBool::new(false),
+            publish_tokens_to_store,
+            published: RwLock::new(Arc::new(PublishedStateStore::empty(
+                initial_tokens,
+                wrapped_native_token,
+            ))),
+            update_guard: Mutex::new(()),
             ready_tx,
         }
     }
 
-    async fn rebuild_indexes(&self) -> usize {
-        let mut id_to_kind = HashMap::new();
-        let mut token_index: HashMap<Bytes, HashSet<String>> = HashMap::new();
-        let mut total_pairs = 0usize;
-
-        for (kind, shard) in self.shards.iter() {
-            let guard = shard.states.read().await;
-            for (id, (_, component)) in guard.iter() {
-                id_to_kind.insert(id.clone(), *kind);
-                total_pairs += 1;
-                for token in component.tokens.iter() {
-                    token_index
-                        .entry(token.address.clone())
-                        .or_default()
-                        .insert(id.clone());
-                }
-            }
+    pub(crate) async fn pin(&self) -> PublishedStatePin {
+        PublishedStatePin {
+            state: Arc::clone(&*self.published.read().await),
         }
+    }
 
-        *self.id_to_kind.write().await = id_to_kind;
-        *self.token_index.write().await = token_index;
-        total_pairs
+    pub(crate) async fn state_version(&self) -> u64 {
+        self.published.read().await.version
     }
 
     pub async fn reset(&self) {
-        for shard in self.shards.values() {
-            shard.clear().await;
-        }
-        *self.id_to_kind.write().await = HashMap::new();
-        *self.token_index.write().await = HashMap::new();
-        *self.block_number.write().await = 0;
-        self.ready.store(false, Ordering::Relaxed);
-        let _ = self.ready_tx.send(false);
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = PublishedStateStore::empty(
+            current.tokens.clone(),
+            current.wrapped_native_token.clone(),
+        );
+        replacement.version = current.version.saturating_add(1);
+        self.publish(replacement).await;
     }
 
     pub async fn reset_protocols(&self, protocols: &[ProtocolKind]) {
@@ -1255,15 +1249,18 @@ impl StateStore {
             return;
         }
 
-        if protocols.len() >= self.shards.len() {
+        if protocols.len() >= ProtocolKind::ALL.len() {
             self.reset().await;
             return;
         }
 
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (*current).clone();
         let mut any_cleared = false;
         for kind in protocols {
-            if let Some(shard) = self.shards.get(kind) {
-                shard.clear().await;
+            if let Some(shard) = replacement.shards.get_mut(kind) {
+                shard.clear();
                 any_cleared = true;
             }
         }
@@ -1272,45 +1269,43 @@ impl StateStore {
             return;
         }
 
-        let total_pairs = self.rebuild_indexes().await;
-        let was_ready = self.ready.load(Ordering::Acquire);
-        let now_ready = total_pairs > 0;
-        if was_ready != now_ready {
-            self.ready.store(now_ready, Ordering::Release);
-            let _ = self.ready_tx.send(now_ready);
-        }
+        rebuild_indexes(&mut replacement);
+        replacement.version = current.version.saturating_add(1);
+        replacement.ready = !replacement.id_to_kind.is_empty();
+        self.publish(replacement).await;
     }
 
     pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
-        // EVM feeds always return a block number
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (*current).clone();
+        replacement.version = current.version.saturating_add(1);
         let block_number = update.block_number_or_timestamp;
-        {
-            let mut guard = self.block_number.write().await;
-            *guard = block_number;
-        }
-
-        let mut index_changes = TokenIndexChanges::default();
+        replacement.block_number = block_number;
         let mut stats = UpdateAccumulator::default();
 
-        self.apply_new_pairs(
+        apply_new_pairs(
+            &mut replacement,
             update.new_pairs,
             &mut update.states,
-            &mut index_changes,
             &mut stats,
-        )
-        .await;
-        self.cache_new_tokens(&mut stats).await;
-        self.apply_state_updates(update.states, &mut stats).await;
-        self.apply_removed_pairs(update.removed_pairs, &mut index_changes, &mut stats)
-            .await;
-
-        if !index_changes.additions.is_empty() || !index_changes.removals.is_empty() {
-            let mut index = self.token_index.write().await;
-            apply_token_index_changes(&mut index, index_changes.additions, index_changes.removals);
+        );
+        apply_state_updates(&mut replacement, update.states, &mut stats);
+        apply_removed_pairs(&mut replacement, update.removed_pairs, &mut stats);
+        if self.publish_tokens_to_store && !stats.tokens_to_cache.is_empty() {
+            self.tokens
+                .insert_batch(stats.tokens_to_cache.iter().cloned())
+                .await;
         }
-
-        let total_pairs = self.total_states().await;
-        self.update_ready_state(total_pairs);
+        for token in stats.tokens_to_cache.drain(..) {
+            replacement
+                .tokens
+                .entry(token.address.clone())
+                .or_insert(token);
+        }
+        let total_pairs = replacement.id_to_kind.len();
+        replacement.ready = total_pairs > 0;
+        self.publish(replacement).await;
 
         UpdateMetrics {
             block_number,
@@ -1327,160 +1322,48 @@ impl StateStore {
         }
     }
 
-    async fn apply_new_pairs(
+    async fn publish(&self, replacement: PublishedStateStore) {
+        let ready = replacement.ready;
+        let previous_ready = self.published.read().await.ready;
+        *self.published.write().await = Arc::new(replacement);
+        if previous_ready != ready {
+            self.ready_tx.send_replace(ready);
+        }
+    }
+
+    pub(crate) async fn publish_candidate(
         &self,
-        new_pairs: HashMap<String, ProtocolComponent>,
-        states: &mut HashMap<String, Box<dyn ProtocolSim>>,
-        index_changes: &mut TokenIndexChanges,
-        stats: &mut UpdateAccumulator,
-    ) {
-        for (id, component) in new_pairs {
-            match ProtocolKind::from_component(&component) {
-                Some(kind) => {
-                    self.insert_new_pair(id, kind, component, states, index_changes, stats)
-                        .await;
-                }
-                None => {
-                    stats.unknown_protocol_new_pairs += 1;
-                    stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
-                }
-            }
-        }
-    }
-
-    async fn insert_new_pair(
-        &self,
-        id: String,
-        kind: ProtocolKind,
-        component: ProtocolComponent,
-        states: &mut HashMap<String, Box<dyn ProtocolSim>>,
-        index_changes: &mut TokenIndexChanges,
-        stats: &mut UpdateAccumulator,
-    ) {
-        let Some(state) = states.remove(&id) else {
-            stats.new_pairs_missing_state += 1;
-            stats.record_anomaly("new_pairs_missing_state", id.as_str());
-            return;
-        };
-        let Some(shard) = self.shards.get(&kind) else {
-            stats.unknown_protocol_new_pairs += 1;
-            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
-            return;
-        };
-
-        let component = Arc::new(component);
-        self.id_to_kind.write().await.insert(id.clone(), kind);
-        stats
-            .tokens_to_cache
-            .extend(component.tokens.iter().cloned());
-        for token in &component.tokens {
-            index_changes
-                .additions
-                .push((token.address.clone(), id.clone()));
-        }
-        shard
-            .insert_new(id, Arc::from(state), Arc::clone(&component))
-            .await;
-        stats.new_pairs_count += 1;
-    }
-
-    async fn cache_new_tokens(&self, stats: &mut UpdateAccumulator) {
-        if stats.tokens_to_cache.is_empty() {
-            return;
-        }
-
-        self.tokens
-            .insert_batch(stats.tokens_to_cache.drain(..))
-            .await;
-    }
-
-    async fn apply_state_updates(
-        &self,
-        states: HashMap<String, Box<dyn ProtocolSim>>,
-        stats: &mut UpdateAccumulator,
-    ) {
-        for (id, state) in states {
-            let kind_opt = { self.id_to_kind.read().await.get(&id).copied() };
-            if let Some(kind) = kind_opt {
-                if let Some(shard) = self.shards.get(&kind) {
-                    if shard.update_state(&id, Arc::from(state)).await {
-                        stats.updated_states += 1;
-                    } else {
-                        stats.states_missing_in_shard += 1;
-                        stats.record_anomaly("states_missing_in_shard", id.as_str());
-                    }
-                }
-            } else {
-                stats.updates_for_unknown_pair += 1;
-                stats.record_anomaly("updates_for_unknown_pair", id.as_str());
-            }
-        }
-    }
-
-    async fn apply_removed_pairs(
-        &self,
-        removed_pairs: HashMap<String, ProtocolComponent>,
-        index_changes: &mut TokenIndexChanges,
-        stats: &mut UpdateAccumulator,
-    ) {
-        for (id, component) in removed_pairs {
-            for token in &component.tokens {
-                index_changes
-                    .removals
-                    .push((token.address.clone(), id.clone()));
-            }
-
-            let removed_kind = {
-                let mut guard = self.id_to_kind.write().await;
-                guard.remove(&id)
-            };
-
-            if let Some(kind) = removed_kind {
-                if let Some(shard) = self.shards.get(&kind) {
-                    shard.remove(&id).await;
-                    stats.removed_pairs_count += 1;
-                }
-            } else {
-                stats.removed_unknown_pair += 1;
-                stats.record_anomaly("removed_unknown_pair", id.as_str());
-            }
-        }
-    }
-
-    fn update_ready_state(&self, total_pairs: usize) {
-        let mut broadcast_value = None;
-        if total_pairs > 0 && !self.ready.load(Ordering::Acquire) {
-            self.ready.store(true, Ordering::Release);
-            broadcast_value = Some(true);
-        } else if total_pairs == 0 && self.ready.load(Ordering::Acquire) {
-            self.ready.store(false, Ordering::Release);
-            broadcast_value = Some(false);
-        }
-
-        if let Some(value) = broadcast_value {
-            let _ = self.ready_tx.send(value);
-        }
+        candidate: PublishedStatePin,
+        target_version: u64,
+    ) -> anyhow::Result<()> {
+        let _guard = self.update_guard.lock().await;
+        let current_version = self.published.read().await.version;
+        anyhow::ensure!(
+            target_version > current_version,
+            "candidate state version {target_version} must be newer than published version {current_version}"
+        );
+        let mut replacement = (*candidate.state).clone();
+        replacement.version = target_version;
+        let tokens = replacement.tokens.values().cloned().collect::<Vec<_>>();
+        self.publish(replacement).await;
+        self.tokens.insert_batch(tokens).await;
+        Ok(())
     }
 
     pub async fn current_block(&self) -> u64 {
-        let guard = self.block_number.read().await;
-        *guard
+        self.published.read().await.block_number
     }
 
     pub async fn total_states(&self) -> usize {
-        let mut total = 0;
-        for shard in self.shards.values() {
-            total += shard.len().await;
-        }
-        total
+        self.published.read().await.id_to_kind.len()
     }
 
     pub async fn has_pool(&self, id: &str) -> bool {
-        self.id_to_kind.read().await.contains_key(id)
+        self.published.read().await.id_to_kind.contains_key(id)
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Relaxed)
+        self.ready_tx.borrow().to_owned()
     }
 
     pub async fn wait_until_ready(&self, wait: Duration) -> bool {
@@ -1508,153 +1391,26 @@ impl StateStore {
         }
     }
 
-    fn ids_for_token_from_index(
-        &self,
-        index: &HashMap<Bytes, HashSet<String>>,
-        token: &Bytes,
-    ) -> Option<HashSet<String>> {
-        let wrapped_native_token = self.tokens.wrapped_native_token();
-        let native_address = native_token_address();
-        let needs_native = wrapped_native_token.as_ref() == Some(token);
-        let needs_wrapped = *token == native_address;
-
-        let mut ids = index.get(token).cloned().unwrap_or_default();
-
-        if needs_native {
-            if let Some(native_ids) = index.get(&native_address) {
-                ids.extend(native_ids.iter().cloned());
-            }
-        }
-
-        if needs_wrapped {
-            if let Some(wrapped_address) = wrapped_native_token.as_ref() {
-                if let Some(wrapped_ids) = index.get(wrapped_address) {
-                    ids.extend(wrapped_ids.iter().cloned());
-                }
-            }
-        }
-
-        (!ids.is_empty()).then_some(ids)
-    }
-
-    fn intersect_pool_ids(left: HashSet<String>, right: HashSet<String>) -> Vec<String> {
-        let (smaller, larger) = if left.len() <= right.len() {
-            (left, right)
-        } else {
-            (right, left)
-        };
-
-        let mut candidate_ids = Vec::with_capacity(smaller.len());
-        for id in smaller {
-            if larger.contains(&id) {
-                candidate_ids.push(id);
-            }
-        }
-
-        candidate_ids
-    }
-
-    async fn pool_entries_for_candidate_ids(
-        &self,
-        candidate_ids: &[String],
-    ) -> Vec<(String, PoolEntry)> {
-        if candidate_ids.is_empty() {
-            return Vec::new();
-        }
-
-        let id_kinds: Vec<(String, ProtocolKind)> = {
-            let guard = self.id_to_kind.read().await;
-            candidate_ids
-                .iter()
-                .filter_map(|id| guard.get(id).copied().map(|kind| (id.clone(), kind)))
-                .collect()
-        };
-
-        if id_kinds.is_empty() {
-            return Vec::new();
-        }
-
-        let mut by_kind: HashMap<ProtocolKind, Vec<String>> = HashMap::new();
-        for (id, kind) in id_kinds {
-            by_kind.entry(kind).or_default().push(id);
-        }
-
-        let mut result = Vec::new();
-        for (kind, ids) in by_kind {
-            if let Some(shard) = self.shards.get(&kind) {
-                let guard = shard.states.read().await;
-                for id in ids {
-                    if let Some((state, component)) = guard.get(&id) {
-                        result.push((id, (Arc::clone(state), Arc::clone(component))));
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
     pub(crate) async fn matching_pools_by_addresses(
         &self,
         token_in: &Bytes,
         token_out: &Bytes,
     ) -> Vec<(String, PoolEntry)> {
-        // Keep both token ID lookups on the same index snapshot under concurrent updates.
-        let (token_in_exact_ids, token_out_exact_ids, token_in_ids, token_out_ids) = {
-            let index = self.token_index.read().await;
-            (
-                index.get(token_in).cloned(),
-                index.get(token_out).cloned(),
-                self.ids_for_token_from_index(&index, token_in),
-                self.ids_for_token_from_index(&index, token_out),
-            )
-        };
-
-        let exact_candidate_ids = match (token_in_exact_ids, token_out_exact_ids) {
-            (Some(token_in_exact_ids), Some(token_out_exact_ids)) => {
-                Self::intersect_pool_ids(token_in_exact_ids, token_out_exact_ids)
-            }
-            _ => Vec::new(),
-        };
-
-        // Prefer exact token matches first, but if those IDs are stale by the time we
-        // resolve active pools, fall back to alias-expanded candidates.
-        if !exact_candidate_ids.is_empty() {
-            let exact_entries = self
-                .pool_entries_for_candidate_ids(exact_candidate_ids.as_slice())
-                .await;
-            if !exact_entries.is_empty() {
-                return exact_entries;
-            }
-        }
-
-        let alias_candidate_ids = match (token_in_ids, token_out_ids) {
-            (Some(token_in_ids), Some(token_out_ids)) => {
-                Self::intersect_pool_ids(token_in_ids, token_out_ids)
-            }
-            _ => Vec::new(),
-        };
-
-        self.pool_entries_for_candidate_ids(alias_candidate_ids.as_slice())
+        self.pin()
             .await
+            .matching_pools_by_addresses(token_in, token_out)
     }
 
     pub(crate) async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
-        let kind_opt = { self.id_to_kind.read().await.get(id).copied() };
-        let kind = kind_opt?;
-        let shard = self.shards.get(&kind)?;
-        let guard = shard.states.read().await;
-        guard
-            .get(id)
-            .map(|(state, component)| (Arc::clone(state), Arc::clone(component)))
+        self.pin().await.pool_by_id(id)
     }
 
     #[cfg(test)]
     pub(crate) async fn pool_ids_by_protocol_system(&self, protocol_system: &str) -> Vec<String> {
+        let published = self.published.read().await;
         let mut ids = Vec::new();
-        for shard in self.shards.values() {
-            let guard = shard.states.read().await;
-            for (id, (_state, component)) in guard.iter() {
+        for shard in published.shards.values() {
+            for (id, (_state, component)) in shard {
                 if component.protocol_system == protocol_system {
                     ids.push(id.clone());
                 }
@@ -1665,23 +1421,192 @@ impl StateStore {
     }
 }
 
-fn apply_token_index_changes(
-    index: &mut HashMap<Bytes, HashSet<String>>,
-    index_additions: Vec<(Bytes, String)>,
-    index_removals: Vec<(Bytes, String)>,
+fn apply_new_pairs(
+    published: &mut PublishedStateStore,
+    new_pairs: HashMap<String, ProtocolComponent>,
+    states: &mut HashMap<String, Box<dyn ProtocolSim>>,
+    stats: &mut UpdateAccumulator,
 ) {
-    for (token, id) in index_additions {
-        index.entry(token).or_default().insert(id);
-    }
+    for (id, component) in new_pairs {
+        let Some(kind) = ProtocolKind::from_component(&component) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            continue;
+        };
+        let Some(state) = states.remove(&id) else {
+            stats.new_pairs_missing_state += 1;
+            stats.record_anomaly("new_pairs_missing_state", id.as_str());
+            continue;
+        };
+        let Some(shard) = published.shards.get_mut(&kind) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            continue;
+        };
 
-    for (token, id) in index_removals {
-        if let Some(set) = index.get_mut(&token) {
-            set.remove(&id);
-            if set.is_empty() {
-                index.remove(&token);
+        let component = Arc::new(component);
+        published.id_to_kind.insert(id.clone(), kind);
+        stats
+            .tokens_to_cache
+            .extend(component.tokens.iter().cloned());
+        for token in &component.tokens {
+            published
+                .token_index
+                .entry(token.address.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+        shard.insert(id, (Arc::from(state), component));
+        stats.new_pairs_count += 1;
+    }
+}
+
+fn apply_state_updates(
+    published: &mut PublishedStateStore,
+    states: HashMap<String, Box<dyn ProtocolSim>>,
+    stats: &mut UpdateAccumulator,
+) {
+    for (id, state) in states {
+        let Some(kind) = published.id_to_kind.get(&id).copied() else {
+            stats.updates_for_unknown_pair += 1;
+            stats.record_anomaly("updates_for_unknown_pair", id.as_str());
+            continue;
+        };
+        let Some(shard) = published.shards.get_mut(&kind) else {
+            stats.states_missing_in_shard += 1;
+            stats.record_anomaly("states_missing_in_shard", id.as_str());
+            continue;
+        };
+        if let Some((existing_state, _)) = shard.get_mut(&id) {
+            *existing_state = Arc::from(state);
+            stats.updated_states += 1;
+        } else {
+            stats.states_missing_in_shard += 1;
+            stats.record_anomaly("states_missing_in_shard", id.as_str());
+        }
+    }
+}
+
+fn apply_removed_pairs(
+    published: &mut PublishedStateStore,
+    removed_pairs: HashMap<String, ProtocolComponent>,
+    stats: &mut UpdateAccumulator,
+) {
+    for (id, component) in removed_pairs {
+        for token in &component.tokens {
+            if let Some(pool_ids) = published.token_index.get_mut(&token.address) {
+                pool_ids.remove(&id);
+                if pool_ids.is_empty() {
+                    published.token_index.remove(&token.address);
+                }
+            }
+        }
+
+        if let Some(kind) = published.id_to_kind.remove(&id) {
+            if let Some(shard) = published.shards.get_mut(&kind) {
+                shard.remove(&id);
+                stats.removed_pairs_count += 1;
+            }
+        } else {
+            stats.removed_unknown_pair += 1;
+            stats.record_anomaly("removed_unknown_pair", id.as_str());
+        }
+    }
+}
+
+fn rebuild_indexes(published: &mut PublishedStateStore) {
+    published.id_to_kind.clear();
+    published.token_index.clear();
+    for (kind, shard) in &published.shards {
+        for (id, (_state, component)) in shard {
+            published.id_to_kind.insert(id.clone(), *kind);
+            for token in &component.tokens {
+                published
+                    .token_index
+                    .entry(token.address.clone())
+                    .or_default()
+                    .insert(id.clone());
             }
         }
     }
+}
+
+fn ids_for_token(published: &PublishedStateStore, token: &Bytes) -> Option<HashSet<String>> {
+    let native_address = native_token_address();
+    let needs_native = published.wrapped_native_token.as_ref() == Some(token);
+    let needs_wrapped = *token == native_address;
+    let mut ids = published
+        .token_index
+        .get(token)
+        .cloned()
+        .unwrap_or_default();
+    if needs_native {
+        if let Some(native_ids) = published.token_index.get(&native_address) {
+            ids.extend(native_ids.iter().cloned());
+        }
+    }
+    if needs_wrapped {
+        if let Some(wrapped_address) = published.wrapped_native_token.as_ref() {
+            if let Some(wrapped_ids) = published.token_index.get(wrapped_address) {
+                ids.extend(wrapped_ids.iter().cloned());
+            }
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn intersect_pool_ids(left: HashSet<String>, right: HashSet<String>) -> Vec<String> {
+    let (smaller, larger) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    smaller
+        .into_iter()
+        .filter(|id| larger.contains(id))
+        .collect()
+}
+
+fn pool_entries_for_ids(
+    published: &PublishedStateStore,
+    ids: Vec<String>,
+) -> Vec<(String, PoolEntry)> {
+    ids.into_iter()
+        .filter_map(|id| pool_by_id_from_published(published, &id).map(|entry| (id, entry)))
+        .collect()
+}
+
+fn matching_pools_from_published(
+    published: &PublishedStateStore,
+    token_in: &Bytes,
+    token_out: &Bytes,
+) -> Vec<(String, PoolEntry)> {
+    if let (Some(token_in_ids), Some(token_out_ids)) = (
+        published.token_index.get(token_in).cloned(),
+        published.token_index.get(token_out).cloned(),
+    ) {
+        let exact =
+            pool_entries_for_ids(published, intersect_pool_ids(token_in_ids, token_out_ids));
+        if !exact.is_empty() {
+            return exact;
+        }
+    }
+
+    match (
+        ids_for_token(published, token_in),
+        ids_for_token(published, token_out),
+    ) {
+        (Some(token_in_ids), Some(token_out_ids)) => {
+            pool_entries_for_ids(published, intersect_pool_ids(token_in_ids, token_out_ids))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn pool_by_id_from_published(published: &PublishedStateStore, id: &str) -> Option<PoolEntry> {
+    let kind = published.id_to_kind.get(id)?;
+    let (state, component) = published.shards.get(kind)?.get(id)?;
+    Some((Arc::clone(state), Arc::clone(component)))
 }
 
 fn add_anomaly_sample(samples: &mut Vec<String>, kind: &str, value: &str) {
@@ -1750,6 +1675,20 @@ mod tests {
         assert!(recovered.redis_transport_last_error.is_none());
     }
 
+    #[tokio::test]
+    async fn subscription_status_records_and_clears_publisher_delay() {
+        let status = BroadcasterSubscriptionStatus::default();
+
+        status.record_publisher_to_consumer_delay(u64::MAX).await;
+        assert_eq!(
+            status.snapshot().await.publisher_to_consumer_delay_ms,
+            Some(0)
+        );
+
+        status.mark_disconnected(None).await;
+        assert_eq!(status.snapshot().await.publisher_to_consumer_delay_ms, None);
+    }
+
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;
 
@@ -1810,11 +1749,6 @@ mod tests {
         }
     }
 
-    fn token(address: &str) -> Bytes {
-        Bytes::from_str(address.trim_start_matches("0x"))
-            .unwrap_or_else(|err| unreachable!("valid token address: {err}"))
-    }
-
     fn address(seed: u8) -> Bytes {
         Bytes::from([seed; 20])
     }
@@ -1865,22 +1799,6 @@ mod tests {
         .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
     }
 
-    fn replay_boundary_for(
-        stream_id: &str,
-        snapshot_id: &str,
-        generation: u64,
-        exclusive_message_seq: u64,
-    ) -> BroadcasterRedisReplayBoundary {
-        BroadcasterRedisReplayBoundary::new(
-            "redis-stream",
-            stream_id,
-            snapshot_id,
-            generation,
-            exclusive_message_seq,
-        )
-        .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
-    }
-
     struct TestAppStateStores {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
@@ -1905,9 +1823,9 @@ mod tests {
             native_state_store: stores.native_state_store,
             vm_state_store: stores.vm_state_store,
             rfq_state_store: stores.rfq_state_store,
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            rfq_stream_health: Arc::new(StreamHealth::new()),
+            native_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            vm_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            rfq_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: flags.enable_vm_pools,
@@ -1999,7 +1917,7 @@ mod tests {
         state
     }
 
-    async fn assert_service_readiness_fails_for_redis_gap(
+    async fn assert_optional_backend_gap_does_not_close_native_readiness(
         backend: SimulatorBackendKind,
         gap_reason: &'static str,
     ) {
@@ -2031,10 +1949,10 @@ mod tests {
             }
         }
 
-        assert!(!state.is_ready().await);
+        assert!(state.is_ready().await);
         let snapshot = state.status_snapshot().await;
         let backend_snapshot = backend_snapshot(&snapshot, backend);
-        assert_eq!(snapshot.status, SimulatorServiceStatus::WarmingUp);
+        assert_eq!(snapshot.status, SimulatorServiceStatus::Ready);
         assert_eq!(
             backend_snapshot.reason,
             Some(SimulatorReadinessReason::RedisReplayGap)
@@ -2258,50 +2176,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redis_generation_continuation_updates_checkpoint_without_restart() {
-        let state = build_readiness_test_state(false, false).await;
-        state
-            .native_broadcaster_subscription
-            .mark_snapshot_started("stream-7", "snapshot-7")
-            .await;
-        state
-            .native_broadcaster_subscription
-            .mark_bootstrap_complete_with_redis_boundary(replay_boundary_for(
-                "stream-7",
-                "snapshot-7",
-                7,
-                103,
-            ))
-            .await;
-        state
-            .native_broadcaster_subscription
-            .mark_redis_catch_up_checkpoint("7-103")
-            .await;
-
-        state
-            .native_broadcaster_subscription
-            .mark_redis_generation_continued(replay_boundary_for("stream-8", "snapshot-8", 8, 1))
-            .await;
-
-        let snapshot = state.native_broadcaster_subscription.snapshot().await;
-        assert!(snapshot.connected);
-        assert!(snapshot.bootstrap_complete);
-        assert_eq!(snapshot.restart_count, 0);
-        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
-        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
-        assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("8-1"));
-        assert!(!snapshot.redis_replay_caught_up);
-        let boundary = snapshot
-            .redis_replay_boundary
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("continuation should publish a Redis boundary"));
-        assert_eq!(boundary.stream_id, "stream-8");
-        assert_eq!(boundary.snapshot_id, "snapshot-8");
-        assert_eq!(boundary.generation, 8);
-        assert_eq!(boundary.exclusive_message_seq, 1);
-    }
-
-    #[tokio::test]
     async fn native_readiness_surfaces_redis_replay_gap() {
         let state = build_readiness_test_state(false, false).await;
         state.native_stream_health.record_update(1).await;
@@ -2340,13 +2214,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_readiness_fails_when_enabled_backend_has_redis_replay_gap() {
-        assert_service_readiness_fails_for_redis_gap(
+    async fn optional_backend_redis_gap_does_not_close_native_readiness() {
+        assert_optional_backend_gap_does_not_close_native_readiness(
             SimulatorBackendKind::Vm,
             "VM Redis replay gap",
         )
         .await;
-        assert_service_readiness_fails_for_redis_gap(
+        assert_optional_backend_gap_does_not_close_native_readiness(
             SimulatorBackendKind::Rfq,
             "RFQ Redis replay gap",
         )
@@ -2797,88 +2671,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn apply_token_index_changes_additions_and_removals() {
-        let mut index: HashMap<Bytes, HashSet<String>> = HashMap::new();
-
-        let token_a = token("0x0000000000000000000000000000000000000001");
-        let token_b = token("0x0000000000000000000000000000000000000002");
-
-        apply_token_index_changes(
-            &mut index,
-            vec![
-                (token_a.clone(), "pool1".to_string()),
-                (token_a.clone(), "pool2".to_string()),
-                (token_b.clone(), "pool1".to_string()),
-            ],
-            vec![],
-        );
-
-        assert_eq!(
-            index
-                .get(&token_a)
-                .unwrap_or_else(|| unreachable!("token_a must be indexed")),
-            &HashSet::from(["pool1".to_string(), "pool2".to_string()])
-        );
-        assert_eq!(
-            index
-                .get(&token_b)
-                .unwrap_or_else(|| unreachable!("token_b must be indexed")),
-            &HashSet::from(["pool1".to_string()])
-        );
-
-        apply_token_index_changes(
-            &mut index,
-            vec![],
-            vec![
-                (token_a.clone(), "pool1".to_string()),
-                (token_b.clone(), "pool1".to_string()),
-            ],
-        );
-
-        assert_eq!(
-            index
-                .get(&token_a)
-                .unwrap_or_else(|| unreachable!("token_a must remain indexed")),
-            &HashSet::from(["pool2".to_string()])
-        );
-        assert!(!index.contains_key(&token_b));
-    }
-
-    #[test]
-    fn apply_token_index_changes_matches_sequential_application() {
-        let token_a = token("0x0000000000000000000000000000000000000003");
-        let token_b = token("0x0000000000000000000000000000000000000004");
-
-        let additions = vec![
-            (token_a.clone(), "pool1".to_string()),
-            (token_a.clone(), "pool2".to_string()),
-            (token_b.clone(), "pool2".to_string()),
-        ];
-        let removals = vec![
-            (token_a.clone(), "pool1".to_string()),
-            (token_b.clone(), "pool2".to_string()),
-        ];
-
-        let mut batched: HashMap<Bytes, HashSet<String>> = HashMap::new();
-        apply_token_index_changes(&mut batched, additions.clone(), removals.clone());
-
-        let mut sequential: HashMap<Bytes, HashSet<String>> = HashMap::new();
-        for (token, id) in additions {
-            sequential.entry(token).or_default().insert(id);
-        }
-        for (token, id) in removals {
-            if let Some(set) = sequential.get_mut(&token) {
-                set.remove(&id);
-                if set.is_empty() {
-                    sequential.remove(&token);
-                }
-            }
-        }
-
-        assert_eq!(batched, sequential);
-    }
-
     #[tokio::test]
     async fn apply_update_tracks_anomaly_counters_and_samples() {
         let token_store = Arc::new(TokenStore::new(
@@ -2908,11 +2700,11 @@ mod tests {
         let removed_unknown_component =
             mk_component(32, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
 
-        store
+        let mut inconsistent = (*store.published.read().await).as_ref().clone();
+        inconsistent
             .id_to_kind
-            .write()
-            .await
             .insert("stale-shard".to_string(), ProtocolKind::UniswapV2);
+        store.publish(inconsistent).await;
 
         let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
         states.insert("unknown-update".to_string(), Box::new(DummySim));
@@ -3219,6 +3011,7 @@ mod tests {
         }
 
         assert_eq!(app_state.vm_readiness().await, VmReadiness::Rebuilding);
+        assert_eq!(app_state.native_readiness().await, NativeReadiness::Ready);
         assert_eq!(
             app_state.encode_availability(false, true, false).await,
             EncodeAvailability::VmRebuilding
@@ -3382,8 +3175,8 @@ mod tests {
             .await;
 
         // Inject stale exact IDs that no longer exist in id_to_kind.
-        let mut index_guard = store.token_index.write().await;
-        *index_guard = HashMap::from([
+        let mut inconsistent = (*store.published.read().await).as_ref().clone();
+        inconsistent.token_index = HashMap::from([
             (
                 wrapped_address.clone(),
                 HashSet::from(["pool-stale".to_string()]),
@@ -3397,7 +3190,7 @@ mod tests {
                 HashSet::from(["pool-stale".to_string(), "pool-native".to_string()]),
             ),
         ]);
-        drop(index_guard);
+        store.publish(inconsistent).await;
 
         let matches = store
             .matching_pools_by_addresses(&wrapped_address, &token_x.address)
@@ -3408,7 +3201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_pools_reads_token_ids_from_single_snapshot() {
+    async fn pinned_readers_keep_complete_old_version_after_publication() {
         let token_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
@@ -3435,61 +3228,36 @@ mod tests {
         );
 
         store
-            .apply_update(mk_update(vec![
-                ("pool-v1".to_string(), component_v1, Box::new(DummySim)),
-                ("pool-v2".to_string(), component_v2, Box::new(DummySim)),
-            ]))
+            .apply_update(mk_update(vec![(
+                "pool-v1".to_string(),
+                component_v1.clone(),
+                Box::new(DummySim),
+            )]))
             .await;
+        let old_pin = store.pin().await;
 
-        let token_a_address = token_a.address.clone();
-        let token_b_address = token_b.address.clone();
-        let mut index_guard = store.token_index.write().await;
-        *index_guard = HashMap::from([
-            (
-                token_a_address.clone(),
-                HashSet::from(["pool-v1".to_string()]),
-            ),
-            (
-                token_b_address.clone(),
-                HashSet::from(["pool-v1".to_string()]),
-            ),
-        ]);
+        let update = mk_update(vec![(
+            "pool-v2".to_string(),
+            component_v2,
+            Box::new(DummySim),
+        )])
+        .set_removed_pairs(HashMap::from([("pool-v1".to_string(), component_v1)]));
+        store.apply_update(update).await;
+        let new_pin = store.pin().await;
 
-        let query_store = Arc::clone(&store);
-        let query_token_a = token_a_address.clone();
-        let query_token_b = token_b_address.clone();
-        let query_task = tokio::spawn(async move {
-            query_store
-                .matching_pools_by_addresses(&query_token_a, &query_token_b)
-                .await
-        });
+        let old_ids: HashSet<String> = old_pin
+            .matching_pools_by_addresses(&token_a.address, &token_b.address)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let new_ids: HashSet<String> = new_pin
+            .matching_pools_by_addresses(&token_a.address, &token_b.address)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
 
-        // Queue the reader before the writer while an external write lock is held.
-        // The previous two-read implementation could then observe v1 for token_a and v2
-        // for token_b, causing a transient empty intersection.
-        tokio::task::yield_now().await;
-
-        let writer_store = Arc::clone(&store);
-        let writer_token_a = token_a_address;
-        let writer_token_b = token_b_address;
-        let writer_task = tokio::spawn(async move {
-            let mut index = writer_store.token_index.write().await;
-            *index = HashMap::from([
-                (writer_token_a, HashSet::from(["pool-v2".to_string()])),
-                (writer_token_b, HashSet::from(["pool-v2".to_string()])),
-            ]);
-        });
-
-        drop(index_guard);
-
-        writer_task
-            .await
-            .unwrap_or_else(|err| unreachable!("writer task should succeed: {err}"));
-        let matches = query_task
-            .await
-            .unwrap_or_else(|err| unreachable!("query task should succeed: {err}"));
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-        assert_eq!(ids, HashSet::from(["pool-v1".to_string()]));
+        assert_eq!(old_ids, HashSet::from(["pool-v1".to_string()]));
+        assert_eq!(new_ids, HashSet::from(["pool-v2".to_string()]));
+        assert_ne!(old_pin.version(), new_pin.version());
     }
 }

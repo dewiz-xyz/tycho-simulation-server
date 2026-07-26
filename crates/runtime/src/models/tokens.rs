@@ -101,6 +101,10 @@ impl TokenStore {
         self.tokens.read().await.clone()
     }
 
+    pub(crate) fn try_snapshot(&self) -> Option<HashMap<Bytes, Token>> {
+        self.tokens.try_read().ok().map(|tokens| tokens.clone())
+    }
+
     pub async fn get(&self, address: &Bytes) -> Option<Token> {
         self.tokens.read().await.get(address).cloned()
     }
