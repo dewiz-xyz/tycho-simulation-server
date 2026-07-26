@@ -38,6 +38,8 @@ pub struct BroadcasterRedisStreamEntry {
         with = "optional_u64_string"
     )]
     pub observed_timestamp_ms: Option<u64>,
+    #[serde(with = "u64_string")]
+    pub published_at_ms: u64,
     /// Serialized `BroadcasterEnvelope` for the Redis delta payload contract.
     pub payload_json: String,
 }
@@ -109,6 +111,14 @@ impl BroadcasterRedisStreamEntry {
         chain_id: u64,
         envelope: &BroadcasterEnvelope,
     ) -> Result<Self, BroadcasterContractError> {
+        Self::from_envelope_at(chain_id, envelope, 0)
+    }
+
+    pub fn from_envelope_at(
+        chain_id: u64,
+        envelope: &BroadcasterEnvelope,
+        published_at_ms: u64,
+    ) -> Result<Self, BroadcasterContractError> {
         ensure_redis_delta_kind(envelope.kind())?;
         let backends = redis_payload_backend_scope(&envelope.payload)?.unwrap_or_default();
         let payload_json = serde_json::to_string(envelope).map_err(|error| {
@@ -126,6 +136,7 @@ impl BroadcasterRedisStreamEntry {
             backend_scope: redis_backend_scope(backends)?,
             block_number: redis_entry_block_number(&envelope.payload),
             observed_timestamp_ms: redis_entry_observed_timestamp_ms(&envelope.payload),
+            published_at_ms,
             payload_json,
         };
         entry.validate()?;
@@ -198,6 +209,8 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             block_number: Option<u64>,
             #[serde(default, with = "optional_u64_string")]
             observed_timestamp_ms: Option<u64>,
+            #[serde(with = "u64_string")]
+            published_at_ms: u64,
             payload_json: String,
         }
 
@@ -212,6 +225,7 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             backend_scope: wire.backend_scope,
             block_number: wire.block_number,
             observed_timestamp_ms: wire.observed_timestamp_ms,
+            published_at_ms: wire.published_at_ms,
             payload_json: wire.payload_json,
         };
         entry.validate().map_err(de::Error::custom)?;
@@ -257,7 +271,11 @@ fn ensure_redis_message_seq(message_seq: u64) -> Result<(), BroadcasterContractE
 
 fn ensure_redis_delta_kind(kind: BroadcasterMessageKind) -> Result<(), BroadcasterContractError> {
     match kind {
-        BroadcasterMessageKind::Update
+        BroadcasterMessageKind::RecoveryStart
+        | BroadcasterMessageKind::RecoveryChunk
+        | BroadcasterMessageKind::RecoveryCatchUp
+        | BroadcasterMessageKind::RecoveryCommit
+        | BroadcasterMessageKind::Update
         | BroadcasterMessageKind::Heartbeat
         | BroadcasterMessageKind::Progress => Ok(()),
         BroadcasterMessageKind::SnapshotStart
@@ -401,12 +419,21 @@ fn redis_entry_observed_timestamp_ms(payload: &BroadcasterPayload) -> Option<u64
             .iter()
             .find(|partition| partition.backend == BroadcasterBackend::Rfq)
             .map(|partition| partition.block_number),
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => catch_up
+            .update
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
+            .map(|partition| partition.block_number),
         BroadcasterPayload::Heartbeat(heartbeat) => heartbeat
             .backend_heads
             .iter()
             .find(|head| head.backend == BroadcasterBackend::Rfq)
             .map(|head| head.block_number),
         BroadcasterPayload::Progress(_)
+        | BroadcasterPayload::RecoveryStart(_)
+        | BroadcasterPayload::RecoveryChunk(_)
+        | BroadcasterPayload::RecoveryCommit(_)
         | BroadcasterPayload::SnapshotStart(_)
         | BroadcasterPayload::SnapshotChunk(_)
         | BroadcasterPayload::SnapshotEnd(_) => None,
@@ -434,8 +461,23 @@ fn redis_payload_chain_block_numbers(payload: &BroadcasterPayload) -> Vec<u64> {
             })
             .map(|partition| partition.block_number)
             .collect(),
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => catch_up
+            .update
+            .partitions
+            .iter()
+            .filter(|partition| {
+                matches!(
+                    partition.backend,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm
+                )
+            })
+            .map(|partition| partition.block_number)
+            .collect(),
         BroadcasterPayload::Heartbeat(_)
         | BroadcasterPayload::Progress(_)
+        | BroadcasterPayload::RecoveryStart(_)
+        | BroadcasterPayload::RecoveryChunk(_)
+        | BroadcasterPayload::RecoveryCommit(_)
         | BroadcasterPayload::SnapshotStart(_)
         | BroadcasterPayload::SnapshotChunk(_)
         | BroadcasterPayload::SnapshotEnd(_) => Vec::new(),
@@ -457,6 +499,10 @@ fn redis_payload_snapshot_id(payload: &BroadcasterPayload) -> Option<&str> {
         BroadcasterPayload::Heartbeat(heartbeat) => Some(&heartbeat.snapshot_id),
         BroadcasterPayload::Progress(progress) => Some(&progress.snapshot_id),
         BroadcasterPayload::Update(_)
+        | BroadcasterPayload::RecoveryStart(_)
+        | BroadcasterPayload::RecoveryChunk(_)
+        | BroadcasterPayload::RecoveryCatchUp(_)
+        | BroadcasterPayload::RecoveryCommit(_)
         | BroadcasterPayload::SnapshotStart(_)
         | BroadcasterPayload::SnapshotChunk(_)
         | BroadcasterPayload::SnapshotEnd(_) => None,
@@ -468,6 +514,10 @@ fn redis_payload_chain_id(payload: &BroadcasterPayload) -> Option<u64> {
         BroadcasterPayload::Heartbeat(heartbeat) => Some(heartbeat.chain_id),
         BroadcasterPayload::Progress(progress) => Some(progress.chain_id),
         BroadcasterPayload::Update(_)
+        | BroadcasterPayload::RecoveryStart(_)
+        | BroadcasterPayload::RecoveryChunk(_)
+        | BroadcasterPayload::RecoveryCatchUp(_)
+        | BroadcasterPayload::RecoveryCommit(_)
         | BroadcasterPayload::SnapshotStart(_)
         | BroadcasterPayload::SnapshotChunk(_)
         | BroadcasterPayload::SnapshotEnd(_) => None,
@@ -479,6 +529,22 @@ fn redis_payload_backend_scope(
 ) -> Result<Option<Vec<BroadcasterBackend>>, BroadcasterContractError> {
     match payload {
         BroadcasterPayload::Update(update) => redis_update_backend_scope(&update.partitions),
+        BroadcasterPayload::RecoveryStart(start) => {
+            start.manifest.validate()?;
+            Ok(Some(start.manifest.backends.clone()))
+        }
+        BroadcasterPayload::RecoveryChunk(chunk) => {
+            chunk.validate()?;
+            Ok(Some(chunk.backends.clone()))
+        }
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => {
+            catch_up.validate()?;
+            redis_update_backend_scope(&catch_up.update.partitions)
+        }
+        BroadcasterPayload::RecoveryCommit(commit) => {
+            commit.validate()?;
+            Ok(Some(commit.backends.clone()))
+        }
         BroadcasterPayload::Heartbeat(heartbeat) => Ok(Some(
             heartbeat
                 .backend_heads
@@ -607,9 +673,8 @@ mod tests {
     };
     use crate::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterGenerationHandoff, BroadcasterHeartbeat, BroadcasterMessageKind,
-        BroadcasterPayload, BroadcasterProgress, BroadcasterStateEntry, BroadcasterUpdateMessage,
-        BroadcasterUpdatePartition,
+        BroadcasterHeartbeat, BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
+        BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[test]
@@ -705,6 +770,7 @@ mod tests {
         assert_eq!(value["backend_scope"], "native");
         assert_eq!(value["block_number"], "124");
         assert!(value.get("observed_timestamp_ms").is_none());
+        assert_eq!(value["published_at_ms"], "0");
         assert!(value.get("event_time_ms").is_none());
         assert_eq!(value["payload_json"], serde_json::to_string(&envelope)?);
 
@@ -730,6 +796,16 @@ mod tests {
     }
 
     #[test]
+    fn redis_stream_entry_records_explicit_publication_time() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope_at(8453, &envelope, 1234)?;
+
+        assert_eq!(entry.published_at_ms, 1234);
+        assert_eq!(serde_json::to_value(entry)?["published_at_ms"], "1234");
+        Ok(())
+    }
+
+    #[test]
     fn redis_stream_entry_deserialization_requires_payload_json() -> Result<()> {
         let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
             "schema_version": "1",
@@ -737,7 +813,8 @@ mod tests {
             "stream_id": "stream-1",
             "message_seq": "1",
             "kind": "update",
-            "backend_scope": "native"
+            "backend_scope": "native",
+            "published_at_ms": "1"
         }))
         .err()
         .ok_or_else(|| anyhow!("missing payload_json should fail deserialization"))?;
@@ -952,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_stream_entry_omits_handoff_for_normal_progress() -> Result<()> {
+    fn redis_stream_entry_round_trips_progress() -> Result<()> {
         let envelope = progress_envelope("stream-1", 8453, "snapshot-1", 6)?;
         let entry = redis_entry(&envelope)?;
 
@@ -962,147 +1039,12 @@ mod tests {
         assert_eq!(entry.block_number, None);
         assert_eq!(entry.observed_timestamp_ms, None);
 
-        let payload: serde_json::Value = serde_json::from_str(&entry.payload_json)?;
-        assert!(payload.get("handoff").is_none());
-
         let value = serde_json::to_value(&entry)?;
         assert!(value.get("block_number").is_none());
         assert!(value.get("observed_timestamp_ms").is_none());
 
         let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
         assert_eq!(decoded, entry);
-
-        Ok(())
-    }
-
-    #[test]
-    fn redis_stream_entry_round_trips_progress_with_handoff() -> Result<()> {
-        let handoff = generation_handoff()?;
-        let progress = BroadcasterProgress::new_with_handoff(
-            8453,
-            "snapshot-2",
-            vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
-            "generation_reset",
-            handoff.clone(),
-        )?;
-        let envelope =
-            BroadcasterEnvelope::new("stream-2", 9, BroadcasterPayload::Progress(progress));
-        let entry = redis_entry(&envelope)?;
-
-        assert_eq!(entry.kind, BroadcasterMessageKind::Progress);
-        assert_eq!(entry.snapshot_id, Some("snapshot-2".to_string()));
-        assert_eq!(entry.backend_scope, "native,vm");
-
-        let payload: serde_json::Value = serde_json::from_str(&entry.payload_json)?;
-        assert_eq!(
-            payload["handoff"],
-            serde_json::json!({
-                "previousStreamId": "stream-1",
-                "previousEntryId": "7-42",
-                "baseHeads": [
-                    {"backend": "native", "blockNumber": 124},
-                    {"backend": "vm", "blockNumber": 125}
-                ]
-            })
-        );
-
-        let decoded_entry: BroadcasterRedisStreamEntry =
-            serde_json::from_value(serde_json::to_value(&entry)?)?;
-        let decoded_envelope: BroadcasterEnvelope =
-            serde_json::from_str(&decoded_entry.payload_json)?;
-        let BroadcasterPayload::Progress(decoded_progress) = decoded_envelope.payload else {
-            return Err(anyhow!("decoded payload should remain progress"));
-        };
-        assert_eq!(decoded_progress.handoff, Some(handoff));
-
-        Ok(())
-    }
-
-    #[test]
-    fn generation_handoff_rejects_empty_ids_and_duplicate_base_heads() -> Result<()> {
-        let error = BroadcasterGenerationHandoff::new("", "7-42", base_heads())
-            .err()
-            .ok_or_else(|| anyhow!("empty previous stream id should fail handoff construction"))?;
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisEntryEmptyField {
-                field: "handoff.previousStreamId",
-            }
-        );
-
-        let error = BroadcasterGenerationHandoff::new("stream-1", " ", base_heads())
-            .err()
-            .ok_or_else(|| anyhow!("empty previous entry id should fail handoff construction"))?;
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisEntryEmptyField {
-                field: "handoff.previousEntryId",
-            }
-        );
-
-        let duplicate_heads = vec![
-            BroadcasterBackendHead::new(BroadcasterBackend::Native, 124),
-            BroadcasterBackendHead::new(BroadcasterBackend::Native, 125),
-        ];
-        let error = BroadcasterGenerationHandoff::new("stream-1", "7-42", duplicate_heads)
-            .err()
-            .ok_or_else(|| anyhow!("duplicate handoff base heads should fail construction"))?;
-        assert_eq!(
-            error,
-            BroadcasterContractError::DuplicateBackendEntry {
-                context: "progress.handoff.baseHeads",
-                backend: BroadcasterBackend::Native,
-            }
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn generation_handoff_deserialization_rejects_empty_ids_and_duplicate_base_heads() -> Result<()>
-    {
-        let empty_stream_error = handoff_decode_error(
-            serde_json::json!({
-                "previousStreamId": "",
-                "previousEntryId": "7-42",
-                "baseHeads": [
-                    {"backend": "native", "blockNumber": 124}
-                ]
-            }),
-            "empty previousStreamId",
-        )?;
-        assert!(empty_stream_error
-            .to_string()
-            .contains("handoff.previousStreamId must not be empty"));
-
-        let empty_entry_error = handoff_decode_error(
-            serde_json::json!({
-                "previousStreamId": "stream-1",
-                "previousEntryId": "",
-                "baseHeads": [
-                    {"backend": "native", "blockNumber": 124}
-                ]
-            }),
-            "empty previousEntryId",
-        )?;
-        assert!(empty_entry_error
-            .to_string()
-            .contains("handoff.previousEntryId must not be empty"));
-
-        let duplicate_heads_error = handoff_decode_error(
-            serde_json::json!({
-                "previousStreamId": "stream-1",
-                "previousEntryId": "7-42",
-                "baseHeads": [
-                    {"backend": "native", "blockNumber": 124},
-                    {"backend": "native", "blockNumber": 125}
-                ]
-            }),
-            "duplicate baseHeads",
-        )?;
-        assert!(duplicate_heads_error
-            .to_string()
-            .contains("duplicate backend entry Native"));
 
         Ok(())
     }
@@ -1235,29 +1177,9 @@ mod tests {
                 chain_id,
                 snapshot_id,
                 vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
-                "generation_reset",
+                "writer_promoted",
             )?),
         ))
-    }
-
-    fn generation_handoff() -> Result<BroadcasterGenerationHandoff, BroadcasterContractError> {
-        BroadcasterGenerationHandoff::new("stream-1", "7-42", base_heads())
-    }
-
-    fn base_heads() -> Vec<BroadcasterBackendHead> {
-        vec![
-            BroadcasterBackendHead::new(BroadcasterBackend::Vm, 125),
-            BroadcasterBackendHead::new(BroadcasterBackend::Native, 124),
-        ]
-    }
-
-    fn handoff_decode_error(
-        value: serde_json::Value,
-        context: &'static str,
-    ) -> Result<serde_json::Error> {
-        serde_json::from_value::<BroadcasterGenerationHandoff>(value)
-            .err()
-            .ok_or_else(|| anyhow!("{context} should fail"))
     }
 
     fn mixed_backend_update_envelope(

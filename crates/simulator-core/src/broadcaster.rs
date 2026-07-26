@@ -133,6 +133,10 @@ pub enum BroadcasterMessageKind {
     SnapshotStart,
     SnapshotChunk,
     SnapshotEnd,
+    RecoveryStart,
+    RecoveryChunk,
+    RecoveryCatchUp,
+    RecoveryCommit,
     Update,
     Heartbeat,
     Progress,
@@ -144,6 +148,10 @@ impl BroadcasterMessageKind {
             Self::SnapshotStart => "snapshot_start",
             Self::SnapshotChunk => "snapshot_chunk",
             Self::SnapshotEnd => "snapshot_end",
+            Self::RecoveryStart => "recovery_start",
+            Self::RecoveryChunk => "recovery_chunk",
+            Self::RecoveryCatchUp => "recovery_catch_up",
+            Self::RecoveryCommit => "recovery_commit",
             Self::Update => "update",
             Self::Heartbeat => "heartbeat",
             Self::Progress => "progress",
@@ -189,6 +197,10 @@ pub enum BroadcasterPayload {
     SnapshotStart(BroadcasterSnapshotStart),
     SnapshotChunk(BroadcasterSnapshotChunk),
     SnapshotEnd(BroadcasterSnapshotEnd),
+    RecoveryStart(BroadcasterRecoveryStart),
+    RecoveryChunk(BroadcasterRecoveryChunk),
+    RecoveryCatchUp(BroadcasterRecoveryCatchUp),
+    RecoveryCommit(BroadcasterRecoveryCommit),
     Update(BroadcasterUpdateMessage),
     Heartbeat(BroadcasterHeartbeat),
     Progress(BroadcasterProgress),
@@ -200,6 +212,10 @@ impl BroadcasterPayload {
             Self::SnapshotStart(_) => BroadcasterMessageKind::SnapshotStart,
             Self::SnapshotChunk(_) => BroadcasterMessageKind::SnapshotChunk,
             Self::SnapshotEnd(_) => BroadcasterMessageKind::SnapshotEnd,
+            Self::RecoveryStart(_) => BroadcasterMessageKind::RecoveryStart,
+            Self::RecoveryChunk(_) => BroadcasterMessageKind::RecoveryChunk,
+            Self::RecoveryCatchUp(_) => BroadcasterMessageKind::RecoveryCatchUp,
+            Self::RecoveryCommit(_) => BroadcasterMessageKind::RecoveryCommit,
             Self::Update(_) => BroadcasterMessageKind::Update,
             Self::Heartbeat(_) => BroadcasterMessageKind::Heartbeat,
             Self::Progress(_) => BroadcasterMessageKind::Progress,
@@ -322,6 +338,190 @@ impl BroadcasterSnapshotEnd {
         Self {
             snapshot_id: snapshot_id.into(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRecoveryManifest {
+    pub recovery_id: String,
+    pub target_state_version: u64,
+    #[serde(deserialize_with = "deserialize_unique_recovery_backends")]
+    pub backends: Vec<BroadcasterBackend>,
+    pub chunk_count: u32,
+    pub replacement_encoded_bytes: u64,
+    pub chunk_encoded_bytes: Vec<u64>,
+    pub chunk_digests: Vec<String>,
+    pub replacement_digest: String,
+    pub buffer_a_count: u32,
+    pub commit_watermark: u64,
+}
+
+impl BroadcasterRecoveryManifest {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the recovery manifest fixes every value consumers validate before commit"
+    )]
+    pub fn new(
+        recovery_id: impl Into<String>,
+        target_state_version: u64,
+        mut backends: Vec<BroadcasterBackend>,
+        replacement_encoded_bytes: u64,
+        chunk_encoded_bytes: Vec<u64>,
+        chunk_digests: Vec<String>,
+        replacement_digest: impl Into<String>,
+        buffer_a_count: u32,
+        commit_watermark: u64,
+    ) -> Result<Self, BroadcasterContractError> {
+        backends.sort();
+        let chunk_count = u32::try_from(chunk_encoded_bytes.len()).map_err(|_| {
+            BroadcasterContractError::RecoveryManifestInvalid {
+                reason: "chunk count exceeds u32".to_string(),
+            }
+        })?;
+        let manifest = Self {
+            recovery_id: recovery_id.into(),
+            target_state_version,
+            backends,
+            chunk_count,
+            replacement_encoded_bytes,
+            chunk_encoded_bytes,
+            chunk_digests,
+            replacement_digest: replacement_digest.into(),
+            buffer_a_count,
+            commit_watermark,
+        };
+        validate_recovery_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), BroadcasterContractError> {
+        validate_recovery_manifest(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRecoveryStart {
+    pub manifest: BroadcasterRecoveryManifest,
+}
+
+impl BroadcasterRecoveryStart {
+    pub fn new(manifest: BroadcasterRecoveryManifest) -> Result<Self, BroadcasterContractError> {
+        validate_recovery_manifest(&manifest)?;
+        Ok(Self { manifest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRecoveryChunk {
+    pub recovery_id: String,
+    pub target_state_version: u64,
+    #[serde(deserialize_with = "deserialize_unique_recovery_backends")]
+    pub backends: Vec<BroadcasterBackend>,
+    pub chunk_index: u32,
+    pub encoded_bytes: u64,
+    pub digest: String,
+    pub payload_fragment: String,
+}
+
+impl BroadcasterRecoveryChunk {
+    pub fn new(
+        recovery_id: impl Into<String>,
+        target_state_version: u64,
+        mut backends: Vec<BroadcasterBackend>,
+        chunk_index: u32,
+        encoded_bytes: u64,
+        digest: impl Into<String>,
+        payload_fragment: impl Into<String>,
+    ) -> Result<Self, BroadcasterContractError> {
+        backends.sort();
+        let chunk = Self {
+            recovery_id: recovery_id.into(),
+            target_state_version,
+            backends,
+            chunk_index,
+            encoded_bytes,
+            digest: digest.into(),
+            payload_fragment: payload_fragment.into(),
+        };
+        validate_recovery_chunk(&chunk)?;
+        Ok(chunk)
+    }
+
+    pub fn validate(&self) -> Result<(), BroadcasterContractError> {
+        validate_recovery_chunk(self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRecoveryCatchUp {
+    pub recovery_id: String,
+    pub target_state_version: u64,
+    pub block_index: u32,
+    pub update: BroadcasterUpdateMessage,
+}
+
+impl BroadcasterRecoveryCatchUp {
+    pub fn new(
+        recovery_id: impl Into<String>,
+        target_state_version: u64,
+        block_index: u32,
+        update: BroadcasterUpdateMessage,
+    ) -> Result<Self, BroadcasterContractError> {
+        let catch_up = Self {
+            recovery_id: recovery_id.into(),
+            target_state_version,
+            block_index,
+            update,
+        };
+        validate_recovery_catch_up(&catch_up)?;
+        Ok(catch_up)
+    }
+
+    pub fn validate(&self) -> Result<(), BroadcasterContractError> {
+        validate_recovery_catch_up(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRecoveryCommit {
+    pub recovery_id: String,
+    pub target_state_version: u64,
+    #[serde(deserialize_with = "deserialize_unique_recovery_backends")]
+    pub backends: Vec<BroadcasterBackend>,
+    pub replacement_digest: String,
+    pub buffer_a_count: u32,
+    pub commit_watermark: u64,
+}
+
+impl BroadcasterRecoveryCommit {
+    pub fn new(
+        recovery_id: impl Into<String>,
+        target_state_version: u64,
+        mut backends: Vec<BroadcasterBackend>,
+        replacement_digest: impl Into<String>,
+        buffer_a_count: u32,
+        commit_watermark: u64,
+    ) -> Result<Self, BroadcasterContractError> {
+        backends.sort();
+        let commit = Self {
+            recovery_id: recovery_id.into(),
+            target_state_version,
+            backends,
+            replacement_digest: replacement_digest.into(),
+            buffer_a_count,
+            commit_watermark,
+        };
+        validate_recovery_commit(&commit)?;
+        Ok(commit)
+    }
+
+    pub fn validate(&self) -> Result<(), BroadcasterContractError> {
+        validate_recovery_commit(self)
     }
 }
 
@@ -635,8 +835,6 @@ pub struct BroadcasterProgress {
     #[serde(deserialize_with = "deserialize_unique_progress_backends")]
     pub backends: Vec<BroadcasterBackend>,
     pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handoff: Option<BroadcasterGenerationHandoff>,
 }
 
 impl BroadcasterProgress {
@@ -657,73 +855,7 @@ impl BroadcasterProgress {
             snapshot_id: snapshot_id.into(),
             backends,
             reason,
-            handoff: None,
         })
-    }
-
-    pub fn new_with_handoff(
-        chain_id: u64,
-        snapshot_id: impl Into<String>,
-        backends: Vec<BroadcasterBackend>,
-        reason: impl Into<String>,
-        handoff: BroadcasterGenerationHandoff,
-    ) -> Result<Self, BroadcasterContractError> {
-        let mut progress = Self::new(chain_id, snapshot_id, backends, reason)?;
-        progress.handoff = Some(handoff);
-        Ok(progress)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BroadcasterGenerationHandoff {
-    pub previous_stream_id: String,
-    pub previous_entry_id: String,
-    pub base_heads: Vec<BroadcasterBackendHead>,
-}
-
-impl BroadcasterGenerationHandoff {
-    pub fn new(
-        previous_stream_id: impl Into<String>,
-        previous_entry_id: impl Into<String>,
-        mut base_heads: Vec<BroadcasterBackendHead>,
-    ) -> Result<Self, BroadcasterContractError> {
-        base_heads.sort_by_key(|head| head.backend);
-        validate_generation_handoff_base_heads(&base_heads)?;
-        Ok(Self {
-            previous_stream_id: required_handoff_field(
-                "handoff.previousStreamId",
-                previous_stream_id.into(),
-            )?,
-            previous_entry_id: required_handoff_field(
-                "handoff.previousEntryId",
-                previous_entry_id.into(),
-            )?,
-            base_heads,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for BroadcasterGenerationHandoff {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct WireHandoff {
-            previous_stream_id: String,
-            previous_entry_id: String,
-            base_heads: Vec<BroadcasterBackendHead>,
-        }
-
-        let wire = WireHandoff::deserialize(deserializer)?;
-        Self::new(
-            wire.previous_stream_id,
-            wire.previous_entry_id,
-            wire.base_heads,
-        )
-        .map_err(de::Error::custom)
     }
 }
 
@@ -992,33 +1124,6 @@ impl BroadcasterSubscriptionTracker {
         Ok(())
     }
 
-    pub fn continue_live_generation(
-        &mut self,
-        boundary: &BroadcasterRedisReplayBoundary,
-    ) -> Result<(), BroadcasterContractError> {
-        let BroadcasterSubscriptionState::Live {
-            chain_id,
-            declared_backends,
-            ..
-        } = self.state.clone()
-        else {
-            return Err(
-                BroadcasterContractError::RedisReplayBoundaryBeforeSnapshotComplete {
-                    state: self.state.label(),
-                },
-            );
-        };
-
-        self.state = BroadcasterSubscriptionState::Live {
-            stream_id: boundary.stream_id.clone(),
-            chain_id,
-            snapshot_id: boundary.snapshot_id.clone(),
-            declared_backends,
-        };
-        self.next_message_seq = Some(next_message_seq(boundary.exclusive_message_seq)?);
-        Ok(())
-    }
-
     pub fn skip_live_delta(
         &mut self,
         envelope: &BroadcasterEnvelope,
@@ -1045,6 +1150,14 @@ impl BroadcasterSubscriptionTracker {
             }
             BroadcasterPayload::SnapshotEnd(_) => {
                 Err(BroadcasterContractError::UnexpectedSnapshotEnd)
+            }
+            BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_) => {
+                Err(BroadcasterContractError::UnexpectedRecoveryMessage {
+                    kind: envelope.kind(),
+                })
             }
             BroadcasterPayload::Update(_)
             | BroadcasterPayload::Heartbeat(_)
@@ -1214,6 +1327,14 @@ impl BroadcasterSubscriptionTracker {
                     snapshot_id: end.snapshot_id.clone(),
                 })
             }
+            BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_) => {
+                Err(BroadcasterContractError::UnexpectedRecoveryMessage {
+                    kind: envelope.kind(),
+                })
+            }
             BroadcasterPayload::Update(_) => {
                 Err(BroadcasterContractError::UpdateBeforeSnapshotComplete)
             }
@@ -1249,6 +1370,14 @@ impl BroadcasterSubscriptionTracker {
             }
             BroadcasterPayload::SnapshotEnd(_) => {
                 Err(BroadcasterContractError::UnexpectedSnapshotEnd)
+            }
+            BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_) => {
+                Err(BroadcasterContractError::UnexpectedRecoveryMessage {
+                    kind: envelope.kind(),
+                })
             }
             BroadcasterPayload::Update(update) => {
                 validate_update_partitions(&update.partitions)?;
@@ -1301,6 +1430,9 @@ pub enum BroadcasterContractError {
     },
     UnexpectedSnapshotChunk,
     UnexpectedSnapshotEnd,
+    UnexpectedRecoveryMessage {
+        kind: BroadcasterMessageKind,
+    },
     UnexpectedSnapshotId {
         expected: String,
         found: String,
@@ -1328,6 +1460,9 @@ pub enum BroadcasterContractError {
     },
     EmptyUpdate,
     ProgressReasonEmpty,
+    RecoveryManifestInvalid {
+        reason: String,
+    },
     EmptyUpdatePartition {
         backend: BroadcasterBackend,
     },
@@ -1683,6 +1818,9 @@ impl fmt::Display for BroadcasterContractError {
             | Self::ExtraSnapshotChunk { .. }
             | Self::SnapshotIncomplete { .. }
             | Self::MissingDeclaredSnapshotBackends { .. } => fmt_snapshot_flow_error(f, self),
+            Self::UnexpectedRecoveryMessage { kind } => {
+                write!(f, "unexpected {kind} outside a Redis recovery transaction")
+            }
             Self::UpdateBeforeSnapshotComplete => {
                 write!(f, "received update before snapshot bootstrap completed")
             }
@@ -1698,6 +1836,9 @@ impl fmt::Display for BroadcasterContractError {
             ),
             Self::EmptyUpdate => write!(f, "update message must contain at least one partition"),
             Self::ProgressReasonEmpty => write!(f, "progress reason must not be empty"),
+            Self::RecoveryManifestInvalid { reason } => {
+                write!(f, "invalid broadcaster recovery payload: {reason}")
+            }
             Self::EmptyUpdatePartition { backend } => {
                 write!(
                     f,
@@ -1911,6 +2052,123 @@ where
     Ok(backends)
 }
 
+fn deserialize_unique_recovery_backends<'de, D>(
+    deserializer: D,
+) -> Result<Vec<BroadcasterBackend>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut backends = Vec::<BroadcasterBackend>::deserialize(deserializer)?;
+    backends.sort();
+    validate_recovery_backends(&backends).map_err(de::Error::custom)?;
+    Ok(backends)
+}
+
+fn validate_recovery_manifest(
+    manifest: &BroadcasterRecoveryManifest,
+) -> Result<(), BroadcasterContractError> {
+    require_recovery_text("recovery_id", &manifest.recovery_id)?;
+    require_recovery_version(manifest.target_state_version)?;
+    validate_recovery_backends(&manifest.backends)?;
+    if manifest.chunk_count == 0 {
+        return Err(recovery_error("chunk_count must be greater than zero"));
+    }
+    if manifest.chunk_count as usize != manifest.chunk_encoded_bytes.len() {
+        return Err(recovery_error(
+            "chunk_count does not match chunk_encoded_bytes",
+        ));
+    }
+    if manifest.chunk_count as usize != manifest.chunk_digests.len() {
+        return Err(recovery_error("chunk_count does not match chunk_digests"));
+    }
+    if manifest.replacement_encoded_bytes == 0 {
+        return Err(recovery_error(
+            "replacement_encoded_bytes must be greater than zero",
+        ));
+    }
+    if manifest.chunk_encoded_bytes.contains(&0) {
+        return Err(recovery_error(
+            "chunk_encoded_bytes values must be greater than zero",
+        ));
+    }
+    for digest in &manifest.chunk_digests {
+        require_recovery_text("chunk_digest", digest)?;
+    }
+    require_recovery_text("replacement_digest", &manifest.replacement_digest)?;
+    if manifest.commit_watermark == 0 {
+        return Err(recovery_error("commit_watermark must be greater than zero"));
+    }
+    Ok(())
+}
+
+fn validate_recovery_chunk(
+    chunk: &BroadcasterRecoveryChunk,
+) -> Result<(), BroadcasterContractError> {
+    require_recovery_text("recovery_id", &chunk.recovery_id)?;
+    require_recovery_version(chunk.target_state_version)?;
+    validate_recovery_backends(&chunk.backends)?;
+    if chunk.encoded_bytes == 0 {
+        return Err(recovery_error("encoded_bytes must be greater than zero"));
+    }
+    require_recovery_text("digest", &chunk.digest)?;
+    require_recovery_text("payload_fragment", &chunk.payload_fragment)?;
+    Ok(())
+}
+
+fn validate_recovery_catch_up(
+    catch_up: &BroadcasterRecoveryCatchUp,
+) -> Result<(), BroadcasterContractError> {
+    require_recovery_text("recovery_id", &catch_up.recovery_id)?;
+    require_recovery_version(catch_up.target_state_version)?;
+    validate_update_partitions(&catch_up.update.partitions)
+}
+
+fn validate_recovery_commit(
+    commit: &BroadcasterRecoveryCommit,
+) -> Result<(), BroadcasterContractError> {
+    require_recovery_text("recovery_id", &commit.recovery_id)?;
+    require_recovery_version(commit.target_state_version)?;
+    validate_recovery_backends(&commit.backends)?;
+    require_recovery_text("replacement_digest", &commit.replacement_digest)?;
+    if commit.commit_watermark == 0 {
+        return Err(recovery_error("commit_watermark must be greater than zero"));
+    }
+    Ok(())
+}
+
+fn validate_recovery_backends(
+    backends: &[BroadcasterBackend],
+) -> Result<(), BroadcasterContractError> {
+    if backends.is_empty() {
+        return Err(recovery_error("backends must not be empty"));
+    }
+    validate_unique_backends("recovery.backends", backends)
+}
+
+fn require_recovery_version(target_state_version: u64) -> Result<(), BroadcasterContractError> {
+    if target_state_version == 0 {
+        Err(recovery_error(
+            "target_state_version must be greater than zero",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_recovery_text(field: &'static str, value: &str) -> Result<(), BroadcasterContractError> {
+    if value.trim().is_empty() {
+        Err(recovery_error(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
+}
+
+fn recovery_error(reason: impl Into<String>) -> BroadcasterContractError {
+    BroadcasterContractError::RecoveryManifestInvalid {
+        reason: reason.into(),
+    }
+}
+
 fn validate_snapshot_start_backends(
     backends: &[BroadcasterBackend],
 ) -> Result<(), BroadcasterContractError> {
@@ -1939,12 +2197,6 @@ fn validate_heartbeat_backend_heads(
     heads: &[BroadcasterBackendHead],
 ) -> Result<(), BroadcasterContractError> {
     validate_unique_backend_heads("heartbeat.backend_heads", heads)
-}
-
-fn validate_generation_handoff_base_heads(
-    heads: &[BroadcasterBackendHead],
-) -> Result<(), BroadcasterContractError> {
-    validate_unique_backend_heads("progress.handoff.baseHeads", heads)
 }
 
 fn validate_progress_backends(
@@ -2055,17 +2307,6 @@ fn validate_unique_backend_entries(
         }
     }
     Ok(())
-}
-
-fn required_handoff_field(
-    field: &'static str,
-    value: String,
-) -> Result<String, BroadcasterContractError> {
-    if value.trim().is_empty() {
-        Err(BroadcasterContractError::RedisEntryEmptyField { field })
-    } else {
-        Ok(value)
-    }
 }
 
 fn validate_declared_backend_entries(
@@ -2962,7 +3203,7 @@ mod tests {
                     8453,
                     "snapshot-1",
                     vec![BroadcasterBackend::Native],
-                    "generation_reset",
+                    "writer_promoted",
                 )?),
             ))?,
             BroadcasterSubscriptionEvent::ProgressAccepted
