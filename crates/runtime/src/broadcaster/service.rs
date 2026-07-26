@@ -1,10 +1,13 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock};
+use futures::FutureExt;
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::warn;
 use tycho_simulation::{
@@ -13,14 +16,16 @@ use tycho_simulation::{
 };
 
 use crate::broadcaster::redis_publisher::{
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherMode,
+    BroadcasterRecoveryTransaction, BroadcasterRedisPublisher, BroadcasterRedisPublisherMode,
+    OversizedRedisEntry, RecoveryCommitAdoptionUncertain, RecoveryPublicationCancelled,
+    SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES,
 };
 use crate::broadcaster::state::{
-    combine_snapshot_exports, BroadcasterReadiness, BroadcasterSnapshotCache,
-    BroadcasterSnapshotExport, BroadcasterSnapshotSessionsSnapshot, BroadcasterStatusSnapshot,
-    BroadcasterUpstreamState,
+    combine_snapshot_exports, BroadcasterReadiness, BroadcasterRecoverySource,
+    BroadcasterRecoveryStatus, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
+    BroadcasterSnapshotSessionsSnapshot, BroadcasterStatusSnapshot, BroadcasterUpstreamState,
 };
-use crate::metrics::emit_broadcaster_snapshot_export_failure;
+use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapshot_export_failure};
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
     BroadcasterSnapshotSessionResponse,
@@ -31,19 +36,20 @@ pub enum SnapshotSessionError {
     NotFound,
     Expired,
     PayloadOutOfRange,
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionCloseReason {
     Expired,
-    GenerationReset,
+    WriterFenceLost,
 }
 
 impl SessionCloseReason {
     const fn label(self) -> &'static str {
         match self {
             Self::Expired => "expired",
-            Self::GenerationReset => "generation_reset",
+            Self::WriterFenceLost => "writer_fence_lost",
         }
     }
 }
@@ -53,11 +59,12 @@ struct BroadcasterSnapshotSessionRegistry {
     next_session_id: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     pending_sessions: Arc<Mutex<HashMap<u64, PendingSnapshotSession>>>,
+    fetch_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
 struct PendingSnapshotSession {
-    snapshot_payloads: Vec<BroadcasterEnvelope>,
+    artifact: Arc<BroadcasterSnapshotArtifact>,
     expires_at: Instant,
 }
 
@@ -73,79 +80,57 @@ impl BroadcasterSnapshotSessionRegistry {
             next_session_id: Arc::new(AtomicU64::new(1)),
             last_error: Arc::new(Mutex::new(None)),
             pending_sessions: Arc::new(Mutex::new(HashMap::new())),
+            fetch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SNAPSHOT_FETCHES)),
         }
-    }
-
-    fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.pending_sessions, &other.pending_sessions)
     }
 
     async fn create_snapshot_session(
         &self,
-        snapshot: BroadcasterSnapshotExport,
-        chain_id: u64,
-        redis_replay_boundary: BroadcasterRedisReplayBoundary,
+        artifact: Arc<BroadcasterSnapshotArtifact>,
         ttl: Duration,
     ) -> Result<BroadcasterSnapshotSessionResponse> {
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let stream_id = snapshot.stream_id;
-        let snapshot_id = snapshot.snapshot_id;
-        let max_payload_bytes = snapshot.max_payload_bytes;
-        let snapshot_chunk_count = snapshot
-            .payloads
-            .iter()
-            .filter(|payload| matches!(payload, BroadcasterPayload::SnapshotChunk(_)))
-            .count() as u32;
-        let mut message_seq = 1u64;
-        let snapshot_payloads = snapshot
-            .payloads
-            .into_iter()
-            .map(|payload| {
-                let envelope = BroadcasterEnvelope::new(stream_id.clone(), message_seq, payload);
-                message_seq = message_seq.saturating_add(1);
-                envelope
-            })
-            .collect::<Vec<_>>();
-        for (index, envelope) in snapshot_payloads.iter().enumerate() {
-            let bytes = serde_json::to_vec(envelope)
-                .with_context(|| format!("snapshot payload {index} is not JSON-serializable"))?;
-            anyhow::ensure!(
-                bytes.len() <= max_payload_bytes,
-                "snapshot payload {index} is {} bytes, above configured max {max_payload_bytes}",
-                bytes.len()
-            );
-        }
-        let payload_count = snapshot_payloads.len() as u32;
         let expires_in_ms = ttl.as_millis().try_into().unwrap_or(u64::MAX);
         let expires_at = Instant::now() + ttl;
-
+        let mut sessions = self.pending_sessions.lock().await;
+        sessions.retain(|_, session| !session.is_expired(Instant::now()));
         anyhow::ensure!(
-            stream_id == redis_replay_boundary.stream_id,
-            "snapshot stream_id mismatch with Redis replay boundary: snapshot={stream_id}, boundary={}",
-            redis_replay_boundary.stream_id
+            sessions.len() < MAX_SNAPSHOT_SESSIONS,
+            "snapshot session capacity reached"
         );
+        let mut retained_artifacts = HashSet::new();
+        let mut retained_bytes = 0usize;
+        for session in sessions.values() {
+            let identity = Arc::as_ptr(&session.artifact) as usize;
+            if retained_artifacts.insert(identity) {
+                retained_bytes = retained_bytes.saturating_add(session.artifact.encoded_bytes);
+            }
+        }
+        let artifact_identity = Arc::as_ptr(&artifact) as usize;
+        if retained_artifacts.insert(artifact_identity) {
+            retained_bytes = retained_bytes.saturating_add(artifact.encoded_bytes);
+        }
         anyhow::ensure!(
-            snapshot_id == redis_replay_boundary.snapshot_id,
-            "snapshot_id mismatch with Redis replay boundary: snapshot={snapshot_id}, boundary={}",
-            redis_replay_boundary.snapshot_id
+            retained_bytes <= MAX_RETAINED_SNAPSHOT_BYTES,
+            "snapshot artifact retention capacity reached"
         );
-
-        self.pending_sessions.lock().await.insert(
+        sessions.insert(
             session_id,
             PendingSnapshotSession {
-                snapshot_payloads,
+                artifact: Arc::clone(&artifact),
                 expires_at,
             },
         );
+        drop(sessions);
 
         Ok(BroadcasterSnapshotSessionResponse {
-            chain_id,
+            chain_id: artifact.chain_id,
             session_id,
-            stream_id,
-            snapshot_id,
-            redis_replay_boundary,
-            payload_count,
-            snapshot_chunk_count,
+            stream_id: artifact.stream_id.clone(),
+            snapshot_id: artifact.snapshot_id.clone(),
+            redis_replay_boundary: artifact.redis_replay_boundary.clone(),
+            payload_count: artifact.payloads.len() as u32,
+            snapshot_chunk_count: artifact.snapshot_chunk_count,
             expires_in_ms,
         })
     }
@@ -155,6 +140,10 @@ impl BroadcasterSnapshotSessionRegistry {
         session_id: u64,
         index: u32,
     ) -> Result<BroadcasterEnvelope, SnapshotSessionError> {
+        let _permit = self
+            .fetch_permits
+            .try_acquire()
+            .map_err(|_| SnapshotSessionError::Busy)?;
         {
             let now = Instant::now();
             let mut guard = self.pending_sessions.lock().await;
@@ -164,7 +153,7 @@ impl BroadcasterSnapshotSessionRegistry {
             if session.is_expired(now) {
                 guard.remove(&session_id);
             } else {
-                let Some(envelope) = session.snapshot_payloads.get(index as usize).cloned() else {
+                let Some(envelope) = session.artifact.payloads.get(index as usize).cloned() else {
                     return Err(SnapshotSessionError::PayloadOutOfRange);
                 };
                 return Ok(envelope);
@@ -223,6 +212,94 @@ impl BroadcasterSnapshotSessionRegistry {
     }
 }
 
+const MAX_SNAPSHOT_SESSIONS: usize = 128;
+const MAX_CONCURRENT_SNAPSHOT_FETCHES: usize = 64;
+const MAX_RETAINED_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
+const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
+const RECOVERY_WARN_AFTER: Duration = Duration::from_secs(30);
+const RECOVERY_ABORT_AFTER: Duration = Duration::from_secs(60);
+const RECOVERY_MAX_LOCAL_FAILURES: u8 = 1;
+const DEFAULT_RECOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryPublicationPhase {
+    Idle,
+    Building,
+    Publishing,
+    Draining,
+    Fatal,
+}
+
+impl RecoveryPublicationPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Building => "building",
+            Self::Publishing => "publishing",
+            Self::Draining => "draining",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Building | Self::Publishing | Self::Draining)
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryPublicationState {
+    work_id: u64,
+    phase: RecoveryPublicationPhase,
+    local_failures: u8,
+    started_at: Instant,
+    warned: bool,
+    complete_native_blocks: HashSet<u64>,
+    buffer_a: Vec<simulator_core::broadcaster::BroadcasterUpdateMessage>,
+    buffer_b: Vec<simulator_core::broadcaster::BroadcasterUpdateMessage>,
+    cancelled: Arc<AtomicBool>,
+    fatal_error: Option<String>,
+    max_buffer_a_count: usize,
+    max_buffer_b_count: usize,
+    last_outcome: Option<&'static str>,
+    last_duration_ms: Option<u64>,
+    last_encoded_bytes: Option<usize>,
+    last_chunk_count: Option<usize>,
+}
+
+impl Default for RecoveryPublicationState {
+    fn default() -> Self {
+        Self {
+            work_id: 0,
+            phase: RecoveryPublicationPhase::Idle,
+            local_failures: 0,
+            started_at: Instant::now(),
+            warned: false,
+            complete_native_blocks: HashSet::new(),
+            buffer_a: Vec::new(),
+            buffer_b: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            fatal_error: None,
+            max_buffer_a_count: 0,
+            max_buffer_b_count: 0,
+            last_outcome: None,
+            last_duration_ms: None,
+            last_encoded_bytes: None,
+            last_chunk_count: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BroadcasterSnapshotArtifact {
+    chain_id: u64,
+    stream_id: String,
+    snapshot_id: String,
+    redis_replay_boundary: BroadcasterRedisReplayBoundary,
+    payloads: Arc<Vec<BroadcasterEnvelope>>,
+    snapshot_chunk_count: u32,
+    encoded_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct BroadcasterServiceState {
     snapshot_max_payload_bytes: usize,
@@ -230,9 +307,15 @@ pub struct BroadcasterServiceState {
     upstream: BroadcasterUpstreamState,
     snapshot_sessions: BroadcasterSnapshotSessionRegistry,
     snapshot_preflight: Arc<RwLock<BroadcasterSnapshotPreflightState>>,
+    snapshot_artifact: Arc<RwLock<Option<Arc<BroadcasterSnapshotArtifact>>>>,
+    snapshot_refresh_active: Arc<AtomicBool>,
+    recovery_publication: Arc<Mutex<RecoveryPublicationState>>,
+    recovery_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    recovery_retry_backoff: Duration,
+    next_recovery_publication_id: Arc<AtomicU64>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
-    // This gate keeps snapshot export plus replay-boundary capture atomic with respect to
-    // updates, heartbeats, and generation resets.
+    // This gate keeps snapshot export and recovery source capture atomic with
+    // respect to accepted updates and replay-boundary capture.
     lifecycle_gate: Arc<Mutex<()>>,
 }
 
@@ -254,141 +337,182 @@ impl BroadcasterServiceState {
         redis_publisher: Arc<BroadcasterRedisPublisher>,
         lifecycle_gate: Arc<Mutex<()>>,
     ) -> Self {
+        Self::with_lifecycle_gate_and_recovery_backoff(
+            snapshot_max_payload_bytes,
+            cache,
+            upstream,
+            redis_publisher,
+            lifecycle_gate,
+            DEFAULT_RECOVERY_RETRY_BACKOFF,
+        )
+    }
+
+    pub fn with_lifecycle_gate_and_recovery_backoff(
+        snapshot_max_payload_bytes: usize,
+        cache: BroadcasterSnapshotCache,
+        upstream: BroadcasterUpstreamState,
+        redis_publisher: Arc<BroadcasterRedisPublisher>,
+        lifecycle_gate: Arc<Mutex<()>>,
+        recovery_retry_backoff: Duration,
+    ) -> Self {
         Self {
             snapshot_max_payload_bytes,
             cache,
             upstream,
             snapshot_sessions: BroadcasterSnapshotSessionRegistry::new(),
             snapshot_preflight: Arc::new(RwLock::new(BroadcasterSnapshotPreflightState::default())),
+            snapshot_artifact: Arc::new(RwLock::new(None)),
+            snapshot_refresh_active: Arc::new(AtomicBool::new(false)),
+            recovery_publication: Arc::new(Mutex::new(RecoveryPublicationState::default())),
+            recovery_workers: Arc::new(Mutex::new(Vec::new())),
+            recovery_retry_backoff,
+            next_recovery_publication_id: Arc::new(AtomicU64::new(1)),
             redis_publisher,
             lifecycle_gate,
         }
     }
 
     pub async fn mark_upstream_connected(&self) {
+        let was_connected = self.upstream.snapshot().await.connected;
         self.upstream.mark_connected().await;
+        if !was_connected {
+            tracing::info!(
+                event = "broadcaster_upstream_connected",
+                backends = ?self.cache.configured_backends(),
+                "Broadcaster connected to its upstream feed"
+            );
+        }
     }
 
     pub async fn mark_build_failed(&self, error: impl Into<String>) {
         self.upstream.mark_build_failed(error).await;
     }
 
-    /// Resets raw/RFQ caches and Redis while holding their shared publication gate.
-    ///
-    /// All services passed here must have been built with the same gate and Redis publisher.
-    pub async fn handle_shared_generation_reset(
-        services: &[Self],
+    pub async fn mark_stream_disconnected(
+        &self,
         reason: impl Into<String>,
         last_error: Option<String>,
     ) {
-        Self::handle_shared_generation_reset_with_cache_scope(
-            services, services, reason, last_error,
-        )
-        .await;
-    }
-
-    /// Advances the shared Redis generation while only clearing caches that restarted.
-    ///
-    /// Snapshot sessions belong to the shared generation, so they are closed for every service.
-    /// Preserved caches are relabelled to the new generation instead of being rewarmed.
-    pub async fn handle_shared_generation_reset_with_cache_scope(
-        generation_services: &[Self],
-        cache_reset_services: &[Self],
-        reason: impl Into<String>,
-        last_error: Option<String>,
-    ) {
-        assert!(
-            !generation_services.is_empty(),
-            "broadcaster generation reset requires at least one service"
-        );
-        assert!(
-            !cache_reset_services.is_empty(),
-            "broadcaster generation reset requires at least one cache reset service"
-        );
-        debug_assert!(
-            generation_services.iter().all(|service| Arc::ptr_eq(
-                &service.lifecycle_gate,
-                &generation_services[0].lifecycle_gate
-            )),
-            "shared broadcaster generation reset requires one lifecycle gate"
-        );
-        debug_assert!(
-            generation_services.iter().all(|service| Arc::ptr_eq(
-                &service.redis_publisher,
-                &generation_services[0].redis_publisher
-            )),
-            "shared broadcaster generation reset requires one Redis publisher"
-        );
-        assert!(
-            cache_reset_services.iter().all(|reset_service| {
-                generation_services
-                    .iter()
-                    .any(|service| service.ptr_eq(reset_service))
-            }),
-            "cache reset services must be part of the shared generation reset"
-        );
-        let reason = reason.into();
-        let _gate = generation_services[0].lifecycle_gate.lock().await;
-        let publisher_mode = generation_services[0].redis_publisher.mode().await;
-        let mut reset_backends = Vec::new();
-        for service in generation_services {
-            if cache_reset_services
-                .iter()
-                .any(|reset_service| service.ptr_eq(reset_service))
-            {
-                service
-                    .upstream
-                    .mark_disconnected(reason.clone(), last_error.clone())
-                    .await;
-            }
-            service
-                .snapshot_sessions
-                .disconnect_all(SessionCloseReason::GenerationReset)
-                .await;
-            if publisher_mode != BroadcasterRedisPublisherMode::Retired {
-                reset_backends.extend(service.cache.configured_backends());
-            }
-        }
-        if publisher_mode == BroadcasterRedisPublisherMode::Retired {
-            return;
-        }
-        reset_backends.sort();
-        reset_backends.dedup();
-        let boundary = match generation_services[0]
-            .redis_publisher
-            .reset_generation_boundary(reason, reset_backends)
-            .await
+        let _gate = self.lifecycle_gate.lock().await;
+        self.cancel_recovery_publication().await;
+        self.upstream.mark_disconnected(reason, last_error).await;
+        let backends = self.cache.configured_backends();
+        if backends
+            .iter()
+            .any(|backend| *backend != simulator_core::broadcaster::BroadcasterBackend::Rfq)
         {
-            Ok(boundary) => boundary,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Skipping broadcaster cache reset because Redis generation reset failed"
-                );
-                return;
-            }
-        };
-        for service in generation_services {
-            if cache_reset_services
-                .iter()
-                .any(|reset_service| service.ptr_eq(reset_service))
-            {
-                service.cache.reset_to_generation(boundary.generation).await;
-            } else {
-                service.cache.relabel_generation(boundary.generation).await;
-            }
+            self.cache.begin_same_generation_recovery().await;
+        } else {
+            self.cache.reset_same_generation().await;
         }
     }
 
-    fn ptr_eq(&self, other: &Self) -> bool {
-        self.snapshot_sessions.ptr_eq(&other.snapshot_sessions)
+    async fn cancel_recovery_publication(&self) {
+        let mut recovery = self.recovery_publication.lock().await;
+        let outcome = if recovery.phase.is_active() {
+            let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
+            recovery.last_outcome = Some("aborted");
+            recovery.last_duration_ms = Some(duration_ms);
+            Some((
+                duration_ms,
+                recovery.last_encoded_bytes.unwrap_or(0),
+                recovery.last_chunk_count.unwrap_or(0),
+                recovery.max_buffer_a_count,
+                recovery.max_buffer_b_count,
+            ))
+        } else {
+            None
+        };
+        recovery.cancelled.store(true, Ordering::Release);
+        recovery.work_id = recovery.work_id.saturating_add(1);
+        recovery.phase = RecoveryPublicationPhase::Idle;
+        recovery.buffer_a.clear();
+        recovery.buffer_b.clear();
+        recovery.complete_native_blocks.clear();
+        recovery.fatal_error = None;
+        drop(recovery);
+        if let Some((duration_ms, encoded_bytes, chunk_count, buffer_a_count, buffer_b_count)) =
+            outcome
+        {
+            warn!(
+                event = "broadcaster_recovery_aborted",
+                duration_ms,
+                encoded_bytes,
+                chunk_count,
+                buffer_a_count,
+                buffer_b_count,
+                "Broadcaster recovery was aborted before completion"
+            );
+            emit_broadcaster_recovery_outcome(
+                "aborted",
+                duration_ms,
+                encoded_bytes,
+                chunk_count,
+                buffer_a_count,
+                buffer_b_count,
+            );
+        }
     }
 
-    pub(crate) async fn redis_publisher_needs_generation_reset(&self) -> bool {
-        matches!(
-            self.redis_publisher.mode().await,
-            BroadcasterRedisPublisherMode::Retired | BroadcasterRedisPublisherMode::Unhealthy
-        )
+    async fn recovery_is_active(&self) -> bool {
+        self.recovery_publication.lock().await.phase.is_active()
+    }
+
+    async fn recovery_status(&self) -> BroadcasterRecoveryStatus {
+        let recovery = self.recovery_publication.lock().await;
+        let active = recovery.phase.is_active();
+        let age_ms = (active || recovery.phase == RecoveryPublicationPhase::Fatal)
+            .then(|| recovery.started_at.elapsed().as_millis() as u64);
+        BroadcasterRecoveryStatus {
+            active,
+            phase: recovery.phase.as_str(),
+            age_ms,
+            attempt: if active {
+                recovery.local_failures.saturating_add(1)
+            } else {
+                recovery.local_failures
+            },
+            buffer_a_count: recovery.buffer_a.len(),
+            buffer_b_count: recovery.buffer_b.len(),
+            oldest_buffered_age_ms: (!recovery.buffer_a.is_empty()
+                || !recovery.buffer_b.is_empty())
+            .then(|| recovery.started_at.elapsed().as_millis() as u64),
+            last_outcome: recovery.last_outcome,
+            last_duration_ms: recovery.last_duration_ms,
+            last_encoded_bytes: recovery.last_encoded_bytes,
+            last_chunk_count: recovery.last_chunk_count,
+            last_error: recovery.fatal_error.clone(),
+        }
+    }
+
+    async fn recovery_fatal_error(&self) -> Option<String> {
+        let recovery = self.recovery_publication.lock().await;
+        (recovery.phase == RecoveryPublicationPhase::Fatal)
+            .then(|| recovery.fatal_error.clone())
+            .flatten()
+    }
+
+    pub(crate) async fn reconnect_backoff_can_reset(&self, freshness: Duration) -> bool {
+        if self.cache.replacement_pending().await {
+            return false;
+        }
+        let recovery_completed = {
+            let recovery = self.recovery_publication.lock().await;
+            recovery.phase == RecoveryPublicationPhase::Idle
+                && recovery.last_outcome == Some("committed")
+        };
+        if !recovery_completed {
+            return false;
+        }
+        let upstream = self.upstream.snapshot().await;
+        upstream.connected
+            && upstream
+                .last_update_age_ms
+                .is_some_and(|age_ms| age_ms < freshness.as_millis() as u64)
+    }
+
+    pub(crate) async fn redis_publisher_is_retired(&self) -> bool {
+        self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Retired
     }
 
     pub async fn promote_when_ready(
@@ -401,14 +525,20 @@ impl BroadcasterServiceState {
         );
         ensure_shared_lifecycle(services, "broadcaster promotion")?;
 
-        let _gate = services[0].lifecycle_gate.lock().await;
+        let gate = services[0].lifecycle_gate.lock().await;
         match services[0].redis_publisher.mode().await {
             BroadcasterRedisPublisherMode::Active => {
-                return services[0]
-                    .redis_publisher
-                    .replay_boundary()
-                    .await
-                    .map(Some);
+                drop(gate);
+                Self::run_snapshot_export_preflight(services).await?;
+                return if services[0].snapshot_artifact.read().await.is_some() {
+                    services[0]
+                        .redis_publisher
+                        .replay_boundary()
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                };
             }
             BroadcasterRedisPublisherMode::Passive => {}
             BroadcasterRedisPublisherMode::Retired | BroadcasterRedisPublisherMode::Unhealthy => {
@@ -416,30 +546,15 @@ impl BroadcasterServiceState {
             }
         }
 
-        for service in services {
-            let status = service.status_snapshot().await;
-            if !matches!(
-                status.readiness,
-                BroadcasterReadiness::Ready | BroadcasterReadiness::SnapshotUnexportable
-            ) {
-                return Ok(None);
-            }
-        }
-
-        if let Err(error) = Self::run_snapshot_export_preflight_locked(services).await {
-            warn!(
-                event = "broadcaster_snapshot_export_failed",
-                error = %error,
-                "Snapshot export preflight failed before writer promotion"
-            );
+        if !services[0].cache.is_ready().await {
             return Ok(None);
         }
 
-        // The process has warmed every configured cache. Promotion is the point
-        // where that local state becomes the active snapshot generation.
-        let mut base_heads = Vec::new();
-        for service in services {
-            base_heads.extend(service.cache.backend_heads().await);
+        let mut base_heads = services[0].cache.backend_heads().await;
+        for service in &services[1..] {
+            if service.cache.is_ready().await {
+                base_heads.extend(service.cache.backend_heads().await);
+            }
         }
         let boundary = services[0]
             .redis_publisher
@@ -448,7 +563,13 @@ impl BroadcasterServiceState {
         for service in services {
             service.cache.relabel_generation(boundary.generation).await;
         }
-        Ok(Some(boundary))
+        drop(gate);
+        Self::run_snapshot_export_preflight(services).await?;
+        if services[0].snapshot_artifact.read().await.is_some() {
+            Ok(Some(boundary))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<()> {
@@ -464,55 +585,654 @@ impl BroadcasterServiceState {
     }
 
     pub async fn apply_feed_message(&self, feed: &FeedMessage<BlockHeader>) -> Result<bool> {
+        Ok(self.apply_feed_message_with_progress(feed).await?.published)
+    }
+
+    pub(crate) async fn apply_feed_message_with_progress(
+        &self,
+        feed: &FeedMessage<BlockHeader>,
+    ) -> Result<BroadcasterFeedApply> {
+        if let Some(error) = self.recovery_fatal_error().await {
+            return Err(anyhow::anyhow!(
+                "broadcaster recovery worker terminated: {error}"
+            ));
+        }
         let _gate = self.lifecycle_gate.lock().await;
-        let mut staged = self.cache.stage_feed_message(feed).await?;
+        let staged = self.cache.stage_feed_message(feed).await?;
         let publishes_update = staged.publishes_update();
-        let recovery_stats = staged.recovery_stats();
-        if staged.is_recovery_commit() {
-            let Some(message) = staged.message() else {
-                return Ok(false);
-            };
-            let serialized_bytes = self
-                .cache
-                .redis_payload_json_size(BroadcasterPayload::Update(message.clone()))
-                .await?;
-            if serialized_bytes > self.snapshot_max_payload_bytes {
-                warn!(
-                    event = "broadcaster_upstream_recovery_failed",
-                    serialized_bytes,
-                    max_payload_bytes = self.snapshot_max_payload_bytes,
-                    "Refusing broadcaster update above the configured payload cap"
-                );
-                staged.defer_oversized_recovery(format!(
-                    "compact recovery is {serialized_bytes} bytes, above configured max {}",
-                    self.snapshot_max_payload_bytes
-                ));
+        let native_progress = (!staged.has_replacement_ready())
+            .then(|| staged.message().and_then(complete_native_block))
+            .flatten();
+        let mut native_progress_was_published = false;
+        if staged.has_replacement_ready() {
+            let source = self.cache.recovery_source(&staged)?;
+            self.cache.commit_staged_update(staged).await;
+            self.start_recovery_publication(source).await;
+        } else if let Some(message) = staged.message() {
+            if self.buffer_recovery_update(message.clone()).await? {
                 self.cache.commit_staged_update(staged).await;
-                return Ok(false);
+            } else {
+                if let Err(error) = self
+                    .publish_to_redis(BroadcasterPayload::Update(message.clone()))
+                    .await
+                {
+                    if error.downcast_ref::<OversizedRedisEntry>().is_some() {
+                        self.cache.commit_staged_update(staged).await;
+                        self.cache
+                            .begin_same_generation_recovery_from_current()
+                            .await;
+                        warn!(
+                            error = %error,
+                            "Oversized live update retained for full-replacement recovery"
+                        );
+                        return Ok(BroadcasterFeedApply {
+                            published: true,
+                            native_progress,
+                        });
+                    }
+                    return Err(error);
+                }
+                self.cache.commit_staged_update(staged).await;
+                native_progress_was_published = true;
             }
+        } else {
+            self.cache.commit_staged_update(staged).await;
         }
-        if let Some(message) = staged.message() {
-            self.publish_to_redis(BroadcasterPayload::Update(message.clone()))
-                .await?;
+        if let Some(block_number) = native_progress.filter(|_| native_progress_was_published) {
+            self.upstream.record_native_progress(block_number).await;
         }
-        self.cache.commit_staged_update(staged).await;
-        if let Some(stats) = recovery_stats {
-            tracing::info!(
-                event = "broadcaster_upstream_recovery_committed",
-                recovery_id = stats.id,
-                elapsed_ms = stats.elapsed_ms,
-                serialized_bytes = stats.serialized_bytes,
-                "Aligned Tycho replacement state published and committed"
+        Ok(BroadcasterFeedApply {
+            published: publishes_update,
+            native_progress,
+        })
+    }
+
+    async fn buffer_recovery_update(
+        &self,
+        update: simulator_core::broadcaster::BroadcasterUpdateMessage,
+    ) -> Result<bool> {
+        let mut recovery = self.recovery_publication.lock().await;
+        if recovery.phase == RecoveryPublicationPhase::Fatal {
+            return Err(anyhow::anyhow!(
+                "broadcaster recovery worker terminated: {}",
+                recovery
+                    .fatal_error
+                    .as_deref()
+                    .unwrap_or("unknown recovery failure")
+            ));
+        }
+        if recovery.phase == RecoveryPublicationPhase::Idle {
+            return Ok(false);
+        }
+
+        if let Some(block_number) = complete_native_block(&update) {
+            recovery.complete_native_blocks.insert(block_number);
+        }
+        let elapsed = recovery.started_at.elapsed();
+        if elapsed >= RECOVERY_WARN_AFTER && !recovery.warned {
+            recovery.warned = true;
+            warn!(
+                event = "broadcaster_recovery_buffer_warning",
+                work_id = recovery.work_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                distinct_native_blocks = recovery.complete_native_blocks.len(),
+                "Broadcaster recovery is retaining live updates"
             );
         }
-        if publishes_update {
-            self.upstream.record_update().await;
+        if elapsed >= RECOVERY_ABORT_AFTER
+            || recovery.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+        {
+            recovery.cancelled.store(true, Ordering::Release);
         }
-        Ok(publishes_update)
+
+        match recovery.phase {
+            RecoveryPublicationPhase::Building => {
+                recovery.buffer_a.push(update);
+                let buffer_a_count = recovery.buffer_a.len();
+                recovery.max_buffer_a_count = recovery.max_buffer_a_count.max(buffer_a_count);
+            }
+            RecoveryPublicationPhase::Publishing | RecoveryPublicationPhase::Draining => {
+                recovery.buffer_b.push(update);
+                let buffer_b_count = recovery.buffer_b.len();
+                recovery.max_buffer_b_count = recovery.max_buffer_b_count.max(buffer_b_count);
+            }
+            RecoveryPublicationPhase::Idle | RecoveryPublicationPhase::Fatal => {}
+        }
+        Ok(true)
+    }
+
+    async fn start_recovery_publication(&self, source: BroadcasterRecoverySource) {
+        let work_id = {
+            let mut recovery = self.recovery_publication.lock().await;
+            recovery.cancelled.store(true, Ordering::Release);
+            recovery.work_id = recovery.work_id.saturating_add(1);
+            recovery.phase = RecoveryPublicationPhase::Building;
+            recovery.local_failures = 0;
+            recovery.started_at = Instant::now();
+            recovery.warned = false;
+            recovery.complete_native_blocks.clear();
+            recovery.buffer_a.clear();
+            recovery.buffer_b.clear();
+            recovery.cancelled = Arc::new(AtomicBool::new(false));
+            recovery.fatal_error = None;
+            recovery.max_buffer_a_count = 0;
+            recovery.max_buffer_b_count = 0;
+            recovery.last_outcome = None;
+            recovery.last_duration_ms = None;
+            recovery.last_encoded_bytes = None;
+            recovery.last_chunk_count = None;
+            recovery.work_id
+        };
+        let service = self.clone();
+        let worker = tokio::spawn(async move {
+            let result =
+                AssertUnwindSafe(service.clone().run_recovery_publication(work_id, source))
+                    .catch_unwind()
+                    .await;
+            if result.is_err() {
+                service
+                    .handle_recovery_worker_termination(
+                        work_id,
+                        "recovery worker panicked".to_string(),
+                    )
+                    .await;
+            }
+        });
+        let mut workers = self.recovery_workers.lock().await;
+        workers.retain(|worker| !worker.is_finished());
+        workers.push(worker);
+    }
+
+    async fn handle_recovery_worker_termination(&self, work_id: u64, reason: String) {
+        let should_fence = {
+            let mut recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id || !recovery.phase.is_active() {
+                false
+            } else {
+                recovery.cancelled.store(true, Ordering::Release);
+                recovery.phase = RecoveryPublicationPhase::Fatal;
+                recovery.fatal_error = Some(reason.clone());
+                recovery.last_outcome = Some("failed");
+                true
+            }
+        };
+        if !should_fence {
+            return;
+        }
+        self.redis_publisher
+            .self_fence(format!("broadcaster recovery worker terminated: {reason}"))
+            .await;
+        self.upstream
+            .mark_disconnected("recovery_worker_terminated", Some(reason))
+            .await;
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the bounded build, publish, and drain phases share one retry state machine"
+    )]
+    async fn run_recovery_publication(self, work_id: u64, mut source: BroadcasterRecoverySource) {
+        loop {
+            self.spawn_recovery_bounds_monitor(work_id).await;
+            let cache = self.cache.clone();
+            let replacement = tokio::task::spawn_blocking(move || {
+                cache.serialize_recovery_source(source, SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES)
+            })
+            .await;
+            let replacement_json = match replacement {
+                Ok(Ok(replacement_json)) => replacement_json,
+                Ok(Err(error)) => {
+                    let Some(retry_source) = self
+                        .handle_local_recovery_failure(
+                            work_id,
+                            format!("failed to serialize recovery replacement: {error:#}"),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+                Err(error) => {
+                    let Some(retry_source) = self
+                        .handle_local_recovery_failure(
+                            work_id,
+                            format!("recovery serialization worker failed: {error}"),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+            };
+
+            let (buffer_a, cancelled) = {
+                let mut recovery = self.recovery_publication.lock().await;
+                if recovery.work_id != work_id
+                    || recovery.phase != RecoveryPublicationPhase::Building
+                {
+                    return;
+                }
+                if recovery.cancelled.load(Ordering::Acquire) {
+                    drop(recovery);
+                    let Some(retry_source) = self
+                        .handle_local_recovery_failure(
+                            work_id,
+                            "recovery exceeded its Buffer A bounds before publication".to_string(),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+                recovery.phase = RecoveryPublicationPhase::Publishing;
+                (
+                    std::mem::take(&mut recovery.buffer_a),
+                    Arc::clone(&recovery.cancelled),
+                )
+            };
+
+            let boundary = match self.redis_publisher.replay_boundary().await {
+                Ok(boundary) => boundary,
+                Err(error) => {
+                    let Some(retry_source) = self
+                        .handle_external_recovery_failure(work_id, error.to_string())
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+            };
+            let publication_id = self
+                .next_recovery_publication_id
+                .fetch_add(1, Ordering::Relaxed);
+            let Some(target_state_version) = boundary
+                .generation
+                .checked_mul(1u64 << 48)
+                .and_then(|base| base.checked_add(publication_id))
+            else {
+                let Some(retry_source) = self
+                    .handle_local_recovery_failure(
+                        work_id,
+                        "recovery target state version overflow".to_string(),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                source = retry_source;
+                continue;
+            };
+            let transaction = BroadcasterRecoveryTransaction {
+                recovery_id: format!("{}-{work_id}-{publication_id}", boundary.generation),
+                target_state_version,
+                backends: self.cache.configured_backends(),
+                replacement_json,
+                buffer_a,
+            };
+            let publication = self
+                .redis_publisher
+                .publish_recovery(transaction, &cancelled)
+                .await;
+            let publication = match publication {
+                Ok(publication) => publication,
+                Err(error)
+                    if error
+                        .downcast_ref::<RecoveryPublicationCancelled>()
+                        .is_some()
+                        || error.downcast_ref::<OversizedRedisEntry>().is_some() =>
+                {
+                    let Some(retry_source) = self
+                        .handle_local_recovery_failure(work_id, format!("{error:#}"))
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<RecoveryCommitAdoptionUncertain>()
+                        .is_some() =>
+                {
+                    self.handle_recovery_worker_termination(work_id, format!("{error:#}"))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let Some(retry_source) = self
+                        .handle_external_recovery_failure(work_id, format!("{error:#}"))
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                    continue;
+                }
+            };
+
+            tracing::info!(
+                event = "broadcaster_upstream_recovery_committed",
+                recovery_id = publication.recovery_id,
+                target_state_version = publication.target_state_version,
+                commit_entry_id = publication.commit_entry_id,
+                encoded_bytes = publication.encoded_bytes,
+                chunk_count = publication.chunk_count,
+                buffer_a_count = publication.buffer_a_count,
+                replay_boundary = publication.replay_boundary.exclusive_entry_id(),
+                "Aligned Tycho replacement state published and committed"
+            );
+
+            {
+                let mut recovery = self.recovery_publication.lock().await;
+                if recovery.work_id != work_id {
+                    return;
+                }
+                recovery.last_encoded_bytes = Some(publication.encoded_bytes);
+                recovery.last_chunk_count = Some(publication.chunk_count);
+                recovery.phase = RecoveryPublicationPhase::Draining;
+            }
+
+            match self.drain_recovery_buffer_b(work_id).await {
+                Ok(true) => {
+                    if let Some(native_head) =
+                        self.cache.backend_heads().await.into_iter().find(|head| {
+                            head.backend == simulator_core::broadcaster::BroadcasterBackend::Native
+                        })
+                    {
+                        self.upstream
+                            .record_native_progress(native_head.block_number)
+                            .await;
+                    }
+                    return;
+                }
+                Ok(false) => {
+                    let Some(retry_source) = self
+                        .handle_local_recovery_failure(
+                            work_id,
+                            "Buffer B exceeded the live Redis entry limit".to_string(),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                }
+                Err(error) => {
+                    let Some(retry_source) = self
+                        .handle_external_recovery_failure(work_id, format!("{error:#}"))
+                        .await
+                    else {
+                        return;
+                    };
+                    source = retry_source;
+                }
+            }
+        }
+    }
+
+    async fn spawn_recovery_bounds_monitor(&self, work_id: u64) {
+        let (cancelled, started_at) = {
+            let recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id || !recovery.phase.is_active() {
+                return;
+            }
+            (Arc::clone(&recovery.cancelled), recovery.started_at)
+        };
+        let recovery_publication = Arc::clone(&self.recovery_publication);
+        let monitor = tokio::spawn(async move {
+            let warn_after =
+                RECOVERY_WARN_AFTER.saturating_sub(Instant::now().duration_since(started_at));
+            tokio::time::sleep(warn_after).await;
+            {
+                let mut recovery = recovery_publication.lock().await;
+                if recovery.work_id != work_id
+                    || !recovery.phase.is_active()
+                    || !Arc::ptr_eq(&recovery.cancelled, &cancelled)
+                {
+                    return;
+                }
+                if !recovery.warned {
+                    recovery.warned = true;
+                    warn!(
+                        event = "broadcaster_recovery_buffer_warning",
+                        work_id,
+                        elapsed_ms = recovery.started_at.elapsed().as_millis() as u64,
+                        distinct_native_blocks = recovery.complete_native_blocks.len(),
+                        "Broadcaster recovery is retaining live updates"
+                    );
+                }
+            }
+            let abort_after =
+                RECOVERY_ABORT_AFTER.saturating_sub(Instant::now().duration_since(started_at));
+            tokio::time::sleep(abort_after).await;
+            let recovery = recovery_publication.lock().await;
+            if recovery.work_id == work_id
+                && recovery.phase.is_active()
+                && Arc::ptr_eq(&recovery.cancelled, &cancelled)
+            {
+                cancelled.store(true, Ordering::Release);
+            }
+        });
+        let mut workers = self.recovery_workers.lock().await;
+        workers.retain(|worker| !worker.is_finished());
+        workers.push(monitor);
+    }
+
+    async fn drain_recovery_buffer_b(&self, work_id: u64) -> Result<bool> {
+        loop {
+            let batch = {
+                let mut recovery = self.recovery_publication.lock().await;
+                if recovery.work_id != work_id
+                    || recovery.phase != RecoveryPublicationPhase::Draining
+                {
+                    return Ok(true);
+                }
+                if recovery.cancelled.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                if recovery.buffer_b.is_empty() {
+                    let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
+                    let encoded_bytes = recovery.last_encoded_bytes.unwrap_or(0);
+                    let chunk_count = recovery.last_chunk_count.unwrap_or(0);
+                    let buffer_a_count = recovery.max_buffer_a_count;
+                    let buffer_b_count = recovery.max_buffer_b_count;
+                    recovery.phase = RecoveryPublicationPhase::Idle;
+                    recovery.complete_native_blocks.clear();
+                    recovery.last_outcome = Some("committed");
+                    recovery.last_duration_ms = Some(duration_ms);
+                    drop(recovery);
+                    emit_broadcaster_recovery_outcome(
+                        "committed",
+                        duration_ms,
+                        encoded_bytes,
+                        chunk_count,
+                        buffer_a_count,
+                        buffer_b_count,
+                    );
+                    return Ok(true);
+                }
+                std::mem::take(&mut recovery.buffer_b)
+            };
+
+            for update in batch {
+                if let Err(error) = self
+                    .publish_to_redis(BroadcasterPayload::Update(update))
+                    .await
+                {
+                    if error.downcast_ref::<OversizedRedisEntry>().is_some() {
+                        return Ok(false);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn handle_local_recovery_failure(
+        &self,
+        work_id: u64,
+        reason: String,
+    ) -> Option<BroadcasterRecoverySource> {
+        let retry_id = {
+            let mut recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id {
+                return None;
+            }
+            if recovery.local_failures >= RECOVERY_MAX_LOCAL_FAILURES {
+                let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
+                let encoded_bytes = recovery.last_encoded_bytes.unwrap_or(0);
+                let chunk_count = recovery.last_chunk_count.unwrap_or(0);
+                let buffer_a_count = recovery.max_buffer_a_count;
+                let buffer_b_count = recovery.max_buffer_b_count;
+                recovery.cancelled.store(true, Ordering::Release);
+                recovery.phase = RecoveryPublicationPhase::Fatal;
+                recovery.fatal_error = Some(reason.clone());
+                recovery.last_outcome = Some("failed");
+                recovery.last_duration_ms = Some(duration_ms);
+                drop(recovery);
+                emit_broadcaster_recovery_outcome(
+                    "failed",
+                    duration_ms,
+                    encoded_bytes,
+                    chunk_count,
+                    buffer_a_count,
+                    buffer_b_count,
+                );
+                self.redis_publisher
+                    .self_fence(format!(
+                        "broadcaster recovery self-fenced after its superseding attempt failed: {reason}"
+                    ))
+                    .await;
+                self.upstream
+                    .mark_disconnected("recovery_self_fenced", Some(reason.clone()))
+                    .await;
+                tracing::error!(
+                    event = "broadcaster_recovery_self_fenced",
+                    work_id,
+                    error = %reason,
+                    "Broadcaster recovery exhausted its local attempt allowance"
+                );
+                return None;
+            }
+            recovery.local_failures = recovery.local_failures.saturating_add(1);
+            tracing::warn!(
+                event = "broadcaster_recovery_superseding_attempt",
+                work_id,
+                local_failures = recovery.local_failures,
+                error = %reason,
+                "Starting the one allowed superseding recovery attempt"
+            );
+            self.prepare_recovery_retry_locked(&mut recovery)
+        };
+        tokio::time::sleep(self.recovery_retry_backoff).await;
+        self.capture_retry_source(work_id, retry_id).await
+    }
+
+    async fn handle_external_recovery_failure(
+        &self,
+        work_id: u64,
+        reason: String,
+    ) -> Option<BroadcasterRecoverySource> {
+        warn!(
+            event = "broadcaster_recovery_external_retry",
+            work_id,
+            error = %reason,
+            "Waiting to retry broadcaster recovery without consuming the local attempt allowance"
+        );
+        loop {
+            {
+                let recovery = self.recovery_publication.lock().await;
+                if recovery.work_id != work_id {
+                    return None;
+                }
+            }
+            match self.redis_publisher.mode().await {
+                BroadcasterRedisPublisherMode::Retired => {
+                    let mut recovery = self.recovery_publication.lock().await;
+                    if recovery.work_id == work_id {
+                        recovery.phase = RecoveryPublicationPhase::Fatal;
+                        recovery.fatal_error =
+                            Some("active Redis writer fence was lost during recovery".to_string());
+                    }
+                    drop(recovery);
+                    self.upstream
+                        .mark_disconnected(
+                            "writer_fence_lost",
+                            Some("active Redis writer fence was lost during recovery".to_string()),
+                        )
+                        .await;
+                    return None;
+                }
+                BroadcasterRedisPublisherMode::Passive => {}
+                BroadcasterRedisPublisherMode::Active
+                | BroadcasterRedisPublisherMode::Unhealthy => {
+                    if self.redis_publisher.renew_lease().await.is_ok() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let retry_id = {
+            let mut recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id {
+                return None;
+            }
+            self.prepare_recovery_retry_locked(&mut recovery)
+        };
+        self.capture_retry_source(work_id, retry_id).await
+    }
+
+    fn prepare_recovery_retry_locked(&self, recovery: &mut RecoveryPublicationState) -> u64 {
+        recovery.phase = RecoveryPublicationPhase::Building;
+        recovery.started_at = Instant::now();
+        recovery.warned = false;
+        recovery.complete_native_blocks.clear();
+        recovery.buffer_a.clear();
+        recovery.buffer_b.clear();
+        recovery.cancelled = Arc::new(AtomicBool::new(false));
+        self.next_recovery_publication_id
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn capture_retry_source(
+        &self,
+        work_id: u64,
+        retry_id: u64,
+    ) -> Option<BroadcasterRecoverySource> {
+        let _gate = self.lifecycle_gate.lock().await;
+        let source = self.cache.pin_recovery_source(retry_id).await;
+        let mut recovery = self.recovery_publication.lock().await;
+        if recovery.work_id != work_id || recovery.phase != RecoveryPublicationPhase::Building {
+            return None;
+        }
+        // Anything buffered before this pin is already represented by the replacement.
+        recovery.buffer_a.clear();
+        Some(source)
     }
 
     pub async fn broadcast_heartbeat(&self) -> Result<()> {
+        if self.recovery_is_active().await {
+            self.redis_publisher.renew_lease().await?;
+            self.snapshot_sessions
+                .cleanup_expired_snapshot_sessions()
+                .await;
+            return Ok(());
+        }
         let _gate = self.lifecycle_gate.lock().await;
+        if self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Unhealthy {
+            self.redis_publisher.renew_lease().await?;
+        }
         if let Some(heartbeat) = self.cache.heartbeat().await? {
             self.publish_to_redis(heartbeat).await?;
         } else {
@@ -540,47 +1260,46 @@ impl BroadcasterServiceState {
             "combined broadcaster snapshot session requires at least one service"
         );
         ensure_shared_lifecycle(services, "combined broadcaster snapshot session")?;
-
-        let _gate = services[0].lifecycle_gate.lock().await;
-        let mut chain_id = None;
-        for service in services {
-            let status = service.status_snapshot().await;
-            if !matches!(
-                status.readiness,
-                BroadcasterReadiness::Ready
-                    | BroadcasterReadiness::SnapshotUnexportable
-                    | BroadcasterReadiness::UpstreamRecovering
-            ) {
-                return Ok(None);
-            }
-            match chain_id {
-                Some(expected) => anyhow::ensure!(
-                    status.chain_id == expected,
-                    "combined broadcaster snapshot session chain_id mismatch: expected {expected}, found {}",
-                    status.chain_id
-                ),
-                None => chain_id = Some(status.chain_id),
-            }
+        if let Err(error) = services[0].redis_publisher.verify_active_writer().await {
+            warn!(
+                error = %error,
+                "Refusing broadcaster snapshot session without active Redis writer fence"
+            );
+            return Ok(None);
         }
-        let snapshot = Self::run_snapshot_export_preflight_locked(services).await?;
-        let chain_id = chain_id.ok_or_else(|| {
-            anyhow::anyhow!("combined broadcaster snapshot session missing chain_id")
-        })?;
-        // Snapshot export and replay-boundary capture have to describe the same
-        // active writer. Passive or stale writers fail closed here.
-        let redis_replay_boundary = match services[0].redis_publisher.replay_boundary().await {
-            Ok(boundary) => boundary,
+        let Some(artifact) = services[0].snapshot_artifact.read().await.clone() else {
+            return Ok(None);
+        };
+        let publisher_status = services[0].redis_publisher.status_snapshot().await;
+        let Some(current_boundary) = publisher_status.replay_boundary else {
+            return Ok(None);
+        };
+        match services[0]
+            .redis_publisher
+            .replay_boundary_is_retained(&artifact.redis_replay_boundary)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
             Err(error) => {
                 warn!(
                     error = %error,
-                    "Refusing broadcaster snapshot session without Redis replay boundary"
+                    "Refusing broadcaster snapshot session without retained Redis replay boundary"
                 );
                 return Ok(None);
             }
-        };
+        }
+        if !artifact_matches_current_boundary(&artifact, &current_boundary) {
+            warn!(
+                artifact_stream_id = artifact.stream_id,
+                artifact_snapshot_id = artifact.snapshot_id,
+                "Refusing stale broadcaster snapshot artifact"
+            );
+            return Ok(None);
+        }
         services[0]
             .snapshot_sessions
-            .create_snapshot_session(snapshot, chain_id, redis_replay_boundary, ttl)
+            .create_snapshot_session(artifact, ttl)
             .await
             .context("failed to create combined broadcaster snapshot session")
             .map(Some)
@@ -597,7 +1316,7 @@ impl BroadcasterServiceState {
                 "Refusing broadcaster snapshot payload without active Redis writer fence"
             );
             self.snapshot_sessions
-                .disconnect_all(SessionCloseReason::GenerationReset)
+                .disconnect_all(SessionCloseReason::WriterFenceLost)
                 .await;
             return Err(SnapshotSessionError::NotFound);
         }
@@ -616,9 +1335,9 @@ impl BroadcasterServiceState {
             )
             .await;
         let preflight = self.snapshot_preflight.read().await;
+        let artifact_available = self.snapshot_artifact.read().await.is_some();
         let now = Instant::now();
-        snapshot.snapshot.exportable =
-            preflight.checked_at.is_none() || preflight.last_error.is_none();
+        snapshot.snapshot.exportable = artifact_available;
         snapshot.snapshot.last_export_check_age_ms = preflight
             .checked_at
             .map(|checked_at| now.saturating_duration_since(checked_at).as_millis() as u64);
@@ -634,90 +1353,123 @@ impl BroadcasterServiceState {
                 u16::try_from(bps.min(10_000)).unwrap_or(10_000)
             });
         snapshot.snapshot.last_export_error = preflight.last_error.clone();
-        if snapshot.readiness == BroadcasterReadiness::Ready && !snapshot.snapshot.exportable {
+        if snapshot.readiness == BroadcasterReadiness::Ready && !artifact_available {
             snapshot.readiness = BroadcasterReadiness::SnapshotUnexportable;
         }
+        let recovery = self.recovery_status().await;
+        if recovery.active {
+            snapshot.readiness = BroadcasterReadiness::UpstreamRecovering;
+        }
+        snapshot.recovery = recovery;
         snapshot
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "singleflight capture, off-thread export, and artifact fencing form one refresh operation"
+    )]
     pub async fn run_snapshot_export_preflight(services: &[Self]) -> Result<()> {
         anyhow::ensure!(
             !services.is_empty(),
             "snapshot export preflight requires at least one service"
         );
         ensure_shared_lifecycle(services, "snapshot export preflight")?;
-        for service in services {
-            if !service.cache.is_ready().await {
-                return Ok(());
-            }
-        }
-        let _gate = services[0].lifecycle_gate.lock().await;
-        Self::run_snapshot_export_preflight_locked(services)
+        if futures::future::join_all(services.iter().map(Self::recovery_is_active))
             .await
-            .map(|_| ())
-    }
-
-    async fn run_snapshot_export_preflight_locked(
-        services: &[Self],
-    ) -> Result<BroadcasterSnapshotExport> {
+            .into_iter()
+            .any(|active| active)
+        {
+            return Ok(());
+        }
+        if services[0]
+            .snapshot_refresh_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _refresh_guard = SnapshotRefreshGuard(Arc::clone(&services[0].snapshot_refresh_active));
         let started_at = Instant::now();
         let result = async {
-            let mut chain_id = None;
-            let mut exports = Vec::with_capacity(services.len());
-            for service in services {
-                let status = service
-                    .cache
-                    .status_snapshot(
-                        service.snapshot_max_payload_bytes,
-                        service.upstream.snapshot().await,
-                        service.snapshot_sessions.snapshot().await,
-                    )
-                    .await;
-                if !status.snapshot.ready {
-                    anyhow::bail!("snapshot cache is still warming up");
+            let (chain_id, boundary, captured, recovery_work_id) = {
+                let _gate = services[0].lifecycle_gate.lock().await;
+                let recovery_work_id = {
+                    let recovery = services[0].recovery_publication.lock().await;
+                    if recovery.phase.is_active() {
+                        return Ok(None);
+                    }
+                    recovery.work_id
+                };
+                let Some(raw_source) = services[0].cache.pin_snapshot_source().await else {
+                    return Ok(None);
+                };
+                let publisher = services[0].redis_publisher.status_snapshot().await;
+                let boundary = publisher.replay_boundary.ok_or_else(|| {
+                    anyhow::anyhow!("active Redis replay boundary is unavailable")
+                })?;
+                let chain_id = services[0].cache.chain_id();
+                let mut captured = vec![(
+                    services[0].cache.clone(),
+                    raw_source,
+                    services[0].snapshot_max_payload_bytes,
+                )];
+                for service in &services[1..] {
+                    anyhow::ensure!(
+                        service.cache.chain_id() == chain_id,
+                        "combined broadcaster snapshot chain_id mismatch"
+                    );
+                    if let Some(source) = service.cache.pin_snapshot_source().await {
+                        captured.push((
+                            service.cache.clone(),
+                            source,
+                            service.snapshot_max_payload_bytes,
+                        ));
+                    }
                 }
-                chain_id.get_or_insert(status.chain_id);
-                exports.push(
-                    service
-                        .cache
-                        .export_snapshot(service.snapshot_max_payload_bytes)
-                        .await?,
-                );
-            }
-            combine_snapshot_exports(
-                chain_id
-                    .ok_or_else(|| anyhow::anyhow!("snapshot export preflight missing chain_id"))?,
-                exports,
-            )
+                (chain_id, boundary, captured, recovery_work_id)
+            };
+
+            let export = tokio::task::spawn_blocking(move || {
+                let exports = captured
+                    .into_iter()
+                    .map(|(cache, source, max_payload_bytes)| {
+                        cache.export_snapshot_source(source, max_payload_bytes)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                combine_snapshot_exports(chain_id, exports)
+            })
+            .await
+            .context("snapshot artifact worker failed")??;
+            let (artifact, largest_payload_bytes) =
+                build_snapshot_artifact(chain_id, export, boundary)?;
+            let artifact = Arc::new(artifact);
+            install_snapshot_artifact_if_current(services, &artifact, recovery_work_id).await?;
+            Ok(Some((artifact, largest_payload_bytes)))
         }
         .await;
-        let result = result.and_then(|export| {
-            validate_snapshot_export_envelopes(&export)
-                .map(|largest_payload_bytes| (export, largest_payload_bytes))
-        });
         let duration_ms = started_at.elapsed().as_millis() as u64;
         let checked_at = Instant::now();
         match result {
-            Ok((export, largest_payload_bytes)) => {
+            Ok(Some((artifact, largest_payload_bytes))) => {
                 for service in services {
                     let mut preflight = service.snapshot_preflight.write().await;
                     preflight.checked_at = Some(checked_at);
                     preflight.succeeded_at = Some(checked_at);
                     preflight.duration_ms = Some(duration_ms);
-                    preflight.payload_count = Some(export.payloads.len());
+                    preflight.payload_count = Some(artifact.payloads.len());
                     preflight.largest_payload_bytes = Some(largest_payload_bytes);
                     preflight.last_error = None;
                 }
                 tracing::info!(
                     event = "broadcaster_snapshot_export_succeeded",
                     duration_ms,
-                    payload_count = export.payloads.len(),
+                    payload_count = artifact.payloads.len(),
                     largest_payload_bytes,
-                    max_payload_bytes = export.max_payload_bytes,
-                    "Broadcaster snapshot export preflight succeeded"
+                    "Broadcaster snapshot artifact refreshed"
                 );
-                Ok(export)
+                Ok(())
             }
+            Ok(None) => Ok(()),
             Err(error) => {
                 let error_message = error.to_string();
                 for service in services {
@@ -730,10 +1482,10 @@ impl BroadcasterServiceState {
                 }
                 emit_broadcaster_snapshot_export_failure();
                 warn!(
-                    event = "broadcaster_snapshot_export_failed",
+                    event = "broadcaster_snapshot_artifact_refresh_failed",
                     duration_ms,
                     error = %error_message,
-                    "Broadcaster snapshot export preflight failed"
+                    "Broadcaster snapshot artifact refresh failed"
                 );
                 Err(error)
             }
@@ -756,7 +1508,7 @@ impl BroadcasterServiceState {
             && self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Retired
         {
             self.snapshot_sessions
-                .disconnect_all(SessionCloseReason::GenerationReset)
+                .disconnect_all(SessionCloseReason::WriterFenceLost)
                 .await;
         }
         result.context("failed to publish accepted broadcaster delta to Redis")
@@ -768,21 +1520,135 @@ impl BroadcasterServiceState {
     }
 }
 
-fn validate_snapshot_export_envelopes(export: &BroadcasterSnapshotExport) -> Result<usize> {
+pub(crate) struct BroadcasterFeedApply {
+    pub(crate) published: bool,
+    pub(crate) native_progress: Option<u64>,
+}
+
+fn complete_native_block(
+    message: &simulator_core::broadcaster::BroadcasterUpdateMessage,
+) -> Option<u64> {
+    message
+        .partitions
+        .iter()
+        .find(|partition| {
+            partition.backend == simulator_core::broadcaster::BroadcasterBackend::Native
+        })
+        .filter(|partition| {
+            partition
+                .messages
+                .iter()
+                .all(|message| message.message.header.partial_block_index.is_none())
+        })
+        .map(|partition| partition.block_number)
+}
+
+struct SnapshotRefreshGuard(Arc<AtomicBool>);
+
+impl Drop for SnapshotRefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn build_snapshot_artifact(
+    chain_id: u64,
+    export: BroadcasterSnapshotExport,
+    redis_replay_boundary: BroadcasterRedisReplayBoundary,
+) -> Result<(BroadcasterSnapshotArtifact, usize)> {
+    anyhow::ensure!(
+        export.stream_id == redis_replay_boundary.stream_id,
+        "snapshot stream_id mismatch with Redis replay boundary"
+    );
+    anyhow::ensure!(
+        export.snapshot_id == redis_replay_boundary.snapshot_id,
+        "snapshot_id mismatch with Redis replay boundary"
+    );
     let mut largest_payload_bytes = 0usize;
-    for (index, payload) in export.payloads.iter().enumerate() {
-        let message_seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-        let envelope =
-            BroadcasterEnvelope::new(export.stream_id.clone(), message_seq, payload.clone());
-        let bytes = serde_json::to_vec(&envelope)?.len();
+    let mut encoded_bytes = 0usize;
+    let mut message_seq = 1u64;
+    let payloads = export
+        .payloads
+        .into_iter()
+        .map(|payload| {
+            let envelope = BroadcasterEnvelope::new(export.stream_id.clone(), message_seq, payload);
+            message_seq = message_seq.saturating_add(1);
+            envelope
+        })
+        .collect::<Vec<_>>();
+    for (index, envelope) in payloads.iter().enumerate() {
+        let bytes = serde_json::to_vec(envelope)?.len();
         anyhow::ensure!(
             bytes <= export.max_payload_bytes,
             "snapshot payload {index} is {bytes} bytes, above configured max {}",
             export.max_payload_bytes
         );
         largest_payload_bytes = largest_payload_bytes.max(bytes);
+        encoded_bytes = encoded_bytes.saturating_add(bytes);
     }
-    Ok(largest_payload_bytes)
+    let snapshot_chunk_count = payloads
+        .iter()
+        .filter(|envelope| matches!(envelope.payload, BroadcasterPayload::SnapshotChunk(_)))
+        .count() as u32;
+    Ok((
+        BroadcasterSnapshotArtifact {
+            chain_id,
+            stream_id: export.stream_id,
+            snapshot_id: export.snapshot_id,
+            redis_replay_boundary,
+            payloads: Arc::new(payloads),
+            snapshot_chunk_count,
+            encoded_bytes,
+        },
+        largest_payload_bytes,
+    ))
+}
+
+fn artifact_matches_current_boundary(
+    artifact: &BroadcasterSnapshotArtifact,
+    current: &BroadcasterRedisReplayBoundary,
+) -> bool {
+    artifact.stream_id == current.stream_id
+        && artifact.snapshot_id == current.snapshot_id
+        && artifact.redis_replay_boundary.generation == current.generation
+        && artifact.redis_replay_boundary.exclusive_message_seq <= current.exclusive_message_seq
+}
+
+async fn install_snapshot_artifact_if_current(
+    services: &[BroadcasterServiceState],
+    artifact: &Arc<BroadcasterSnapshotArtifact>,
+    captured_recovery_work_id: u64,
+) -> Result<()> {
+    let _gate = services[0].lifecycle_gate.lock().await;
+    let recovery_is_unchanged = {
+        let recovery = services[0].recovery_publication.lock().await;
+        recovery.work_id == captured_recovery_work_id && !recovery.phase.is_active()
+    };
+    anyhow::ensure!(
+        recovery_is_unchanged,
+        "snapshot artifact crossed a recovery publication boundary"
+    );
+    let current_boundary = services[0]
+        .redis_publisher
+        .status_snapshot()
+        .await
+        .replay_boundary
+        .ok_or_else(|| anyhow::anyhow!("active Redis replay boundary disappeared"))?;
+    anyhow::ensure!(
+        artifact_matches_current_boundary(artifact, &current_boundary),
+        "snapshot artifact became stale before publication"
+    );
+    anyhow::ensure!(
+        services[0]
+            .redis_publisher
+            .replay_boundary_is_retained(&artifact.redis_replay_boundary)
+            .await?,
+        "snapshot artifact replay boundary was trimmed before publication"
+    );
+    for service in services {
+        *service.snapshot_artifact.write().await = Some(Arc::clone(artifact));
+    }
+    Ok(())
 }
 
 fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) -> Result<()> {
@@ -804,6 +1670,7 @@ fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use anyhow::{anyhow, Result};
@@ -819,7 +1686,7 @@ mod tests {
             BlockHeader, FeedMessage, SynchronizerState,
         },
         tycho_common::{
-            dto::{AccountUpdate, BlockChanges, Chain as DtoChain, ChangeType, ResponseAccount},
+            dto::{Chain as DtoChain, ResponseAccount},
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
             Bytes,
@@ -838,8 +1705,9 @@ mod tests {
     };
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-        BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
-        BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
+        BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolSyncStatus,
+        BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
+        BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -904,6 +1772,626 @@ mod tests {
                 .map(|value| value.0 == self.0)
                 .unwrap_or(false)
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_routes_live_updates_through_buffer_a_then_buffer_b() -> Result<()> {
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::new(BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.started_at = tokio::time::Instant::now();
+        }
+
+        assert!(
+            service
+                .buffer_recovery_update(native_buffer_update(10)?)
+                .await?
+        );
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            assert_eq!(recovery.buffer_a.len(), 1);
+            assert!(recovery.buffer_b.is_empty());
+            recovery.phase = super::RecoveryPublicationPhase::Publishing;
+        }
+
+        assert!(
+            service
+                .buffer_recovery_update(native_buffer_update(11)?)
+                .await?
+        );
+        {
+            let recovery = service.recovery_publication.lock().await;
+            assert_eq!(recovery.buffer_a.len(), 1);
+            assert_eq!(recovery.buffer_b.len(), 1);
+        }
+        let status = service.recovery_status().await;
+        assert!(status.active);
+        assert_eq!(status.phase, "publishing");
+        assert_eq!(status.buffer_a_count, 1);
+        assert_eq!(status.buffer_b_count, 1);
+        assert!(status.age_ms.is_some());
+        assert!(status.oldest_buffered_age_ms.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_cancels_after_sixty_four_distinct_native_blocks() -> Result<()> {
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::new(BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.started_at = tokio::time::Instant::now();
+        }
+
+        for block in 1..=64 {
+            assert!(
+                service
+                    .buffer_recovery_update(native_buffer_update(block)?)
+                    .await?
+            );
+        }
+
+        let recovery = service.recovery_publication.lock().await;
+        assert_eq!(recovery.complete_native_blocks.len(), 64);
+        assert!(recovery.cancelled.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_warns_at_thirty_seconds_and_cancels_at_sixty_seconds() -> Result<()> {
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::new(BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.started_at = tokio::time::Instant::now() - super::RECOVERY_WARN_AFTER;
+        }
+        service
+            .buffer_recovery_update(native_buffer_update(10)?)
+            .await?;
+        assert!(service.recovery_publication.lock().await.warned);
+
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.started_at = tokio::time::Instant::now() - super::RECOVERY_ABORT_AFTER;
+            recovery.cancelled.store(false, Ordering::Release);
+        }
+        service.spawn_recovery_bounds_monitor(1).await;
+        timeout(Duration::from_secs(1), async {
+            while !service
+                .recovery_publication
+                .lock()
+                .await
+                .cancelled
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("60-second watchdog did not cancel recovery"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffer_b_drains_as_ordered_ordinary_entries() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Draining;
+            recovery.buffer_b = vec![native_buffer_update(11)?, native_buffer_update(12)?];
+        }
+
+        assert!(service.drain_recovery_buffer_b(1).await?);
+        let appends = writer.appends().await;
+        assert_eq!(
+            appends
+                .iter()
+                .filter(|entry| entry.kind == BroadcasterMessageKind::Update)
+                .filter_map(|entry| entry.block_number)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_local_recovery_failure_self_fences() -> Result<()> {
+        let service = ready_service().await?;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.local_failures = super::RECOVERY_MAX_LOCAL_FAILURES;
+        }
+
+        let retry = service
+            .handle_local_recovery_failure(1, "second bounded attempt failed".to_string())
+            .await;
+
+        assert!(retry.is_none());
+        assert_eq!(
+            service.redis_publisher.mode().await,
+            super::BroadcasterRedisPublisherMode::Retired
+        );
+        assert_eq!(
+            service.recovery_publication.lock().await.phase,
+            super::RecoveryPublicationPhase::Fatal
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_recovery_failure_does_not_consume_local_attempt_allowance() -> Result<()> {
+        let service = ready_service().await?;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Publishing;
+            recovery.local_failures = 0;
+        }
+
+        let retry = service
+            .handle_external_recovery_failure(1, "planned Redis outage".to_string())
+            .await;
+
+        assert!(retry.is_some());
+        assert_eq!(service.recovery_publication.lock().await.local_failures, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_live_entry_enters_chunked_recovery_without_ordinary_retry() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        let ordinary_updates_before = writer
+            .appends()
+            .await
+            .iter()
+            .filter(|entry| entry.kind == BroadcasterMessageKind::Update)
+            .count();
+
+        let oversized = raw_feed_with_account_payload(11, 11, 10, "x".repeat(9 * 1024 * 1024));
+        assert!(service.apply_feed_message(&oversized).await?);
+
+        assert!(service.cache.replacement_pending().await);
+        assert_eq!(
+            writer
+                .appends()
+                .await
+                .iter()
+                .filter(|entry| entry.kind == BroadcasterMessageKind::Update)
+                .count(),
+            ordinary_updates_before,
+            "the oversized ordinary entry must not be retried"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_artifact_remains_available_during_recovery() -> Result<()> {
+        let service = ready_service().await?;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.started_at = tokio::time::Instant::now();
+        }
+
+        let session = service
+            .create_snapshot_session(Duration::from_secs(300))
+            .await?
+            .ok_or_else(|| anyhow!("retained artifact should remain replayable during recovery"))?;
+
+        assert_eq!(session.redis_replay_boundary.exclusive_message_seq, 2);
+        assert!(service.snapshot_artifact.read().await.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_rejects_artifact_after_recovery_epoch_changes() -> Result<()> {
+        let service = ready_service().await?;
+        let artifact = service
+            .snapshot_artifact
+            .write()
+            .await
+            .take()
+            .ok_or_else(|| anyhow!("ready service should have a snapshot artifact"))?;
+        let captured_work_id = service.recovery_publication.lock().await.work_id;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = recovery.work_id.saturating_add(1);
+        }
+
+        let Err(error) = super::install_snapshot_artifact_if_current(
+            std::slice::from_ref(&service),
+            &artifact,
+            captured_work_id,
+        )
+        .await
+        else {
+            return Err(anyhow!(
+                "snapshot captured before recovery must not replace the retained artifact"
+            ));
+        };
+
+        assert!(error
+            .to_string()
+            .contains("crossed a recovery publication boundary"));
+        assert!(service.snapshot_artifact.read().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_recovery_retry_waits_before_capturing_superseding_source() -> Result<()> {
+        let service = ready_service().await?;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Building;
+            recovery.started_at = tokio::time::Instant::now();
+        }
+
+        let mut retry = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .handle_local_recovery_failure(1, "planned local failure".to_string())
+                    .await
+            }
+        });
+        assert!(
+            timeout(Duration::from_millis(50), &mut retry)
+                .await
+                .is_err(),
+            "the superseding source must not be captured before bounded backoff"
+        );
+        let source = timeout(Duration::from_secs(1), retry)
+            .await
+            .map_err(|_| anyhow!("superseding recovery did not start after bounded backoff"))?
+            .map_err(|error| anyhow!("retry task failed: {error}"))?;
+        assert!(source.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_worker_termination_self_fences_publication() -> Result<()> {
+        let service = ready_service().await?;
+        {
+            let mut recovery = service.recovery_publication.lock().await;
+            recovery.work_id = 1;
+            recovery.phase = super::RecoveryPublicationPhase::Publishing;
+        }
+
+        service
+            .handle_recovery_worker_termination(1, "planned worker termination".to_string())
+            .await;
+
+        assert_eq!(
+            service.redis_publisher.mode().await,
+            super::BroadcasterRedisPublisherMode::Retired
+        );
+        let recovery = service.recovery_publication.lock().await;
+        assert_eq!(recovery.phase, super::RecoveryPublicationPhase::Fatal);
+        assert_eq!(
+            recovery.fatal_error.as_deref(),
+            Some("planned worker termination")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_recovery_commit_self_fences_without_starting_another_attempt() -> Result<()>
+    {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        writer.lose_recovery_commit_replies().await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+
+        timeout(Duration::from_secs(1), async {
+            while publisher.mode().await != super::BroadcasterRedisPublisherMode::Retired {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("uncertain commit did not self-fence the publisher"))?;
+
+        let appends = writer.appends().await;
+        assert_eq!(
+            appends
+                .iter()
+                .filter(|entry| entry.kind == BroadcasterMessageKind::RecoveryStart)
+                .count(),
+            1,
+            "an uncertain authoritative commit must not start another transaction"
+        );
+        assert_eq!(
+            appends
+                .iter()
+                .filter(|entry| entry.kind == BroadcasterMessageKind::RecoveryCommit)
+                .count(),
+            1,
+            "the fake writer records the authoritative commit before losing its reply"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_commit_renews_progress_after_a_slow_publication() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let mut config = publisher_config();
+        config.append_retry_window = Duration::from_secs(7);
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            config,
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        writer
+            .delay_recovery_commit(Duration::from_millis(5_100))
+            .await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let kinds = writer
+                    .appends()
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>();
+                if kinds.contains(&BroadcasterMessageKind::RecoveryChunk)
+                    && !kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("recovery did not reach its private pre-commit phase"))?;
+        assert!(
+            service
+                .create_snapshot_session(Duration::from_secs(300))
+                .await?
+                .is_some(),
+            "a retained artifact should bootstrap while recovery entries remain private"
+        );
+
+        timeout(Duration::from_secs(7), async {
+            while !service
+                .reconnect_backoff_can_reset(Duration::from_secs(5))
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("slow recovery did not renew progress after commit"))?;
+        assert!(
+            service
+                .upstream
+                .snapshot()
+                .await
+                .last_update_age_ms
+                .is_some_and(|age_ms| age_ms < 500),
+            "the five-second lease must start at successful recovery publication"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test keeps reconnect, recovery, retained snapshot, and backoff assertions in one scenario"
+    )]
+    async fn reconnect_after_gap_publishes_recovery_in_same_generation() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(
+            !service
+                .reconnect_backoff_can_reset(Duration::from_secs(5))
+                .await
+        );
+
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        assert!(service.snapshot_artifact.read().await.is_some());
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!(
+                "header gap must force reconnect before replacement"
+            ));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+        let recovery_wait = timeout(Duration::from_secs(1), async {
+            loop {
+                let kinds = writer
+                    .appends()
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>();
+                if kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
+                    && service
+                        .reconnect_backoff_can_reset(Duration::from_secs(5))
+                        .await
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if recovery_wait.is_err() {
+            let (phase, fatal_error) = {
+                let recovery = service.recovery_publication.lock().await;
+                (recovery.phase, recovery.fatal_error.clone())
+            };
+            let append_kinds = writer
+                .appends()
+                .await
+                .into_iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>();
+            return Err(anyhow!(
+                "recovery did not commit: phase={:?}, fatal={:?}, appends={:?}",
+                phase,
+                fatal_error,
+                append_kinds
+            ));
+        }
+
+        let appends = writer.appends().await;
+        let kinds = appends.iter().map(|entry| entry.kind).collect::<Vec<_>>();
+        assert!(kinds.contains(&BroadcasterMessageKind::RecoveryStart));
+        assert!(kinds.contains(&BroadcasterMessageKind::RecoveryChunk));
+        assert!(kinds.contains(&BroadcasterMessageKind::RecoveryCommit));
+        assert!(appends
+            .iter()
+            .all(|entry| entry.stream_id == "chain-1-stream-1"));
+        assert!(service.snapshot_artifact.read().await.is_some());
+        assert!(
+            service
+                .create_snapshot_session(Duration::from_secs(300))
+                .await?
+                .is_some(),
+            "the retained artifact should admit bootstrap immediately after commit"
+        );
+        assert!(
+            service
+                .reconnect_backoff_can_reset(Duration::from_secs(5))
+                .await
+        );
+        service.mark_stream_disconnected("ended", None).await;
+        service.mark_upstream_connected().await;
+        assert!(
+            !service
+                .reconnect_backoff_can_reset(Duration::from_secs(5))
+                .await,
+            "a later reconnect must complete its own replacement before resetting backoff"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1017,15 +2505,15 @@ mod tests {
             std::slice::from_ref(&service),
             "active_writer_promoted",
         )
-        .await?;
+        .await;
 
-        assert!(promotion.is_none());
+        assert!(promotion.is_err());
         let status = service.status_snapshot().await;
         assert_eq!(status.readiness, BroadcasterReadiness::SnapshotUnexportable);
         assert!(!status.snapshot.exportable);
         assert!(status.snapshot.last_export_error.is_some());
-        assert!(writer.appends().await.is_empty());
-        assert_eq!(publisher.status_snapshot().await.mode, "passive");
+        assert_eq!(writer.appends().await.len(), 1);
+        assert_eq!(publisher.status_snapshot().await.mode, "active");
         Ok(())
     }
 
@@ -1054,7 +2542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promotion_marker_handoff_base_heads_match_warmed_caches() -> Result<()> {
+    async fn promotion_marker_declares_warmed_cache_backends() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let old_publisher =
             BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
@@ -1110,15 +2598,10 @@ mod tests {
             .last()
             .cloned()
             .ok_or_else(|| anyhow!("promotion should append a marker"))?;
-        let handoff = progress_payload(&marker)?
-            .handoff
-            .ok_or_else(|| anyhow!("promotion marker should include handoff proof"))?;
-        let mut expected_heads = vec![
-            BroadcasterBackendHead::new(BroadcasterBackend::Native, 101),
-            BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 202),
-        ];
-        expected_heads.sort_by_key(|head| head.backend);
-        assert_eq!(handoff.base_heads, expected_heads);
+        assert_eq!(
+            progress_payload(&marker)?.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
         Ok(())
     }
 
@@ -1263,6 +2746,8 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
         let session = service
             .create_snapshot_session(Duration::from_secs(300))
             .await?
@@ -1350,6 +2835,8 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
         let session = service
             .create_snapshot_session(Duration::from_secs(300))
             .await?
@@ -1372,7 +2859,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_session_boundary_is_registered_before_queued_update() -> Result<()> {
+    async fn snapshot_session_uses_cached_boundary_without_waiting_for_queued_update() -> Result<()>
+    {
         let service = ready_service().await?;
         let gate = service.lock_lifecycle_gate_for_test().await;
 
@@ -1386,7 +2874,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let update_task = tokio::spawn({
+        let mut update_task = tokio::spawn({
             let service = service.clone();
             async move {
                 service
@@ -1395,15 +2883,15 @@ mod tests {
             }
         });
 
-        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
+        let session = timeout(Duration::from_millis(25), &mut subscribe_task)
+            .await
+            .map_err(|_| anyhow!("cached snapshot session should not wait on the lifecycle gate"))?
+            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
+            .ok_or_else(|| anyhow!("expected ready broadcaster snapshot session"))?;
+        assert!(timeout(Duration::from_millis(25), &mut update_task)
             .await
             .is_err());
         drop(gate);
-
-        let session = subscribe_task
-            .await
-            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
-            .ok_or_else(|| anyhow!("expected ready broadcaster snapshot session"))?;
 
         update_task
             .await
@@ -1464,6 +2952,11 @@ mod tests {
         rfq_service
             .apply_update(&rfq_only_update(12, "rfq-1", 7))
             .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(&[
+            raw_service.clone(),
+            rfq_service.clone(),
+        ])
+        .await?;
         let gate = raw_service.lock_lifecycle_gate_for_test().await;
 
         let services = vec![raw_service.clone(), rfq_service.clone()];
@@ -1476,7 +2969,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let update_task = tokio::spawn({
+        let mut update_task = tokio::spawn({
             let rfq_service = rfq_service.clone();
             async move {
                 rfq_service
@@ -1485,15 +2978,15 @@ mod tests {
             }
         });
 
-        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
+        let session = timeout(Duration::from_millis(25), &mut subscribe_task)
+            .await
+            .map_err(|_| anyhow!("cached snapshot session should not wait on the lifecycle gate"))?
+            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
+            .ok_or_else(|| anyhow!("expected combined broadcaster snapshot session"))?;
+        assert!(timeout(Duration::from_millis(25), &mut update_task)
             .await
             .is_err());
         drop(gate);
-
-        let session = subscribe_task
-            .await
-            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
-            .ok_or_else(|| anyhow!("expected combined broadcaster snapshot session"))?;
         update_task
             .await
             .map_err(|error| anyhow!("update task failed: {error}"))??;
@@ -1552,128 +3045,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_session_is_cleared_by_generation_reset() -> Result<()> {
-        let service = ready_service().await?;
-        let gate = service.lock_lifecycle_gate_for_test().await;
-
-        let mut subscribe_task = tokio::spawn({
-            let service = service.clone();
-            async move {
-                service
-                    .create_snapshot_session(Duration::from_secs(300))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-
-        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
-            .await
-            .is_err());
-        drop(gate);
-
-        let session = subscribe_task
-            .await
-            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
-            .ok_or_else(|| anyhow!("expected ready broadcaster snapshot session"))?;
-
-        let reset_task = tokio::spawn({
-            let service = service.clone();
-            async move {
-                BroadcasterServiceState::handle_shared_generation_reset(
-                    std::slice::from_ref(&service),
-                    "stale",
-                    Some("boom".to_string()),
-                )
-                .await
-            }
-        });
-        reset_task
-            .await
-            .map_err(|error| anyhow!("reset task failed: {error}"))?;
-
-        let Err(error) = service
-            .snapshot_session_payload(session.session_id, 0)
-            .await
-        else {
-            return Err(anyhow!("reset snapshot session should not serve payloads"));
-        };
-        assert_eq!(error, SnapshotSessionError::NotFound);
-        let status = service.status_snapshot().await;
-        assert_eq!(status.snapshot_sessions.active, 0);
-        assert_eq!(
-            status.snapshot_sessions.last_error.as_deref(),
-            Some("all snapshot sessions closed: generation_reset")
-        );
-        assert_eq!(status.snapshot.stream_id, "chain-1-stream-2");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn generation_reset_requires_new_redis_stream_generation() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer.clone()),
-        ));
-        publisher
-            .promote(
-                base_heads([BroadcasterBackend::Native]),
-                "active_writer_promoted",
-            )
-            .await?;
-        let service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            cache,
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            Arc::new(Mutex::new(())),
-        );
-        service.mark_upstream_connected().await;
-        service
-            .apply_update(&native_only_update(10, "native-1"))
-            .await?;
-        let initial_stream_id = publisher.status_snapshot().await.stream_id;
-
-        BroadcasterServiceState::handle_shared_generation_reset(
-            std::slice::from_ref(&service),
-            "stale",
-            Some("boom".to_string()),
-        )
-        .await;
-
-        let reset_status = publisher.status_snapshot().await;
-        assert!(reset_status.healthy);
-        assert_ne!(reset_status.stream_id, initial_stream_id);
-        assert!(reset_status.replay_boundary.is_some());
-
-        service.mark_upstream_connected().await;
-        service
-            .apply_update(&native_only_update(11, "native-2"))
-            .await?;
-
-        let recovered_status = publisher.status_snapshot().await;
-        assert!(recovered_status.healthy);
-        assert_eq!(recovered_status.stream_id, reset_status.stream_id);
-        assert!(recovered_status.replay_boundary.is_some());
-        let reset_generation_entries = writer
-            .appends()
-            .await
-            .into_iter()
-            .filter(|entry| entry.stream_id == recovered_status.stream_id)
-            .map(|entry| (entry.message_seq, entry.kind))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            reset_generation_entries,
-            vec![
-                (1, BroadcasterMessageKind::Progress),
-                (2, BroadcasterMessageKind::Update)
-            ]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn apply_update_fails_when_redis_publication_fails() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let writer = ServiceFakeRedisWriter::default();
@@ -1716,300 +3087,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the regression keeps session, generation, oversize, and recovery assertions together"
-    )]
-    async fn oversized_initial_raw_snapshot_warms_but_recovery_diff_stays_private() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer.clone()),
-        ));
-        publisher
-            .promote(base_heads([BroadcasterBackend::Vm]), "test_active")
-            .await?;
-        let service = BroadcasterServiceState::with_lifecycle_gate(
-            2_500,
-            cache,
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            Arc::new(Mutex::new(())),
-        );
-        service.mark_upstream_connected().await;
-        let header = |number, hash, parent| BlockHeader {
-            hash: Bytes::from([hash; 32]),
-            number,
-            parent_hash: Bytes::from([parent; 32]),
-            revert: false,
-            timestamp: number * 10,
-            partial_block_index: None,
-        };
-        let address = Bytes::from([42u8; 20]);
-        let feed = |block: BlockHeader, value: u8| {
-            let account = ResponseAccount::new(
-                DtoChain::Ethereum,
-                address.clone(),
-                "large-account".to_string(),
-                (0..20)
-                    .map(|index| (Bytes::from([index; 32]), Bytes::from(vec![value; 256])))
-                    .collect(),
-                Bytes::from([value; 32]),
-                HashMap::new(),
-                Bytes::from([7u8; 128]),
-                Bytes::from([8u8; 32]),
-                Bytes::from([9u8; 32]),
-                Bytes::from([10u8; 32]),
-                None,
-            );
-            FeedMessage {
-                state_msgs: HashMap::from([(
-                    "vm:curve".to_string(),
-                    StateSyncMessage {
-                        header: block.clone(),
-                        snapshots: Snapshot {
-                            states: HashMap::new(),
-                            vm_storage: HashMap::from([(address.clone(), account)]),
-                        },
-                        deltas: None,
-                        removed_components: HashMap::new(),
-                    },
-                )]),
-                sync_states: HashMap::from([(
-                    "vm:curve".to_string(),
-                    SynchronizerState::Ready(block),
-                )]),
-            }
-        };
-
-        assert!(
-            service
-                .apply_feed_message(&feed(header(10, 10, 9), 1))
-                .await?
-        );
-        let session = service
-            .create_snapshot_session(Duration::from_secs(300))
-            .await?
-            .ok_or_else(|| anyhow!("active service should create a snapshot session"))?;
-        let boundary_before = publisher
-            .status_snapshot()
-            .await
-            .replay_boundary
-            .ok_or_else(|| anyhow!("active publisher should expose a boundary"))?;
-        let before =
-            serde_json::to_value(service.cache.export_snapshot(8_388_608).await?.payloads)?;
-        let append_count = writer.appends().await.len();
-
-        assert!(
-            !service
-                .apply_feed_message(&feed(header(12, 12, 11), 2))
-                .await?
-        );
-        assert_eq!(writer.appends().await.len(), append_count);
-        let degraded = service.status_snapshot().await;
-        assert_eq!(degraded.readiness, BroadcasterReadiness::UpstreamRecovering);
-        assert!(degraded.snapshot.recovery_pending);
-        assert!(degraded.snapshot.recovery_error.is_some());
-        let recovery_id = degraded.snapshot.recovery_id;
-        assert_eq!(
-            publisher.status_snapshot().await.replay_boundary,
-            Some(boundary_before.clone())
-        );
-        assert!(service
-            .snapshot_session_payload(session.session_id, 0)
-            .await
-            .is_ok());
-        let recovery_session = service
-            .create_snapshot_session(Duration::from_secs(300))
-            .await?
-            .ok_or_else(|| anyhow!("committed snapshot should remain available during recovery"))?;
-        assert_eq!(recovery_session.stream_id, boundary_before.stream_id);
-        assert_eq!(recovery_session.snapshot_id, boundary_before.snapshot_id);
-        assert_eq!(recovery_session.redis_replay_boundary, boundary_before);
-        assert!(service
-            .snapshot_session_payload(recovery_session.session_id, 0)
-            .await
-            .is_ok());
-        assert_eq!(writer.appends().await.len(), append_count);
-        assert_eq!(
-            serde_json::to_value(service.cache.export_snapshot(8_388_608).await?.payloads,)?,
-            before
-        );
-        assert!(
-            !service
-                .apply_feed_message(&feed(header(12, 12, 11), 2))
-                .await?
-        );
-        assert_eq!(writer.appends().await.len(), append_count);
-        assert_eq!(
-            service.status_snapshot().await.snapshot.recovery_id,
-            recovery_id
-        );
-
-        let block_13 = header(13, 13, 12);
-        let deletion = FeedMessage {
-            state_msgs: HashMap::from([(
-                "vm:curve".to_string(),
-                StateSyncMessage {
-                    header: block_13.clone(),
-                    snapshots: Snapshot::default(),
-                    deltas: Some(BlockChanges {
-                        account_updates: HashMap::from([(
-                            address.clone(),
-                            AccountUpdate::new(
-                                address,
-                                DtoChain::Ethereum,
-                                HashMap::new(),
-                                None,
-                                None,
-                                ChangeType::Deletion,
-                            ),
-                        )]),
-                        ..Default::default()
-                    }),
-                    removed_components: HashMap::new(),
-                },
-            )]),
-            sync_states: HashMap::from([(
-                "vm:curve".to_string(),
-                SynchronizerState::Ready(block_13),
-            )]),
-        };
-        assert!(service.apply_feed_message(&deletion).await?);
-        assert_eq!(writer.appends().await.len(), append_count + 1);
-        let recovered = service.status_snapshot().await;
-        assert_eq!(recovered.readiness, BroadcasterReadiness::Ready);
-        assert!(!recovered.snapshot.recovery_pending);
-        let boundary_after = publisher
-            .status_snapshot()
-            .await
-            .replay_boundary
-            .ok_or_else(|| anyhow!("recovered publisher should keep its boundary"))?;
-        assert_eq!(boundary_after.generation, boundary_before.generation);
-        assert_eq!(boundary_after.stream_id, boundary_before.stream_id);
-        assert_eq!(boundary_after.snapshot_id, boundary_before.snapshot_id);
-        assert_eq!(
-            boundary_after.exclusive_message_seq,
-            boundary_before.exclusive_message_seq + 1
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the exact wire boundary compares accepted and deferred recovery services"
-    )]
-    async fn compact_recovery_cap_uses_full_redis_envelope_size() -> Result<()> {
-        let header = |number, hash, parent| BlockHeader {
-            hash: Bytes::from([hash; 32]),
-            number,
-            parent_hash: Bytes::from([parent; 32]),
-            revert: false,
-            timestamp: number * 10,
-            partial_block_index: None,
-        };
-        let address = Bytes::from([43u8; 20]);
-        let feed = |block: BlockHeader, value: u8| FeedMessage {
-            state_msgs: HashMap::from([(
-                "vm:curve".to_string(),
-                StateSyncMessage {
-                    header: block.clone(),
-                    snapshots: Snapshot {
-                        states: HashMap::new(),
-                        vm_storage: HashMap::from([(
-                            address.clone(),
-                            ResponseAccount::new(
-                                DtoChain::Ethereum,
-                                address.clone(),
-                                "account".to_string(),
-                                HashMap::from([(Bytes::from([1u8; 32]), Bytes::from([value; 64]))]),
-                                Bytes::from([value; 32]),
-                                HashMap::new(),
-                                Bytes::from([value; 32]),
-                                Bytes::from([2u8; 32]),
-                                Bytes::from([3u8; 32]),
-                                Bytes::from([4u8; 32]),
-                                None,
-                            ),
-                        )]),
-                    },
-                    deltas: None,
-                    removed_components: HashMap::new(),
-                },
-            )]),
-            sync_states: HashMap::from([("vm:curve".to_string(), SynchronizerState::Ready(block))]),
-        };
-        let initial = feed(header(10, 10, 9), 1);
-        let replacement = feed(header(12, 12, 11), 2);
-
-        let sizing_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
-        sizing_cache.apply_feed_message(&initial).await?;
-        let staged = sizing_cache.stage_feed_message(&replacement).await?;
-        let payload = BroadcasterPayload::Update(
-            staged
-                .message()
-                .ok_or_else(|| anyhow!("aligned recovery should produce a compact update"))?
-                .clone(),
-        );
-        let wire_bytes = sizing_cache
-            .redis_payload_json_size(payload.clone())
-            .await?;
-        let payload_only_bytes = serde_json::to_vec(&payload)?.len();
-        assert!(wire_bytes > payload_only_bytes);
-
-        let accepted_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
-        let accepted_writer = ServiceFakeRedisWriter::default();
-        let accepted_publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(accepted_writer.clone()),
-        ));
-        accepted_publisher
-            .promote(base_heads([BroadcasterBackend::Vm]), "test_active")
-            .await?;
-        let accepted = BroadcasterServiceState::with_lifecycle_gate(
-            wire_bytes,
-            accepted_cache,
-            BroadcasterUpstreamState::default(),
-            accepted_publisher,
-            Arc::new(Mutex::new(())),
-        );
-        accepted.mark_upstream_connected().await;
-        assert!(accepted.apply_feed_message(&initial).await?);
-        let accepted_before = accepted_writer.appends().await.len();
-        assert!(accepted.apply_feed_message(&replacement).await?);
-        assert_eq!(accepted_writer.appends().await.len(), accepted_before + 1);
-
-        let deferred_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
-        let deferred_writer = ServiceFakeRedisWriter::default();
-        let deferred_publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(deferred_writer.clone()),
-        ));
-        deferred_publisher
-            .promote(base_heads([BroadcasterBackend::Vm]), "test_active")
-            .await?;
-        let deferred = BroadcasterServiceState::with_lifecycle_gate(
-            wire_bytes - 1,
-            deferred_cache,
-            BroadcasterUpstreamState::default(),
-            deferred_publisher,
-            Arc::new(Mutex::new(())),
-        );
-        deferred.mark_upstream_connected().await;
-        assert!(deferred.apply_feed_message(&initial).await?);
-        let deferred_before = deferred_writer.appends().await.len();
-        assert!(!deferred.apply_feed_message(&replacement).await?);
-        assert_eq!(deferred_writer.appends().await.len(), deferred_before);
-        assert_eq!(
-            deferred.status_snapshot().await.readiness,
-            BroadcasterReadiness::UpstreamRecovering
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn heartbeat_fails_when_redis_publication_fails() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let writer = ServiceFakeRedisWriter::default();
@@ -2046,198 +3123,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_generation_reset_keeps_backend_caches_and_redis_publisher_aligned() -> Result<()>
-    {
-        let (raw_service, rfq_service, _writer, publisher) = ready_raw_and_rfq_services().await?;
-
-        BroadcasterServiceState::handle_shared_generation_reset(
-            &[raw_service.clone(), rfq_service.clone()],
-            "stale",
-            Some("boom".to_string()),
-        )
-        .await;
-
-        let raw_status = raw_service.status_snapshot().await;
-        assert_eq!(
-            raw_status.readiness,
-            BroadcasterReadiness::UpstreamDisconnected
-        );
-        assert_eq!(raw_status.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(raw_status.snapshot.total_states, 0);
-
-        let rfq_status = rfq_service.status_snapshot().await;
-        assert_eq!(
-            rfq_status.readiness,
-            BroadcasterReadiness::UpstreamDisconnected
-        );
-        assert_eq!(rfq_status.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(rfq_status.snapshot.total_states, 0);
-
-        assert_eq!(
-            publisher.status_snapshot().await.stream_id,
-            "chain-1-stream-2"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rfq_generation_reset_relabels_raw_cache_without_clearing_it() -> Result<()> {
-        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
-        let raw_before = raw_service.status_snapshot().await;
-        assert_eq!(raw_before.readiness, BroadcasterReadiness::Ready);
-        assert_eq!(raw_before.snapshot.total_states, 1);
-
-        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
-            &[raw_service.clone(), rfq_service.clone()],
-            std::slice::from_ref(&rfq_service),
-            "rfq_restart",
-            Some("rfq stale".to_string()),
-        )
-        .await;
-
-        let raw_after = raw_service.status_snapshot().await;
-        assert_eq!(raw_after.readiness, BroadcasterReadiness::Ready);
-        assert_eq!(raw_after.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(raw_after.snapshot.snapshot_id, "chain-1-snapshot-2");
-        assert_eq!(
-            raw_after.snapshot.total_states,
-            raw_before.snapshot.total_states
-        );
-
-        let rfq_after = rfq_service.status_snapshot().await;
-        assert_eq!(
-            rfq_after.readiness,
-            BroadcasterReadiness::UpstreamDisconnected
-        );
-        assert_eq!(rfq_after.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(rfq_after.snapshot.snapshot_id, "chain-1-snapshot-2");
-        assert_eq!(rfq_after.snapshot.total_states, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn raw_generation_reset_relabels_rfq_cache_without_clearing_it() -> Result<()> {
-        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
-        let rfq_before = rfq_service.status_snapshot().await;
-        assert_eq!(rfq_before.readiness, BroadcasterReadiness::Ready);
-        assert_eq!(rfq_before.snapshot.total_states, 1);
-
-        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
-            &[raw_service.clone(), rfq_service.clone()],
-            std::slice::from_ref(&raw_service),
-            "raw_restart",
-            Some("raw stale".to_string()),
-        )
-        .await;
-
-        let raw_after = raw_service.status_snapshot().await;
-        assert_eq!(
-            raw_after.readiness,
-            BroadcasterReadiness::UpstreamDisconnected
-        );
-        assert_eq!(raw_after.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(raw_after.snapshot.snapshot_id, "chain-1-snapshot-2");
-        assert_eq!(raw_after.snapshot.total_states, 0);
-
-        let rfq_after = rfq_service.status_snapshot().await;
-        assert_eq!(rfq_after.readiness, BroadcasterReadiness::Ready);
-        assert_eq!(rfq_after.snapshot.stream_id, "chain-1-stream-2");
-        assert_eq!(rfq_after.snapshot.snapshot_id, "chain-1-snapshot-2");
-        assert_eq!(
-            rfq_after.snapshot.total_states,
-            rfq_before.snapshot.total_states
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn partial_generation_reset_uses_all_configured_backends_for_marker() -> Result<()> {
-        let (raw_service, rfq_service, writer, _publisher) = raw_and_rfq_services().await?;
-
-        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
-            &[raw_service.clone(), rfq_service.clone()],
-            std::slice::from_ref(&rfq_service),
-            "rfq_restart",
-            Some("rfq stale".to_string()),
-        )
-        .await;
-
-        let reset_marker = writer
-            .appends()
-            .await
-            .last()
-            .cloned()
-            .ok_or_else(|| anyhow!("generation reset should publish a marker"))?;
-        assert_eq!(reset_marker.stream_id, "chain-1-stream-2");
-        assert_eq!(reset_marker.message_seq, 1);
-        assert_eq!(reset_marker.backend_scope, "native,rfq");
-        assert_eq!(
-            progress_payload(&reset_marker)?.backends,
-            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn combined_snapshot_session_works_after_preserved_cache_is_relabelled() -> Result<()> {
-        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
-        let old_session = BroadcasterServiceState::create_snapshot_session_for_services(
-            &[raw_service.clone(), rfq_service.clone()],
-            Duration::from_secs(300),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("expected initial combined snapshot session"))?;
-
-        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
-            &[raw_service.clone(), rfq_service.clone()],
-            std::slice::from_ref(&rfq_service),
-            "rfq_restart",
-            Some("rfq stale".to_string()),
-        )
-        .await;
-
-        let Err(error) = raw_service
-            .snapshot_session_payload(old_session.session_id, 0)
-            .await
-        else {
-            return Err(anyhow!("old generation snapshot session should be closed"));
-        };
-        assert_eq!(error, SnapshotSessionError::NotFound);
-
-        rfq_service.mark_upstream_connected().await;
-        rfq_service
-            .apply_update(&rfq_only_update(203, "rfq-2", 8))
-            .await?;
-
-        let session = BroadcasterServiceState::create_snapshot_session_for_services(
-            &[raw_service.clone(), rfq_service.clone()],
-            Duration::from_secs(300),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("expected combined snapshot session after RFQ rewarm"))?;
-
-        assert_eq!(session.stream_id, "chain-1-stream-2");
-        assert_eq!(session.snapshot_id, "chain-1-snapshot-2");
-        assert_eq!(session.redis_replay_boundary.stream_id, "chain-1-stream-2");
-        assert_eq!(
-            session.redis_replay_boundary.snapshot_id,
-            "chain-1-snapshot-2"
-        );
-        let start = raw_service
-            .snapshot_session_payload(session.session_id, 0)
-            .await
-            .map_err(|error| anyhow!("snapshot payload failed: {error:?}"))?;
-        assert_eq!(start.stream_id, "chain-1-stream-2");
-        assert!(matches!(
-            start.payload,
-            BroadcasterPayload::SnapshotStart(ref start)
-                if start.snapshot_id == "chain-1-snapshot-2"
-                    && start.backends == vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn snapshot_session_response_includes_redis_replay_boundary() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let writer = ServiceFakeRedisWriter::default();
@@ -2261,6 +3146,8 @@ mod tests {
         service.mark_upstream_connected().await;
         service
             .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
             .await?;
 
         let session = service
@@ -2299,65 +3186,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_session_rejects_snapshot_stream_id_boundary_mismatch() -> Result<()> {
-        let registry = BroadcasterSnapshotSessionRegistry::new();
-
-        let Err(error) = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary_with_ids("stream-2", "snapshot-1"),
-                Duration::from_secs(300),
-            )
-            .await
-        else {
-            return Err(anyhow!(
-                "snapshot stream_id mismatch should reject the session"
-            ));
-        };
-
-        assert!(
-            format!("{error:#}").contains("snapshot stream_id mismatch"),
-            "unexpected error: {error:#}"
-        );
-        assert_eq!(registry.snapshot().await.active, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pending_session_rejects_snapshot_id_boundary_mismatch() -> Result<()> {
-        let registry = BroadcasterSnapshotSessionRegistry::new();
-
-        let Err(error) = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary_with_ids("stream-1", "snapshot-2"),
-                Duration::from_secs(300),
-            )
-            .await
-        else {
-            return Err(anyhow!("snapshot_id mismatch should reject the session"));
-        };
-
-        assert!(
-            format!("{error:#}").contains("snapshot_id mismatch"),
-            "unexpected error: {error:#}"
-        );
-        assert_eq!(registry.snapshot().await.active, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn pending_session_serves_payloads_until_expiry() -> Result<()> {
         let registry = BroadcasterSnapshotSessionRegistry::new();
         let session = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary(),
-                Duration::from_secs(300),
-            )
+            .create_snapshot_session(snapshot_artifact(), Duration::from_secs(300))
             .await?;
 
         let first = registry
@@ -2375,12 +3207,7 @@ mod tests {
     async fn pending_session_rejects_payload_index_out_of_range() -> Result<()> {
         let registry = BroadcasterSnapshotSessionRegistry::new();
         let session = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary(),
-                Duration::from_secs(300),
-            )
+            .create_snapshot_session(snapshot_artifact(), Duration::from_secs(300))
             .await?;
 
         let Err(error) = registry.snapshot_payload(session.session_id, 9).await else {
@@ -2396,16 +3223,11 @@ mod tests {
     async fn disconnect_all_clears_pending_sessions() -> Result<()> {
         let registry = BroadcasterSnapshotSessionRegistry::new();
         let session = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary(),
-                Duration::from_secs(300),
-            )
+            .create_snapshot_session(snapshot_artifact(), Duration::from_secs(300))
             .await?;
 
         registry
-            .disconnect_all(super::SessionCloseReason::GenerationReset)
+            .disconnect_all(super::SessionCloseReason::WriterFenceLost)
             .await;
 
         let Err(error) = registry.snapshot_payload(session.session_id, 0).await else {
@@ -2416,7 +3238,7 @@ mod tests {
         assert_eq!(snapshot.active, 0);
         assert_eq!(
             snapshot.last_error.as_deref(),
-            Some("all snapshot sessions closed: generation_reset")
+            Some("all snapshot sessions closed: writer_fence_lost")
         );
         Ok(())
     }
@@ -2425,12 +3247,7 @@ mod tests {
     async fn expired_pending_session_records_expiry() -> Result<()> {
         let registry = BroadcasterSnapshotSessionRegistry::new();
         let session = registry
-            .create_snapshot_session(
-                snapshot_export(),
-                1,
-                replay_boundary(),
-                Duration::from_millis(1),
-            )
+            .create_snapshot_session(snapshot_artifact(), Duration::from_millis(1))
             .await?;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -2472,61 +3289,9 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
         Ok(service)
-    }
-
-    async fn raw_and_rfq_services() -> Result<(
-        BroadcasterServiceState,
-        BroadcasterServiceState,
-        ServiceFakeRedisWriter,
-        Arc<BroadcasterRedisPublisher>,
-    )> {
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer.clone()),
-        ));
-        publisher
-            .promote(
-                base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
-                "active_writer_promoted",
-            )
-            .await?;
-        let lifecycle_gate = Arc::new(Mutex::new(()));
-        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            Arc::clone(&lifecycle_gate),
-        );
-        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            lifecycle_gate,
-        );
-
-        Ok((raw_service, rfq_service, writer, publisher))
-    }
-
-    async fn ready_raw_and_rfq_services() -> Result<(
-        BroadcasterServiceState,
-        BroadcasterServiceState,
-        ServiceFakeRedisWriter,
-        Arc<BroadcasterRedisPublisher>,
-    )> {
-        let (raw_service, rfq_service, writer, publisher) = raw_and_rfq_services().await?;
-        raw_service.mark_upstream_connected().await;
-        rfq_service.mark_upstream_connected().await;
-        raw_service
-            .apply_update(&native_only_update(101, "native-1"))
-            .await?;
-        rfq_service
-            .apply_update(&rfq_only_update(202, "rfq-1", 7))
-            .await?;
-        Ok((raw_service, rfq_service, writer, publisher))
     }
 
     #[derive(Debug, Clone, Default)]
@@ -2540,6 +3305,8 @@ mod tests {
         active_token: Option<String>,
         active_generation: u64,
         fail_next_appends: usize,
+        lose_recovery_commit_replies: bool,
+        recovery_commit_delay: Option<Duration>,
     }
 
     impl ServiceFakeRedisWriter {
@@ -2549,6 +3316,14 @@ mod tests {
 
         async fn appends(&self) -> Vec<BroadcasterRedisStreamEntry> {
             self.inner.lock().await.appends.clone()
+        }
+
+        async fn lose_recovery_commit_replies(&self) {
+            self.inner.lock().await.lose_recovery_commit_replies = true;
+        }
+
+        async fn delay_recovery_commit(&self, delay: Duration) {
+            self.inner.lock().await.recovery_commit_delay = Some(delay);
         }
     }
 
@@ -2579,28 +3354,9 @@ mod tests {
                 guard.active_token = Some(command.writer_token.to_string());
                 let generation = guard.active_generation;
                 let entry_id = format!("{generation}-1");
-                let previous_tail = guard.appends.last().cloned();
-                let marker_fields =
-                    if previous_tail.is_some() && !command.handoff_marker_fields.is_empty() {
-                        command.handoff_marker_fields
-                    } else {
-                        command.normal_marker_fields
-                    };
-                let previous_stream_id = previous_tail
-                    .as_ref()
-                    .map(|entry| entry.stream_id.as_str())
-                    .unwrap_or_default();
-                let previous_entry_id = previous_tail
-                    .as_ref()
-                    .map(crate::broadcaster::redis_publisher::redis_entry_id)
-                    .transpose()?
-                    .unwrap_or_default();
-                guard.appends.push(entry_from_fields(
-                    marker_fields,
-                    generation,
-                    previous_stream_id,
-                    &previous_entry_id,
-                )?);
+                guard
+                    .appends
+                    .push(entry_from_fields(command.normal_marker_fields, generation)?);
                 Ok(crate::broadcaster::redis_publisher::RedisPromotionResult {
                     generation,
                     entry_id,
@@ -2613,6 +3369,15 @@ mod tests {
             command: crate::broadcaster::redis_publisher::RedisAppendCommand<'a>,
         ) -> futures::future::BoxFuture<'a, Result<String>> {
             Box::pin(async move {
+                let commit_delay = {
+                    let guard = self.inner.lock().await;
+                    (command.entry.kind == BroadcasterMessageKind::RecoveryCommit)
+                        .then_some(guard.recovery_commit_delay)
+                        .flatten()
+                };
+                if let Some(delay) = commit_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 let mut guard = self.inner.lock().await;
                 if guard.active_token.is_some()
                     && (guard.active_token.as_deref() != Some(command.writer_token)
@@ -2628,6 +3393,18 @@ mod tests {
                     return Err(anyhow!("planned append failure"));
                 }
                 let entry_id = crate::broadcaster::redis_publisher::redis_entry_id(command.entry)?;
+                if command.entry.kind == BroadcasterMessageKind::RecoveryCommit
+                    && guard.lose_recovery_commit_replies
+                {
+                    if !guard
+                        .appends
+                        .iter()
+                        .any(|entry| entry.message_seq == command.entry.message_seq)
+                    {
+                        guard.appends.push(command.entry.clone());
+                    }
+                    return Err(anyhow!("planned lost recovery commit reply"));
+                }
                 guard.appends.push(command.entry.clone());
                 Ok(entry_id)
             })
@@ -2653,24 +3430,13 @@ mod tests {
     fn entry_from_fields(
         fields: &[(String, String)],
         generation: u64,
-        previous_stream_id: &str,
-        previous_entry_id: &str,
     ) -> Result<BroadcasterRedisStreamEntry> {
         let mut value = serde_json::Map::new();
         for (field, field_value) in fields {
-            let field_value = field_value
-                .replace(
-                    crate::broadcaster::redis_publisher::GENERATION_PLACEHOLDER,
-                    &generation.to_string(),
-                )
-                .replace(
-                    crate::broadcaster::redis_publisher::PREVIOUS_STREAM_ID_PLACEHOLDER,
-                    previous_stream_id,
-                )
-                .replace(
-                    crate::broadcaster::redis_publisher::PREVIOUS_ENTRY_ID_PLACEHOLDER,
-                    previous_entry_id,
-                );
+            let field_value = field_value.replace(
+                crate::broadcaster::redis_publisher::GENERATION_PLACEHOLDER,
+                &generation.to_string(),
+            );
             value.insert(field.clone(), serde_json::Value::String(field_value));
         }
         serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
@@ -2697,6 +3463,14 @@ mod tests {
                 BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
             ],
         }
+    }
+
+    fn snapshot_artifact() -> Arc<super::BroadcasterSnapshotArtifact> {
+        Arc::new(
+            super::build_snapshot_artifact(1, snapshot_export(), replay_boundary())
+                .unwrap_or_else(|_| unreachable!("valid snapshot artifact"))
+                .0,
+        )
     }
 
     fn replay_boundary() -> simulator_core::broadcaster::BroadcasterRedisReplayBoundary {
@@ -2762,6 +3536,82 @@ mod tests {
                 partial_block_index: None,
             }),
         )]))
+    }
+
+    fn native_buffer_update(block_number: u64) -> Result<BroadcasterUpdateMessage> {
+        let sync_status = BroadcasterProtocolSyncStatus::from_synchronizer_state(
+            &SynchronizerState::Ready(BlockHeader {
+                hash: Bytes::from(vec![1_u8; 32]),
+                number: block_number,
+                parent_hash: Bytes::from(vec![2_u8; 32]),
+                revert: false,
+                timestamp: block_number * 10,
+                partial_block_index: None,
+            }),
+        );
+        BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::new(
+            BroadcasterBackend::Native,
+            block_number,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::BTreeMap::from([("uniswap_v2".to_string(), sync_status)]),
+        )])
+        .map_err(Into::into)
+    }
+
+    fn raw_feed(number: u64, hash: u8, parent_hash: u8) -> FeedMessage<BlockHeader> {
+        raw_feed_with_account_payload(number, hash, parent_hash, "test".to_string())
+    }
+
+    fn raw_feed_with_account_payload(
+        number: u64,
+        hash: u8,
+        parent_hash: u8,
+        account_payload: String,
+    ) -> FeedMessage<BlockHeader> {
+        let header = BlockHeader {
+            hash: Bytes::from([hash; 32]),
+            number,
+            parent_hash: Bytes::from([parent_hash; 32]),
+            revert: false,
+            timestamp: number * 10,
+            partial_block_index: None,
+        };
+        let account_address = Bytes::from([1_u8; 20]);
+        FeedMessage {
+            state_msgs: HashMap::from([(
+                "uniswap_v2".to_string(),
+                StateSyncMessage {
+                    header: header.clone(),
+                    snapshots: Snapshot {
+                        states: HashMap::new(),
+                        vm_storage: HashMap::from([(
+                            account_address.clone(),
+                            ResponseAccount::new(
+                                DtoChain::Ethereum,
+                                account_address,
+                                account_payload,
+                                HashMap::new(),
+                                Bytes::from([hash; 32]),
+                                HashMap::new(),
+                                Bytes::from([1_u8; 32]),
+                                Bytes::from([2_u8; 32]),
+                                Bytes::from([3_u8; 32]),
+                                Bytes::from([4_u8; 32]),
+                                None,
+                            ),
+                        )]),
+                    },
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "uniswap_v2".to_string(),
+                SynchronizerState::Ready(header),
+            )]),
+        }
     }
 
     fn native_update_state(block_number: u64, component_id: &str, seed: u8) -> Update {
