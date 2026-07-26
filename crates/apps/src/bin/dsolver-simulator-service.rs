@@ -8,7 +8,31 @@ async fn main() -> anyhow::Result<()> {
     let app = rpc::create_router(service.runtime);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service())
+    let server = axum::serve(listener, app.into_make_service());
+    let supervisor = wait_for_supervisor(service.supervisors);
+    tokio::select! {
+        result = server => result
+            .map_err(|error| anyhow::anyhow!("Failed to start server: {error}")),
+        result = supervisor => {
+            result?;
+            Err(anyhow::anyhow!("Broadcaster subscription supervisor terminated unexpectedly"))
+        }
+    }
+}
+
+async fn wait_for_supervisor(supervisors: Vec<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::channel(supervisors.len().max(1));
+    for supervisor in supervisors {
+        let finished_tx = finished_tx.clone();
+        tokio::spawn(async move {
+            let _ = finished_tx.send(supervisor.await).await;
+        });
+    }
+    drop(finished_tx);
+
+    finished_rx
+        .recv()
         .await
-        .map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
+        .ok_or_else(|| anyhow::anyhow!("No broadcaster subscription supervisors were started"))?
+        .map_err(|error| anyhow::anyhow!("Broadcaster subscription supervisor panicked: {error}"))
 }

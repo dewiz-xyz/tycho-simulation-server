@@ -20,6 +20,7 @@ const DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES: &str = "8388608";
 const DEFAULT_BROADCASTER_REDIS_BLOCK_MS: &str = "5000";
 const DEFAULT_BROADCASTER_REDIS_READ_COUNT: &str = "128";
 const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
+pub const NATIVE_PROGRESS_LEASE_SECS: u64 = 5;
 
 /// Per-chain runtime profile resolved from `CHAIN_ID`.
 #[derive(Clone, Debug)]
@@ -90,12 +91,10 @@ pub fn load_config() -> AppConfig {
 
     AppConfig {
         chain_profile,
-        tycho_url: resolved_chain.tycho_url,
         tycho_broadcaster_url: require_trimmed_env("TYCHO_BROADCASTER_URL"),
         bebop_url: resolved_chain.bebop_url,
         hashflow_filename: resolved_chain.hashflow_filename,
         liquorice_url: resolved_chain.liquorice_url,
-        api_key: network.api_key,
         rpc_url: network.rpc_url,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
@@ -117,7 +116,6 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_min_ms: stream.stream_restart_backoff_min_ms,
         stream_restart_backoff_max_ms: stream.stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
-        readiness_stale_secs: stream.readiness_stale_secs,
         slippage,
         memory,
         bebop_key,
@@ -147,6 +145,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         }
     };
     let network = load_network_config();
+    let api_key = require_env("TYCHO_API_KEY");
     let timeouts = load_timeout_config();
     let resolved_chain = match resolve_chain_config(
         &registries,
@@ -183,7 +182,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         bebop_url: resolved_chain.bebop_url,
         hashflow_filename: resolved_chain.hashflow_filename,
         liquorice_url: resolved_chain.liquorice_url,
-        api_key: network.api_key,
+        api_key,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
@@ -199,7 +198,6 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         stream_restart_backoff_min_ms: stream.stream_restart_backoff_min_ms,
         stream_restart_backoff_max_ms: stream.stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
-        readiness_stale_secs: stream.readiness_stale_secs,
         memory,
         tuning,
         bebop_key,
@@ -296,7 +294,6 @@ fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
 }
 
 struct NetworkConfig {
-    api_key: String,
     rpc_url: Option<String>,
     tvl_threshold: f64,
     tvl_keep_threshold: f64,
@@ -322,7 +319,6 @@ struct StreamConfig {
     stream_restart_backoff_min_ms: u64,
     stream_restart_backoff_max_ms: u64,
     stream_restart_backoff_jitter_pct: f64,
-    readiness_stale_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,7 +365,6 @@ impl Default for SlippageConfig {
 }
 
 fn load_network_config() -> NetworkConfig {
-    let api_key = require_env("TYCHO_API_KEY");
     let rpc_url = optional_trimmed_env("RPC_URL");
     let tvl_threshold: f64 = parse_env_or_default("TVL_THRESHOLD", "100");
     let tvl_keep_ratio: f64 = parse_env_or_default("TVL_KEEP_RATIO", "0.2");
@@ -387,7 +382,6 @@ fn load_network_config() -> NetworkConfig {
     );
 
     NetworkConfig {
-        api_key,
         rpc_url,
         tvl_threshold,
         tvl_keep_threshold,
@@ -434,7 +428,6 @@ fn load_stream_config() -> StreamConfig {
         parse_env_or_default("STREAM_RESTART_BACKOFF_MAX_MS", "30000");
     let stream_restart_backoff_jitter_pct =
         parse_env_or_default("STREAM_RESTART_BACKOFF_JITTER_PCT", "0.2");
-    let readiness_stale_secs = parse_env_or_default("READINESS_STALE_SECS", "300");
 
     assert!(stream_stale_secs > 0, "STREAM_STALE_SECS must be > 0");
     assert!(
@@ -467,8 +460,6 @@ fn load_stream_config() -> StreamConfig {
         (0.0..=1.0).contains(&stream_restart_backoff_jitter_pct),
         "STREAM_RESTART_BACKOFF_JITTER_PCT must be within [0.0, 1.0]"
     );
-    assert!(readiness_stale_secs > 0, "READINESS_STALE_SECS must be > 0");
-
     StreamConfig {
         stream_stale_secs,
         stream_missing_block_burst,
@@ -479,7 +470,6 @@ fn load_stream_config() -> StreamConfig {
         stream_restart_backoff_min_ms,
         stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct,
-        readiness_stale_secs,
     }
 }
 
@@ -500,8 +490,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS,
     );
-    let maxlen = optional_trimmed_env("BROADCASTER_REDIS_MAXLEN")
-        .map(|value| parse_value_or_panic("BROADCASTER_REDIS_MAXLEN", &value));
+    let maxlen = Some(parse_env_or_default("BROADCASTER_REDIS_MAXLEN", "5000"));
 
     assert_valid_redis_url(&redis_url);
     assert!(block_ms > 0, "BROADCASTER_REDIS_BLOCK_MS must be > 0");
@@ -650,12 +639,10 @@ fn load_slippage_config() -> SlippageConfig {
 #[derive(Clone)]
 pub struct AppConfig {
     pub chain_profile: ChainProfile,
-    pub tycho_url: String,
     pub tycho_broadcaster_url: String,
     pub bebop_url: String,
     pub hashflow_filename: String,
     pub liquorice_url: Option<String>,
-    pub api_key: String,
     pub rpc_url: Option<String>,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
@@ -677,7 +664,6 @@ pub struct AppConfig {
     pub stream_restart_backoff_min_ms: u64,
     pub stream_restart_backoff_max_ms: u64,
     pub stream_restart_backoff_jitter_pct: f64,
-    pub readiness_stale_secs: u64,
     pub slippage: SlippageConfig,
     pub memory: MemoryConfig,
     pub bebop_user: String,
@@ -711,7 +697,6 @@ pub struct BroadcasterConfig {
     pub stream_restart_backoff_min_ms: u64,
     pub stream_restart_backoff_max_ms: u64,
     pub stream_restart_backoff_jitter_pct: f64,
-    pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
     pub tuning: BroadcasterTuning,
     pub bebop_user: String,
@@ -1663,7 +1648,7 @@ route_policy = " default "
         assert_eq!(config.block_ms, 5_000);
         assert_eq!(config.read_count, 128);
         assert_eq!(config.append_retry_window_ms, 5_000);
-        assert_eq!(config.maxlen, None);
+        assert_eq!(config.maxlen, Some(5_000));
     }
 
     #[test]
@@ -1716,7 +1701,7 @@ route_policy = " default "
         assert_eq!(config.block_ms, 5_000);
         assert_eq!(config.read_count, 256);
         assert_eq!(config.append_retry_window_ms, 5_000);
-        assert_eq!(config.maxlen, None);
+        assert_eq!(config.maxlen, Some(5_000));
     }
 
     #[test]
