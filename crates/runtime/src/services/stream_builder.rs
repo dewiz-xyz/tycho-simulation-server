@@ -31,7 +31,6 @@ use tycho_simulation::{
             uniswap_v4::state::UniswapV4State,
             vm::state::EVMPoolState,
         },
-        stream::ProtocolStreamBuilder,
     },
     protocol::models::Update,
     rfq::{
@@ -61,167 +60,6 @@ pub(crate) const RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
 // because they do not request firm quotes.
 pub(crate) const ENCODE_RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const LIQUORICE_QUOTE_EXPIRY_SECS: u64 = 300;
-
-#[derive(Clone, Copy)]
-enum StreamDecodePolicy {
-    Native,
-    Vm,
-    Broadcaster,
-}
-
-pub async fn build_native_stream(
-    tycho_url: &str,
-    api_key: &str,
-    tvl_add_threshold: f64,
-    tvl_keep_threshold: f64,
-    tokens: Arc<TokenStore>,
-    chain: Chain,
-    protocols: &[String],
-) -> Result<
-    impl futures::Stream<
-            Item = Result<
-                tycho_simulation::protocol::models::Update,
-                Box<dyn std::error::Error + Send + Sync + 'static>,
-            >,
-        > + Unpin
-        + Send,
-> {
-    let (mut builder, tvl_filter) = base_builder(
-        tycho_url,
-        api_key,
-        tvl_add_threshold,
-        tvl_keep_threshold,
-        decode_skip_state_failures(StreamDecodePolicy::Native),
-        chain,
-    );
-
-    for protocol in protocols {
-        builder = register_native_protocol(builder, protocol, &tvl_filter)?;
-    }
-
-    let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
-
-    Ok(stream.map(|item| {
-        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
-    }))
-}
-
-fn register_native_protocol(
-    builder: ProtocolStreamBuilder,
-    protocol: &str,
-    tvl_filter: &ComponentFilter,
-) -> Result<ProtocolStreamBuilder> {
-    match protocol {
-        "uniswap_v2" | "sushiswap_v2" => {
-            Ok(builder.exchange::<UniswapV2State>(protocol, tvl_filter.clone(), None))
-        }
-        "pancakeswap_v2" => {
-            Ok(builder.exchange::<PancakeswapV2State>(protocol, tvl_filter.clone(), None))
-        }
-        "uniswap_v3" | "pancakeswap_v3" => {
-            Ok(builder.exchange::<UniswapV3State>(protocol, tvl_filter.clone(), None))
-        }
-        "uniswap_v4" => Ok(builder.exchange::<UniswapV4State>(protocol, tvl_filter.clone(), None)),
-        "ekubo_v2" => Ok(builder.exchange::<EkuboState>(protocol, tvl_filter.clone(), None)),
-        "fluid_v1" => Ok(builder.exchange::<FluidV1>(
-            protocol,
-            tvl_filter.clone(),
-            Some(fluid_v1_paused_pools_filter),
-        )),
-        "rocketpool" => Ok(builder.exchange::<RocketpoolState>(protocol, tvl_filter.clone(), None)),
-        "ekubo_v3" => Ok(builder.exchange::<EkuboV3State>(protocol, tvl_filter.clone(), None)),
-        "aerodrome_slipstreams" => {
-            Ok(builder.exchange::<AerodromeSlipstreamsState>(protocol, tvl_filter.clone(), None))
-        }
-        "erc4626" => Ok(builder.exchange::<ERC4626State>(
-            protocol,
-            tvl_filter.clone(),
-            Some(erc4626_filter),
-        )),
-        other => bail!("Unknown native protocol in chain profile: {}", other),
-    }
-}
-
-pub async fn build_vm_stream(
-    tycho_url: &str,
-    api_key: &str,
-    tvl_add_threshold: f64,
-    tvl_keep_threshold: f64,
-    tokens: Arc<TokenStore>,
-    chain: Chain,
-    protocols: &[String],
-) -> Result<
-    impl futures::Stream<
-            Item = Result<
-                tycho_simulation::protocol::models::Update,
-                Box<dyn std::error::Error + Send + Sync + 'static>,
-            >,
-        > + Unpin
-        + Send,
-> {
-    let (mut builder, tvl_filter) = base_builder(
-        tycho_url,
-        api_key,
-        tvl_add_threshold,
-        tvl_keep_threshold,
-        decode_skip_state_failures(StreamDecodePolicy::Vm),
-        chain,
-    );
-
-    for protocol in protocols {
-        builder = register_vm_protocol(builder, protocol, &tvl_filter)?;
-    }
-
-    let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
-
-    Ok(stream.map(|item| {
-        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
-    }))
-}
-
-pub async fn build_broadcaster_stream(
-    tycho_url: &str,
-    api_key: &str,
-    tvl_add_threshold: f64,
-    tvl_keep_threshold: f64,
-    tokens: Arc<TokenStore>,
-    chain: Chain,
-    protocols: &BroadcasterProtocols,
-) -> Result<
-    impl futures::Stream<
-            Item = Result<
-                tycho_simulation::protocol::models::Update,
-                Box<dyn std::error::Error + Send + Sync + 'static>,
-            >,
-        > + Unpin
-        + Send,
-> {
-    let (mut builder, tvl_filter) = base_builder(
-        tycho_url,
-        api_key,
-        tvl_add_threshold,
-        tvl_keep_threshold,
-        decode_skip_state_failures(StreamDecodePolicy::Broadcaster),
-        chain,
-    );
-
-    for protocol in &protocols.native {
-        builder = register_native_protocol(builder, protocol, &tvl_filter)?;
-    }
-
-    for protocol in &protocols.vm {
-        builder = register_vm_protocol(builder, protocol, &tvl_filter)?;
-    }
-
-    let snapshot = tokens.snapshot().await;
-    let stream = builder.set_tokens(snapshot).await.build().await?;
-
-    Ok(stream.map(|item| {
-        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
-    }))
-}
 
 pub async fn build_broadcaster_raw_stream(
     tycho_url: &str,
@@ -263,11 +101,7 @@ pub async fn build_broadcaster_subscription_decoder(
     protocols: &[String],
 ) -> Result<Arc<TychoStreamDecoder<BlockHeader>>> {
     let mut decoder = TychoStreamDecoder::new();
-    decoder.skip_state_decode_failures(decode_skip_state_failures(match backend {
-        BroadcasterBackend::Native => StreamDecodePolicy::Native,
-        BroadcasterBackend::Vm => StreamDecodePolicy::Vm,
-        BroadcasterBackend::Rfq => StreamDecodePolicy::Broadcaster,
-    }));
+    decoder.skip_state_decode_failures(true);
 
     match backend {
         BroadcasterBackend::Native => {
@@ -432,24 +266,6 @@ fn merge_missing_tokens(tokens: &mut HashMap<Bytes, Token>, extra: HashMap<Bytes
     }
 }
 
-fn register_vm_protocol(
-    builder: ProtocolStreamBuilder,
-    protocol: &str,
-    tvl_filter: &ComponentFilter,
-) -> Result<ProtocolStreamBuilder> {
-    match protocol {
-        "vm:balancer_v2" => Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(
-            protocol,
-            tvl_filter.clone(),
-            Some(balancer_v2_pool_filter),
-        )),
-        "vm:curve" | "vm:maverick_v2" => {
-            Ok(builder.exchange::<EVMPoolState<PreCachedDB>>(protocol, tvl_filter.clone(), None))
-        }
-        other => bail!("Unknown VM protocol in chain profile: {}", other),
-    }
-}
-
 fn register_native_decoder(
     decoder: &mut TychoStreamDecoder<BlockHeader>,
     protocol: &str,
@@ -493,30 +309,6 @@ fn register_vm_decoder(
     Ok(())
 }
 
-fn base_builder(
-    tycho_url: &str,
-    api_key: &str,
-    tvl_add_threshold: f64,
-    tvl_keep_threshold: f64,
-    skip_state_decode_failures: bool,
-    chain: Chain,
-) -> (ProtocolStreamBuilder, ComponentFilter) {
-    let add_tvl = tvl_add_threshold;
-    let keep_tvl = tvl_keep_threshold.min(add_tvl);
-    info!(
-        "Using TVL thresholds: remove/keep={} add={}",
-        keep_tvl, add_tvl
-    );
-    let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
-
-    let builder = ProtocolStreamBuilder::new(tycho_url, chain)
-        .latency_buffer(15)
-        .auth_key(Some(api_key.to_string()))
-        .skip_state_decode_failures(skip_state_decode_failures);
-
-    (builder, tvl_filter)
-}
-
 fn raw_base_builder(
     tycho_url: &str,
     api_key: &str,
@@ -547,13 +339,6 @@ fn raw_base_builder(
     (builder, tvl_filter)
 }
 
-fn decode_skip_state_failures(policy: StreamDecodePolicy) -> bool {
-    matches!(
-        policy,
-        StreamDecodePolicy::Native | StreamDecodePolicy::Vm | StreamDecodePolicy::Broadcaster
-    )
-}
-
 #[cfg(test)]
 #[expect(
     clippy::panic,
@@ -569,14 +354,12 @@ mod tests {
     };
 
     use super::{
-        build_broadcaster_stream, decode_skip_state_failures, merge_missing_tokens,
-        register_native_protocol, register_vm_protocol, rfq_decoder_tokens, BroadcasterProtocols,
-        StreamDecodePolicy,
+        merge_missing_tokens, register_native_decoder, register_vm_decoder, rfq_decoder_tokens,
     };
     use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
     use tycho_simulation::{
-        evm::stream::ProtocolStreamBuilder,
-        tycho_client::feed::component_tracker::ComponentFilter,
+        evm::decoder::TychoStreamDecoder,
+        tycho_client::feed::BlockHeader,
         tycho_common::{
             models::{token::Token, Chain},
             Bytes,
@@ -584,17 +367,6 @@ mod tests {
     };
 
     use crate::models::tokens::TokenStore;
-
-    fn test_builder() -> ProtocolStreamBuilder {
-        ProtocolStreamBuilder::new(
-            "localhost",
-            tycho_simulation::tycho_common::models::Chain::Ethereum,
-        )
-    }
-
-    fn test_filter() -> ComponentFilter {
-        ComponentFilter::with_tvl_range(0.0, 1.0)
-    }
 
     fn manifest_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -651,74 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn native_stream_keeps_decode_skip_enabled() {
-        assert!(decode_skip_state_failures(StreamDecodePolicy::Native));
-    }
-
-    #[test]
-    fn vm_stream_keeps_decode_skip_enabled() {
-        assert!(decode_skip_state_failures(StreamDecodePolicy::Vm));
-    }
-
-    #[test]
-    fn broadcaster_stream_keeps_decode_skip_enabled() {
-        assert!(decode_skip_state_failures(StreamDecodePolicy::Broadcaster));
-    }
-
-    #[test]
-    fn unknown_native_protocol_returns_error() {
-        let builder = test_builder();
-        let filter = test_filter();
-        let result = register_native_protocol(builder, "unknown_protocol", &filter);
-        assert!(result.is_err());
-        let Err(err) = result else {
-            unreachable!("expected error for unknown native protocol");
-        };
-        assert!(err.to_string().contains("Unknown native protocol"));
-    }
-
-    #[test]
-    fn unknown_vm_protocol_returns_error() {
-        let builder = test_builder();
-        let filter = test_filter();
-        let result = register_vm_protocol(builder, "vm:unknown", &filter);
-        assert!(result.is_err());
-        let Err(err) = result else {
-            unreachable!("expected error for unknown VM protocol");
-        };
-        assert!(err.to_string().contains("Unknown VM protocol"));
-    }
-
-    #[tokio::test]
-    async fn broadcaster_stream_rejects_unknown_native_protocol() {
-        let tokens = test_token_store([test_token(
-            "0x0000000000000000000000000000000000000001",
-            "TKNA",
-        )]);
-        let result = build_broadcaster_stream(
-            "localhost",
-            "key",
-            1.0,
-            1.0,
-            tokens,
-            Chain::Ethereum,
-            &BroadcasterProtocols {
-                native: vec!["unknown_protocol".to_string()],
-                vm: Vec::new(),
-            },
-        )
-        .await;
-
-        assert!(result.is_err());
-        let Err(err) = result else {
-            unreachable!("expected unknown broadcaster protocol to fail");
-        };
-        assert!(err.to_string().contains("Unknown native protocol"));
-    }
-
-    #[test]
     fn manifest_native_protocols_all_register_successfully() {
-        let filter = test_filter();
         let (ethereum_native_protocols, _) = chain_protocols(1);
         let (base_native_protocols, _) = chain_protocols(8453);
 
@@ -728,7 +433,8 @@ mod tests {
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
         {
-            let result = register_native_protocol(test_builder(), protocol, &filter);
+            let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
+            let result = register_native_decoder(&mut decoder, protocol);
             assert!(
                 result.is_ok(),
                 "expected native protocol {protocol} to register"
@@ -738,7 +444,6 @@ mod tests {
 
     #[test]
     fn manifest_vm_protocols_all_register_successfully() {
-        let filter = test_filter();
         let (_, ethereum_vm_protocols) = chain_protocols(1);
         let (_, base_vm_protocols) = chain_protocols(8453);
 
@@ -748,7 +453,8 @@ mod tests {
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
         {
-            let result = register_vm_protocol(test_builder(), protocol, &filter);
+            let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
+            let result = register_vm_decoder(&mut decoder, protocol);
             assert!(
                 result.is_ok(),
                 "expected VM protocol {protocol} to register"

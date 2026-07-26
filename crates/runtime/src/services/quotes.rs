@@ -22,7 +22,7 @@ use crate::models::messages::{
     QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
 use crate::models::protocol::ProtocolKind;
-use crate::models::state::{AppState, SimulationRebuildGuard};
+use crate::models::state::{AppState, PublishedStatePin, SimulationRebuildGuard};
 use crate::models::tokens::TokenStoreError;
 
 use super::simulation_executor::{SimulationExecutionError, SimulationExecutor};
@@ -338,6 +338,7 @@ struct QuoteRequestRunner {
     run: QuoteRunState,
     cancel: Option<CancellationToken>,
     readiness_wait: Duration,
+    native_pin: Option<PublishedStatePin>,
 }
 
 fn pool_descriptor(id: String, component: &ProtocolComponent) -> PoolDescriptor {
@@ -375,10 +376,24 @@ pub async fn get_amounts_out(
     request: AmountOutRequest,
     cancel: Option<CancellationToken>,
 ) -> QuoteComputation {
-    QuoteRequestRunner::new(state, request, cancel)
-        .await
-        .run()
-        .await
+    let runner = QuoteRequestRunner::new(state.clone(), request, cancel).await;
+    let (mut computation, native_version) = runner.run().await;
+    if let Some(native_version) = native_version {
+        let version_is_current = state.native_state_store.state_version().await == native_version;
+        if !state.is_ready().await || !version_is_current {
+            computation.responses.clear();
+            computation.meta.status = QuoteStatus::WarmingUp;
+            computation.meta.result_quality = QuoteResultQuality::RequestLevelFailure;
+            computation.meta.partial_kind = None;
+            computation.meta.failures.push(make_failure(
+                QuoteFailureKind::WarmUp,
+                "Native state changed while the quote was running; retry against the current version"
+                    .to_string(),
+                None,
+            ));
+        }
+    }
+    computation
 }
 
 impl QuoteRequestRunner {
@@ -420,10 +435,11 @@ impl QuoteRequestRunner {
             },
             cancel,
             readiness_wait: Duration::from_secs(2),
+            native_pin: None,
         }
     }
 
-    async fn run(mut self) -> QuoteComputation {
+    async fn run(mut self) -> (QuoteComputation, Option<u64>) {
         if self.is_cancelled() {
             self.run.classification.mark_request_degradation();
             self.push_failure(make_failure(
@@ -431,35 +447,48 @@ impl QuoteRequestRunner {
                 "Quote request cancelled before execution".to_string(),
                 None,
             ));
-            return self.finish(RequestExit::new(
-                QuoteStatus::Ready,
-                QuoteResultQuality::RequestLevelFailure,
-            ));
+            return (
+                self.finish(RequestExit::new(
+                    QuoteStatus::Ready,
+                    QuoteResultQuality::RequestLevelFailure,
+                )),
+                None,
+            );
         }
         let pair = match self.parse_pair() {
             Ok(pair) => pair,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => return (self.finish(exit), None),
         };
         if let Err(exit) = self.ensure_ready().await {
-            return self.finish(exit);
+            return (self.finish(exit), None);
         }
         let (token_in_ref, token_out_ref) = match self.load_tokens(&pair).await {
             Ok(tokens) => tokens,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => {
+                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
+                return (self.finish(exit), version);
+            }
         };
         let amounts_in = match self.parse_amounts() {
             Ok(amounts) => amounts,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => {
+                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
+                return (self.finish(exit), version);
+            }
         };
         let prepared = match self
             .prepare_execution(&pair, token_in_ref, token_out_ref, amounts_in)
             .await
         {
             Ok(prepared) => prepared,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => {
+                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
+                return (self.finish(exit), version);
+            }
         };
         self.execute_pool_quotes(prepared).await;
-        self.finish_current_state()
+        let version = self.native_pin.as_ref().map(PublishedStatePin::version);
+        (self.finish_current_state(), version)
     }
 
     fn finish(self, exit: RequestExit) -> QuoteComputation {
@@ -598,6 +627,8 @@ impl QuoteRequestRunner {
 
     async fn ensure_ready(&mut self) -> Result<(), RequestExit> {
         if self.state.is_ready().await {
+            self.native_pin = Some(self.state.native_state_store.pin().await);
+            self.refresh_meta_snapshot().await;
             return Ok(());
         }
         let ready = self.state.wait_for_readiness(self.readiness_wait).await;
@@ -616,18 +647,35 @@ impl QuoteRequestRunner {
                 QuoteResultQuality::RequestLevelFailure,
             ));
         }
+        self.native_pin = Some(self.state.native_state_store.pin().await);
         self.refresh_meta_snapshot().await;
         Ok(())
     }
 
     async fn refresh_meta_snapshot(&mut self) {
-        self.run.meta.block_number = self.state.current_block().await;
+        let native_pin = self.native_pin.as_ref();
+        self.run.meta.block_number = native_pin
+            .map(PublishedStatePin::current_block)
+            .unwrap_or_default();
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
         self.run.meta.rfq_update_timestamp = self.state.current_rfq_update_timestamp().await;
-        self.run.meta.total_pools = Some(self.state.total_pools().await);
+        let native_pools = native_pin.map(PublishedStatePin::total_states).unwrap_or(0);
+        let (vm_pools, rfq_pools) = tokio::join!(
+            self.state.vm_state_store.total_states(),
+            self.state.rfq_state_store.total_states()
+        );
+        self.run.meta.total_pools = Some(native_pools + vm_pools + rfq_pools);
     }
 
     async fn load_tokens(&mut self, pair: &RequestPair) -> Result<(Token, Token), RequestExit> {
+        if let Some(pin) = self.native_pin.as_ref() {
+            if let (Some(token_in), Some(token_out)) = (
+                pin.token(&pair.token_in_bytes),
+                pin.token(&pair.token_out_bytes),
+            ) {
+                return Ok((token_in, token_out));
+            }
+        }
         let (token_in_res, token_out_res) = tokio::join!(
             self.state.tokens.ensure(&pair.token_in_bytes),
             self.state.tokens.ensure(&pair.token_out_bytes)
@@ -752,7 +800,7 @@ impl QuoteRequestRunner {
             self.run.metrics.skipped_rfq_unavailable = true;
         }
         self.refresh_meta_snapshot().await;
-        let mut candidates = self.load_candidate_sets(pair, vm_ready, rfq_ready).await;
+        let mut candidates = self.load_candidate_sets(pair, vm_ready, rfq_ready).await?;
         candidates.rfq_candidates = filter_directional_rfq_candidates(
             candidates.rfq_candidates,
             &token_in_ref,
@@ -786,12 +834,20 @@ impl QuoteRequestRunner {
         pair: &RequestPair,
         vm_ready: bool,
         rfq_ready: bool,
-    ) -> CandidateSets {
-        let native_candidates = self
-            .state
-            .native_state_store
+    ) -> Result<CandidateSets, RequestExit> {
+        let Some(native_pin) = self.native_pin.as_ref() else {
+            self.push_failure(make_failure(
+                QuoteFailureKind::Internal,
+                "Native state pin missing after readiness".to_string(),
+                None,
+            ));
+            return Err(RequestExit::new(
+                QuoteStatus::InternalError,
+                QuoteResultQuality::RequestLevelFailure,
+            ));
+        };
+        let native_candidates = native_pin
             .matching_pools_by_addresses(&pair.token_in_bytes, &pair.token_out_bytes)
-            .await
             .into_iter()
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
@@ -824,11 +880,11 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
-        CandidateSets {
+        Ok(CandidateSets {
             native_candidates,
             vm_candidates,
             rfq_candidates,
-        }
+        })
     }
 
     fn prepare_candidate_metadata(
@@ -3126,9 +3182,9 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            rfq_stream_health: Arc::new(StreamHealth::new()),
+            native_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            vm_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            rfq_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: config.enable_vm_pools,
@@ -6198,6 +6254,52 @@ mod tests {
             runner.run.pool_results[0].outcome,
             PoolOutcomeKind::InternalError
         ));
+    }
+
+    #[tokio::test]
+    async fn quote_metadata_is_refreshed_from_the_pinned_native_version() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let pinned = fixture.native_state_store.pin().await;
+
+        let token_a =
+            Bytes::from_str("0x0000000000000000000000000000000000000005").expect("valid address");
+        let token_b =
+            Bytes::from_str("0x0000000000000000000000000000000000000006").expect("valid address");
+        let mut newer_states = HashMap::new();
+        let mut newer_pairs = HashMap::new();
+        insert_pool_state(
+            &mut newer_states,
+            &mut newer_pairs,
+            "pool-newer",
+            "0x0000000000000000000000000000000000000011",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![make_token(&token_a, "NEW1"), make_token(&token_b, "NEW2")],
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(1_000u32),
+                calls: default_calls(),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(2, newer_states, newer_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-pinned-meta", &["1"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        runner.native_pin = Some(pinned);
+        runner.refresh_meta_snapshot().await;
+
+        assert_eq!(runner.run.meta.block_number, 1);
+        assert_eq!(runner.run.meta.total_pools, Some(1));
     }
 
     #[tokio::test]

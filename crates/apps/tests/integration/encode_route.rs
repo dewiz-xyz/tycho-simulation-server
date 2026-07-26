@@ -1082,6 +1082,31 @@ async fn encode_route_rejects_vm_route_when_vm_is_rebuilding() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn encode_route_rejects_base_v4_route_while_shared_database_rebuilds() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        chain: Chain::Base,
+        request_pool_protocol: "uniswap_v4",
+        component_protocol_system: "uniswap_v4",
+        component_protocol_type_name: "uniswap_v4_pool",
+        vm_pool: true,
+        enable_vm_pools: true,
+        vm_rebuilding: true,
+        request_id: "req-base-v4-rebuilding",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state rebuilding for requested route"
+    );
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
     let config = EncodeFixtureConfig {

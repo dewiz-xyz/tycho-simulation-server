@@ -12,9 +12,12 @@ pub(super) enum PoolBackend {
 impl PoolBackend {
     fn from_kind(kind: Option<ProtocolKind>) -> Self {
         match kind {
-            Some(ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2) => {
-                Self::Vm
-            }
+            Some(
+                ProtocolKind::Curve
+                | ProtocolKind::BalancerV2
+                | ProtocolKind::MaverickV2
+                | ProtocolKind::UniswapV4,
+            ) => Self::Vm,
             Some(ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice) => {
                 Self::Rfq
             }
@@ -79,6 +82,7 @@ mod tests {
         assert!(PoolBackend::from_protocol_hint("RFQ:BEBOP").is_rfq());
         assert!(PoolBackend::from_protocol_hint("hashflow_pool").is_rfq());
         assert!(PoolBackend::from_protocol_hint("uniswap_v3").is_native());
+        assert!(PoolBackend::from_protocol_hint("uniswap_v4").is_vm());
     }
 
     #[test]

@@ -163,9 +163,9 @@ pub(super) fn test_app_state(
         native_state_store,
         vm_state_store,
         rfq_state_store,
-        native_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream_health: Arc::new(StreamHealth::new()),
-        rfq_stream_health: Arc::new(StreamHealth::new()),
+        native_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+        vm_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+        rfq_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
         configured_backends: ConfiguredBackends {
             vm: config.enable_vm_pools,

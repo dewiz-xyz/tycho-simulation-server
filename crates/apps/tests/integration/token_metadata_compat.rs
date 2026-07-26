@@ -426,7 +426,7 @@ async fn simulate_missing_token_preserves_token_coverage_semantics_without_tycho
 }
 
 #[tokio::test]
-async fn encode_missing_token_preserves_client_error_without_tycho_fetch() -> Result<()> {
+async fn encode_missing_native_token_uses_pinned_metadata_without_fetch() -> Result<()> {
     let token_in_hex = "0x0000000000000000000000000000000000000011";
     let token_out_hex = "0x0000000000000000000000000000000000000012";
     let token_in = parse_address(token_in_hex)?;
@@ -457,13 +457,13 @@ async fn encode_missing_token_preserves_client_error_without_tycho_fetch() -> Re
     assert_eq!(response.error, "Token not found");
     assert_eq!(
         authority.broadcaster_hits.load(Ordering::SeqCst),
-        2,
-        "/encode token lookups should use the broadcaster mirror"
+        0,
+        "/encode must not mix global token metadata into a pinned native request"
     );
     authority.assert_no_tycho_fetches();
     assert!(
-        token_store.snapshot().await.contains_key(&token_in),
-        "resolved broadcaster token should remain cached in the simulator mirror"
+        !token_store.snapshot().await.contains_key(&token_in),
+        "a failed pinned native lookup must not populate the global token mirror"
     );
     Ok(())
 }

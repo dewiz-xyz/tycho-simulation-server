@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
-use crate::models::state::AppState;
+use crate::models::state::{AppState, PublishedStatePin};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
@@ -101,6 +101,10 @@ pub struct EncodeComputation {
     pub reset_approval: bool,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "request validation, pinning, resimulation, and final fencing stay visible in one request flow"
+)]
 async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
@@ -138,6 +142,12 @@ async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
+    let native_pin = if uses_native {
+        Some(state.native_state_store.pin().await)
+    } else {
+        None
+    };
+    let native_version = native_pin.as_ref().map(PublishedStatePin::version);
     let rebuild_guard = state
         .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
         .await;
@@ -147,7 +157,7 @@ async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
-    let resimulated = resimulate::resimulate_route(
+    let resimulated = resimulate::resimulate_route_with_native_pin(
         &state,
         &normalized,
         chain,
@@ -155,6 +165,7 @@ async fn encode_route(
         &token_out,
         allowlist,
         rebuild_guard,
+        native_pin,
     )
     .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
@@ -191,6 +202,16 @@ async fn encode_route(
     )?;
 
     let debug = response::build_debug(&state, &request).await;
+    if let Some(native_version) = native_version {
+        let availability = state.encode_availability(true, false, false).await;
+        if availability.availability_message().is_some()
+            || state.native_state_store.state_version().await != native_version
+        {
+            return Err(EncodeError::unavailable(
+                "Native state changed while the route was being encoded; retry against the current version",
+            ));
+        }
+    }
 
     Ok(EncodeComputation {
         response: RouteEncodeResponse {
