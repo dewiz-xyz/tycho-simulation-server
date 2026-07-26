@@ -5,33 +5,21 @@ use serde::Serialize;
 use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
 use crate::models::state::{
-    AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
-    SimulatorBackendSubscriptionSnapshot, SimulatorReadinessReason, SimulatorServiceStatus,
-    SimulatorStatusSnapshot,
+    AppState, NativeReadiness, SimulatorBackendStatusSnapshot,
+    SimulatorBackendSubscriptionSnapshot, SimulatorReadinessReason, SimulatorStatusSnapshot,
 };
 
 #[derive(Serialize)]
 pub struct StatusPayload {
     status: &'static str,
-    block: u64,
-    pools: usize,
     chain_id: u64,
     backends: BTreeMap<&'static str, BackendStatusPayload>,
 }
 
 impl From<SimulatorStatusSnapshot> for StatusPayload {
     fn from(snapshot: SimulatorStatusSnapshot) -> Self {
-        let native_backend = snapshot
-            .backends
-            .iter()
-            .find(|backend| backend.kind == SimulatorBackendKind::Native);
-
         Self {
             status: snapshot.status.label(),
-            block: native_backend
-                .and_then(|backend| backend.block_number)
-                .unwrap_or(0),
-            pools: native_backend.map_or(0, |backend| backend.pool_count),
             chain_id: snapshot.chain_id,
             backends: snapshot
                 .backends
@@ -61,6 +49,8 @@ pub struct BackendStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_update_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    publisher_to_consumer_delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     subscription: Option<BackendSubscriptionPayload>,
 }
 
@@ -77,6 +67,7 @@ impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
             last_error: snapshot.last_error,
             rebuild_duration_ms: snapshot.rebuild_duration_ms,
             last_update_age_ms: snapshot.last_update_age_ms,
+            publisher_to_consumer_delay_ms: snapshot.publisher_to_consumer_delay_ms,
             subscription: snapshot.subscription.map(Into::into),
         }
     }
@@ -128,13 +119,16 @@ impl From<SimulatorBackendSubscriptionSnapshot> for BackendSubscriptionPayload {
 
 pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
     let snapshot = state.status_snapshot().await;
-    let status_code = if snapshot.status == SimulatorServiceStatus::Ready {
+    (StatusCode::OK, Json(snapshot.into()))
+}
+
+pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
+    let status_code = if state.native_readiness().await == NativeReadiness::Ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-
-    (status_code, Json(snapshot.into()))
+    (status_code, Json(state.status_snapshot().await.into()))
 }
 
 #[cfg(test)]
@@ -298,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_exposes_legacy_native_block_and_pool_fields() {
+    async fn status_exposes_native_backend_details_without_legacy_aliases() {
         let state = test_state(false, false);
         seed_native_ready_store(&state).await;
         state.native_stream_health.record_update(1).await;
@@ -307,14 +301,12 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
         assert_eq!(payload.status, "ready");
-        assert_eq!(payload.block, 1);
-        assert_eq!(payload.pools, 1);
-        assert_eq!(Some(payload.block), payload.backends["native"].block_number);
-        assert_eq!(payload.pools, payload.backends["native"].pool_count);
+        assert_eq!(payload.backends["native"].block_number, Some(1));
+        assert_eq!(payload.backends["native"].pool_count, 1);
     }
 
     #[tokio::test]
-    async fn status_returns_service_unavailable_for_stale_native_state() {
+    async fn status_remains_available_for_stale_native_state() {
         let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
@@ -323,16 +315,16 @@ mod tests {
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
-        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_code, StatusCode::OK);
         assert_eq!(payload.status, "stale");
-        assert_eq!(Some(payload.block), payload.backends["native"].block_number);
-        assert_eq!(payload.pools, payload.backends["native"].pool_count);
+        assert_eq!(payload.backends["native"].block_number, Some(1));
+        assert_eq!(payload.backends["native"].pool_count, 1);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
     }
 
     #[tokio::test]
-    async fn status_stays_unavailable_when_vm_is_ready_but_native_is_not() {
+    async fn status_reports_native_unavailable_when_vm_is_ready() {
         let state = test_state(true, true);
         let vm_component = ProtocolComponent::new(
             address(4),
@@ -364,7 +356,7 @@ mod tests {
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
-        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_code, StatusCode::OK);
         assert_eq!(payload.status, "warming_up");
         assert_eq!(payload.backends["native"].status, "warming_up");
         assert_eq!(payload.backends["native"].reason, Some("state_warming_up"));
@@ -406,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_returns_service_unavailable_for_enabled_backend_redis_gap() {
+    async fn status_remains_live_for_enabled_backend_redis_gap() {
         let state = test_state(false, true);
         seed_native_ready_store(&state).await;
         state.native_stream_health.record_update(1).await;
@@ -441,8 +433,8 @@ mod tests {
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
-        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(payload.status, "warming_up");
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(payload.status, "ready");
         assert_eq!(payload.backends["native"].status, "ready");
         assert_eq!(payload.backends["rfq"].status, "warming_up");
         assert_eq!(payload.backends["rfq"].reason, Some("redis_replay_gap"));
