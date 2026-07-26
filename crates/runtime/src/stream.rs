@@ -3,11 +3,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{sleep, timeout, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tycho_simulation::{
-    evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::Update as TychoUpdate,
     tycho_client::feed::{BlockHeader, FeedMessage, HeaderLike, SynchronizerState},
 };
@@ -15,24 +13,16 @@ use tycho_simulation::{
 use crate::broadcaster::service::BroadcasterServiceState;
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
-use crate::models::{
-    protocol,
-    state::{StateStore, VmStreamStatus},
-    stream_health::StreamHealth,
-};
+use crate::models::stream_health::StreamHealth;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
-    Native,
-    Vm,
     Broadcaster,
 }
 
 impl StreamKind {
     fn as_str(self) -> &'static str {
         match self {
-            StreamKind::Native => protocol::NATIVE,
-            StreamKind::Vm => protocol::VM,
             StreamKind::Broadcaster => "broadcaster",
         }
     }
@@ -45,7 +35,6 @@ pub enum StreamRestartReason {
     Advanced,
     Stale,
     Ended,
-    BuildFailed,
 }
 
 impl StreamRestartReason {
@@ -56,7 +45,6 @@ impl StreamRestartReason {
             StreamRestartReason::Advanced => "advanced",
             StreamRestartReason::Stale => "stale",
             StreamRestartReason::Ended => "ended",
-            StreamRestartReason::BuildFailed => "build_failed",
         }
     }
 }
@@ -65,13 +53,6 @@ impl StreamRestartReason {
 pub struct StreamExit {
     pub reason: StreamRestartReason,
     pub last_error: Option<String>,
-    pub broadcaster_reset_scope: BroadcasterResetScope,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BroadcasterResetScope {
-    RestartedService,
-    AllServices,
 }
 
 #[derive(Debug, Clone)]
@@ -89,36 +70,16 @@ pub struct StreamSupervisorConfig {
     pub memory: MemoryConfig,
 }
 
-pub struct VmStreamControls {
-    pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub simulation_rebuild_gate: Arc<RwLock<()>>,
-}
-
 #[derive(Debug, Clone)]
 pub struct BroadcasterStreamControls {
     pub service: BroadcasterServiceState,
-    pub generation_services: Vec<BroadcasterServiceState>,
-    pub cache_reset_services: Vec<BroadcasterServiceState>,
 }
 
 impl BroadcasterStreamControls {
-    async fn reset_generation(
-        &self,
-        scope: BroadcasterResetScope,
-        reason: &str,
-        last_error: Option<String>,
-    ) {
-        let cache_reset_services = match scope {
-            BroadcasterResetScope::RestartedService => &self.cache_reset_services,
-            BroadcasterResetScope::AllServices => &self.generation_services,
-        };
-        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
-            &self.generation_services,
-            cache_reset_services,
-            reason,
-            last_error,
-        )
-        .await;
+    async fn mark_disconnected(&self, reason: &str, last_error: Option<String>) {
+        self.service
+            .mark_stream_disconnected(reason, last_error)
+            .await;
     }
 }
 
@@ -137,65 +98,7 @@ enum BroadcasterRawStreamMessage {
 }
 
 fn stream_exit(reason: StreamRestartReason, last_error: Option<String>) -> StreamExit {
-    stream_exit_with_broadcaster_reset_scope(
-        reason,
-        last_error,
-        BroadcasterResetScope::RestartedService,
-    )
-}
-
-fn stream_exit_with_broadcaster_reset_scope(
-    reason: StreamRestartReason,
-    last_error: Option<String>,
-    broadcaster_reset_scope: BroadcasterResetScope,
-) -> StreamExit {
-    StreamExit {
-        reason,
-        last_error,
-        broadcaster_reset_scope,
-    }
-}
-
-pub async fn process_stream(
-    kind: StreamKind,
-    mut stream: impl futures::Stream<
-            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
-        > + Unpin
-        + Send,
-    state_store: Arc<StateStore>,
-    health: Arc<StreamHealth>,
-    cfg: StreamSupervisorConfig,
-) -> StreamExit {
-    info!(stream = kind.as_str(), "Starting stream processing");
-    health.mark_started().await;
-
-    let mut ready_logged = false;
-
-    loop {
-        match next_stream_message(kind, &mut stream, &health, &cfg).await {
-            StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
-            StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
-            StreamMessage::Update(update) => {
-                if let Some(exit) = handle_stream_update(
-                    kind,
-                    update,
-                    &state_store,
-                    &health,
-                    &cfg,
-                    &mut ready_logged,
-                )
-                .await
-                {
-                    return exit;
-                }
-            }
-            StreamMessage::Error(err_msg) => {
-                if let Some(exit) = handle_stream_error(kind, err_msg, &health, &cfg).await {
-                    return exit;
-                }
-            }
-        }
-    }
+    StreamExit { reason, last_error }
 }
 
 pub async fn process_broadcaster_stream(
@@ -254,7 +157,7 @@ pub async fn process_broadcaster_raw_stream(
         stream = StreamKind::Broadcaster.as_str(),
         "Starting raw broadcaster stream processing"
     );
-    health.mark_started().await;
+    health.mark_started_preserving_head().await;
 
     let mut ready_logged = false;
 
@@ -345,12 +248,17 @@ async fn next_broadcaster_raw_stream_message(
     health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
 ) -> BroadcasterRawStreamMessage {
-    let has_received_update = health.has_received_update().await;
-    let stream_timeout = if has_received_update {
-        cfg.stream_stale
+    let last_progress_age = health.last_update_age_ms().await.map(Duration::from_millis);
+    let progress_age = if let Some(age) = last_progress_age {
+        age
     } else {
-        cfg.readiness_stale
+        Duration::from_millis(health.started_age_ms().await.unwrap_or_default())
     };
+    if progress_age >= cfg.readiness_stale {
+        return BroadcasterRawStreamMessage::Stale;
+    }
+    let stream_timeout = cfg.readiness_stale.saturating_sub(progress_age);
+    let has_received_update = health.has_received_update().await;
 
     match timeout(stream_timeout, stream.next()).await {
         Err(_) => {
@@ -386,66 +294,6 @@ async fn next_broadcaster_raw_stream_message(
         Ok(Some(Ok(update))) => BroadcasterRawStreamMessage::Update(update),
         Ok(Some(Err(err))) => BroadcasterRawStreamMessage::Error(err.to_string()),
     }
-}
-
-async fn handle_stream_update(
-    kind: StreamKind,
-    update: TychoUpdate,
-    state_store: &StateStore,
-    health: &StreamHealth,
-    cfg: &StreamSupervisorConfig,
-    ready_logged: &mut bool,
-) -> Option<StreamExit> {
-    let now = Instant::now();
-    let has_advanced = update
-        .sync_states
-        .values()
-        .any(|state| matches!(state, SynchronizerState::Advanced(_)));
-
-    if has_advanced {
-        let advanced = health.record_advanced(now).await;
-        if advanced.window_started {
-            info!(
-                event = "stream_advanced",
-                stream = kind.as_str(),
-                advanced_total = advanced.total_count,
-                burst_count = advanced.burst_count,
-                window_secs = cfg.resync_grace.as_secs(),
-                "Advanced synchronizer state detected"
-            );
-        }
-        if advanced.elapsed >= cfg.resync_grace {
-            return Some(stream_exit(
-                StreamRestartReason::Advanced,
-                Some("advanced_state_grace_exceeded".to_string()),
-            ));
-        }
-    } else {
-        health.clear_advanced().await;
-    }
-
-    let metrics = state_store.apply_update(update).await;
-    health.record_update(metrics.block_number).await;
-    log_stream_update(kind, &metrics);
-    maybe_log_memory_snapshot(
-        kind.as_str(),
-        "stream_update",
-        Some(metrics.new_pairs),
-        cfg.memory,
-        false,
-    );
-
-    if !*ready_logged && metrics.total_pairs > 0 {
-        info!(
-            stream = kind.as_str(),
-            block = metrics.block_number,
-            total_pairs = metrics.total_pairs,
-            "Service ready: first pools ingested"
-        );
-        *ready_logged = true;
-    }
-
-    None
 }
 
 async fn handle_broadcaster_update(
@@ -499,19 +347,10 @@ async fn handle_broadcaster_update(
     if let Err(error) = service.apply_update(&update).await {
         let error = error.to_string();
         health.set_last_error(Some(error.clone())).await;
-        let reset_scope = if service.redis_publisher_needs_generation_reset().await {
-            BroadcasterResetScope::AllServices
-        } else {
-            BroadcasterResetScope::RestartedService
-        };
-        return Some(stream_exit_with_broadcaster_reset_scope(
-            StreamRestartReason::Error,
-            Some(error),
-            reset_scope,
-        ));
+        return Some(stream_exit(StreamRestartReason::Error, Some(error)));
     }
 
-    health.record_update(block_number).await;
+    health.record_progress(block_number).await;
     maybe_log_memory_snapshot(
         "broadcaster",
         "stream_update",
@@ -591,29 +430,22 @@ async fn handle_broadcaster_raw_update(
         .values()
         .map(|message| message.snapshots.states.len())
         .sum();
-    let published = match service.apply_feed_message(&update).await {
-        Ok(published) => published,
+    let applied = match service.apply_feed_message_with_progress(&update).await {
+        Ok(applied) => applied,
         Err(error) => {
             let error = error.to_string();
             health.set_last_error(Some(error.clone())).await;
-            let reset_scope = if service.redis_publisher_needs_generation_reset().await {
-                BroadcasterResetScope::AllServices
-            } else {
-                BroadcasterResetScope::RestartedService
-            };
-            return Some(stream_exit_with_broadcaster_reset_scope(
-                StreamRestartReason::Error,
-                Some(error),
-                reset_scope,
-            ));
+            return Some(stream_exit(StreamRestartReason::Error, Some(error)));
         }
     };
 
-    if !published {
+    if !applied.published {
         return None;
     }
 
-    health.record_update(block_number).await;
+    if let Some(native_block) = applied.native_progress {
+        health.record_progress(native_block).await;
+    }
     maybe_log_memory_snapshot(
         "broadcaster",
         "stream_update",
@@ -652,39 +484,6 @@ fn broadcaster_raw_block_number(update: &FeedMessage<BlockHeader>) -> u64 {
         .map(|message| message.header.clone().block_number_or_timestamp())
         .max()
         .unwrap_or_default()
-}
-
-fn log_stream_update(kind: StreamKind, metrics: &crate::models::state::UpdateMetrics) {
-    info!(
-        event = "stream_update",
-        stream = kind.as_str(),
-        block = metrics.block_number,
-        updated_states = metrics.updated_states,
-        new_pairs = metrics.new_pairs,
-        removed_pairs = metrics.removed_pairs,
-        total_pairs = metrics.total_pairs,
-        new_pairs_missing_state = metrics.new_pairs_missing_state,
-        unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
-        updates_for_unknown_pair = metrics.updates_for_unknown_pair,
-        states_missing_in_shard = metrics.states_missing_in_shard,
-        removed_unknown_pair = metrics.removed_unknown_pair,
-        anomaly_samples = ?metrics.anomaly_samples,
-        "Stream update processed"
-    );
-    if metrics.has_anomalies() {
-        warn!(
-            event = "stream_update_anomaly",
-            stream = kind.as_str(),
-            block = metrics.block_number,
-            new_pairs_missing_state = metrics.new_pairs_missing_state,
-            unknown_protocol_new_pairs = metrics.unknown_protocol_new_pairs,
-            updates_for_unknown_pair = metrics.updates_for_unknown_pair,
-            states_missing_in_shard = metrics.states_missing_in_shard,
-            removed_unknown_pair = metrics.removed_unknown_pair,
-            anomaly_samples = ?metrics.anomaly_samples,
-            "Stream update contained ingest anomalies"
-        );
-    }
 }
 
 async fn handle_stream_error(
@@ -736,76 +535,6 @@ async fn handle_stream_error(
     None
 }
 
-pub async fn supervise_native_stream<F, Fut, S>(
-    build_stream: F,
-    state_store: Arc<StateStore>,
-    health: Arc<StreamHealth>,
-    cfg: StreamSupervisorConfig,
-) where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
-    S: futures::Stream<
-            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
-        > + Unpin
-        + Send,
-{
-    let mut backoff = cfg.restart_backoff_min;
-
-    loop {
-        let stream = match build_stream().await {
-            Ok(stream) => stream,
-            Err(err) => {
-                warn!(
-                    event = "stream_build_failed",
-                    stream = StreamKind::Native.as_str(),
-                    error = %err,
-                    "Failed to build native stream"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
-                continue;
-            }
-        };
-
-        let exit = process_stream(
-            StreamKind::Native,
-            stream,
-            Arc::clone(&state_store),
-            Arc::clone(&health),
-            cfg.clone(),
-        )
-        .await;
-
-        let restart_count = health.increment_restart().await;
-        health.reset_bursts().await;
-        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-        let has_received_update = health.has_received_update().await;
-        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-        let last_block = health.last_block().await;
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "stream_restart",
-            stream = StreamKind::Native.as_str(),
-            reason = exit.reason.as_str(),
-            restart_count,
-            backoff_ms,
-            started_age_ms,
-            has_received_update,
-            last_block,
-            last_update_age_ms,
-            "Restarting native stream"
-        );
-
-        state_store.reset().await;
-        maybe_purge_allocator("native_restart", cfg.memory);
-
-        sleep(Duration::from_millis(backoff_ms)).await;
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
-    }
-}
-
 pub async fn supervise_broadcaster_stream<F, Fut, S>(
     build_stream: F,
     health: Arc<StreamHealth>,
@@ -850,6 +579,9 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
         health.reset_bursts().await;
         let started_age_ms = health.started_age_ms().await.unwrap_or(0);
         let has_received_update = health.has_received_update().await;
+        if has_received_update {
+            backoff = cfg.restart_backoff_min;
+        }
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -868,12 +600,15 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
         );
 
         controls
-            .reset_generation(
-                exit.broadcaster_reset_scope,
-                exit.reason.as_str(),
-                exit.last_error.clone(),
-            )
+            .mark_disconnected(exit.reason.as_str(), exit.last_error.clone())
             .await;
+        if controls.service.redis_publisher_is_retired().await {
+            error!(
+                event = "broadcaster_writer_fence_lost",
+                "Broadcaster feed supervisor is terminating after writer fencing loss"
+            );
+            return;
+        }
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
         sleep(Duration::from_millis(backoff_ms)).await;
@@ -932,6 +667,13 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
         health.reset_bursts().await;
         let started_age_ms = health.started_age_ms().await.unwrap_or(0);
         let has_received_update = health.has_received_update().await;
+        let recovery_completed = controls
+            .service
+            .reconnect_backoff_can_reset(cfg.readiness_stale)
+            .await;
+        if recovery_completed {
+            backoff = cfg.restart_backoff_min;
+        }
         let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
         let last_block = health.last_block().await;
 
@@ -944,188 +686,27 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
             backoff_ms,
             started_age_ms,
             has_received_update,
+            recovery_completed,
             last_block,
             last_update_age_ms,
             "Restarting raw broadcaster stream"
         );
 
         controls
-            .reset_generation(
-                exit.broadcaster_reset_scope,
-                exit.reason.as_str(),
-                exit.last_error.clone(),
-            )
+            .mark_disconnected(exit.reason.as_str(), exit.last_error.clone())
             .await;
+        if controls.service.redis_publisher_is_retired().await {
+            error!(
+                event = "broadcaster_writer_fence_lost",
+                "Raw broadcaster feed supervisor is terminating after writer fencing loss"
+            );
+            return;
+        }
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
         sleep(Duration::from_millis(backoff_ms)).await;
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
     }
-}
-
-pub async fn supervise_vm_stream<F, Fut, S>(
-    build_stream: F,
-    state_store: Arc<StateStore>,
-    health: Arc<StreamHealth>,
-    cfg: StreamSupervisorConfig,
-    controls: VmStreamControls,
-) where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
-    S: futures::Stream<
-            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
-        > + Unpin
-        + Send,
-{
-    let mut backoff = cfg.restart_backoff_min;
-    let mut pending_rebuild: Option<VmRebuildState> = None;
-
-    loop {
-        let stream = match build_stream().await {
-            Ok(stream) => {
-                if let Some(rebuild) = pending_rebuild.take() {
-                    finish_vm_rebuild(&controls, rebuild, cfg.memory).await;
-                }
-                stream
-            }
-            Err(err) => {
-                warn!(
-                    event = "stream_build_failed",
-                    stream = StreamKind::Vm.as_str(),
-                    error = %err,
-                    "Failed to build VM stream"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
-                continue;
-            }
-        };
-
-        let exit = process_stream(
-            StreamKind::Vm,
-            stream,
-            Arc::clone(&state_store),
-            Arc::clone(&health),
-            cfg.clone(),
-        )
-        .await;
-
-        let restart_count = health.increment_restart().await;
-        health.reset_bursts().await;
-        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-        let has_received_update = health.has_received_update().await;
-        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-        let last_block = health.last_block().await;
-
-        let rebuild_state = begin_vm_rebuild(
-            &controls,
-            Arc::clone(&state_store),
-            exit.reason,
-            exit.last_error,
-            cfg.memory,
-        )
-        .await;
-        pending_rebuild = Some(rebuild_state);
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "stream_restart",
-            stream = StreamKind::Vm.as_str(),
-            reason = exit.reason.as_str(),
-            restart_count,
-            backoff_ms,
-            started_age_ms,
-            has_received_update,
-            last_block,
-            last_update_age_ms,
-            "Restarting VM stream"
-        );
-
-        sleep(Duration::from_millis(backoff_ms)).await;
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
-    }
-}
-
-struct VmRebuildState {
-    guard: OwnedRwLockWriteGuard<()>,
-    rebuild_id: u64,
-    started_at: Instant,
-}
-
-async fn begin_vm_rebuild(
-    controls: &VmStreamControls,
-    state_store: Arc<StateStore>,
-    reason: StreamRestartReason,
-    last_error: Option<String>,
-    memory_cfg: MemoryConfig,
-) -> VmRebuildState {
-    let rebuild_id = {
-        let mut status = controls.vm_stream.write().await;
-        status.rebuilding = true;
-        status.restart_count = status.restart_count.saturating_add(1);
-        status.rebuild_started_at = Some(Instant::now());
-        status.last_error = last_error.or_else(|| Some(reason.as_str().to_string()));
-        status.restart_count
-    };
-
-    info!(
-        event = "vm_rebuild_start",
-        rebuild_id,
-        rebuild_started_age_ms = 0_u64,
-        "VM rebuild started"
-    );
-    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_start", None, memory_cfg, true);
-
-    let guard = acquire_vm_rebuild_guard(controls).await;
-
-    state_store.reset().await;
-
-    if let Err(err) = SHARED_TYCHO_DB.clear() {
-        warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
-    }
-    maybe_purge_allocator("vm_rebuild", memory_cfg);
-    maybe_log_memory_snapshot(
-        protocol::VM,
-        "vm_rebuild_after_clear",
-        None,
-        memory_cfg,
-        true,
-    );
-
-    VmRebuildState {
-        guard,
-        rebuild_id,
-        started_at: Instant::now(),
-    }
-}
-
-async fn acquire_vm_rebuild_guard(controls: &VmStreamControls) -> OwnedRwLockWriteGuard<()> {
-    controls.simulation_rebuild_gate.clone().write_owned().await
-}
-
-async fn finish_vm_rebuild(
-    controls: &VmStreamControls,
-    rebuild: VmRebuildState,
-    memory_cfg: MemoryConfig,
-) {
-    drop(rebuild.guard);
-
-    let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
-    {
-        let mut status = controls.vm_stream.write().await;
-        status.rebuilding = false;
-        status.rebuild_started_at = None;
-    }
-
-    info!(
-        event = "vm_rebuild_success",
-        rebuild_id = rebuild.rebuild_id,
-        duration_ms,
-        rebuild_started_age_ms = duration_ms,
-        "VM rebuild completed"
-    );
-    maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {
@@ -1168,13 +749,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::Mutex;
     use tycho_simulation::protocol::models::Update;
 
     use super::{
-        begin_vm_rebuild, classify_stream_error, handle_broadcaster_raw_update,
-        handle_broadcaster_update, BroadcasterResetScope, StreamRestartReason,
-        StreamSupervisorConfig, VmStreamControls,
+        classify_stream_error, handle_broadcaster_update, StreamRestartReason,
+        StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -1183,17 +763,9 @@ mod tests {
     use crate::broadcaster::service::BroadcasterServiceState;
     use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
     use crate::config::MemoryConfig;
-    use crate::models::state::{StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
-    use crate::models::tokens::TokenStore;
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
-    use tycho_simulation::{
-        tycho_client::feed::{
-            synchronizer::{Snapshot, StateSyncMessage},
-            BlockHeader, FeedMessage, SynchronizerState,
-        },
-        tycho_common::{dto::ResponseAccount, models::Chain, Bytes},
-    };
+    use tycho_simulation::tycho_common::Bytes;
 
     #[test]
     fn classifies_state_decoding_failure_messages() {
@@ -1252,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcaster_update_uses_full_reset_scope_when_publisher_fails(
+    async fn broadcaster_update_returns_error_when_publisher_fails(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
             BroadcasterRedisPublisherConfig {
@@ -1291,95 +863,7 @@ mod tests {
         .await
         .ok_or("publisher failure should restart the broadcaster stream")?;
 
-        assert_eq!(
-            exit.broadcaster_reset_scope,
-            BroadcasterResetScope::AllServices
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn oversized_raw_recovery_stays_degraded_without_supervisor_exit_or_health_advance(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let service = BroadcasterServiceState::with_lifecycle_gate(
-            512,
-            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Vm]),
-            BroadcasterUpstreamState::default(),
-            test_redis_publisher(8453),
-            Arc::new(Mutex::new(())),
-        );
-        service.mark_upstream_connected().await;
-        let health = StreamHealth::new();
-        let mut ready_logged = false;
-        let address = Bytes::from([42u8; 20]);
-        let feed = |number: u64, hash: u8, parent: u8, value: u8| {
-            let header = BlockHeader {
-                hash: Bytes::from([hash; 32]),
-                number,
-                parent_hash: Bytes::from([parent; 32]),
-                revert: false,
-                timestamp: number * 10,
-                partial_block_index: None,
-            };
-            let account = ResponseAccount::new(
-                tycho_simulation::tycho_common::dto::Chain::Base,
-                address.clone(),
-                "large-account".to_string(),
-                HashMap::from([(Bytes::from([1u8; 32]), Bytes::from(vec![value; 4_096]))]),
-                Bytes::from([value; 32]),
-                HashMap::new(),
-                Bytes::from([7u8; 128]),
-                Bytes::from([8u8; 32]),
-                Bytes::from([9u8; 32]),
-                Bytes::from([10u8; 32]),
-                None,
-            );
-            FeedMessage {
-                state_msgs: HashMap::from([(
-                    "vm:curve".to_string(),
-                    StateSyncMessage {
-                        header: header.clone(),
-                        snapshots: Snapshot {
-                            states: HashMap::new(),
-                            vm_storage: HashMap::from([(address.clone(), account)]),
-                        },
-                        deltas: None,
-                        removed_components: HashMap::new(),
-                    },
-                )]),
-                sync_states: HashMap::from([(
-                    "vm:curve".to_string(),
-                    SynchronizerState::Ready(header),
-                )]),
-            }
-        };
-
-        assert!(handle_broadcaster_raw_update(
-            feed(10, 10, 9, 1),
-            &service,
-            &health,
-            &test_supervisor_config(),
-            &mut ready_logged,
-        )
-        .await
-        .is_none());
-        assert_eq!(health.last_block().await, 10);
-
-        assert!(handle_broadcaster_raw_update(
-            feed(12, 12, 11, 2),
-            &service,
-            &health,
-            &test_supervisor_config(),
-            &mut ready_logged,
-        )
-        .await
-        .is_none());
-        assert_eq!(health.last_block().await, 10);
-        assert_eq!(health.restart_count().await, 0);
-        assert_eq!(
-            service.status_snapshot().await.readiness,
-            crate::broadcaster::state::BroadcasterReadiness::UpstreamRecovering
-        );
+        assert_eq!(exit.reason, StreamRestartReason::Error);
         Ok(())
     }
 
@@ -1448,66 +932,6 @@ mod tests {
                 ),
             ),
         ]))
-    }
-
-    #[tokio::test]
-    async fn vm_rebuild_marks_rebuilding_but_waits_for_guard_before_resetting_state(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let state_store = Arc::new(StateStore::new(token_store));
-        state_store
-            .apply_update(Update::new(7, HashMap::new(), HashMap::new()))
-            .await;
-
-        let vm_stream = Arc::new(RwLock::new(VmStreamStatus::default()));
-        let simulation_rebuild_gate = Arc::new(RwLock::new(()));
-        let request_guard = Arc::clone(&simulation_rebuild_gate).read_owned().await;
-        let controls = VmStreamControls {
-            vm_stream: Arc::clone(&vm_stream),
-            simulation_rebuild_gate,
-        };
-        let state_store_for_task = Arc::clone(&state_store);
-
-        let task = tokio::spawn(async move {
-            begin_vm_rebuild(
-                &controls,
-                state_store_for_task,
-                StreamRestartReason::Error,
-                Some("test reset".to_string()),
-                MemoryConfig {
-                    purge_enabled: false,
-                    snapshots_enabled: false,
-                    snapshots_min_interval_secs: 60,
-                    snapshots_min_new_pairs: 1000,
-                    snapshots_emit_emf: false,
-                },
-            )
-            .await
-        });
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if vm_stream.read().await.rebuilding {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await?;
-
-        assert_eq!(state_store.current_block().await, 7);
-
-        drop(request_guard);
-        let rebuild = tokio::time::timeout(Duration::from_millis(100), task).await??;
-        assert_eq!(state_store.current_block().await, 0);
-        drop(rebuild);
-        Ok(())
     }
 
     fn test_supervisor_config() -> StreamSupervisorConfig {
