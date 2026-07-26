@@ -3,7 +3,7 @@
 ## What this service does
 - DSolver Simulator is a fast simulation API for DeFi swaps and routing, built on Tycho state.
 - Rust Axum service that consumes a Tycho broadcaster stream, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation and route encoding.
-- Main local binaries: `dsolver-tycho-broadcaster-service` feeds the local stream, and `dsolver-simulator-service` exposes `/status`, `/simulate`, and `/encode`.
+- Main local binaries: `dsolver-tycho-broadcaster-service` feeds the local stream, and `dsolver-simulator-service` exposes `/status`, `/ready`, `/simulate`, and `/encode`.
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
@@ -20,15 +20,14 @@
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness
-- `GET /status` returns:
-  - `200 OK` with `{ "status": "ready", "chain_id": <u64>, "backends": { "native": { "status": "ready", ... } } }` when the service is healthy
-  - `503 Service Unavailable` with nested backend status details while native readiness is not ready.
+- `GET /status` always returns HTTP `200` with current service and backend state.
+- `GET /ready` returns HTTP `200` when native traffic can be served and `503` with the same state detail otherwise.
 - `backends.native.status` carries native readiness; `backends.vm.status` and `backends.rfq.status` keep backend-specific readiness separate when those backends are configured.
 - Cold starts can take several minutes (3–5+ mins; VM or RFQ pools can take up to roughly 10 minutes on a fresh warmup).
 - `scripts/wait_ready.sh --expect-chain-id <id>` is still the manual guard if you want the native readiness gate directly.
-- When VM pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id <id> --require-vm-ready --timeout 600`.
-- When RFQ pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id <id> --require-rfq-ready --timeout 600`.
-- When both VM and RFQ backends matter on Ethereum, prefer `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600`.
+- When VM pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id <id> --require-vm-ready --timeout 600`.
+- When RFQ pools matter, prefer `scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id <id> --require-rfq-ready --timeout 600`.
+- When both VM and RFQ backends matter on Ethereum, prefer `scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600`.
 
 ## Local analysis workflow (recommended)
 - Run the reporting-first analyzer:
@@ -56,9 +55,9 @@
 - Build broadcaster: `cargo build -p apps --bin dsolver-tycho-broadcaster-service --release`
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
-  - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
+  - `scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1`
   - `scripts/verify_broadcaster_redis.sh --repo .`
-  - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600`
+  - `scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1 --require-rfq-ready --timeout 600`
   - `scripts/stop_server.sh --repo .`
 
 ## API docs

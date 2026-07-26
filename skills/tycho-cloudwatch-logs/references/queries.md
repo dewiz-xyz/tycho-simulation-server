@@ -22,8 +22,10 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | block-updates | Block height progress | Matches "Block update:" messages. |
 | block-updates-window | Block height progress (window) | Same as block-updates, but sorts ascending. |
 | block-updates-count | Block update frequency | Counts block update logs; also reports first/last timestamp in window. |
-| readiness | Service readiness | Matches "Service ready: first pools ingested". |
+| readiness | Service readiness | Broadcaster, simulator, and backend readiness transitions plus the legacy ready message. |
 | resync | Resync lifecycle | Matches any "Resync" message. |
+| broadcaster-recovery | Broadcaster recovery lifecycle | Recovery start, alignment, commit, buffer warning, retry, and self-fencing events. |
+| broadcaster-redis | Broadcaster Redis health | Append/replay/rebootstrap errors, writer promotion, and fencing loss. |
 | stream-health | Stream startup and errors | Stream start/update plus stream errors and unexpected exits. |
 | stream-supervision | Stream supervision lifecycle | Restarts, stale streams, missing blocks, advanced state. |
 | vm-rebuild | VM rebuild lifecycle | VM rebuild start/success and cleanup failures. |
@@ -375,9 +377,20 @@ fields @timestamp
 ```
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"from":"?(?<from>[^",}]+)"?/
+| parse @message /"to":"?(?<to>[^",}]+)"?/
+| parse @message /"backend":"(?<backend>[^"]+)"/
+| parse @message /"status":"(?<backend_status>[^"]+)"/
+| parse @message /"reason":"?(?<reason>[^",}]+)"?/
+| parse @message /"error":"(?<error>[^"]+)"/
 | filter msg like /Service ready:/
+  or event = "broadcaster_readiness_changed"
+  or event = "simulator_readiness_changed"
+  or event = "simulator_backend_recovered"
+  or event = "simulator_backend_degraded"
 | sort @timestamp desc
-| display @timestamp, msg, @logStream
+| display @timestamp, event, from, to, backend, backend_status, reason, error, msg, @logStream
 | limit 100
 ```
 
@@ -391,6 +404,47 @@ fields @timestamp, @logStream
 | filter msg like /Resync/
 | sort @timestamp desc
 | display @timestamp, event, resync_id, duration_ms, msg, @logStream
+| limit 100
+```
+
+### broadcaster-recovery
+```
+fields @timestamp, @logStream
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"recovery_id":"?(?<recovery_id>[^",}]+)"?/
+| parse @message /"work_id":(?<work_id>[0-9]+)/
+| parse @message /"elapsed_ms":(?<elapsed_ms>[0-9]+)/
+| parse @message /"encoded_bytes":(?<encoded_bytes>[0-9]+)/
+| parse @message /"chunk_count":(?<chunk_count>[0-9]+)/
+| parse @message /"buffer_a_count":(?<buffer_a_count>[0-9]+)/
+| parse @message /"buffer_b_count":(?<buffer_b_count>[0-9]+)/
+| parse @message /"distinct_native_blocks":(?<distinct_native_blocks>[0-9]+)/
+| parse @message /"error":"(?<error>[^"]+)"/
+| filter event like /^broadcaster_(upstream_)?recovery_/
+| sort @timestamp desc
+| display @timestamp, event, recovery_id, work_id, elapsed_ms, encoded_bytes, chunk_count, buffer_a_count, buffer_b_count, distinct_native_blocks, error, @logStream
+| limit 100
+```
+
+Use the latest start/commit or terminal event to reconstruct the current attempt.
+Use `/status` when you need the live phase, age, and current Buffer A/B occupancy.
+
+### broadcaster-redis
+```
+fields @timestamp, @logStream
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"operation":"(?<operation>[^"]+)"/
+| parse @message /"reason":"(?<reason>[^"]+)"/
+| parse @message /"error":"(?<error>[^"]+)"/
+| parse @message /"stream_id":"(?<stream_id>[^"]+)"/
+| filter event = "redis_stream_append_failed"
+  or event = "broadcaster_writer_fence_lost"
+  or event = "redis_writer_promoted"
+  or @message like /Redis replay gap/
+  or @message like /BroadcasterRedisTransportFailure/
+  or @message like /BroadcasterRedisRebootstrap/
+| sort @timestamp desc
+| display @timestamp, event, operation, reason, stream_id, error, @logStream
 | limit 100
 ```
 
