@@ -6,20 +6,18 @@
 mod checkpoint;
 mod client;
 mod error;
-mod handoff;
 mod reader;
 mod snapshot;
 mod url;
 
 pub use client::{
-    BroadcasterReplayClient, BroadcasterReplayConfig, GenerationHandoffCandidate, ReplayBatch,
-    ReplayBatchItem, ReplayMessage, ReplayPoll,
+    BroadcasterReplayClient, BroadcasterReplayConfig, ReplayBatch, ReplayMessage, ReplayPoll,
 };
 pub use error::{BroadcasterReplayClientError, Result};
 pub use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
-    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisReplayBoundary,
-    BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterProgress, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterSnapshotSessionResponse,
 };
 
 pub use self::checkpoint::ReplayCheckpoint;
@@ -29,13 +27,12 @@ mod tests {
     use anyhow::{anyhow, Result};
     use redis::streams::{StreamKey, StreamReadReply};
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
-        BroadcasterGenerationHandoff, BroadcasterHeartbeat, BroadcasterPayload,
-        BroadcasterProgress, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
+        BroadcasterPayload, BroadcasterProgress, BroadcasterRedisReplayBoundary,
+        BroadcasterRedisStreamEntry,
     };
 
     use super::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction};
-    use super::client::{build_replay_batch, ReplayBatchItem};
     use super::reader::{
         blocking_read_timeout, redis_xread_messages, RedisStreamInfo, RedisStreamMessage,
     };
@@ -86,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_checkpoint_detects_generation_reset_before_duplicate_sequence() -> Result<()> {
+    fn replay_checkpoint_detects_writer_replacement_before_duplicate_sequence() -> Result<()> {
         let checkpoint = ReplayCheckpoint::new(replay_boundary(18)?, ETHEREUM_CHAIN_ID);
         let envelope = BroadcasterEnvelope::new(
             "stream-2",
@@ -95,7 +92,7 @@ mod tests {
                 ETHEREUM_CHAIN_ID,
                 "snapshot-2",
                 vec![BroadcasterBackend::Native],
-                "generation_reset",
+                "writer_promoted",
             )?),
         );
         let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
@@ -289,57 +286,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn replay_batch_accepts_valid_generation_handoff() -> Result<()> {
-        let checkpoint = ReplayCheckpoint::new(replay_boundary(3)?, ETHEREUM_CHAIN_ID);
-        let envelope = handoff_envelope(Some(BroadcasterGenerationHandoff::new(
-            "stream-1",
-            "1-3",
-            vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 40)],
-        )?))?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
-
-        let batch = build_replay_batch(
-            &checkpoint,
-            vec![RedisStreamMessage {
-                entry_id: "2-1".to_string(),
-                entry,
-            }],
-            true,
-        )?;
-
-        let [ReplayBatchItem::GenerationHandoff(candidate)] = batch.items.as_slice() else {
-            return Err(anyhow!(
-                "generation handoff marker should become a handoff item"
-            ));
-        };
-        assert_eq!(candidate.boundary.stream_id, "stream-2");
-        assert_eq!(candidate.boundary.snapshot_id, "snapshot-2");
-        assert_eq!(candidate.checkpoint_after.entry_id(), "2-1");
-        Ok(())
-    }
-
-    #[test]
-    fn replay_batch_rejects_handoff_without_previous_checkpoint_proof() -> Result<()> {
-        let checkpoint = ReplayCheckpoint::new(replay_boundary(3)?, ETHEREUM_CHAIN_ID);
-        let envelope = handoff_envelope(None)?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
-
-        let Err(error) = build_replay_batch(
-            &checkpoint,
-            vec![RedisStreamMessage {
-                entry_id: "2-1".to_string(),
-                entry,
-            }],
-            true,
-        ) else {
-            return Err(anyhow!("handoff marker without proof should fail closed"));
-        };
-
-        assert!(error.to_string().contains("missing handoff proof"));
-        Ok(())
-    }
-
     fn heartbeat_envelope(
         stream_id: &str,
         message_seq: u64,
@@ -353,31 +299,6 @@ mod tests {
                 "snapshot-1",
                 vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
             )?),
-        ))
-    }
-
-    fn handoff_envelope(
-        handoff: Option<BroadcasterGenerationHandoff>,
-    ) -> Result<BroadcasterEnvelope> {
-        let progress = match handoff {
-            Some(handoff) => BroadcasterProgress::new_with_handoff(
-                ETHEREUM_CHAIN_ID,
-                "snapshot-2",
-                vec![BroadcasterBackend::Native],
-                "active_writer_promoted",
-                handoff,
-            )?,
-            None => BroadcasterProgress::new(
-                ETHEREUM_CHAIN_ID,
-                "snapshot-2",
-                vec![BroadcasterBackend::Native],
-                "active_writer_promoted",
-            )?,
-        };
-        Ok(BroadcasterEnvelope::new(
-            "stream-2",
-            1,
-            BroadcasterPayload::Progress(progress),
         ))
     }
 

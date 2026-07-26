@@ -17,7 +17,7 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
     BroadcasterProtocolMessage, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
     BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterSubscriptionTracker,
-    BroadcasterUpdatePartition,
+    BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 
 use super::snapshot::RawSnapshotReassembly;
@@ -95,16 +95,24 @@ impl BroadcasterSubscriptionProcessor {
         self.bootstrap_redis_replay_boundary = Some(boundary);
     }
 
+    pub(super) fn recovery_copy(&self, replay_boundary: BroadcasterRedisReplayBoundary) -> Self {
+        Self {
+            expected_chain_id: self.expected_chain_id,
+            controls: self.controls.recovery_copy(),
+            decoder: Arc::clone(&self.decoder),
+            tracker: BroadcasterSubscriptionTracker::new(),
+            raw_snapshot: RawSnapshotReassembly::default(),
+            bootstrap_block: None,
+            bootstrap_redis_replay_boundary: Some(replay_boundary),
+            rebuild: None,
+        }
+    }
+
     pub(super) fn bootstrap_complete(&self) -> bool {
         matches!(
             self.tracker.state(),
             simulator_core::broadcaster::BroadcasterSubscriptionState::Live { .. }
         )
-    }
-
-    #[cfg(test)]
-    pub(super) fn next_message_seq(&self) -> Option<u64> {
-        self.tracker.next_message_seq()
     }
 
     pub(super) fn align_redis_replay_boundary(
@@ -114,15 +122,6 @@ impl BroadcasterSubscriptionProcessor {
         self.tracker
             .align_live_replay_boundary(boundary)
             .map_err(|error| anyhow!("invalid broadcaster Redis replay boundary: {error}"))
-    }
-
-    pub(super) fn continue_redis_generation_handoff(
-        &mut self,
-        boundary: &BroadcasterRedisReplayBoundary,
-    ) -> Result<()> {
-        self.tracker
-            .continue_live_generation(boundary)
-            .map_err(|error| anyhow!("invalid broadcaster Redis generation handoff: {error}"))
     }
 
     pub(super) async fn observe(&mut self, envelope: BroadcasterEnvelope) -> Result<()> {
@@ -154,7 +153,6 @@ impl BroadcasterSubscriptionProcessor {
             }
             BroadcasterPayload::SnapshotEnd(_end) => {
                 self.apply_reassembled_snapshot_messages().await?;
-                self.refresh_bootstrap_health().await;
                 let boundary = self
                     .bootstrap_redis_replay_boundary
                     .clone()
@@ -177,11 +175,19 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::Heartbeat(heartbeat) => {
                 for head in heartbeat.backend_heads {
                     if head.backend == self.controls.backend() {
-                        self.apply_heartbeat(head).await;
+                        self.apply_heartbeat(head);
                     }
                 }
             }
             BroadcasterPayload::Progress(_progress) => {}
+            BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_) => {
+                return Err(anyhow!(
+                    "Redis recovery payload reached a backend processor before commit"
+                ));
+            }
         }
 
         Ok(())
@@ -193,12 +199,29 @@ impl BroadcasterSubscriptionProcessor {
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
         if redis_entry_scope_contains(entry, self.controls.backend()) {
-            return self.observe(envelope.clone()).await;
+            self.observe(envelope.clone()).await?;
+            self.controls
+                .broadcaster_subscription()
+                .record_publisher_to_consumer_delay(entry.published_at_ms)
+                .await;
+            return Ok(());
         }
 
         self.tracker
             .skip_live_delta(envelope)
             .map_err(|error| anyhow!("invalid skipped broadcaster Redis envelope: {error}"))
+    }
+
+    pub(super) async fn apply_recovery_update(
+        &self,
+        update: BroadcasterUpdateMessage,
+    ) -> Result<()> {
+        for partition in update.partitions {
+            if partition.backend == self.controls.backend() {
+                self.apply_live_update_partition(partition).await?;
+            }
+        }
+        Ok(())
     }
 
     fn ensure_snapshot_includes_backend(&self, start: &BroadcasterSnapshotStart) -> Result<()> {
@@ -279,22 +302,42 @@ impl BroadcasterSubscriptionProcessor {
         partition: BroadcasterUpdatePartition,
     ) -> Result<()> {
         let block_number = partition.block_number;
+        let _shared_db_guard = match &self.controls {
+            BroadcasterSubscriptionControls::Vm(controls) if !controls.recovery_guard_held => {
+                Some(controls.simulation_rebuild_gate.write().await)
+            }
+            _ => None,
+        };
         if !partition.messages.is_empty() {
             self.ensure_raw_messages_supported()?;
             self.apply_protocol_messages(partition.messages).await?;
-            self.controls
-                .stream_health()
-                .record_update(block_number)
-                .await;
+            if self.controls.backend() == BroadcasterBackend::Rfq {
+                self.controls
+                    .stream_health()
+                    .record_update(block_number)
+                    .await;
+            } else {
+                self.controls
+                    .stream_health()
+                    .record_progress(block_number)
+                    .await;
+            }
             return Ok(());
         }
 
         let update = live_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
-        self.controls
-            .stream_health()
-            .record_update(block_number)
-            .await;
+        if self.controls.backend() == BroadcasterBackend::Rfq {
+            self.controls
+                .stream_health()
+                .record_update(block_number)
+                .await;
+        } else {
+            self.controls
+                .stream_health()
+                .record_progress(block_number)
+                .await;
+        }
         Ok(())
     }
 
@@ -303,6 +346,9 @@ impl BroadcasterSubscriptionProcessor {
         messages: Vec<BroadcasterProtocolMessage>,
     ) -> Result<()> {
         for message in messages {
+            if !self.controls.protocols().contains(&message.protocol) {
+                continue;
+            }
             self.apply_protocol_message(message).await?;
         }
         Ok(())
@@ -326,29 +372,7 @@ impl BroadcasterSubscriptionProcessor {
         Ok(())
     }
 
-    async fn apply_heartbeat(&self, head: BroadcasterBackendHead) {
-        self.controls
-            .state_store()
-            .apply_update(Update::new(
-                head.block_number,
-                HashMap::new(),
-                HashMap::new(),
-            ))
-            .await;
-        self.controls
-            .stream_health()
-            .record_update(head.block_number)
-            .await;
-    }
-
-    async fn refresh_bootstrap_health(&self) {
-        if let Some(block_number) = self.bootstrap_block {
-            self.controls
-                .stream_health()
-                .record_update(block_number)
-                .await;
-        }
-    }
+    fn apply_heartbeat(&self, _head: BroadcasterBackendHead) {}
 
     fn ensure_raw_messages_supported(&self) -> Result<()> {
         if self.controls.backend() == BroadcasterBackend::Rfq {
@@ -443,6 +467,27 @@ async fn begin_or_continue_vm_rebuild(
     }
 
     SubscriptionRebuildState { guard }
+}
+
+pub(super) async fn begin_vm_recovery(
+    controls: &BroadcasterSubscriptionControls,
+) -> Option<SubscriptionRebuildState> {
+    let BroadcasterSubscriptionControls::Vm(vm_controls) = controls else {
+        return None;
+    };
+    Some(begin_or_continue_vm_rebuild(vm_controls, None).await)
+}
+
+pub(super) async fn finish_vm_recovery(
+    controls: &BroadcasterSubscriptionControls,
+    rebuild: SubscriptionRebuildState,
+) {
+    drop(rebuild.guard);
+    if let BroadcasterSubscriptionControls::Vm(vm_controls) = controls {
+        let mut vm_stream = vm_controls.vm_stream.write().await;
+        vm_stream.rebuilding = false;
+        vm_stream.rebuild_started_at = None;
+    }
 }
 
 async fn begin_or_continue_rfq_rebuild(

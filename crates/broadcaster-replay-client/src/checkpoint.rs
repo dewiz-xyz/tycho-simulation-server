@@ -175,19 +175,6 @@ impl ReplayCheckpoint {
             expected_chain_id: self.expected_chain_id,
         }
     }
-
-    pub(crate) fn after_generation_handoff(
-        &self,
-        boundary: BroadcasterRedisReplayBoundary,
-        entry_id: String,
-    ) -> Self {
-        Self {
-            entry_id,
-            last_message_seq: boundary.exclusive_message_seq,
-            boundary,
-            expected_chain_id: self.expected_chain_id,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

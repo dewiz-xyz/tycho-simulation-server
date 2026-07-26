@@ -3,13 +3,11 @@ use std::time::Duration;
 use futures::Stream;
 use reqwest::Client;
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
-    BroadcasterSnapshotSessionResponse,
+    BroadcasterEnvelope, BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
 };
 
 use crate::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction, ReplayCheckpoint};
 use crate::error::{BroadcasterReplayClientError, Result};
-use crate::handoff::{redis_generation_handoff_candidate, validate_handoff_candidate};
 use crate::reader::{RedisStreamMessage, TokioRedisStreamReader};
 use crate::snapshot::{
     create_broadcaster_snapshot_session, fetch_broadcaster_snapshot_payload,
@@ -162,7 +160,7 @@ pub enum ReplayPoll {
 /// Validated Redis entries from one replay poll.
 pub struct ReplayBatch {
     /// Replay items in Redis order.
-    pub items: Vec<ReplayBatchItem>,
+    pub items: Vec<ReplayMessage>,
     /// True when this batch drained the current stream tail.
     pub caught_up_after_batch: bool,
 }
@@ -170,26 +168,7 @@ pub struct ReplayBatch {
 impl ReplayBatch {
     #[must_use]
     pub fn checkpoint_after(&self) -> Option<&ReplayCheckpoint> {
-        self.items.last().map(ReplayBatchItem::checkpoint_after)
-    }
-}
-
-#[derive(Debug, Clone)]
-/// One validated replay item.
-pub enum ReplayBatchItem {
-    /// Normal broadcaster delta from the current generation.
-    Message(ReplayMessage),
-    /// First progress marker in the next Redis generation.
-    GenerationHandoff(GenerationHandoffCandidate),
-}
-
-impl ReplayBatchItem {
-    #[must_use]
-    pub fn checkpoint_after(&self) -> &ReplayCheckpoint {
-        match self {
-            Self::Message(message) => &message.checkpoint_after,
-            Self::GenerationHandoff(candidate) => &candidate.checkpoint_after,
-        }
+        self.items.last().map(|message| &message.checkpoint_after)
     }
 }
 
@@ -203,19 +182,6 @@ pub struct ReplayMessage {
     /// Decoded broadcaster payload.
     pub envelope: BroadcasterEnvelope,
     /// Checkpoint to use after this message is applied.
-    pub checkpoint_after: ReplayCheckpoint,
-}
-
-#[derive(Debug, Clone)]
-/// Validated handoff marker between Redis stream generations.
-pub struct GenerationHandoffCandidate {
-    /// Decoded Redis stream metadata.
-    pub entry: BroadcasterRedisStreamEntry,
-    /// Progress envelope carrying the handoff proof.
-    pub envelope: BroadcasterEnvelope,
-    /// New replay boundary for the next generation.
-    pub boundary: BroadcasterRedisReplayBoundary,
-    /// Checkpoint to use after the handoff is accepted.
     pub checkpoint_after: ReplayCheckpoint,
 }
 
@@ -236,24 +202,15 @@ pub(crate) fn build_replay_batch(
                 ))
             })?;
 
-        match next_checkpoint.ensure_next_message(&message) {
-            Ok(()) => {
-                let checkpoint_after = next_checkpoint.after_applied(&message);
-                next_checkpoint = checkpoint_after.clone();
-                items.push(ReplayBatchItem::Message(ReplayMessage {
-                    entry_id: message.entry_id,
-                    entry: message.entry,
-                    envelope,
-                    checkpoint_after,
-                }));
-            }
-            Err(_) if redis_generation_handoff_candidate(&next_checkpoint, &message, &envelope) => {
-                let candidate = validate_handoff_candidate(&next_checkpoint, message, envelope)?;
-                next_checkpoint = candidate.checkpoint_after.clone();
-                items.push(ReplayBatchItem::GenerationHandoff(candidate));
-            }
-            Err(error) => return Err(error),
-        }
+        next_checkpoint.ensure_next_message(&message)?;
+        let checkpoint_after = next_checkpoint.after_applied(&message);
+        next_checkpoint = checkpoint_after.clone();
+        items.push(ReplayMessage {
+            entry_id: message.entry_id,
+            entry: message.entry,
+            envelope,
+            checkpoint_after,
+        });
     }
 
     Ok(ReplayBatch {

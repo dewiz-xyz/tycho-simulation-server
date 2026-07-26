@@ -3,11 +3,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use broadcaster_replay_client::{
     BroadcasterReplayClient, BroadcasterReplayClientError, BroadcasterReplayConfig,
-    BroadcasterSnapshotSessionResponse, GenerationHandoffCandidate, ReplayBatchItem,
-    ReplayCheckpoint, ReplayPoll,
+    BroadcasterSnapshotSessionResponse, ReplayCheckpoint, ReplayMessage, ReplayPoll,
 };
 use futures::StreamExt;
 use rand::Rng;
@@ -15,10 +15,12 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRecoveryCatchUp,
+    BroadcasterRecoveryChunk, BroadcasterRecoveryCommit, BroadcasterRecoveryManifest,
     BroadcasterRedisReplayBoundary,
 };
 
+use crate::broadcaster::redis_publisher::replay_entry_encoded_size;
 use crate::config::BroadcasterRedisConfig;
 use crate::memory::maybe_purge_allocator;
 use crate::metrics::{
@@ -38,8 +40,8 @@ mod snapshot;
 mod tests;
 
 use self::processor::{
-    handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
-    SubscriptionRebuildState,
+    begin_vm_recovery, finish_vm_recovery, handle_subscription_reset,
+    BroadcasterSubscriptionProcessor, PreparedRedisProcessor, SubscriptionRebuildState,
 };
 
 #[derive(Clone)]
@@ -67,6 +69,8 @@ pub(crate) struct VmBroadcasterSubscriptionControls {
     pub protocols: Vec<String>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
+    pub wire_backend: BroadcasterBackend,
+    pub recovery_guard_held: bool,
 }
 
 #[derive(Clone)]
@@ -83,13 +87,21 @@ impl BroadcasterSubscriptionControls {
     fn backend(&self) -> BroadcasterBackend {
         match self {
             Self::Native(_) => BroadcasterBackend::Native,
+            Self::Vm(controls) => controls.wire_backend,
+            Self::Rfq(_) => BroadcasterBackend::Rfq,
+        }
+    }
+
+    fn logical_backend(&self) -> BroadcasterBackend {
+        match self {
+            Self::Native(_) => BroadcasterBackend::Native,
             Self::Vm(_) => BroadcasterBackend::Vm,
             Self::Rfq(_) => BroadcasterBackend::Rfq,
         }
     }
 
     fn backend_label(&self) -> &'static str {
-        self.backend().as_str()
+        self.logical_backend().as_str()
     }
 
     fn broadcaster_subscription(&self) -> &BroadcasterSubscriptionStatus {
@@ -131,8 +143,43 @@ impl BroadcasterSubscriptionControls {
             Self::Rfq(controls) => &controls.protocols,
         }
     }
+
+    fn recovery_copy(&self) -> Self {
+        match self {
+            Self::Native(controls) => Self::Native(NativeBroadcasterSubscriptionControls {
+                broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                stream_health: Arc::new(StreamHealth::new()),
+                tokens: Arc::clone(&controls.tokens),
+                protocols: controls.protocols.clone(),
+            }),
+            Self::Vm(controls) => Self::Vm(VmBroadcasterSubscriptionControls {
+                broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                stream_health: Arc::new(StreamHealth::new()),
+                tokens: Arc::clone(&controls.tokens),
+                protocols: controls.protocols.clone(),
+                vm_stream: Arc::clone(&controls.vm_stream),
+                simulation_rebuild_gate: Arc::clone(&controls.simulation_rebuild_gate),
+                wire_backend: controls.wire_backend,
+                recovery_guard_held: true,
+            }),
+            Self::Rfq(controls) => Self::Rfq(RfqBroadcasterSubscriptionControls {
+                broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                stream_health: Arc::new(StreamHealth::new()),
+                tokens: Arc::clone(&controls.tokens),
+                protocols: controls.protocols.clone(),
+                simulation_rebuild_gate: Arc::clone(&controls.simulation_rebuild_gate),
+            }),
+        }
+    }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "subscription ownership and restart decisions stay in one supervisor loop"
+)]
 pub(crate) async fn supervise_broadcaster_redis_subscription(
     broadcaster_url: String,
     expected_chain_id: u64,
@@ -178,7 +225,7 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
             }
         };
 
-        let prepared = match prepare_broadcaster_redis_subscription(
+        let mut prepared = match prepare_broadcaster_redis_subscription(
             &replay_client,
             expected_chain_id,
             &controls,
@@ -201,8 +248,14 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
                 continue;
             }
         };
+        prepared.redis_maxlen = redis_config.maxlen;
 
         info!(
+            event = "broadcaster_backend_recovered",
+            backends = ?controls
+                .iter()
+                .map(BroadcasterSubscriptionControls::backend_label)
+                .collect::<Vec<_>>(),
             stream_key = prepared.replay_boundary.stream_key.as_str(),
             stream_id = prepared.replay_boundary.stream_id.as_str(),
             exclusive_entry_id = prepared.replay_boundary.exclusive_entry_id(),
@@ -251,6 +304,16 @@ struct PreparedBroadcasterRedisSubscription {
     processors: Vec<PreparedRedisProcessor>,
     replay_boundary: BroadcasterRedisReplayBoundary,
     expected_chain_id: u64,
+    recovery: Option<RecoveryAssembly>,
+    redis_maxlen: Option<u64>,
+}
+
+struct RecoveryAssembly {
+    manifest: BroadcasterRecoveryManifest,
+    chunks: BTreeMap<u32, BroadcasterRecoveryChunk>,
+    buffer_a: BTreeMap<u32, BroadcasterRecoveryCatchUp>,
+    vm_rebuild: Option<SubscriptionRebuildState>,
+    started_at: Instant,
 }
 
 struct PendingRedisProcessor {
@@ -374,6 +437,8 @@ async fn finish_prepared_broadcaster_redis_subscription(
         processors,
         replay_boundary,
         expected_chain_id,
+        recovery: None,
+        redis_maxlen: None,
     })
 }
 
@@ -512,6 +577,10 @@ fn pending_processor_bootstrap_error(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "tail polling, recovery timeout, and transport retry share one ordered replay loop"
+)]
 async fn process_broadcaster_redis_subscription(
     replay_client: &impl ReplayPollSource,
     mut prepared: PreparedBroadcasterRedisSubscription,
@@ -577,7 +646,15 @@ async fn process_broadcaster_redis_subscription(
         };
 
         match poll {
-            ReplayPoll::Pending => {}
+            ReplayPoll::Pending => {
+                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
+                    return (
+                        SubscriptionExit::error(message),
+                        redis_processor_rebuilds(prepared.processors),
+                        caught_up_once,
+                    );
+                }
+            }
             ReplayPoll::CaughtUp {
                 checkpoint: caught_up_checkpoint,
             } => {
@@ -588,6 +665,13 @@ async fn process_broadcaster_redis_subscription(
                 )
                 .await;
                 checkpoint = caught_up_checkpoint;
+                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
+                    return (
+                        SubscriptionExit::error(message),
+                        redis_processor_rebuilds(prepared.processors),
+                        caught_up_once,
+                    );
+                }
             }
             ReplayPoll::Batch(batch) => {
                 let caught_up_after_batch = batch.caught_up_after_batch;
@@ -604,10 +688,32 @@ async fn process_broadcaster_redis_subscription(
                     caught_up_once = true;
                     mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id())
                         .await;
+                    if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
+                        return (
+                            SubscriptionExit::error(message),
+                            redis_processor_rebuilds(prepared.processors),
+                            caught_up_once,
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+fn incomplete_recovery_timeout(
+    prepared: &PreparedBroadcasterRedisSubscription,
+    cfg: &StreamSupervisorConfig,
+) -> Option<String> {
+    prepared.recovery.as_ref().and_then(|recovery| {
+        (recovery.started_at.elapsed() >= cfg.readiness_stale).then(|| {
+            format!(
+                "recovery {} remained incomplete at the Redis tail for {} ms",
+                recovery.manifest.recovery_id,
+                recovery.started_at.elapsed().as_millis()
+            )
+        })
+    })
 }
 
 trait ReplayPollSource {
@@ -710,32 +816,35 @@ fn replay_error_exit(error: BroadcasterReplayClientError) -> SubscriptionExit {
 async fn apply_replay_batch(
     prepared: &mut PreparedBroadcasterRedisSubscription,
     checkpoint: &mut ReplayCheckpoint,
-    items: Vec<ReplayBatchItem>,
+    items: Vec<ReplayMessage>,
 ) -> std::result::Result<(), SubscriptionExit> {
-    for item in items {
-        match item {
-            ReplayBatchItem::Message(message) => {
-                for prepared_processor in &mut prepared.processors {
-                    if message.entry.message_seq
-                        <= prepared_processor.replay_boundary.exclusive_message_seq
-                    {
-                        continue;
-                    }
-                    prepared_processor
-                        .processor
-                        .observe_redis_delta(&message.entry, &message.envelope)
-                        .await
-                        .map_err(|error| SubscriptionExit::error(error.to_string()))?;
+    for message in items {
+        if matches!(
+            message.envelope.payload,
+            BroadcasterPayload::RecoveryStart(_)
+                | BroadcasterPayload::RecoveryChunk(_)
+                | BroadcasterPayload::RecoveryCatchUp(_)
+                | BroadcasterPayload::RecoveryCommit(_)
+        ) || prepared.recovery.is_some()
+        {
+            apply_recovery_message(prepared, &message)
+                .await
+                .map_err(|error| SubscriptionExit::error(error.to_string()))?;
+        } else {
+            for prepared_processor in &mut prepared.processors {
+                if message.entry.message_seq
+                    <= prepared_processor.replay_boundary.exclusive_message_seq
+                {
+                    continue;
                 }
-                *checkpoint = message.checkpoint_after;
-            }
-            ReplayBatchItem::GenerationHandoff(candidate) => {
-                continue_redis_generation_handoff(prepared, &candidate)
+                prepared_processor
+                    .processor
+                    .observe_redis_delta(&message.entry, &message.envelope)
                     .await
-                    .map_err(|error| SubscriptionExit::redis_gap(error.to_string()))?;
-                *checkpoint = candidate.checkpoint_after;
+                    .map_err(|error| SubscriptionExit::error(error.to_string()))?;
             }
         }
+        *checkpoint = message.checkpoint_after;
         mark_redis_replay_checkpoints(
             &prepared.processors,
             checkpoint.entry_id(),
@@ -746,100 +855,356 @@ async fn apply_replay_batch(
     Ok(())
 }
 
-async fn continue_redis_generation_handoff(
+#[expect(
+    clippy::too_many_lines,
+    reason = "all recovery message kinds are validated against one private assembly state"
+)]
+async fn apply_recovery_message(
     prepared: &mut PreparedBroadcasterRedisSubscription,
-    candidate: &GenerationHandoffCandidate,
+    message: &ReplayMessage,
 ) -> Result<()> {
-    let BroadcasterPayload::Progress(progress) = &candidate.envelope.payload else {
-        return Err(anyhow!(
-            "Redis replay gap: generation handoff payload is not progress"
-        ));
-    };
+    match &message.envelope.payload {
+        BroadcasterPayload::RecoveryStart(start) => {
+            start.manifest.validate()?;
+            let expected_commit = message
+                .entry
+                .message_seq
+                .checked_add(u64::from(start.manifest.chunk_count))
+                .and_then(|seq| seq.checked_add(u64::from(start.manifest.buffer_a_count)))
+                .and_then(|seq| seq.checked_add(1))
+                .ok_or_else(|| anyhow!("recovery commit watermark overflow"))?;
+            if expected_commit != start.manifest.commit_watermark {
+                return Err(anyhow!(
+                    "recovery {} commit watermark mismatch: expected {}, got {}",
+                    start.manifest.recovery_id,
+                    expected_commit,
+                    start.manifest.commit_watermark
+                ));
+            }
+            let mut vm_rebuild = if let Some(existing) = prepared.recovery.take() {
+                if existing.manifest == start.manifest {
+                    return Err(anyhow!(
+                        "recovery {} repeated RecoveryStart in the stream",
+                        start.manifest.recovery_id
+                    ));
+                }
+                tracing::warn!(
+                    event = "broadcaster_recovery_superseded",
+                    old_recovery_id = existing.manifest.recovery_id,
+                    new_recovery_id = start.manifest.recovery_id,
+                    "Discarding uncommitted recovery assembly"
+                );
+                existing.vm_rebuild
+            } else {
+                None
+            };
 
-    let enabled_backends = prepared_enabled_backends(prepared);
-    if progress.backends != enabled_backends {
+            for prepared_processor in &prepared.processors {
+                if !start
+                    .manifest
+                    .backends
+                    .contains(&prepared_processor.processor.controls.backend())
+                {
+                    continue;
+                }
+                let current_version = prepared_processor
+                    .processor
+                    .controls
+                    .state_store()
+                    .state_version()
+                    .await;
+                anyhow::ensure!(
+                    start.manifest.target_state_version > current_version,
+                    "recovery target state version {} must be newer than published {} state version {current_version}",
+                    start.manifest.target_state_version,
+                    prepared_processor.processor.controls.backend_label()
+                );
+                prepared_processor
+                    .processor
+                    .controls
+                    .broadcaster_subscription()
+                    .mark_recovery_started()
+                    .await;
+                if vm_rebuild.is_none() {
+                    vm_rebuild = begin_vm_recovery(&prepared_processor.processor.controls).await;
+                }
+            }
+            prepared.recovery = Some(RecoveryAssembly {
+                manifest: start.manifest.clone(),
+                chunks: BTreeMap::new(),
+                buffer_a: BTreeMap::new(),
+                vm_rebuild,
+                started_at: Instant::now(),
+            });
+            Ok(())
+        }
+        BroadcasterPayload::RecoveryChunk(chunk) => {
+            chunk.validate()?;
+            let recovery = prepared
+                .recovery
+                .as_mut()
+                .ok_or_else(|| anyhow!("recovery chunk arrived before RecoveryStart"))?;
+            validate_recovery_identity(
+                &recovery.manifest,
+                &chunk.recovery_id,
+                chunk.target_state_version,
+            )?;
+            if chunk.backends != recovery.manifest.backends {
+                return Err(anyhow!(
+                    "recovery chunk backend set does not match manifest"
+                ));
+            }
+            let chunk_index = usize::try_from(chunk.chunk_index)?;
+            if chunk_index != recovery.chunks.len() {
+                return Err(anyhow!(
+                    "recovery chunk arrived out of order: expected {}, got {}",
+                    recovery.chunks.len(),
+                    chunk.chunk_index
+                ));
+            }
+            if chunk_index >= usize::try_from(recovery.manifest.chunk_count)? {
+                return Err(anyhow!(
+                    "recovery chunk index {} is outside manifest count {}",
+                    chunk.chunk_index,
+                    recovery.manifest.chunk_count
+                ));
+            }
+            if chunk.encoded_bytes != recovery.manifest.chunk_encoded_bytes[chunk_index] {
+                return Err(anyhow!(
+                    "recovery chunk {} encoded size does not match manifest",
+                    chunk.chunk_index
+                ));
+            }
+            let actual_encoded_bytes = u64::try_from(replay_entry_encoded_size(
+                &prepared.replay_boundary.stream_key,
+                prepared.redis_maxlen,
+                &message.entry,
+            )?)?;
+            if chunk.encoded_bytes != actual_encoded_bytes {
+                return Err(anyhow!(
+                    "recovery chunk {} encoded size does not match its Redis entry",
+                    chunk.chunk_index
+                ));
+            }
+            let digest = recovery_digest(chunk.payload_fragment.as_bytes());
+            if digest != chunk.digest || digest != recovery.manifest.chunk_digests[chunk_index] {
+                return Err(anyhow!(
+                    "recovery chunk {} digest does not match manifest",
+                    chunk.chunk_index
+                ));
+            }
+            recovery.chunks.insert(chunk.chunk_index, chunk.clone());
+            Ok(())
+        }
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => {
+            catch_up.validate()?;
+            let recovery = prepared
+                .recovery
+                .as_mut()
+                .ok_or_else(|| anyhow!("recovery catch-up arrived before RecoveryStart"))?;
+            validate_recovery_identity(
+                &recovery.manifest,
+                &catch_up.recovery_id,
+                catch_up.target_state_version,
+            )?;
+            if catch_up.block_index >= recovery.manifest.buffer_a_count {
+                return Err(anyhow!(
+                    "recovery catch-up index {} is outside manifest count {}",
+                    catch_up.block_index,
+                    recovery.manifest.buffer_a_count
+                ));
+            }
+            if recovery.chunks.len() != usize::try_from(recovery.manifest.chunk_count)?
+                || usize::try_from(catch_up.block_index)? != recovery.buffer_a.len()
+            {
+                return Err(anyhow!(
+                    "recovery catch-up arrived out of order: expected {}, got {}",
+                    recovery.buffer_a.len(),
+                    catch_up.block_index
+                ));
+            }
+            recovery
+                .buffer_a
+                .insert(catch_up.block_index, catch_up.clone());
+            Ok(())
+        }
+        BroadcasterPayload::RecoveryCommit(commit) => {
+            commit.validate()?;
+            commit_recovery(
+                prepared,
+                message.entry.message_seq,
+                message.entry.published_at_ms,
+                commit,
+            )
+            .await
+        }
+        _ => Err(anyhow!(
+            "ordinary broadcaster payload interleaved inside a recovery transaction"
+        )),
+    }
+}
+
+fn validate_recovery_identity(
+    manifest: &BroadcasterRecoveryManifest,
+    recovery_id: &str,
+    target_state_version: u64,
+) -> Result<()> {
+    if recovery_id != manifest.recovery_id || target_state_version != manifest.target_state_version
+    {
         return Err(anyhow!(
-            "Redis replay gap: handoff progress backends {:?} do not match enabled backends {:?}",
-            progress.backends,
-            enabled_backends
+            "recovery identity does not match the active manifest"
         ));
     }
-    let Some(handoff) = progress.handoff.as_ref() else {
-        return Err(anyhow!(
-            "Redis replay gap: generation handoff marker is missing handoff proof"
-        ));
-    };
-    ensure_handoff_base_heads_match(prepared, &handoff.base_heads).await?;
+    Ok(())
+}
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "validation and atomic candidate publication must remain one commit boundary"
+)]
+async fn commit_recovery(
+    prepared: &mut PreparedBroadcasterRedisSubscription,
+    commit_message_seq: u64,
+    published_at_ms: u64,
+    commit: &BroadcasterRecoveryCommit,
+) -> Result<()> {
+    let mut recovery = prepared
+        .recovery
+        .take()
+        .ok_or_else(|| anyhow!("RecoveryCommit arrived before RecoveryStart"))?;
+    validate_recovery_identity(
+        &recovery.manifest,
+        &commit.recovery_id,
+        commit.target_state_version,
+    )?;
+    if commit.backends != recovery.manifest.backends
+        || commit.replacement_digest != recovery.manifest.replacement_digest
+        || commit.buffer_a_count != recovery.manifest.buffer_a_count
+        || commit.commit_watermark != recovery.manifest.commit_watermark
+        || commit_message_seq != commit.commit_watermark
+    {
+        return Err(anyhow!(
+            "RecoveryCommit does not match the active recovery manifest"
+        ));
+    }
+    if recovery.chunks.len() != usize::try_from(recovery.manifest.chunk_count)?
+        || recovery.buffer_a.len() != usize::try_from(recovery.manifest.buffer_a_count)?
+    {
+        return Err(anyhow!(
+            "recovery {} committed before every declared fragment arrived",
+            recovery.manifest.recovery_id
+        ));
+    }
+
+    let replacement_json = recovery
+        .chunks
+        .values()
+        .map(|chunk| chunk.payload_fragment.as_str())
+        .collect::<String>();
+    if replacement_json.len() != usize::try_from(recovery.manifest.replacement_encoded_bytes)?
+        || recovery_digest(replacement_json.as_bytes()) != recovery.manifest.replacement_digest
+    {
+        return Err(anyhow!(
+            "recovery {} replacement bytes do not match the manifest",
+            recovery.manifest.recovery_id
+        ));
+    }
+    let snapshot: Vec<BroadcasterEnvelope> = serde_json::from_str(&replacement_json)
+        .map_err(|error| anyhow!("failed to decode recovery replacement snapshot: {error}"))?;
+
+    let boundary = BroadcasterRedisReplayBoundary::new(
+        prepared.replay_boundary.stream_key.clone(),
+        prepared.replay_boundary.stream_id.clone(),
+        prepared.replay_boundary.snapshot_id.clone(),
+        prepared.replay_boundary.generation,
+        commit_message_seq,
+    )?;
+    let mut candidates = Vec::new();
+    for (processor_index, prepared_processor) in prepared.processors.iter().enumerate() {
+        let backend = prepared_processor.processor.controls.backend();
+        if !recovery.manifest.backends.contains(&backend) {
+            continue;
+        }
+        let mut candidate = prepared_processor.processor.recovery_copy(boundary.clone());
+        for envelope in &snapshot {
+            candidate.observe(envelope.clone()).await?;
+        }
+        if !candidate.bootstrap_complete() {
+            return Err(anyhow!(
+                "recovery replacement did not complete {} snapshot bootstrap",
+                backend
+            ));
+        }
+        for catch_up in recovery.buffer_a.values() {
+            candidate
+                .apply_recovery_update(catch_up.update.clone())
+                .await?;
+        }
+        candidates.push((
+            processor_index,
+            candidate.controls.logical_backend(),
+            candidate.controls.state_store().pin().await,
+        ));
+    }
+
+    for (processor_index, backend, candidate) in candidates {
+        let block_number = candidate.current_block();
+        let live = prepared
+            .processors
+            .get_mut(processor_index)
+            .ok_or_else(|| anyhow!("recovery candidate lost its live backend"))?;
+        live.processor
+            .controls
+            .state_store()
+            .publish_candidate(candidate, recovery.manifest.target_state_version)
+            .await?;
+        if backend == BroadcasterBackend::Rfq {
+            live.processor
+                .controls
+                .stream_health()
+                .record_update(block_number)
+                .await;
+        } else {
+            live.processor
+                .controls
+                .stream_health()
+                .record_progress(block_number)
+                .await;
+        }
+        live.processor
+            .controls
+            .broadcaster_subscription()
+            .mark_bootstrap_complete_with_redis_boundary(boundary.clone())
+            .await;
+        live.processor
+            .controls
+            .broadcaster_subscription()
+            .record_publisher_to_consumer_delay(published_at_ms)
+            .await;
+    }
     for prepared_processor in &mut prepared.processors {
         prepared_processor
             .processor
-            .continue_redis_generation_handoff(&candidate.boundary)?;
-        prepared_processor.replay_boundary = candidate.boundary.clone();
-        prepared_processor
-            .processor
-            .controls
-            .broadcaster_subscription()
-            .mark_redis_generation_continued(candidate.boundary.clone())
-            .await;
+            .align_redis_replay_boundary(&boundary)?;
+        prepared_processor.replay_boundary = boundary.clone();
     }
-    prepared.replay_boundary = candidate.boundary.clone();
-    Ok(())
-}
+    prepared.replay_boundary = boundary;
 
-fn prepared_enabled_backends(
-    prepared: &PreparedBroadcasterRedisSubscription,
-) -> Vec<BroadcasterBackend> {
-    let mut backends = prepared
-        .processors
-        .iter()
-        .map(|processor| processor.processor.controls.backend())
-        .collect::<Vec<_>>();
-    backends.sort();
-    backends
-}
-
-async fn ensure_handoff_base_heads_match(
-    prepared: &PreparedBroadcasterRedisSubscription,
-    base_heads: &[BroadcasterBackendHead],
-) -> Result<()> {
-    let mut heads_by_backend = BTreeMap::new();
-    for head in base_heads {
-        heads_by_backend.insert(head.backend, head.block_number);
-    }
-
-    for prepared_processor in &prepared.processors {
-        let backend = prepared_processor.processor.controls.backend();
-        let Some(expected_block) = heads_by_backend.remove(&backend) else {
-            return Err(anyhow!(
-                "Redis replay gap: handoff base heads are missing {} backend",
-                backend
-            ));
-        };
-        let current_block = prepared_processor
-            .processor
-            .controls
-            .state_store()
-            .current_block()
-            .await;
-        if current_block != expected_block {
-            return Err(anyhow!(
-                "Redis replay gap: handoff {} base head {} does not match local block {}",
-                backend,
-                expected_block,
-                current_block
-            ));
+    if let Some(vm_rebuild) = recovery.vm_rebuild.take() {
+        if let Some(vm) = prepared.processors.iter().find(|processor| {
+            matches!(
+                processor.processor.controls,
+                BroadcasterSubscriptionControls::Vm(_)
+            )
+        }) {
+            finish_vm_recovery(&vm.processor.controls, vm_rebuild).await;
         }
     }
-
-    if let Some((backend, _)) = heads_by_backend.into_iter().next() {
-        return Err(anyhow!(
-            "Redis replay gap: handoff base heads include unexpected {} backend",
-            backend
-        ));
-    }
-
     Ok(())
+}
+
+fn recovery_digest(bytes: &[u8]) -> String {
+    format!("{:x}", keccak256(bytes))
 }
 
 async fn mark_redis_replay_checkpoints(
