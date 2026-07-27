@@ -6,13 +6,15 @@ use axum::{
 use runtime::broadcaster::app::BroadcasterAppState;
 
 use crate::handlers::broadcaster::{
-    create_snapshot_session, ready, snapshot_session_payload, status, token_lookup, token_snapshot,
+    create_snapshot_session, deployment_ready, ready, snapshot_session_payload, status,
+    token_lookup, token_snapshot,
 };
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/ready", get(ready))
+        .route("/deployment-ready", get(deployment_ready))
         .route("/snapshot-sessions", post(create_snapshot_session))
         .route(
             "/snapshot-sessions/:session_id/payloads/:index",
@@ -150,7 +152,7 @@ mod tests {
         let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "upstream_disconnected");
         assert_eq!(body["upstream"]["connected"], false);
         assert_eq!(body["snapshot"]["ready"], false);
@@ -166,7 +168,7 @@ mod tests {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["upstream"]["connected"], true);
         assert_eq!(body["snapshot"]["ready"], false);
@@ -212,11 +214,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn deployment_ready_uses_explicit_admission_instead_of_readiness() -> Result<()> {
+        let active = create_broadcaster_router(build_state(SeedMode::Ready).await?);
+        let (status, body) = get_json(active, "/deployment-ready").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployment_admission"]["admitted"], true);
+        assert_eq!(body["deployment_admission"]["phase"], "admitted");
+
+        let passive = create_broadcaster_router(build_passive_ready_state().await?);
+        let (status, body) = get_json(passive, "/deployment-ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["deployment_admission"]["admitted"], false);
+        assert_eq!(body["deployment_admission"]["phase"], "warming");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn status_reports_passive_publisher_as_not_ready() -> Result<()> {
         let app = create_broadcaster_router(build_passive_ready_state().await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "redis_publisher_passive");
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["redis_publisher"]["healthy"], true);
@@ -250,24 +268,28 @@ mod tests {
 
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "redis_publisher_retired");
         assert_eq!(body["redis_publisher"]["healthy"], false);
         assert_eq!(body["redis_publisher"]["mode"], "retired");
         assert!(body["redis_publisher"]["replay_boundary"].is_null());
+        assert_eq!(body["deployment_admission"]["admitted"], false);
+        assert_eq!(body["deployment_admission"]["phase"], "retired");
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn status_reports_unhealthy_publisher_while_remaining_live() -> Result<()> {
+    async fn bridge_status_rejects_unhealthy_publisher() -> Result<()> {
         let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
 
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
         assert_eq!(body["redis_publisher"]["healthy"], false);
         assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
+        assert_eq!(body["deployment_admission"]["admitted"], true);
+        assert_eq!(body["deployment_admission"]["phase"], "admitted");
         Ok(())
     }
 
@@ -277,7 +299,7 @@ mod tests {
 
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");

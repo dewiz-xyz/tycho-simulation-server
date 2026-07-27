@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use runtime::broadcaster::redis_publisher::BroadcasterRedisPublisherStatus;
+use runtime::broadcaster::redis_publisher::{
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterRedisPublisherStatus,
+};
 use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterRecoveryStatus, BroadcasterSnapshotSessionsSnapshot,
     BroadcasterSnapshotStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
@@ -20,6 +22,7 @@ pub struct BroadcasterStatusPayload {
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    pub deployment_admission: BroadcasterDeploymentAdmissionPayload,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -42,6 +45,25 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                 })
                 .collect(),
             redis_publisher: snapshot.redis_publisher,
+            deployment_admission: snapshot.deployment_admission.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterDeploymentAdmissionPayload {
+    pub admitted: bool,
+    pub phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<BroadcasterDeploymentAdmissionSnapshot> for BroadcasterDeploymentAdmissionPayload {
+    fn from(snapshot: BroadcasterDeploymentAdmissionSnapshot) -> Self {
+        Self {
+            admitted: snapshot.admitted,
+            phase: snapshot.phase.as_str(),
+            last_error: snapshot.last_error,
         }
     }
 }

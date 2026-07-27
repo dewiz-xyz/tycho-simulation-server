@@ -109,6 +109,12 @@ impl BroadcasterAppState {
             _ => {}
         }
         snapshot.redis_publisher = Some(redis_status);
+        snapshot.deployment_admission = self.redis_publisher.deployment_admission_snapshot();
+        if !snapshot.deployment_admission.admitted
+            && snapshot.readiness == BroadcasterReadiness::Ready
+        {
+            snapshot.readiness = BroadcasterReadiness::SnapshotWarmingUp;
+        }
         let mut previous = self.last_reported_readiness.lock().await;
         let previous_value = *previous;
         if previous_value != Some(snapshot.readiness) {
@@ -140,6 +146,10 @@ impl BroadcasterAppState {
 
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.redis_publisher.begin_shutdown();
     }
 
     pub async fn lookup_tokens(

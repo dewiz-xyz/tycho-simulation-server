@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::keccak256;
 use anyhow::{Context, Result};
 use futures::FutureExt;
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -16,9 +17,10 @@ use tycho_simulation::{
 };
 
 use crate::broadcaster::redis_publisher::{
+    format_redis_snapshot_id, format_redis_stream_id, BroadcasterDeploymentPhase,
     BroadcasterRecoveryTransaction, BroadcasterRedisPublisher, BroadcasterRedisPublisherMode,
     OversizedRedisEntry, RecoveryCommitAdoptionUncertain, RecoveryPublicationCancelled,
-    SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES,
+    SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES, STARTUP_HANDOFF_ABORT_AFTER,
 };
 use crate::broadcaster::state::{
     combine_snapshot_exports, BroadcasterReadiness, BroadcasterRecoverySource,
@@ -27,8 +29,8 @@ use crate::broadcaster::state::{
 };
 use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapshot_export_failure};
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
-    BroadcasterSnapshotSessionResponse,
+    BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +304,32 @@ struct BroadcasterSnapshotArtifact {
     encoded_bytes: usize,
 }
 
+#[derive(Debug)]
+struct BroadcasterSnapshotCandidate {
+    chain_id: u64,
+    export: BroadcasterSnapshotExport,
+    base_heads: Vec<BroadcasterBackendHead>,
+    captured_recovery_work_ids: Vec<u64>,
+    handoff_id: u64,
+    snapshot_chunk_count: u32,
+    encoded_bytes_upper_bound: usize,
+    largest_payload_bytes_upper_bound: usize,
+    payload_digests: Vec<String>,
+}
+
+#[derive(Debug)]
+struct StartupCandidateCapture {
+    chain_id: u64,
+    handoff_id: u64,
+    captured: Vec<(
+        BroadcasterSnapshotCache,
+        crate::broadcaster::state::BroadcasterSnapshotSource,
+        usize,
+    )>,
+    base_heads: Vec<BroadcasterBackendHead>,
+    recovery_work_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BroadcasterServiceState {
     snapshot_max_payload_bytes: usize,
@@ -572,10 +600,8 @@ impl BroadcasterServiceState {
         );
         ensure_shared_lifecycle(services, "broadcaster promotion")?;
 
-        let gate = services[0].lifecycle_gate.lock().await;
         match services[0].redis_publisher.mode().await {
             BroadcasterRedisPublisherMode::Active => {
-                drop(gate);
                 Self::run_snapshot_export_preflight(services).await?;
                 return if services[0].snapshot_artifact.read().await.is_some() {
                     services[0]
@@ -593,29 +619,19 @@ impl BroadcasterServiceState {
             }
         }
 
-        if !services[0].cache.is_ready().await {
+        let Some(candidate) = prepare_startup_snapshot_candidate(services).await? else {
             return Ok(None);
-        }
-
-        let mut base_heads = services[0].cache.backend_heads().await;
-        for service in &services[1..] {
-            if service.cache.is_ready().await {
-                base_heads.extend(service.cache.backend_heads().await);
+        };
+        let handoff_id = candidate.handoff_id;
+        match promote_prepared_startup_candidate(services, candidate, reason.into()).await {
+            Ok(boundary) => Ok(Some(boundary)),
+            Err(error) => {
+                services[0]
+                    .redis_publisher
+                    .abort_startup_handoff(handoff_id, error.to_string())
+                    .await;
+                Err(error)
             }
-        }
-        let boundary = services[0]
-            .redis_publisher
-            .promote(base_heads, reason)
-            .await?;
-        for service in services {
-            service.cache.relabel_generation(boundary.generation).await;
-        }
-        drop(gate);
-        Self::run_snapshot_export_preflight(services).await?;
-        if services[0].snapshot_artifact.read().await.is_some() {
-            Ok(Some(boundary))
-        } else {
-            Ok(None)
         }
     }
 
@@ -1461,6 +1477,53 @@ impl BroadcasterServiceState {
         snapshot
     }
 
+    async fn startup_candidate_sources(
+        services: &[Self],
+    ) -> Result<Option<StartupCandidateCapture>> {
+        let _gate = services[0].lifecycle_gate.lock().await;
+        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Passive
+            || !services[0].cache.is_ready().await
+        {
+            return Ok(None);
+        }
+
+        let chain_id = services[0].cache.chain_id();
+        let mut captured = Vec::with_capacity(services.len());
+        let mut base_heads = Vec::new();
+        let mut recovery_work_ids = Vec::with_capacity(services.len());
+        for (index, service) in services.iter().enumerate() {
+            anyhow::ensure!(
+                service.cache.chain_id() == chain_id,
+                "combined broadcaster snapshot chain_id mismatch"
+            );
+            let recovery = service.recovery_publication.lock().await;
+            if recovery.phase.is_active() {
+                return Ok(None);
+            }
+            recovery_work_ids.push(recovery.work_id);
+            drop(recovery);
+
+            if let Some(source) = service.cache.pin_snapshot_source().await {
+                base_heads.extend(source.backend_heads());
+                captured.push((
+                    service.cache.clone(),
+                    source,
+                    service.snapshot_max_payload_bytes,
+                ));
+            } else if index == 0 {
+                return Ok(None);
+            }
+        }
+        let handoff_id = services[0].redis_publisher.begin_startup_handoff().await?;
+        Ok(Some(StartupCandidateCapture {
+            chain_id,
+            handoff_id,
+            captured,
+            base_heads,
+            recovery_work_ids,
+        }))
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "singleflight capture, off-thread export, and artifact fencing form one refresh operation"
@@ -1471,6 +1534,9 @@ impl BroadcasterServiceState {
             "snapshot export preflight requires at least one service"
         );
         ensure_shared_lifecycle(services, "snapshot export preflight")?;
+        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Active {
+            return Ok(());
+        }
         if futures::future::join_all(services.iter().map(Self::recovery_is_active))
             .await
             .into_iter()
@@ -1628,6 +1694,265 @@ struct SnapshotRefreshGuard(Arc<AtomicBool>);
 impl Drop for SnapshotRefreshGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn prepare_startup_snapshot_candidate(
+    services: &[BroadcasterServiceState],
+) -> Result<Option<BroadcasterSnapshotCandidate>> {
+    let Some(capture) = BroadcasterServiceState::startup_candidate_sources(services).await? else {
+        return Ok(None);
+    };
+    let StartupCandidateCapture {
+        chain_id,
+        handoff_id,
+        captured,
+        base_heads,
+        recovery_work_ids,
+    } = capture;
+    let started_at = Instant::now();
+    let worker = tokio::task::spawn_blocking(move || {
+        let exports = captured
+            .into_iter()
+            .map(|(cache, source, max_payload_bytes)| {
+                cache.export_snapshot_source(source, max_payload_bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let export = combine_snapshot_exports(chain_id, exports)?;
+        build_snapshot_candidate(chain_id, export, base_heads, recovery_work_ids, handoff_id)
+    });
+    let result = match tokio::time::timeout(STARTUP_HANDOFF_ABORT_AFTER, worker).await {
+        Ok(joined) => joined
+            .context("startup snapshot candidate worker failed")
+            .and_then(std::convert::identity),
+        Err(_) => Err(anyhow::anyhow!(
+            "startup snapshot candidate exceeded the 60-second bound"
+        )),
+    };
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    let checked_at = Instant::now();
+
+    match result {
+        Ok(candidate) => {
+            for service in services {
+                let mut preflight = service.snapshot_preflight.write().await;
+                preflight.checked_at = Some(checked_at);
+                preflight.succeeded_at = Some(checked_at);
+                preflight.duration_ms = Some(duration_ms);
+                preflight.payload_count = Some(candidate.export.payloads.len());
+                preflight.largest_payload_bytes = Some(candidate.largest_payload_bytes_upper_bound);
+                preflight.last_error = None;
+            }
+            tracing::info!(
+                event = "broadcaster_startup_snapshot_candidate_ready",
+                duration_ms,
+                payload_count = candidate.export.payloads.len(),
+                largest_payload_bytes = candidate.largest_payload_bytes_upper_bound,
+                "Broadcaster startup snapshot candidate is ready"
+            );
+            Ok(Some(candidate))
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            services[0]
+                .redis_publisher
+                .abort_startup_handoff(handoff_id, error_message.clone())
+                .await;
+            for service in services {
+                let mut preflight = service.snapshot_preflight.write().await;
+                preflight.checked_at = Some(checked_at);
+                preflight.duration_ms = Some(duration_ms);
+                preflight.payload_count = None;
+                preflight.largest_payload_bytes = None;
+                preflight.last_error = Some(error_message.clone());
+            }
+            emit_broadcaster_snapshot_export_failure();
+            Err(error)
+        }
+    }
+}
+
+async fn promote_prepared_startup_candidate(
+    services: &[BroadcasterServiceState],
+    candidate: BroadcasterSnapshotCandidate,
+    reason: String,
+) -> Result<BroadcasterRedisReplayBoundary> {
+    let _gate = services[0].lifecycle_gate.lock().await;
+    anyhow::ensure!(
+        services[0].redis_publisher.mode().await == BroadcasterRedisPublisherMode::Passive,
+        "startup snapshot candidate can only promote a passive publisher"
+    );
+    ensure_recovery_work_ids_current(services, &candidate.captured_recovery_work_ids).await?;
+    let frozen_handoff = services[0]
+        .redis_publisher
+        .freeze_startup_handoff(candidate.handoff_id)
+        .await?;
+
+    services[0]
+        .redis_publisher
+        .set_deployment_phase(BroadcasterDeploymentPhase::Promoting, None);
+    let boundary = services[0]
+        .redis_publisher
+        .promote(candidate.base_heads.clone(), reason)
+        .await?;
+    for service in services {
+        service.cache.relabel_generation(boundary.generation).await;
+    }
+
+    services[0]
+        .redis_publisher
+        .set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
+    let artifact = Arc::new(finalize_snapshot_candidate(candidate, boundary.clone()));
+    for service in services {
+        *service.snapshot_artifact.write().await = Some(Arc::clone(&artifact));
+    }
+
+    services[0]
+        .redis_publisher
+        .drain_startup_handoff(frozen_handoff)
+        .await?;
+    services[0].redis_publisher.admit_deployment();
+    Ok(boundary)
+}
+
+async fn ensure_recovery_work_ids_current(
+    services: &[BroadcasterServiceState],
+    captured_recovery_work_ids: &[u64],
+) -> Result<()> {
+    anyhow::ensure!(
+        captured_recovery_work_ids.len() == services.len(),
+        "startup snapshot candidate recovery fence count changed"
+    );
+    for (service, captured_work_id) in services.iter().zip(captured_recovery_work_ids) {
+        let recovery = service.recovery_publication.lock().await;
+        anyhow::ensure!(
+            recovery.work_id == *captured_work_id && !recovery.phase.is_active(),
+            "startup snapshot candidate crossed a recovery publication boundary"
+        );
+    }
+    Ok(())
+}
+
+fn build_snapshot_candidate(
+    chain_id: u64,
+    mut export: BroadcasterSnapshotExport,
+    base_heads: Vec<BroadcasterBackendHead>,
+    captured_recovery_work_ids: Vec<u64>,
+    handoff_id: u64,
+) -> Result<BroadcasterSnapshotCandidate> {
+    let placeholder_stream_id = format_redis_stream_id(chain_id, u64::MAX);
+    let placeholder_snapshot_id = format_redis_snapshot_id(chain_id, u64::MAX);
+    relabel_snapshot_export(&mut export, placeholder_stream_id, placeholder_snapshot_id);
+
+    let mut encoded_bytes_upper_bound = 0usize;
+    let mut largest_payload_bytes_upper_bound = 0usize;
+    let mut payload_digests = Vec::with_capacity(export.payloads.len());
+    for (index, payload) in export.payloads.iter().cloned().enumerate() {
+        anyhow::ensure!(
+            matches!(
+                payload,
+                BroadcasterPayload::SnapshotStart(_)
+                    | BroadcasterPayload::SnapshotChunk(_)
+                    | BroadcasterPayload::SnapshotEnd(_)
+            ),
+            "startup snapshot candidate contains a non-snapshot payload"
+        );
+        let message_seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let envelope = BroadcasterEnvelope::new(export.stream_id.clone(), message_seq, payload);
+        let encoded = serde_json::to_vec(&envelope)?;
+        anyhow::ensure!(
+            encoded.len() <= export.max_payload_bytes,
+            "startup snapshot payload {index} is {} bytes, above configured max {}",
+            encoded.len(),
+            export.max_payload_bytes
+        );
+        encoded_bytes_upper_bound = encoded_bytes_upper_bound.saturating_add(encoded.len());
+        largest_payload_bytes_upper_bound = largest_payload_bytes_upper_bound.max(encoded.len());
+        payload_digests.push(format!("{:x}", keccak256(&encoded)));
+    }
+    let snapshot_chunk_count = export
+        .payloads
+        .iter()
+        .filter(|payload| matches!(payload, BroadcasterPayload::SnapshotChunk(_)))
+        .count() as u32;
+
+    Ok(BroadcasterSnapshotCandidate {
+        chain_id,
+        export,
+        base_heads,
+        captured_recovery_work_ids,
+        handoff_id,
+        snapshot_chunk_count,
+        encoded_bytes_upper_bound,
+        largest_payload_bytes_upper_bound,
+        payload_digests,
+    })
+}
+
+fn finalize_snapshot_candidate(
+    mut candidate: BroadcasterSnapshotCandidate,
+    redis_replay_boundary: BroadcasterRedisReplayBoundary,
+) -> BroadcasterSnapshotArtifact {
+    debug_assert_eq!(
+        candidate.payload_digests.len(),
+        candidate.export.payloads.len()
+    );
+    relabel_snapshot_export(
+        &mut candidate.export,
+        redis_replay_boundary.stream_id.clone(),
+        redis_replay_boundary.snapshot_id.clone(),
+    );
+    let payloads = candidate
+        .export
+        .payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let message_seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            BroadcasterEnvelope::new(
+                redis_replay_boundary.stream_id.clone(),
+                message_seq,
+                payload,
+            )
+        })
+        .collect();
+    BroadcasterSnapshotArtifact {
+        chain_id: candidate.chain_id,
+        stream_id: redis_replay_boundary.stream_id.clone(),
+        snapshot_id: redis_replay_boundary.snapshot_id.clone(),
+        redis_replay_boundary,
+        payloads: Arc::new(payloads),
+        snapshot_chunk_count: candidate.snapshot_chunk_count,
+        encoded_bytes: candidate.encoded_bytes_upper_bound,
+    }
+}
+
+fn relabel_snapshot_export(
+    export: &mut BroadcasterSnapshotExport,
+    stream_id: String,
+    snapshot_id: String,
+) {
+    export.stream_id = stream_id;
+    export.snapshot_id = snapshot_id.clone();
+    for payload in &mut export.payloads {
+        match payload {
+            BroadcasterPayload::SnapshotStart(start) => {
+                start.snapshot_id.clone_from(&snapshot_id);
+            }
+            BroadcasterPayload::SnapshotChunk(chunk) => {
+                chunk.snapshot_id.clone_from(&snapshot_id);
+            }
+            BroadcasterPayload::SnapshotEnd(end) => {
+                end.snapshot_id.clone_from(&snapshot_id);
+            }
+            BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_)
+            | BroadcasterPayload::Update(_)
+            | BroadcasterPayload::Heartbeat(_)
+            | BroadcasterPayload::Progress(_) => {}
+        }
     }
 }
 
@@ -2625,8 +2950,8 @@ mod tests {
         assert_eq!(status.readiness, BroadcasterReadiness::SnapshotUnexportable);
         assert!(!status.snapshot.exportable);
         assert!(status.snapshot.last_export_error.is_some());
-        assert_eq!(writer.appends().await.len(), 1);
-        assert_eq!(publisher.status_snapshot().await.mode, "active");
+        assert!(writer.appends().await.is_empty());
+        assert_eq!(publisher.status_snapshot().await.mode, "passive");
         Ok(())
     }
 
@@ -3673,6 +3998,52 @@ mod tests {
             return Err(anyhow!("Redis stream entry payload should be progress"));
         };
         Ok(progress)
+    }
+
+    #[test]
+    fn startup_candidate_is_generation_neutral_until_infallible_finalization() -> Result<()> {
+        let candidate = super::build_snapshot_candidate(
+            1,
+            snapshot_export(),
+            base_heads([BroadcasterBackend::Native]),
+            vec![3],
+            9,
+        )?;
+        assert_eq!(
+            candidate.export.stream_id,
+            "chain-1-stream-18446744073709551615"
+        );
+        assert_eq!(
+            candidate.export.snapshot_id,
+            "chain-1-snapshot-18446744073709551615"
+        );
+        assert_eq!(candidate.captured_recovery_work_ids, vec![3]);
+        assert_eq!(candidate.handoff_id, 9);
+        assert_eq!(candidate.payload_digests.len(), 2);
+
+        let boundary = simulator_core::broadcaster::BroadcasterRedisReplayBoundary::new(
+            "dsolver:broadcaster:test:events",
+            "chain-1-stream-7",
+            "chain-1-snapshot-7",
+            7,
+            1,
+            7 << 48,
+        )?;
+        let artifact = super::finalize_snapshot_candidate(candidate, boundary);
+        assert_eq!(artifact.stream_id, "chain-1-stream-7");
+        assert_eq!(artifact.snapshot_id, "chain-1-snapshot-7");
+        assert_eq!(artifact.payloads.len(), 2);
+        assert!(artifact.payloads.iter().all(|envelope| {
+            envelope.stream_id == "chain-1-stream-7"
+                && match &envelope.payload {
+                    BroadcasterPayload::SnapshotStart(start) => {
+                        start.snapshot_id == "chain-1-snapshot-7"
+                    }
+                    BroadcasterPayload::SnapshotEnd(end) => end.snapshot_id == "chain-1-snapshot-7",
+                    _ => false,
+                }
+        }));
+        Ok(())
     }
 
     fn snapshot_export() -> BroadcasterSnapshotExport {

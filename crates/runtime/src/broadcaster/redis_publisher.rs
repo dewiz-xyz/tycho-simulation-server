@@ -36,6 +36,7 @@ pub(crate) const SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LIVE_REDIS_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECOVERY_FRAGMENT_TARGET_BYTES: usize = 3_500_000;
 const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
+pub(crate) const STARTUP_HANDOFF_ABORT_AFTER: Duration = Duration::from_secs(60);
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
 
 // Redis has no native "check active writer, then XADD" command. These small Lua
@@ -50,6 +51,21 @@ local maxlen = ARGV[3]
 local expected_writer_token = ARGV[4]
 local expected_generation = ARGV[5]
 local normal_marker_field_count = tonumber(ARGV[6] or "0")
+
+-- A normal promotion may have committed even if its reply was lost. Retrying
+-- with the same process token must return that generation instead of fencing it.
+if expected_writer_token == "" then
+  local current_writer_token = redis.call("GET", writer_key)
+  local current_generation = tostring(redis.call("GET", generation_key) or "")
+  if current_writer_token == writer_token and current_generation ~= "" then
+    local entry_id = current_generation .. "-1"
+    local marker = redis.call("XRANGE", stream_key, entry_id, entry_id, "COUNT", 1)
+    if #marker == 1 then
+      redis.call("PEXPIRE", writer_key, lease_ttl_ms)
+      return {current_generation, entry_id}
+    end
+  end
+end
 
 -- Recovery may reclaim an expired fence, but it must never displace another
 -- writer or reuse a generation after Redis lost its in-memory keys.
@@ -453,44 +469,60 @@ impl TokioRedisStreamWriter {
     }
 }
 
+fn redis_promotion_command(request: RedisPromotionCommand<'_>) -> redis::Cmd {
+    let mut command = redis::cmd("EVAL");
+    command
+        .arg(PROMOTE_WRITER_SCRIPT)
+        .arg(3)
+        .arg(request.stream_key)
+        .arg(request.writer_key)
+        .arg(request.writer_generation_key)
+        .arg(request.writer_token)
+        .arg(lease_ttl_ms(request.lease_ttl))
+        .arg(
+            request
+                .maxlen
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        )
+        .arg(request.expected_writer_token.unwrap_or_default())
+        .arg(
+            request
+                .expected_generation
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        )
+        .arg(request.normal_marker_fields.len());
+    for (field, value) in request.normal_marker_fields {
+        command.arg(field).arg(value);
+    }
+    command
+}
+
 impl RedisStreamWriter for TokioRedisStreamWriter {
     fn promote<'a>(
         &'a self,
         request: RedisPromotionCommand<'a>,
     ) -> BoxFuture<'a, Result<RedisPromotionResult>> {
         Box::pin(async move {
-            let mut command = redis::cmd("EVAL");
-            command
-                .arg(PROMOTE_WRITER_SCRIPT)
-                .arg(3)
-                .arg(request.stream_key)
-                .arg(request.writer_key)
-                .arg(request.writer_generation_key)
-                .arg(request.writer_token)
-                .arg(lease_ttl_ms(request.lease_ttl))
-                .arg(
-                    request
-                        .maxlen
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
-                )
-                .arg(request.expected_writer_token.unwrap_or_default())
-                .arg(
-                    request
-                        .expected_generation
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
-                )
-                .arg(request.normal_marker_fields.len());
-            for (field, value) in request.normal_marker_fields {
-                command.arg(field).arg(value);
-            }
-
             let mut connection = self.connection.clone();
-            let reply = command
+            let first = redis_promotion_command(request)
                 .query_async::<Vec<String>>(&mut connection)
-                .await
-                .context("Redis active writer promotion failed")?;
+                .await;
+            let reply = match first {
+                Ok(reply) => reply,
+                Err(first_error) if request.expected_writer_token.is_none() => {
+                    redis_promotion_command(request)
+                        .query_async::<Vec<String>>(&mut connection)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Redis active writer promotion retry failed after: {first_error}"
+                            )
+                        })?
+                }
+                Err(error) => return Err(error).context("Redis active writer promotion failed"),
+            };
             let [generation, entry_id] = reply.as_slice() else {
                 return Err(anyhow!(
                     "Redis active writer promotion returned invalid reply"
@@ -634,8 +666,10 @@ pub struct BroadcasterRedisPublisher {
     recovery_gate: Arc<Mutex<PublisherRecoveryGate>>,
     recovery_coordinator: Arc<Mutex<()>>,
     next_recovery_id: Arc<AtomicU64>,
+    next_startup_handoff_id: Arc<AtomicU64>,
     feed_gate: watch::Sender<FeedGateState>,
     feed_pause_guard: Arc<Mutex<()>>,
+    deployment_admission: watch::Sender<BroadcasterDeploymentAdmissionSnapshot>,
 }
 
 impl fmt::Debug for BroadcasterRedisPublisher {
@@ -662,6 +696,60 @@ pub struct BroadcasterRedisPublisherStatus {
     pub retry_exhaustion_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcasterDeploymentPhase {
+    Warming,
+    CandidateBuilding,
+    Promoting,
+    ArtifactFinalizing,
+    HandoffDraining,
+    Admitted,
+    Retired,
+    Fatal,
+    ShuttingDown,
+}
+
+impl BroadcasterDeploymentPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warming => "warming",
+            Self::CandidateBuilding => "candidate_building",
+            Self::Promoting => "promoting",
+            Self::ArtifactFinalizing => "artifact_finalizing",
+            Self::HandoffDraining => "handoff_draining",
+            Self::Admitted => "admitted",
+            Self::Retired => "retired",
+            Self::Fatal => "fatal",
+            Self::ShuttingDown => "shutting_down",
+        }
+    }
+
+    pub const fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Retired | Self::Fatal | Self::ShuttingDown)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcasterDeploymentAdmissionSnapshot {
+    pub admitted: bool,
+    pub phase: BroadcasterDeploymentPhase,
+    pub last_error: Option<String>,
+}
+
+impl BroadcasterDeploymentAdmissionSnapshot {
+    fn new(phase: BroadcasterDeploymentPhase, last_error: Option<String>) -> Self {
+        Self {
+            admitted: phase.is_admitted(),
+            phase,
+            last_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,6 +789,7 @@ struct BroadcasterRedisPublisherState {
     append_failure_count: u64,
     retry_exhaustion_count: u64,
     last_error: Option<String>,
+    startup_handoff: Option<StartupHandoffBuffer>,
 }
 
 #[derive(Debug, Default)]
@@ -716,6 +805,22 @@ struct PublisherRecoveryGate {
 struct QueuedPublisherPayload {
     payload: BroadcasterPayload,
     accepted_at: Instant,
+}
+
+#[derive(Debug)]
+struct StartupHandoffBuffer {
+    id: u64,
+    started_at: Instant,
+    payloads: VecDeque<BroadcasterPayload>,
+    complete_native_blocks: HashSet<u64>,
+    cancelled: bool,
+    frozen: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct FrozenStartupHandoff {
+    id: u64,
+    payloads: VecDeque<BroadcasterPayload>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -789,6 +894,16 @@ impl BroadcasterRedisPublisher {
         let writer_key = redis_writer_key(&config.stream_key);
         let writer_generation_key = redis_writer_generation_key(&config.stream_key);
         let (feed_gate, _) = watch::channel(FeedGateState::default());
+        let deployment_phase = match mode {
+            BroadcasterRedisPublisherMode::Active => BroadcasterDeploymentPhase::Admitted,
+            BroadcasterRedisPublisherMode::Retired => BroadcasterDeploymentPhase::Retired,
+            BroadcasterRedisPublisherMode::Passive | BroadcasterRedisPublisherMode::Unhealthy => {
+                BroadcasterDeploymentPhase::Warming
+            }
+        };
+        let (deployment_admission, _) = watch::channel(
+            BroadcasterDeploymentAdmissionSnapshot::new(deployment_phase, None),
+        );
         let initial_state_version = state_version_base(generation);
         Self {
             config,
@@ -809,13 +924,141 @@ impl BroadcasterRedisPublisher {
                 append_failure_count: 0,
                 retry_exhaustion_count: 0,
                 last_error: None,
+                startup_handoff: None,
             })),
             recovery_gate: Arc::new(Mutex::new(PublisherRecoveryGate::default())),
             recovery_coordinator: Arc::new(Mutex::new(())),
             next_recovery_id: Arc::new(AtomicU64::new(1)),
+            next_startup_handoff_id: Arc::new(AtomicU64::new(1)),
             feed_gate,
             feed_pause_guard: Arc::new(Mutex::new(())),
+            deployment_admission,
         }
+    }
+
+    pub fn deployment_admission_snapshot(&self) -> BroadcasterDeploymentAdmissionSnapshot {
+        self.deployment_admission.borrow().clone()
+    }
+
+    pub(crate) fn set_deployment_phase(
+        &self,
+        phase: BroadcasterDeploymentPhase,
+        last_error: Option<String>,
+    ) {
+        self.deployment_admission.send_modify(|current| {
+            if current.phase.is_terminal() || (current.admitted && !phase.is_terminal()) {
+                return;
+            }
+            *current = BroadcasterDeploymentAdmissionSnapshot::new(phase, last_error);
+        });
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.set_deployment_phase(BroadcasterDeploymentPhase::ShuttingDown, None);
+    }
+
+    pub(crate) async fn begin_startup_handoff(&self) -> Result<u64> {
+        let mut guard = self.inner.lock().await;
+        anyhow::ensure!(
+            guard.mode == BroadcasterRedisPublisherMode::Passive,
+            "startup handoff requires a passive Redis publisher"
+        );
+        let id = self.next_startup_handoff_id.fetch_add(1, Ordering::Relaxed);
+        guard.startup_handoff = Some(StartupHandoffBuffer {
+            id,
+            started_at: Instant::now(),
+            payloads: VecDeque::new(),
+            complete_native_blocks: HashSet::new(),
+            cancelled: false,
+            frozen: false,
+        });
+        drop(guard);
+        self.set_deployment_phase(BroadcasterDeploymentPhase::CandidateBuilding, None);
+        Ok(id)
+    }
+
+    pub(crate) async fn abort_startup_handoff(&self, id: u64, error: impl Into<String>) {
+        let error = error.into();
+        let mut guard = self.inner.lock().await;
+        if guard
+            .startup_handoff
+            .as_ref()
+            .is_some_and(|buffer| buffer.id == id)
+        {
+            guard.startup_handoff = None;
+        }
+        drop(guard);
+        self.set_deployment_phase(BroadcasterDeploymentPhase::Warming, Some(error));
+    }
+
+    pub(crate) async fn freeze_startup_handoff(&self, id: u64) -> Result<FrozenStartupHandoff> {
+        let mut guard = self.inner.lock().await;
+        anyhow::ensure!(
+            guard.mode == BroadcasterRedisPublisherMode::Passive,
+            "startup handoff can only freeze a passive publisher"
+        );
+        let buffer = guard
+            .startup_handoff
+            .as_mut()
+            .filter(|buffer| buffer.id == id)
+            .ok_or_else(|| anyhow!("startup handoff candidate is no longer current"))?;
+        if buffer.started_at.elapsed() >= STARTUP_HANDOFF_ABORT_AFTER
+            || buffer.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+        {
+            buffer.cancelled = true;
+        }
+        anyhow::ensure!(
+            !buffer.cancelled,
+            "startup handoff exceeded the 64-block or 60-second bound"
+        );
+        anyhow::ensure!(!buffer.frozen, "startup handoff is already frozen");
+        buffer.frozen = true;
+        Ok(FrozenStartupHandoff {
+            id,
+            payloads: std::mem::take(&mut buffer.payloads),
+        })
+    }
+
+    pub(crate) async fn drain_startup_handoff(&self, handoff: FrozenStartupHandoff) -> Result<()> {
+        self.set_deployment_phase(BroadcasterDeploymentPhase::HandoffDraining, None);
+        let mut guard = self.inner.lock().await;
+        anyhow::ensure!(
+            guard.mode == BroadcasterRedisPublisherMode::Active,
+            "startup handoff drain requires the promoted Redis writer"
+        );
+        anyhow::ensure!(
+            guard
+                .startup_handoff
+                .as_ref()
+                .is_some_and(|buffer| buffer.id == handoff.id && buffer.frozen),
+            "startup handoff drain no longer matches the frozen candidate"
+        );
+
+        let append_failures_before = guard.append_failure_count;
+        for payload in handoff.payloads {
+            let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
+            if let Err(error) = self.append_live_payload_locked(&mut guard, payload).await {
+                let message = format!("{error:#}");
+                if is_stale_writer_error(&error) {
+                    guard.record_retired(message.clone());
+                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
+                } else {
+                    if guard.append_failure_count > append_failures_before {
+                        guard.retry_exhaustion_count =
+                            guard.retry_exhaustion_count.saturating_add(1);
+                    }
+                    guard.record_retired(message.clone());
+                    self.set_deployment_phase(BroadcasterDeploymentPhase::Fatal, Some(message));
+                }
+                return Err(error);
+            }
+        }
+        guard.startup_handoff = None;
+        Ok(())
+    }
+
+    pub(crate) fn admit_deployment(&self) {
+        self.set_deployment_phase(BroadcasterDeploymentPhase::Admitted, None);
     }
 
     pub(crate) async fn begin_recovery(
@@ -868,7 +1111,27 @@ impl BroadcasterRedisPublisher {
         let mut guard = self.inner.lock().await;
         drop(recovery_gate);
         match guard.mode {
-            BroadcasterRedisPublisherMode::Passive => return Ok(()),
+            BroadcasterRedisPublisherMode::Passive => {
+                if let Some(buffer) = guard.startup_handoff.as_mut() {
+                    anyhow::ensure!(
+                        !buffer.frozen,
+                        "startup handoff cannot accept publications after it is frozen"
+                    );
+                    if let Some(block_number) = complete_native_block(&payload) {
+                        buffer.complete_native_blocks.insert(block_number);
+                    }
+                    if buffer.started_at.elapsed() >= STARTUP_HANDOFF_ABORT_AFTER
+                        || buffer.complete_native_blocks.len()
+                            >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+                    {
+                        buffer.cancelled = true;
+                        buffer.payloads.clear();
+                    } else if !buffer.cancelled {
+                        buffer.payloads.push_back(payload);
+                    }
+                }
+                return Ok(());
+            }
             BroadcasterRedisPublisherMode::Retired => {
                 return Err(anyhow!(
                     "Redis broadcaster publisher is retired; this process is no longer the active writer"
@@ -900,7 +1163,8 @@ impl BroadcasterRedisPublisher {
                 }
                 let message = format!("{error:#}");
                 if is_stale_writer_error(&error) {
-                    guard.record_retired(message);
+                    guard.record_retired(message.clone());
+                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
                 } else {
                     let retry_exhausted = guard.append_failure_count > append_failures_before;
                     guard.record_unhealthy(message, retry_exhausted);
@@ -1059,6 +1323,12 @@ impl BroadcasterRedisPublisher {
                 Ok(entry_id) => commit_entry_id = Some(entry_id),
                 Err(error) => {
                     record_publisher_error(&mut guard, append_failures_before, &error);
+                    if guard.mode == BroadcasterRedisPublisherMode::Retired {
+                        self.set_deployment_phase(
+                            BroadcasterDeploymentPhase::Retired,
+                            Some(format!("{error:#}")),
+                        );
+                    }
                     if is_commit && !is_stale_writer_error(&error) {
                         return Err(RecoveryCommitAdoptionUncertain {
                             message: format!("{error:#}"),
@@ -1087,8 +1357,10 @@ impl BroadcasterRedisPublisher {
     }
 
     pub(crate) async fn self_fence(&self, reason: impl Into<String>) {
+        let reason = reason.into();
         let mut guard = self.inner.lock().await;
-        guard.record_retired(reason.into());
+        guard.record_retired(reason.clone());
+        self.set_deployment_phase(BroadcasterDeploymentPhase::Fatal, Some(reason));
     }
 
     pub async fn promote(
@@ -1147,7 +1419,9 @@ impl BroadcasterRedisPublisher {
             }
             Err(error) => {
                 if is_stale_writer_error(&error) {
-                    guard.record_retired(format!("{error:#}"));
+                    let message = format!("{error:#}");
+                    guard.record_retired(message.clone());
+                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
                 }
                 Err(error)
             }
@@ -1363,7 +1637,8 @@ impl BroadcasterRedisPublisher {
             let message = format!("{error:#}");
             if is_stale_writer_error(&error) {
                 emit_broadcaster_writer_fence_failure();
-                guard.record_retired(message);
+                guard.record_retired(message.clone());
+                self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
             } else {
                 guard.record_unhealthy(message, false);
             }
@@ -1414,9 +1689,13 @@ impl BroadcasterRedisPublisher {
                 let message = format!("{error:#}");
                 if is_stale_writer_error(&error) {
                     emit_broadcaster_writer_fence_failure();
-                    guard.record_retired(message);
-                } else {
+                    guard.record_retired(message.clone());
+                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
+                } else if recovering {
                     guard.record_unhealthy(message, false);
+                } else {
+                    guard.mode = BroadcasterRedisPublisherMode::Passive;
+                    guard.last_error = Some(message);
                 }
                 return Err(error);
             }
@@ -1901,11 +2180,11 @@ const fn decimal_digits(mut value: usize) -> usize {
     digits
 }
 
-fn format_redis_stream_id(chain_id: u64, generation: u64) -> String {
+pub(crate) fn format_redis_stream_id(chain_id: u64, generation: u64) -> String {
     format!("chain-{chain_id}-stream-{generation}")
 }
 
-fn format_redis_snapshot_id(chain_id: u64, generation: u64) -> String {
+pub(crate) fn format_redis_snapshot_id(chain_id: u64, generation: u64) -> String {
     format!("chain-{chain_id}-snapshot-{generation}")
 }
 

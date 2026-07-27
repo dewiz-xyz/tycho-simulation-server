@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -20,8 +20,9 @@ use tycho_simulation::tycho_common::Bytes;
 
 use super::{
     redis_entry_fields, redis_entry_id, redis_stream_entry_matches_reply,
-    writer_lease_ttl_for_heartbeat_interval, BroadcasterRedisPublisher,
+    writer_lease_ttl_for_heartbeat_interval, BroadcasterDeploymentPhase, BroadcasterRedisPublisher,
     BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode, RedisStreamWriter,
+    TokioRedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
@@ -116,6 +117,317 @@ async fn passive_publisher_skips_appends_and_has_no_replay_boundary() -> Result<
         "passive warmup must not append Redis entries"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn startup_handoff_preserves_cross_backend_publication_order_until_admission() -> Result<()> {
+    let native_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let rfq_cache = ready_cache(BroadcasterBackend::Rfq, 20, "rfq-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+
+    let handoff_id = publisher.begin_startup_handoff().await?;
+    assert_eq!(
+        publisher.deployment_admission_snapshot().phase,
+        BroadcasterDeploymentPhase::CandidateBuilding
+    );
+    let native = native_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let rfq = rfq_cache
+        .apply_update(&update(BroadcasterBackend::Rfq, 21, "rfq-2"))
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(native))
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(rfq))
+        .await?;
+
+    let handoff = publisher.freeze_startup_handoff(handoff_id).await?;
+    publisher.set_deployment_phase(BroadcasterDeploymentPhase::Promoting, None);
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
+            "startup_handoff",
+        )
+        .await?;
+    publisher.set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
+    publisher.drain_startup_handoff(handoff).await?;
+    assert_eq!(
+        publisher.deployment_admission_snapshot().phase,
+        BroadcasterDeploymentPhase::HandoffDraining
+    );
+    publisher.admit_deployment();
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends
+            .iter()
+            .map(|append| (
+                append.entry.message_seq,
+                append.entry.backend_scope.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(1, "native,rfq"), (2, "native"), (3, "rfq")]
+    );
+    assert_eq!(
+        publisher.deployment_admission_snapshot(),
+        super::BroadcasterDeploymentAdmissionSnapshot {
+            admitted: true,
+            phase: BroadcasterDeploymentPhase::Admitted,
+            last_error: None,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_handoff_overflow_discards_private_work_and_allows_retry() -> Result<()> {
+    let cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()));
+    let handoff_id = publisher.begin_startup_handoff().await?;
+
+    for block_number in 11..=74 {
+        let message = cache
+            .apply_update(&update(
+                BroadcasterBackend::Native,
+                block_number,
+                &format!("native-{block_number}"),
+            ))
+            .await?;
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(message))
+            .await?;
+    }
+
+    let Err(error) = publisher.freeze_startup_handoff(handoff_id).await else {
+        return Err(anyhow!(
+            "64 native blocks must cancel the private startup candidate"
+        ));
+    };
+    assert!(error.to_string().contains("64-block or 60-second bound"));
+    publisher
+        .abort_startup_handoff(handoff_id, error.to_string())
+        .await;
+    let retry_id = publisher.begin_startup_handoff().await?;
+    assert_ne!(retry_id, handoff_id);
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Passive
+    );
+    assert_eq!(
+        publisher.deployment_admission_snapshot().phase,
+        BroadcasterDeploymentPhase::CandidateBuilding
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn admission_latches_through_recoverable_failure_and_closes_for_shutdown() -> Result<()> {
+    let cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    publisher.admit_deployment();
+
+    writer.fail_next_appends(100).await;
+    let update = cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    assert!(publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+        .is_err());
+    let admitted = publisher.deployment_admission_snapshot();
+    assert!(admitted.admitted);
+    assert_eq!(admitted.phase, BroadcasterDeploymentPhase::Admitted);
+
+    publisher.begin_shutdown();
+    let shutting_down = publisher.deployment_admission_snapshot();
+    assert!(!shutting_down.admitted);
+    assert_eq!(
+        shutting_down.phase,
+        BroadcasterDeploymentPhase::ShuttingDown
+    );
+    Ok(())
+}
+
+#[test]
+fn deployment_phase_names_cover_every_public_state() {
+    assert_eq!(
+        [
+            BroadcasterDeploymentPhase::Warming,
+            BroadcasterDeploymentPhase::CandidateBuilding,
+            BroadcasterDeploymentPhase::Promoting,
+            BroadcasterDeploymentPhase::ArtifactFinalizing,
+            BroadcasterDeploymentPhase::HandoffDraining,
+            BroadcasterDeploymentPhase::Admitted,
+            BroadcasterDeploymentPhase::Retired,
+            BroadcasterDeploymentPhase::Fatal,
+            BroadcasterDeploymentPhase::ShuttingDown,
+        ]
+        .map(BroadcasterDeploymentPhase::as_str),
+        [
+            "warming",
+            "candidate_building",
+            "promoting",
+            "artifact_finalizing",
+            "handoff_draining",
+            "admitted",
+            "retired",
+            "fatal",
+            "shutting_down",
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable Redis provided through BROADCASTER_REDIS_HANDOFF_TEST_URL"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the handoff assertions stay together to keep the cross-writer order visible"
+)]
+async fn two_broadcasters_handoff_without_loss_or_duplication_on_real_redis() -> Result<()> {
+    let redis_url = std::env::var("BROADCASTER_REDIS_HANDOFF_TEST_URL")
+        .map_err(|_| anyhow!("BROADCASTER_REDIS_HANDOFF_TEST_URL must be set"))?;
+    let stream_key = format!(
+        "dsolver:broadcaster:handoff-test:{}:events",
+        std::process::id()
+    );
+    let config = BroadcasterRedisPublisherConfig {
+        stream_key: stream_key.clone(),
+        ..publisher_config()
+    };
+    let old = BroadcasterRedisPublisher::new(
+        config.clone(),
+        Arc::new(TokioRedisStreamWriter::connect(&redis_url).await?),
+    );
+    let new = BroadcasterRedisPublisher::new(
+        config,
+        Arc::new(TokioRedisStreamWriter::connect(&redis_url).await?),
+    );
+    let native_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let rfq_cache = ready_cache(BroadcasterBackend::Rfq, 20, "rfq-1").await?;
+
+    old.promote(
+        base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
+        "old_active",
+    )
+    .await?;
+    let old_final = native_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "old-final"))
+        .await?;
+    old.publish_accepted_payload(BroadcasterPayload::Update(old_final))
+        .await?;
+
+    let handoff_id = new.begin_startup_handoff().await?;
+    let native_handoff = native_cache
+        .apply_update(&update(BroadcasterBackend::Native, 12, "new-native"))
+        .await?;
+    let rfq_handoff = rfq_cache
+        .apply_update(&update(BroadcasterBackend::Rfq, 21, "new-rfq"))
+        .await?;
+    new.publish_accepted_payload(BroadcasterPayload::Update(native_handoff))
+        .await?;
+    new.publish_accepted_payload(BroadcasterPayload::Update(rfq_handoff))
+        .await?;
+    let handoff = new.freeze_startup_handoff(handoff_id).await?;
+    let boundary = new
+        .promote(
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
+            "new_active",
+        )
+        .await?;
+    let reconciled_boundary = new
+        .promote(
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
+            "new_active",
+        )
+        .await?;
+    assert_eq!(
+        reconciled_boundary, boundary,
+        "repeating the same promotion token must reconcile the accepted CAS"
+    );
+    new.drain_startup_handoff(handoff).await?;
+    new.admit_deployment();
+
+    let stale = native_cache
+        .apply_update(&update(BroadcasterBackend::Native, 13, "stale-old"))
+        .await?;
+    assert!(
+        old.publish_accepted_payload(BroadcasterPayload::Update(stale))
+            .await
+            .is_err(),
+        "the replaced writer must be fenced"
+    );
+
+    let client = redis::Client::open(redis_url)?;
+    let mut connection = client.get_connection_manager().await?;
+    let reply = redis::cmd("XRANGE")
+        .arg(&stream_key)
+        .arg("-")
+        .arg("+")
+        .query_async::<StreamRangeReply>(&mut connection)
+        .await?;
+    let entries = reply
+        .ids
+        .iter()
+        .map(stream_id_to_entry)
+        .collect::<Result<Vec<_>>>()?;
+
+    assert_eq!(
+        reply
+            .ids
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1-1", "1-2", "2-1", "2-2", "2-3"]
+    );
+    assert_eq!(boundary.exclusive_entry_id(), "2-1");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.kind, entry.backend_scope.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (BroadcasterMessageKind::Progress, "native,rfq"),
+            (BroadcasterMessageKind::Update, "native"),
+            (BroadcasterMessageKind::Progress, "native,rfq"),
+            (BroadcasterMessageKind::Update, "native"),
+            (BroadcasterMessageKind::Update, "rfq"),
+        ]
+    );
+    assert!(entries[3].state_version > entries[1].state_version);
+    assert_eq!(
+        reply
+            .ids
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        entries.len()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fatal_self_fence_closes_deployment_admission() {
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()));
+    publisher.admit_deployment();
+    publisher.self_fence("planned fatal failure").await;
+
+    let admission = publisher.deployment_admission_snapshot();
+    assert!(!admission.admitted);
+    assert_eq!(admission.phase, BroadcasterDeploymentPhase::Fatal);
+    assert_eq!(
+        admission.last_error.as_deref(),
+        Some("planned fatal failure")
+    );
 }
 
 #[tokio::test]
@@ -1385,6 +1697,19 @@ fn stream_range_reply(entry_id: &str, fields: &[(String, String)]) -> StreamRang
             delivered_count: None,
         }],
     }
+}
+
+fn stream_id_to_entry(stream_id: &StreamId) -> Result<BroadcasterRedisStreamEntry> {
+    let fields = stream_id
+        .map
+        .iter()
+        .map(|(field, value)| {
+            redis::from_redis_value::<String>(value.clone())
+                .map(|value| (field.clone(), serde_json::Value::String(value)))
+                .map_err(Into::into)
+        })
+        .collect::<Result<serde_json::Map<String, serde_json::Value>>>()?;
+    serde_json::from_value(serde_json::Value::Object(fields)).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Default)]

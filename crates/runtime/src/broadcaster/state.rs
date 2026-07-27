@@ -29,7 +29,10 @@ use simulator_core::broadcaster::{
     BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
-use super::redis_publisher::BroadcasterRedisPublisherStatus;
+use super::redis_publisher::{
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterDeploymentPhase,
+    BroadcasterRedisPublisherStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcasterReadiness {
@@ -69,6 +72,7 @@ pub struct BroadcasterStatusSnapshot {
     pub snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    pub deployment_admission: BroadcasterDeploymentAdmissionSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +190,19 @@ impl BroadcasterRecoverySource {
             &partition.messages,
             &partition.sync_statuses,
         )
+    }
+}
+
+impl BroadcasterSnapshotSource {
+    pub(crate) fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
+        self.partitions
+            .iter()
+            .filter_map(|(backend, partition)| {
+                partition
+                    .block_number
+                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
+            })
+            .collect()
     }
 }
 
@@ -829,6 +846,11 @@ impl BroadcasterSnapshotCache {
             snapshot_sessions,
             backends,
             redis_publisher: None,
+            deployment_admission: BroadcasterDeploymentAdmissionSnapshot {
+                admitted: false,
+                phase: BroadcasterDeploymentPhase::Warming,
+                last_error: None,
+            },
         }
     }
 
