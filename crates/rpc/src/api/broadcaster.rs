@@ -154,7 +154,7 @@ mod tests {
         let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "upstream_disconnected");
         assert_eq!(body["upstream"]["connected"], false);
         assert_eq!(body["snapshot"]["ready"], false);
@@ -170,7 +170,7 @@ mod tests {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["upstream"]["connected"], true);
         assert_eq!(body["snapshot"]["ready"], false);
@@ -232,11 +232,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn status_reports_passive_publisher_as_not_ready() -> Result<()> {
+    async fn status_reports_passive_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_passive_ready_state().await?);
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_passive");
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["redis_publisher"]["healthy"], true);
@@ -361,12 +361,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bridge_status_rejects_unhealthy_publisher() -> Result<()> {
+    async fn status_reports_unhealthy_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
 
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
         assert_eq!(body["redis_publisher"]["healthy"], false);
         assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
@@ -381,7 +381,7 @@ mod tests {
 
         let (status, body) = get_json(app, "/status").await?;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");

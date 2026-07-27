@@ -17,8 +17,10 @@ pub async fn status(
     State(state): State<BroadcasterAppState>,
 ) -> (StatusCode, Json<BroadcasterStatusPayload>) {
     let snapshot = state.status_snapshot().await;
-    let status_code = bridge_status_code(snapshot.readiness);
-    (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
+    (
+        StatusCode::OK,
+        Json(BroadcasterStatusPayload::from(snapshot)),
+    )
 }
 
 pub async fn ready(
@@ -115,20 +117,6 @@ pub async fn token_lookup(
 
 pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Response {
     (StatusCode::OK, Json(state.token_snapshot().await)).into_response()
-}
-
-fn bridge_status_code(readiness: BroadcasterReadiness) -> StatusCode {
-    match readiness {
-        BroadcasterReadiness::Ready
-        | BroadcasterReadiness::UpstreamRecovering
-        | BroadcasterReadiness::SnapshotUnexportable => StatusCode::OK,
-        BroadcasterReadiness::RedisPublisherPassive
-        | BroadcasterReadiness::RedisPublisherRetired
-        | BroadcasterReadiness::RedisPublisherUnhealthy
-        | BroadcasterReadiness::SnapshotWarmingUp
-        | BroadcasterReadiness::UpstreamDisconnected
-        | BroadcasterReadiness::NativeProgressStale => StatusCode::SERVICE_UNAVAILABLE,
-    }
 }
 
 async fn snapshot_session_create_response(
