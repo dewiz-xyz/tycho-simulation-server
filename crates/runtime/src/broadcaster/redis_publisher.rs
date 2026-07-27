@@ -31,11 +31,15 @@ const RETRY_BACKOFF_CAP: Duration = Duration::from_millis(200);
 const MIN_WRITER_LEASE_TTL: Duration = Duration::from_secs(30);
 const WRITER_LEASE_HEARTBEAT_MULTIPLIER: u32 = 3;
 const STALE_WRITER_MESSAGE: &str = "stale Redis broadcaster writer";
+// Keep this in sync with the writer fence errors returned by the Lua scripts.
+pub(super) const MISSING_FENCE_MESSAGE: &str = "missing Redis broadcaster writer fence";
+const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const RECOVERY_REDIS_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LIVE_REDIS_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECOVERY_FRAGMENT_TARGET_BYTES: usize = 3_500_000;
 const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
+const MAX_PENDING_RECOVERY_PAYLOADS: usize = 1024;
 pub(crate) const STARTUP_HANDOFF_ABORT_AFTER: Duration = Duration::from_secs(60);
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
 
@@ -1088,6 +1092,11 @@ impl BroadcasterRedisPublisher {
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
         let mut recovery_gate = self.recovery_gate.lock().await;
         if recovery_gate.open_recovery_id.is_some() {
+            if matches!(payload, BroadcasterPayload::Heartbeat(_)) {
+                // The heartbeat task renews the lease while the reservation is open. Replaying
+                // this later would publish stale backend heads.
+                return Ok(());
+            }
             if let Some(block_number) = complete_native_block(&payload) {
                 recovery_gate.complete_native_blocks.insert(block_number);
                 if recovery_gate.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
@@ -1097,6 +1106,10 @@ impl BroadcasterRedisPublisher {
                     }
                 }
             }
+            anyhow::ensure!(
+                recovery_gate.pending_payloads.len() < MAX_PENDING_RECOVERY_PAYLOADS,
+                "Redis broadcaster recovery payload queue is full"
+            );
             recovery_gate
                 .pending_payloads
                 .push_back(QueuedPublisherPayload {
@@ -1413,6 +1426,7 @@ impl BroadcasterRedisPublisher {
             .await;
         match result {
             Ok(()) => {
+                self.resync_stream_tail_locked(&mut guard).await?;
                 guard.mode = BroadcasterRedisPublisherMode::Active;
                 guard.last_error = None;
                 Ok(())
@@ -1425,6 +1439,83 @@ impl BroadcasterRedisPublisher {
                 }
                 Err(error)
             }
+        }
+    }
+
+    async fn resync_stream_tail_locked(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+    ) -> Result<()> {
+        let inspection = timeout(
+            WRITER_PROBE_TIMEOUT,
+            self.writer.inspect_writer(RedisInspectCommand {
+                stream_key: &self.config.stream_key,
+                writer_key: &self.writer_key,
+                writer_generation_key: &self.writer_generation_key,
+                writer_token: &self.writer_token,
+                generation: guard.generation,
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("Redis stream tail resync timed out"))
+        .and_then(|inspection| inspection)
+        .context("Redis stream tail resync failed before reactivating the publisher")?;
+        if inspection.generation != guard.generation {
+            return Ok(());
+        }
+        let Some(last_entry_id) = inspection.last_entry_id else {
+            return Ok(());
+        };
+        let (generation, sequence) = parse_redis_entry_id(&last_entry_id)?;
+        if generation != guard.generation || sequence < guard.next_message_seq {
+            return Ok(());
+        }
+        let old_next_message_seq = guard.next_message_seq;
+        let next_message_seq = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Redis broadcaster message_seq overflow during tail resync"))?;
+        warn!(
+            event = "redis_writer_tail_resynced",
+            stream_key = self.config.stream_key.as_str(),
+            generation = guard.generation,
+            old_next_message_seq,
+            adopted_entry_id = last_entry_id.as_str(),
+            "Redis broadcaster writer adopted the current stream tail"
+        );
+        guard.next_message_seq = next_message_seq;
+        guard.latest_entry_id = Some(last_entry_id);
+        // State versions are allocated before append and never reused. Consumers tolerate gaps.
+        Ok(())
+    }
+
+    pub(crate) async fn recovery_gate_is_open(&self) -> bool {
+        self.recovery_gate.lock().await.open_recovery_id.is_some()
+    }
+
+    pub(crate) async fn writer_fence_is_absent(&self) -> bool {
+        let generation = {
+            let guard = self.inner.lock().await;
+            if guard.mode != BroadcasterRedisPublisherMode::Unhealthy {
+                return false;
+            }
+            guard.generation
+        };
+        // A false positive is harmless. Promotion rechecks token and generation atomically and
+        // never displaces a newer live writer.
+        match timeout(
+            WRITER_PROBE_TIMEOUT,
+            self.writer.verify_writer(RedisVerifyCommand {
+                writer_key: &self.writer_key,
+                writer_generation_key: &self.writer_generation_key,
+                writer_token: &self.writer_token,
+                generation,
+                lease_ttl: self.config.writer_lease_ttl,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) | Err(_) => false,
+            Ok(Err(error)) => format!("{error:#}").contains(MISSING_FENCE_MESSAGE),
         }
     }
 

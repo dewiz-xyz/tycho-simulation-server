@@ -269,6 +269,8 @@ struct RecoveryPublicationState {
     last_chunk_count: Option<usize>,
 }
 
+type RecoveryAbortMetrics = (u64, usize, usize, usize, usize);
+
 impl Default for RecoveryPublicationState {
     fn default() -> Self {
         Self {
@@ -461,6 +463,14 @@ impl BroadcasterServiceState {
 
     async fn cancel_recovery_publication(&self) {
         let mut recovery = self.recovery_publication.lock().await;
+        let outcome = Self::cancel_recovery_publication_locked(&mut recovery);
+        drop(recovery);
+        Self::emit_recovery_abort(outcome);
+    }
+
+    fn cancel_recovery_publication_locked(
+        recovery: &mut RecoveryPublicationState,
+    ) -> Option<RecoveryAbortMetrics> {
         let outcome = if recovery.phase.is_active() {
             let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
             recovery.last_outcome = Some("aborted");
@@ -483,7 +493,10 @@ impl BroadcasterServiceState {
         recovery.publisher_recovery_id = None;
         recovery.complete_native_blocks.clear();
         recovery.fatal_error = None;
-        drop(recovery);
+        outcome
+    }
+
+    fn emit_recovery_abort(outcome: Option<RecoveryAbortMetrics>) {
         if let Some((duration_ms, encoded_bytes, chunk_count, buffer_a_count, buffer_b_count)) =
             outcome
         {
@@ -648,8 +661,11 @@ impl BroadcasterServiceState {
             "broadcaster writer recovery requires at least one service"
         );
         ensure_shared_lifecycle(services, "broadcaster writer recovery")?;
-        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Unhealthy
-            || !services[0].redis_publisher.feeds_are_paused()
+        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Unhealthy {
+            return Ok(None);
+        }
+        if !services[0].redis_publisher.feeds_are_paused()
+            && !services[0].redis_publisher.writer_fence_is_absent().await
         {
             return Ok(None);
         }
@@ -1244,6 +1260,16 @@ impl BroadcasterServiceState {
                 recovery.cancelled.load(Ordering::Acquire)
             };
             if recovery_cancelled {
+                let outcome = {
+                    let mut recovery = self.recovery_publication.lock().await;
+                    if recovery.work_id != work_id {
+                        return None;
+                    }
+                    Self::cancel_recovery_publication_locked(&mut recovery)
+                };
+                Self::emit_recovery_abort(outcome);
+                // If pausing observes a retired publisher, worker termination is already a no-op.
+                // The promotion task exits on Retired and paused feeds fail closed upstream.
                 if let Err(error) = self
                     .redis_publisher
                     .pause_feeds_until_writer_verified()
@@ -1334,7 +1360,7 @@ impl BroadcasterServiceState {
     }
 
     pub async fn broadcast_heartbeat(&self) -> Result<()> {
-        if self.recovery_is_active().await {
+        if self.recovery_is_active().await || self.redis_publisher.recovery_gate_is_open().await {
             self.redis_publisher.renew_lease().await?;
             self.snapshot_sessions
                 .cleanup_expired_snapshot_sessions()
@@ -2721,6 +2747,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_mid_replacement_realigns_after_reconnect() -> Result<()> {
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::new(BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(
+            service
+                .apply_feed_message(&raw_feed_for_protocols(
+                    10,
+                    10,
+                    9,
+                    &["uniswap_v2", "uniswap_v3"],
+                ))
+                .await?
+        );
+
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        assert!(!service.apply_feed_message(&raw_feed(13, 13, 12)).await?);
+
+        service.mark_stream_disconnected("stream ended", None).await;
+        service.mark_upstream_connected().await;
+        let fresh_result = service
+            .apply_feed_message(&raw_feed_for_protocols(
+                15,
+                15,
+                14,
+                &["uniswap_v2", "uniswap_v3"],
+            ))
+            .await;
+        assert!(
+            fresh_result.is_ok(),
+            "fresh replacement must realign after reconnect: {fresh_result:?}"
+        );
+        assert!(fresh_result?);
+        Ok(())
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "the test keeps reconnect, recovery, retained snapshot, and backoff assertions in one scenario"
@@ -3044,7 +3121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_shared_publisher_recovers_generation_and_discards_old_queue() -> Result<()> {
+    async fn expired_fence_without_recovery_recovers_generation() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
             publisher_config(),
@@ -3067,86 +3144,197 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
-        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
-            .await?;
-        let session = service
-            .create_snapshot_session(Duration::from_secs(300))
-            .await?
-            .ok_or_else(|| anyhow!("expected initial snapshot session"))?;
 
-        writer.fail_next_appends(100).await;
-        let failed_update = service
-            .cache
-            .apply_update(&native_only_update(11, "native-2"))
-            .await?;
-        assert!(publisher
-            .publish_accepted_payload(BroadcasterPayload::Update(failed_update))
-            .await
-            .is_err());
         writer.expire_active_writer().await;
-        service
-            .mark_stream_disconnected("shared_publisher_paused", None)
-            .await;
+        let Err(error) = service.broadcast_heartbeat().await else {
+            return Err(anyhow!("expired writer fence should reject the heartbeat"));
+        };
+        assert!(format!("{error:#}").contains("missing Redis broadcaster writer fence"));
+        let status = publisher.status_snapshot().await;
+        assert_eq!(status.mode, "unhealthy");
+        assert!(status
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing"));
+        service.mark_stream_disconnected("stream_error", None).await;
+        assert!(!publisher.feeds_are_paused());
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        publisher
-            .begin_recovery(&[BroadcasterBackend::Native], Arc::clone(&cancelled))
-            .await;
-        publisher
-            .publish_accepted_payload(BroadcasterPayload::Update(native_buffer_update(12)?))
-            .await?;
-        assert_eq!(publisher.pending_recovery_payload_stats().await.0, 1);
-
-        let pause_epoch = service.shared_publisher_pause_epoch();
-        let pause_task = tokio::spawn({
-            let publisher = Arc::clone(&publisher);
-            async move { publisher.pause_feeds_until_writer_verified().await }
-        });
-        service
-            .wait_for_shared_publisher_pause_after(pause_epoch)
-            .await;
         let boundary = BroadcasterServiceState::recover_shared_publisher_when_paused(
             std::slice::from_ref(&service),
             "active_writer_recovered",
         )
         .await?
-        .ok_or_else(|| anyhow!("paused unhealthy publisher should recover"))?;
-        timeout(Duration::from_secs(1), pause_task)
-            .await
-            .map_err(|_| anyhow!("feed pause did not observe the recovered writer"))?
-            .map_err(|error| anyhow!("feed pause task failed: {error}"))??;
+        .ok_or_else(|| anyhow!("missing fence should make writer recovery reachable"))?;
 
         assert_eq!(boundary.generation, 2);
-        assert_eq!(boundary.stream_id, "chain-1-stream-2");
-        assert_eq!(publisher.pending_recovery_payload_stats().await.0, 0);
-        assert!(!publisher.feeds_are_paused());
-        assert!(!service.has_current_snapshot_artifact().await);
         assert_eq!(
-            service.status_snapshot().await.snapshot.stream_id,
-            boundary.stream_id
+            publisher.mode().await,
+            super::BroadcasterRedisPublisherMode::Active
         );
-        service.cache.reset_same_generation().await;
-        service
-            .cache
-            .apply_update(&native_only_update(13, "native-3"))
-            .await?;
-        service.mark_upstream_connected().await;
-        service.upstream.record_update().await;
-        let status = service.status_snapshot().await;
-        assert_eq!(status.readiness, BroadcasterReadiness::SnapshotUnexportable);
-        assert!(!status.snapshot.exportable);
+        assert_eq!(publisher.pending_recovery_payload_stats().await.0, 0);
+        Ok(())
+    }
 
-        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
-            .await?;
-        let status = service.status_snapshot().await;
-        assert_eq!(status.readiness, BroadcasterReadiness::Ready);
-        assert!(status.snapshot.exportable);
-        assert!(matches!(
-            service
-                .snapshot_session_payload(session.session_id, 0)
-                .await,
-            Err(SnapshotSessionError::NotFound)
+    #[tokio::test]
+    async fn expired_fence_taken_by_newer_writer_is_not_displaced() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
         ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+
+        writer.expire_active_writer().await;
+        assert!(service.broadcast_heartbeat().await.is_err());
+        service.mark_stream_disconnected("stream_error", None).await;
+        let newer_publisher =
+            BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+        let newer_boundary = newer_publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "newer_writer_promoted",
+            )
+            .await?;
+
+        assert!(
+            BroadcasterServiceState::recover_shared_publisher_when_paused(
+                std::slice::from_ref(&service),
+                "active_writer_recovered",
+            )
+            .await?
+            .is_none()
+        );
+        assert_ne!(
+            publisher.mode().await,
+            super::BroadcasterRedisPublisherMode::Active
+        );
+        assert_eq!(newer_boundary.generation, 2);
+        assert_eq!(writer.active_generation().await, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_keeps_lease_renewed_by_heartbeats() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let (service, publisher) = ready_feed_service_with_writer(writer.clone()).await?;
+        writer.delay_recovery_commit(Duration::from_secs(1)).await;
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+        timeout(Duration::from_secs(1), async {
+            while !publisher.recovery_gate_is_open().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("recovery did not reserve the publisher gate"))?;
+
+        service.mark_stream_disconnected("stream_error", None).await;
+        assert!(publisher.recovery_gate_is_open().await);
+        assert_eq!(
+            service.recovery_publication.lock().await.phase,
+            super::RecoveryPublicationPhase::Idle
+        );
+        let renew_count = writer.renew_count().await;
+
+        service.broadcast_heartbeat().await?;
+        service.broadcast_heartbeat().await?;
+
+        assert_eq!(writer.renew_count().await, renew_count + 2);
+        assert_eq!(
+            publisher.pending_recovery_payload_stats().await,
+            (0, 0, None)
+        );
+        assert!(writer
+            .appends()
+            .await
+            .iter()
+            .all(|entry| entry.kind != BroadcasterMessageKind::Heartbeat));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_pause_reaches_writer_recovery() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let (service, publisher) = ready_feed_service_with_writer(writer.clone()).await?;
+        writer.delay_recovery_commit(Duration::from_secs(5)).await;
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+        let (work_id, cancelled) = timeout(Duration::from_secs(1), async {
+            loop {
+                let recovery = service.recovery_publication.lock().await;
+                if recovery.phase == super::RecoveryPublicationPhase::Publishing
+                    && recovery.publisher_recovery_id.is_some()
+                {
+                    return (recovery.work_id, Arc::clone(&recovery.cancelled));
+                }
+                drop(recovery);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("recovery did not reach publishing"))?;
+        writer.expire_active_writer().await;
+        cancelled.store(true, Ordering::Release);
+        let pause_epoch = service.shared_publisher_pause_epoch();
+        let failure_task = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .handle_external_recovery_failure(work_id, "planned Redis outage".to_string())
+                    .await
+            }
+        });
+        service
+            .wait_for_shared_publisher_pause_after(pause_epoch)
+            .await;
+        {
+            let recovery = service.recovery_publication.lock().await;
+            assert_eq!(recovery.phase, super::RecoveryPublicationPhase::Idle);
+            assert_eq!(recovery.last_outcome, Some("aborted"));
+        }
+
+        service.mark_stream_disconnected("stream_error", None).await;
+        let boundary = BroadcasterServiceState::recover_shared_publisher_when_paused(
+            std::slice::from_ref(&service),
+            "active_writer_recovered",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("paused publisher should recover the expired writer fence"))?;
+        assert_eq!(boundary.generation, 2);
+        timeout(Duration::from_secs(1), failure_task)
+            .await
+            .map_err(|_| anyhow!("recovery failure task did not observe the new writer"))?
+            .map_err(|error| anyhow!("recovery failure task failed: {error}"))?;
+        assert!(!publisher.feeds_are_paused());
         Ok(())
     }
 
@@ -3839,6 +4027,33 @@ mod tests {
         Ok(service)
     }
 
+    async fn ready_feed_service_with_writer(
+        writer: ServiceFakeRedisWriter,
+    ) -> Result<(BroadcasterServiceState, Arc<BroadcasterRedisPublisher>)> {
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        Ok((service, publisher))
+    }
+
     #[derive(Debug, Clone, Default)]
     struct ServiceFakeRedisWriter {
         inner: Arc<Mutex<ServiceFakeRedisWriterState>>,
@@ -3849,6 +4064,7 @@ mod tests {
         appends: Vec<BroadcasterRedisStreamEntry>,
         active_token: Option<String>,
         active_generation: u64,
+        renew_count: usize,
         fail_next_appends: usize,
         lose_recovery_commit_replies: bool,
         recovery_commit_delay: Option<Duration>,
@@ -3873,6 +4089,14 @@ mod tests {
 
         async fn expire_active_writer(&self) {
             self.inner.lock().await.active_token = None;
+        }
+
+        async fn renew_count(&self) -> usize {
+            self.inner.lock().await.renew_count
+        }
+
+        async fn active_generation(&self) -> u64 {
+            self.inner.lock().await.active_generation
         }
     }
 
@@ -3963,9 +4187,12 @@ mod tests {
             command: crate::broadcaster::redis_publisher::RedisRenewCommand<'a>,
         ) -> futures::future::BoxFuture<'a, Result<()>> {
             Box::pin(async move {
-                let guard = self.inner.lock().await;
+                let mut guard = self.inner.lock().await;
+                guard.renew_count = guard.renew_count.saturating_add(1);
                 if guard.active_token.is_none() {
-                    return Err(anyhow!("missing Redis broadcaster writer fence"));
+                    return Err(anyhow!(
+                        crate::broadcaster::redis_publisher::MISSING_FENCE_MESSAGE
+                    ));
                 }
                 if guard.active_token.as_deref() != Some(command.writer_token)
                     || guard.active_generation != command.generation
@@ -4159,6 +4386,27 @@ mod tests {
 
     fn raw_feed(number: u64, hash: u8, parent_hash: u8) -> FeedMessage<BlockHeader> {
         raw_feed_with_account_payload(number, hash, parent_hash, "test".to_string())
+    }
+
+    fn raw_feed_for_protocols(
+        number: u64,
+        hash: u8,
+        parent_hash: u8,
+        protocols: &[&str],
+    ) -> FeedMessage<BlockHeader> {
+        let feed = raw_feed(number, hash, parent_hash);
+        let message = feed.state_msgs["uniswap_v2"].clone();
+        let sync_state = feed.sync_states["uniswap_v2"].clone();
+        FeedMessage {
+            state_msgs: protocols
+                .iter()
+                .map(|protocol| ((*protocol).to_string(), message.clone()))
+                .collect(),
+            sync_states: protocols
+                .iter()
+                .map(|protocol| ((*protocol).to_string(), sync_state.clone()))
+                .collect(),
+        }
     }
 
     fn partial_raw_feed(number: u64, hash: u8, parent_hash: u8) -> FeedMessage<BlockHeader> {

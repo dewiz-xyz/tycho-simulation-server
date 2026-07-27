@@ -411,9 +411,10 @@ impl BroadcasterSnapshotCache {
 
     pub async fn begin_same_generation_recovery(&self) {
         let mut guard = self.inner.write().await;
-        if guard.replacement.is_some() {
-            return;
-        }
+        // Pending candidates chain from the previous connection; the reconnect
+        // stream re-delivers full snapshots, so stale candidates must not survive
+        // into the next alignment attempt.
+        let superseded_recovery_id = guard.replacement.take().map(|pending| pending.id);
         let id = guard.next_recovery_id;
         guard.next_recovery_id = guard.next_recovery_id.saturating_add(1);
         guard.replacement = Some(UpstreamReplacementState {
@@ -424,6 +425,7 @@ impl BroadcasterSnapshotCache {
         info!(
             event = "broadcaster_upstream_recovery_started",
             recovery_id = id,
+            superseded_recovery_id = ?superseded_recovery_id,
             reason = "stream_discontinuity",
             "Starting same-generation recovery after the upstream stream became invalid"
         );
@@ -4857,6 +4859,168 @@ mod tests {
                 .any(|message| message.message.header == block_12),
             _ => false,
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_mid_recovery_discards_stale_candidates_and_aligns_from_fresh_snapshot(
+    ) -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    (
+                        "uniswap_v2",
+                        raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                    ),
+                    (
+                        "uniswap_v3",
+                        raw_snapshot_message("uniswap_v3", block_10.clone(), 2),
+                    ),
+                ],
+                vec![
+                    ("uniswap_v2", block_10.clone()),
+                    ("uniswap_v3", block_10.clone()),
+                ],
+            ))
+            .await?;
+        cache.begin_same_generation_recovery().await;
+
+        let block_12 = linked_header(12, 12, 11);
+        let first_replacement = raw_feed(
+            vec![(
+                "uniswap_v2",
+                raw_snapshot_message("uniswap_v2", block_12.clone(), 9),
+            )],
+            vec![("uniswap_v2", block_12), ("uniswap_v3", block_10.clone())],
+        );
+        assert!(cache
+            .apply_feed_message(&first_replacement)
+            .await?
+            .is_none());
+        assert!(cache.replacement_pending().await);
+
+        cache.begin_same_generation_recovery().await;
+        let block_15 = linked_header(15, 15, 14);
+        let fresh_replacement = raw_feed(
+            vec![
+                (
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_15.clone(), 11),
+                ),
+                (
+                    "uniswap_v3",
+                    raw_snapshot_message("uniswap_v3", block_15.clone(), 12),
+                ),
+            ],
+            vec![
+                ("uniswap_v2", block_15.clone()),
+                ("uniswap_v3", block_15.clone()),
+            ],
+        );
+        let fresh_result = cache.apply_feed_message(&fresh_replacement).await;
+        assert!(
+            fresh_result.is_ok(),
+            "fresh Tycho replacement must align after reconnect: {fresh_result:?}"
+        );
+        assert!(fresh_result?.is_none());
+        assert!(!cache.replacement_pending().await);
+        let snapshot = cache.export_snapshot(8_388_608).await?;
+        assert!(snapshot.payloads.iter().any(|payload| match payload {
+            BroadcasterPayload::SnapshotChunk(chunk) => chunk
+                .partitions
+                .iter()
+                .flat_map(|partition| &partition.messages)
+                .any(|message| message.message.header == block_15),
+            _ => false,
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rearming_recovery_supersedes_pending_replacement_with_new_id() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                )],
+                vec![("uniswap_v2", block_10)],
+            ))
+            .await?;
+
+        cache.begin_same_generation_recovery().await;
+        let first_status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(first_status.snapshot.recovery_pending);
+        assert_eq!(first_status.snapshot.recovery_id, Some(1));
+
+        cache.begin_same_generation_recovery().await;
+        let second_status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(second_status.snapshot.recovery_pending);
+        assert_eq!(second_status.snapshot.recovery_id, Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_from_current_recovery_discards_seeded_candidates() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    (
+                        "uniswap_v2",
+                        raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                    ),
+                    (
+                        "uniswap_v3",
+                        raw_snapshot_message("uniswap_v3", block_10.clone(), 2),
+                    ),
+                ],
+                vec![("uniswap_v2", block_10.clone()), ("uniswap_v3", block_10)],
+            ))
+            .await?;
+        cache.begin_same_generation_recovery_from_current().await;
+        cache.begin_same_generation_recovery().await;
+
+        let block_15 = linked_header(15, 15, 14);
+        let fresh_replacement = raw_feed(
+            vec![
+                (
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_15.clone(), 11),
+                ),
+                (
+                    "uniswap_v3",
+                    raw_snapshot_message("uniswap_v3", block_15.clone(), 12),
+                ),
+            ],
+            vec![("uniswap_v2", block_15.clone()), ("uniswap_v3", block_15)],
+        );
+        let fresh_result = cache.apply_feed_message(&fresh_replacement).await;
+        assert!(
+            fresh_result.is_ok(),
+            "fresh Tycho replacement must discard seeded candidates: {fresh_result:?}"
+        );
+        assert!(fresh_result?.is_none());
+        assert!(!cache.replacement_pending().await);
         Ok(())
     }
 

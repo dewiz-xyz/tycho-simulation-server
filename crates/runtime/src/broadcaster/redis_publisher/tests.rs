@@ -1128,6 +1128,62 @@ async fn sibling_native_queue_cancels_recovery_at_sixty_four_blocks() -> Result<
 }
 
 #[tokio::test]
+async fn gate_open_heartbeats_are_not_queued() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    publisher
+        .begin_recovery(&[BroadcasterBackend::Native], cancelled)
+        .await;
+    let heartbeat = raw_cache
+        .heartbeat()
+        .await?
+        .ok_or_else(|| anyhow!("ready cache should produce a heartbeat"))?;
+
+    publisher.publish_accepted_payload(heartbeat).await?;
+
+    assert_eq!(
+        publisher.pending_recovery_payload_stats().await,
+        (0, 0, None)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_queue_rejects_overflow() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    publisher
+        .begin_recovery(&[BroadcasterBackend::Rfq], cancelled)
+        .await;
+    let update = BroadcasterUpdateMessage::from_tycho_update(
+        &update(BroadcasterBackend::Rfq, 10, "rfq-1"),
+        &HashMap::new(),
+    )?;
+
+    for _ in 0..super::MAX_PENDING_RECOVERY_PAYLOADS {
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(update.clone()))
+            .await?;
+    }
+    let Err(error) = publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+    else {
+        return Err(anyhow!("recovery queue overflow should be rejected"));
+    };
+
+    assert!(format!("{error:#}").contains("recovery payload queue is full"));
+    assert_eq!(
+        publisher.pending_recovery_payload_stats().await.0,
+        super::MAX_PENDING_RECOVERY_PAYLOADS
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn identical_recovery_duplicate_is_accepted_after_lost_append_reply() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
@@ -1551,6 +1607,147 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
 }
 
 #[tokio::test]
+async fn lost_append_that_landed_is_resynced_on_lease_renewal() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+    writer.stall_after_record_message_seq(2).await;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let Err(error) = publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+    else {
+        return Err(anyhow!("lost append reply should exhaust the retry window"));
+    };
+    assert!(format!("{error:#}").contains("retry window exhausted"));
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Unhealthy
+    );
+    assert_eq!(
+        writer
+            .appends()
+            .await
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    publisher.renew_lease().await?;
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Active
+    );
+    let heartbeat = raw_cache
+        .heartbeat()
+        .await?
+        .ok_or_else(|| anyhow!("ready cache should produce a heartbeat"))?;
+    publisher.publish_accepted_payload(heartbeat).await?;
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        publisher.status_snapshot().await.latest_entry_id.as_deref(),
+        Some("1-3")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_renewal_without_landed_tail_keeps_sequence() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    writer.delay_appends(Duration::from_millis(50)).await;
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let Err(error) = publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+    else {
+        return Err(anyhow!("stalled append should exhaust the retry window"));
+    };
+    assert!(format!("{error:#}").contains("retry window exhausted"));
+
+    writer.delay_appends(Duration::ZERO).await;
+    publisher.renew_lease().await?;
+    let heartbeat = raw_cache
+        .heartbeat()
+        .await?
+        .ok_or_else(|| anyhow!("ready cache should produce a heartbeat"))?;
+    publisher.publish_accepted_payload(heartbeat).await?;
+
+    assert_eq!(
+        writer
+            .appends()
+            .await
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tail_resync_failure_keeps_publisher_unhealthy() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+    writer.fail_next_appends(100).await;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    assert!(publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+        .is_err());
+    writer.fail_next_inspects(1).await;
+
+    let Err(error) = publisher.renew_lease().await else {
+        return Err(anyhow!("tail inspection failure should block reactivation"));
+    };
+    assert!(format!("{error:#}")
+        .contains("Redis stream tail resync failed before reactivating the publisher"));
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Unhealthy
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn publish_rejects_message_sequence_overflow() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
@@ -1732,6 +1929,8 @@ struct FakeRedisWriterState {
     conflict_next_append_replies: usize,
     append_delay: Option<Duration>,
     blocked_message_seq: Option<u64>,
+    stall_after_record_message_seq: Option<u64>,
+    fail_next_inspects: usize,
     append_attempt_count: usize,
 }
 
@@ -1766,6 +1965,14 @@ impl FakeRedisWriter {
 
     async fn block_message_seq(&self, message_seq: u64) {
         self.inner.lock().await.blocked_message_seq = Some(message_seq);
+    }
+
+    async fn stall_after_record_message_seq(&self, message_seq: u64) {
+        self.inner.lock().await.stall_after_record_message_seq = Some(message_seq);
+    }
+
+    async fn fail_next_inspects(&self, count: usize) {
+        self.inner.lock().await.fail_next_inspects = count;
     }
 
     async fn wait_for_blocked_append(&self) {
@@ -1901,6 +2108,13 @@ impl RedisStreamWriter for FakeRedisWriter {
             guard.appends.push(CapturedAppend {
                 entry: command.entry.clone(),
             });
+            if guard.stall_after_record_message_seq == Some(command.entry.message_seq) {
+                guard.stall_after_record_message_seq = None;
+                drop(guard);
+                self.append_started.notify_one();
+                futures::future::pending::<()>().await;
+                unreachable!("pending append future only exits when cancelled");
+            }
             if guard.lose_next_append_replies > 0 {
                 guard.lose_next_append_replies -= 1;
                 return Err(anyhow!("planned lost append reply"));
@@ -1929,6 +2143,42 @@ impl RedisStreamWriter for FakeRedisWriter {
                 return Err(anyhow!("planned Redis renew failure"));
             }
             Ok(())
+        })
+    }
+
+    fn inspect_writer<'a>(
+        &'a self,
+        command: super::RedisInspectCommand<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<super::RedisWriterInspection>> {
+        Box::pin(async move {
+            let mut guard = self.inner.lock().await;
+            if guard.active_token.is_none() {
+                return Err(anyhow!(super::MISSING_FENCE_MESSAGE));
+            }
+            if guard.active_token.as_deref() != Some(command.writer_token)
+                || guard.active_generation != command.generation
+            {
+                return Err(anyhow!("stale Redis broadcaster writer token"));
+            }
+            if guard.fail_next_inspects > 0 {
+                guard.fail_next_inspects -= 1;
+                return Err(anyhow!("planned Redis inspect failure"));
+            }
+            let first_entry_id = guard
+                .appends
+                .first()
+                .map(|append| redis_entry_id(&append.entry))
+                .transpose()?;
+            let last_entry_id = guard
+                .appends
+                .last()
+                .map(|append| redis_entry_id(&append.entry))
+                .transpose()?;
+            Ok(super::RedisWriterInspection {
+                generation: guard.active_generation,
+                first_entry_id,
+                last_entry_id,
+            })
         })
     }
 }
