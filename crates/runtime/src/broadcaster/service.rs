@@ -1679,20 +1679,20 @@ impl BroadcasterServiceState {
                 (chain_id, boundary, captured, recovery_work_ids)
             };
 
-            let export = tokio::task::spawn_blocking(move || {
+            let (artifact, largest_payload_bytes) = tokio::task::spawn_blocking(move || {
                 let exports = captured
                     .into_iter()
                     .map(|(cache, source, max_payload_bytes)| {
                         cache.export_snapshot_source(source, max_payload_bytes)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                combine_snapshot_exports(chain_id, exports)
+                let export = combine_snapshot_exports(chain_id, exports)?;
+                let (artifact, largest_payload_bytes) =
+                    build_snapshot_artifact(chain_id, export, boundary)?;
+                Ok::<_, anyhow::Error>((Arc::new(artifact), largest_payload_bytes))
             })
             .await
             .context("snapshot artifact worker failed")??;
-            let (artifact, largest_payload_bytes) =
-                build_snapshot_artifact(chain_id, export, boundary)?;
-            let artifact = Arc::new(artifact);
             install_snapshot_artifact_if_current(services, &artifact, &recovery_work_ids).await?;
             Ok(Some((artifact, largest_payload_bytes)))
         }
@@ -3965,7 +3965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_session_response_includes_redis_replay_boundary() -> Result<()> {
+    async fn snapshot_refresh_matches_direct_export_and_session_boundary() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let writer = ServiceFakeRedisWriter::default();
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
@@ -3980,7 +3980,7 @@ mod tests {
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
-            cache,
+            cache.clone(),
             BroadcasterUpstreamState::default(),
             publisher,
             Arc::new(Mutex::new(())),
@@ -3989,8 +3989,37 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
+        let expected_export = cache.export_snapshot(8_388_608).await?;
+        let expected_payloads = expected_export
+            .payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let message_seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+                BroadcasterEnvelope::new(expected_export.stream_id.clone(), message_seq, payload)
+            })
+            .collect::<Vec<_>>();
+        let expected_encoded_bytes = expected_payloads
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|encoded| encoded.len())
+            .sum::<usize>();
         BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
             .await?;
+
+        let artifact = service
+            .snapshot_artifact
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("expected refreshed broadcaster snapshot artifact"))?;
+        assert_eq!(
+            serde_json::to_vec(artifact.payloads.as_ref())?,
+            serde_json::to_vec(&expected_payloads)?
+        );
+        assert_eq!(artifact.encoded_bytes, expected_encoded_bytes);
 
         let session = service
             .create_snapshot_session(Duration::from_secs(300))
