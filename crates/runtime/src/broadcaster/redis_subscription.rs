@@ -15,9 +15,9 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRecoveryCatchUp,
-    BroadcasterRecoveryChunk, BroadcasterRecoveryCommit, BroadcasterRecoveryManifest,
-    BroadcasterRedisReplayBoundary,
+    complete_broadcaster_partition_block, BroadcasterBackend, BroadcasterEnvelope,
+    BroadcasterPayload, BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk,
+    BroadcasterRecoveryCommit, BroadcasterRecoveryManifest, BroadcasterRedisReplayBoundary,
 };
 
 use crate::broadcaster::redis_publisher::replay_entry_encoded_size;
@@ -144,18 +144,26 @@ impl BroadcasterSubscriptionControls {
         }
     }
 
-    fn recovery_copy(&self) -> Self {
+    async fn recovery_copy(&self) -> Self {
+        let tokens = self.tokens();
+        let token_snapshot = tokens.snapshot().await;
         match self {
             Self::Native(controls) => Self::Native(NativeBroadcasterSubscriptionControls {
                 broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
-                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                state_store: Arc::new(StateStore::new_private_with_snapshot(
+                    Arc::clone(&controls.tokens),
+                    token_snapshot,
+                )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
                 protocols: controls.protocols.clone(),
             }),
             Self::Vm(controls) => Self::Vm(VmBroadcasterSubscriptionControls {
                 broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
-                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                state_store: Arc::new(StateStore::new_private_with_snapshot(
+                    Arc::clone(&controls.tokens),
+                    token_snapshot,
+                )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
                 protocols: controls.protocols.clone(),
@@ -166,7 +174,10 @@ impl BroadcasterSubscriptionControls {
             }),
             Self::Rfq(controls) => Self::Rfq(RfqBroadcasterSubscriptionControls {
                 broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
-                state_store: Arc::new(StateStore::new_private(Arc::clone(&controls.tokens))),
+                state_store: Arc::new(StateStore::new_private_with_snapshot(
+                    Arc::clone(&controls.tokens),
+                    token_snapshot,
+                )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
                 protocols: controls.protocols.clone(),
@@ -919,6 +930,13 @@ async fn apply_recovery_message(
                     start.manifest.target_state_version,
                     prepared_processor.processor.controls.backend_label()
                 );
+                // Fence in-flight native readers before recovery closes subscription readiness.
+                prepared_processor
+                    .processor
+                    .controls
+                    .state_store()
+                    .fence_requests()
+                    .await;
                 prepared_processor
                     .processor
                     .controls
@@ -1111,6 +1129,8 @@ async fn commit_recovery(
     }
     let snapshot: Vec<BroadcasterEnvelope> = serde_json::from_str(&replacement_json)
         .map_err(|error| anyhow!("failed to decode recovery replacement snapshot: {error}"))?;
+    let complete_native_block =
+        committed_recovery_complete_native_block(&snapshot, &recovery.buffer_a);
 
     let boundary = BroadcasterRedisReplayBoundary::new(
         prepared.replay_boundary.stream_key.clone(),
@@ -1118,6 +1138,7 @@ async fn commit_recovery(
         prepared.replay_boundary.snapshot_id.clone(),
         prepared.replay_boundary.generation,
         commit_message_seq,
+        recovery.manifest.target_state_version,
     )?;
     let mut candidates = Vec::new();
     for (processor_index, prepared_processor) in prepared.processors.iter().enumerate() {
@@ -1125,7 +1146,10 @@ async fn commit_recovery(
         if !recovery.manifest.backends.contains(&backend) {
             continue;
         }
-        let mut candidate = prepared_processor.processor.recovery_copy(boundary.clone());
+        let mut candidate = prepared_processor
+            .processor
+            .recovery_copy(boundary.clone())
+            .await;
         for envelope in &snapshot {
             candidate.observe(envelope.clone()).await?;
         }
@@ -1144,10 +1168,11 @@ async fn commit_recovery(
             processor_index,
             candidate.controls.logical_backend(),
             candidate.controls.state_store().pin().await,
+            complete_native_block,
         ));
     }
 
-    for (processor_index, backend, candidate) in candidates {
+    for (processor_index, backend, candidate, complete_native_block) in candidates {
         let block_number = candidate.current_block();
         let live = prepared
             .processors
@@ -1158,18 +1183,30 @@ async fn commit_recovery(
             .state_store()
             .publish_candidate(candidate, recovery.manifest.target_state_version)
             .await?;
-        if backend == BroadcasterBackend::Rfq {
-            live.processor
-                .controls
-                .stream_health()
-                .record_update(block_number)
-                .await;
-        } else {
-            live.processor
-                .controls
-                .stream_health()
-                .record_progress(block_number)
-                .await;
+        match backend {
+            BroadcasterBackend::Rfq => {
+                live.processor
+                    .controls
+                    .stream_health()
+                    .record_update(block_number)
+                    .await;
+            }
+            BroadcasterBackend::Native => {
+                if let Some(complete_native_block) = complete_native_block {
+                    live.processor
+                        .controls
+                        .stream_health()
+                        .record_progress(complete_native_block)
+                        .await;
+                }
+            }
+            BroadcasterBackend::Vm => {
+                live.processor
+                    .controls
+                    .stream_health()
+                    .record_progress(block_number)
+                    .await;
+            }
         }
         live.processor
             .controls
@@ -1201,6 +1238,39 @@ async fn commit_recovery(
         }
     }
     Ok(())
+}
+
+fn committed_recovery_complete_native_block(
+    snapshot: &[BroadcasterEnvelope],
+    buffer_a: &BTreeMap<u32, BroadcasterRecoveryCatchUp>,
+) -> Option<u64> {
+    let replacement_blocks = snapshot
+        .iter()
+        .flat_map(|envelope| match &envelope.payload {
+            BroadcasterPayload::SnapshotChunk(chunk) => chunk
+                .partitions
+                .iter()
+                .filter_map(|partition| {
+                    (partition.backend == BroadcasterBackend::Native)
+                        .then(|| {
+                            complete_broadcaster_partition_block(
+                                partition.block_number,
+                                &partition.messages,
+                                &partition.sync_statuses,
+                            )
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        });
+    replacement_blocks
+        .chain(
+            buffer_a
+                .values()
+                .filter_map(|catch_up| catch_up.update.complete_native_block()),
+        )
+        .max()
 }
 
 fn recovery_digest(bytes: &[u8]) -> String {

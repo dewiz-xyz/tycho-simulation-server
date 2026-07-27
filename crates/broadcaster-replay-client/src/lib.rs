@@ -50,7 +50,11 @@ mod tests {
                 vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
             )?),
         );
-        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            ETHEREUM_CHAIN_ID,
+            &envelope,
+            envelope.message_seq,
+        )?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "1-2".to_string(),
@@ -69,7 +73,11 @@ mod tests {
     fn replay_checkpoint_rejects_wrong_chain_id_before_applying_update() -> Result<()> {
         let checkpoint = ReplayCheckpoint::new(replay_boundary(0)?, ETHEREUM_CHAIN_ID);
         let envelope = heartbeat_envelope("stream-1", 1, BASE_CHAIN_ID)?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope(BASE_CHAIN_ID, &envelope)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            BASE_CHAIN_ID,
+            &envelope,
+            envelope.message_seq,
+        )?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "1-1".to_string(),
@@ -95,7 +103,11 @@ mod tests {
                 "writer_promoted",
             )?),
         );
-        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            ETHEREUM_CHAIN_ID,
+            &envelope,
+            envelope.message_seq,
+        )?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "2-1".to_string(),
@@ -308,6 +320,7 @@ mod tests {
             "stream-1",
             "snapshot-1",
             1,
+            exclusive_message_seq,
             exclusive_message_seq,
         )?)
     }

@@ -95,10 +95,13 @@ impl BroadcasterSubscriptionProcessor {
         self.bootstrap_redis_replay_boundary = Some(boundary);
     }
 
-    pub(super) fn recovery_copy(&self, replay_boundary: BroadcasterRedisReplayBoundary) -> Self {
+    pub(super) async fn recovery_copy(
+        &self,
+        replay_boundary: BroadcasterRedisReplayBoundary,
+    ) -> Self {
         Self {
             expected_chain_id: self.expected_chain_id,
-            controls: self.controls.recovery_copy(),
+            controls: self.controls.recovery_copy().await,
             decoder: Arc::clone(&self.decoder),
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
@@ -125,6 +128,14 @@ impl BroadcasterSubscriptionProcessor {
     }
 
     pub(super) async fn observe(&mut self, envelope: BroadcasterEnvelope) -> Result<()> {
+        self.observe_with_state_version(envelope, None).await
+    }
+
+    async fn observe_with_state_version(
+        &mut self,
+        envelope: BroadcasterEnvelope,
+        state_version: Option<u64>,
+    ) -> Result<()> {
         if let BroadcasterPayload::SnapshotStart(start) = &envelope.payload {
             self.ensure_snapshot_chain_id(start.chain_id)?;
             self.ensure_snapshot_includes_backend(start)?;
@@ -160,17 +171,17 @@ impl BroadcasterSubscriptionProcessor {
                         anyhow!("HTTP snapshot completed without Redis replay boundary")
                     })?;
                 self.controls
+                    .state_store()
+                    .align_bootstrap_state_version(boundary.state_version)
+                    .await;
+                self.controls
                     .broadcaster_subscription()
                     .mark_bootstrap_complete_with_redis_boundary(boundary)
                     .await;
                 self.finish_rebuild().await;
             }
             BroadcasterPayload::Update(update) => {
-                for partition in update.partitions {
-                    if partition.backend == self.controls.backend() {
-                        self.apply_live_update_partition(partition).await?;
-                    }
-                }
+                self.apply_live_update(update, state_version).await?;
             }
             BroadcasterPayload::Heartbeat(heartbeat) => {
                 for head in heartbeat.backend_heads {
@@ -199,7 +210,8 @@ impl BroadcasterSubscriptionProcessor {
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
         if redis_entry_scope_contains(entry, self.controls.backend()) {
-            self.observe(envelope.clone()).await?;
+            self.observe_with_state_version(envelope.clone(), Some(entry.state_version))
+                .await?;
             self.controls
                 .broadcaster_subscription()
                 .record_publisher_to_consumer_delay(entry.published_at_ms)
@@ -216,12 +228,7 @@ impl BroadcasterSubscriptionProcessor {
         &self,
         update: BroadcasterUpdateMessage,
     ) -> Result<()> {
-        for partition in update.partitions {
-            if partition.backend == self.controls.backend() {
-                self.apply_live_update_partition(partition).await?;
-            }
-        }
-        Ok(())
+        self.apply_live_update(update, None).await
     }
 
     fn ensure_snapshot_includes_backend(&self, start: &BroadcasterSnapshotStart) -> Result<()> {
@@ -297,46 +304,86 @@ impl BroadcasterSubscriptionProcessor {
         self.apply_protocol_messages(messages).await
     }
 
-    async fn apply_live_update_partition(
+    async fn apply_live_update(
         &self,
-        partition: BroadcasterUpdatePartition,
+        update: BroadcasterUpdateMessage,
+        state_version: Option<u64>,
     ) -> Result<()> {
-        let block_number = partition.block_number;
         let _shared_db_guard = match &self.controls {
             BroadcasterSubscriptionControls::Vm(controls) if !controls.recovery_guard_held => {
                 Some(controls.simulation_rebuild_gate.write().await)
             }
             _ => None,
         };
-        if !partition.messages.is_empty() {
-            self.ensure_raw_messages_supported()?;
-            self.apply_protocol_messages(partition.messages).await?;
-            if self.controls.backend() == BroadcasterBackend::Rfq {
+
+        let mut combined: Option<Update> = None;
+        let mut block_number: Option<u64> = None;
+        let mut complete_native_block: Option<u64> = None;
+        for partition in update
+            .partitions
+            .into_iter()
+            .filter(|partition| partition.backend == self.controls.backend())
+        {
+            if let Some(complete_block) = partition.complete_native_block() {
+                complete_native_block = Some(
+                    complete_native_block
+                        .unwrap_or_default()
+                        .max(complete_block),
+                );
+            }
+            block_number = Some(block_number.unwrap_or_default().max(partition.block_number));
+            let decoded = if partition.messages.is_empty() {
+                Some(live_partition_update(partition))
+            } else {
+                self.ensure_raw_messages_supported()?;
+                self.decode_protocol_messages(partition.messages).await?
+            };
+            if let Some(decoded) = decoded {
+                combined = Some(match combined {
+                    Some(current) => current.merge(decoded),
+                    None => decoded,
+                });
+            }
+        }
+
+        let Some(block_number) = block_number else {
+            return Ok(());
+        };
+        if let Some(mut combined) = combined {
+            combined.block_number_or_timestamp = block_number;
+            match state_version {
+                Some(state_version) => {
+                    self.controls
+                        .state_store()
+                        .apply_update_at_version(combined, state_version)
+                        .await?;
+                }
+                None => {
+                    self.controls.state_store().apply_update(combined).await;
+                }
+            }
+        }
+        match self.controls.backend() {
+            BroadcasterBackend::Rfq => {
                 self.controls
                     .stream_health()
                     .record_update(block_number)
                     .await;
-            } else {
+            }
+            BroadcasterBackend::Native => {
+                if let Some(complete_block) = complete_native_block {
+                    self.controls
+                        .stream_health()
+                        .record_progress(complete_block)
+                        .await;
+                }
+            }
+            BroadcasterBackend::Vm => {
                 self.controls
                     .stream_health()
                     .record_progress(block_number)
                     .await;
             }
-            return Ok(());
-        }
-
-        let update = live_partition_update(partition);
-        self.controls.state_store().apply_update(update).await;
-        if self.controls.backend() == BroadcasterBackend::Rfq {
-            self.controls
-                .stream_health()
-                .record_update(block_number)
-                .await;
-        } else {
-            self.controls
-                .stream_health()
-                .record_progress(block_number)
-                .await;
         }
         Ok(())
     }
@@ -345,31 +392,39 @@ impl BroadcasterSubscriptionProcessor {
         &self,
         messages: Vec<BroadcasterProtocolMessage>,
     ) -> Result<()> {
-        for message in messages {
-            if !self.controls.protocols().contains(&message.protocol) {
-                continue;
-            }
-            self.apply_protocol_message(message).await?;
+        if let Some(update) = self.decode_protocol_messages(messages).await? {
+            self.controls.state_store().apply_update(update).await;
         }
         Ok(())
     }
 
-    async fn apply_protocol_message(&self, raw: BroadcasterProtocolMessage) -> Result<()> {
-        let mut state_msgs = HashMap::new();
-        state_msgs.insert(raw.protocol.clone(), raw.message);
-        let mut sync_states = HashMap::new();
-        sync_states.insert(raw.protocol, raw.sync_state);
-        let feed = FeedMessage {
-            state_msgs,
-            sync_states,
-        };
-        let update = self
-            .decoder
-            .decode(&feed)
-            .await
-            .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))?;
-        self.controls.state_store().apply_update(update).await;
-        Ok(())
+    async fn decode_protocol_messages(
+        &self,
+        messages: Vec<BroadcasterProtocolMessage>,
+    ) -> Result<Option<Update>> {
+        let mut combined: Option<Update> = None;
+        for raw in messages {
+            if !self.controls.protocols().contains(&raw.protocol) {
+                continue;
+            }
+            let mut state_msgs = HashMap::new();
+            state_msgs.insert(raw.protocol.clone(), raw.message);
+            let mut sync_states = HashMap::new();
+            sync_states.insert(raw.protocol, raw.sync_state);
+            let feed = FeedMessage {
+                state_msgs,
+                sync_states,
+            };
+            let update =
+                self.decoder.decode(&feed).await.map_err(|error| {
+                    anyhow!("failed to decode broadcaster raw payload: {error}")
+                })?;
+            combined = Some(match combined {
+                Some(current) => current.merge(update),
+                None => update,
+            });
+        }
+        Ok(combined)
     }
 
     fn apply_heartbeat(&self, _head: BroadcasterBackendHead) {}
@@ -392,6 +447,7 @@ pub(super) fn default_test_redis_replay_boundary() -> BroadcasterRedisReplayBoun
         "snapshot-1".to_string(),
         1,
         0,
+        0,
     ) {
         Ok(boundary) => boundary,
         Err(error) => unreachable!("test Redis replay boundary should be valid: {error}"),
@@ -403,6 +459,8 @@ pub(super) async fn handle_subscription_reset(
     last_error: Option<String>,
     rebuild: Option<SubscriptionRebuildState>,
 ) -> Option<SubscriptionRebuildState> {
+    // Advance the request fence before exposing the disconnected subscription state.
+    controls.state_store().fence_requests().await;
     controls
         .broadcaster_subscription()
         .mark_disconnected(last_error.clone())
