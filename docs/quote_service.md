@@ -169,6 +169,7 @@ Practical client rule:
 Important failure kinds include:
 
 - `warm_up`
+- `stale_native_state`
 - `token_validation`
 - `token_coverage`
 - `timeout`
@@ -178,6 +179,11 @@ Important failure kinds include:
 - `inconsistent_result`
 - `internal`
 - `invalid_request`
+
+Native pool rows computed against a superseded native version are dropped and reported through
+`stale_native_state`. A natively-routed request that consistently runs longer than one native
+update interval will always be fenced, so operators must keep the request timeout below that
+interval. VM/RFQ-only requests are never fenced.
 
 `meta.pool_results` is the per-pool anomaly layer.
 
