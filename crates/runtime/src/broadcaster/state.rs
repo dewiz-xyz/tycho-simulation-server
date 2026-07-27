@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use tokio::sync::RwLock;
@@ -21,14 +22,17 @@ use tycho_simulation::{
 };
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterHeartbeat, BroadcasterPayload,
-    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterRedisStreamEntry,
-    BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-    BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
-    BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    complete_broadcaster_partition_block, BroadcasterBackend, BroadcasterBackendHead,
+    BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
+    BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
+    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
+    BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
-use super::redis_publisher::BroadcasterRedisPublisherStatus;
+use super::redis_publisher::{
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterDeploymentPhase,
+    BroadcasterRedisPublisherStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcasterReadiness {
@@ -40,12 +44,14 @@ pub enum BroadcasterReadiness {
     UpstreamRecovering,
     SnapshotUnexportable,
     UpstreamDisconnected,
+    NativeProgressStale,
 }
 
 impl BroadcasterReadiness {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
+            Self::NativeProgressStale => "native_progress_stale",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
             Self::UpstreamRecovering | Self::SnapshotUnexportable => "degraded",
             Self::RedisPublisherPassive => "redis_publisher_passive",
@@ -61,10 +67,47 @@ pub struct BroadcasterStatusSnapshot {
     pub readiness: BroadcasterReadiness,
     pub chain_id: u64,
     pub upstream: BroadcasterUpstreamSnapshot,
+    pub recovery: BroadcasterRecoveryStatus,
     pub snapshot: BroadcasterSnapshotStatus,
     pub snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    pub deployment_admission: BroadcasterDeploymentAdmissionSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct BroadcasterRecoveryStatus {
+    pub active: bool,
+    pub phase: &'static str,
+    pub age_ms: Option<u64>,
+    pub attempt: u8,
+    pub buffer_a_count: usize,
+    pub buffer_b_count: usize,
+    pub oldest_buffered_age_ms: Option<u64>,
+    pub last_outcome: Option<&'static str>,
+    pub last_duration_ms: Option<u64>,
+    pub last_encoded_bytes: Option<usize>,
+    pub last_chunk_count: Option<usize>,
+    pub last_error: Option<String>,
+}
+
+impl Default for BroadcasterRecoveryStatus {
+    fn default() -> Self {
+        Self {
+            active: false,
+            phase: "idle",
+            age_ms: None,
+            attempt: 0,
+            buffer_a_count: 0,
+            buffer_b_count: 0,
+            oldest_buffered_age_ms: None,
+            last_outcome: None,
+            last_duration_ms: None,
+            last_encoded_bytes: None,
+            last_chunk_count: None,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,26 +161,49 @@ pub struct BroadcasterSnapshotExport {
     pub payloads: Vec<BroadcasterPayload>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub(crate) struct BroadcasterSnapshotSource {
+    stream_id: String,
+    snapshot_id: String,
+    partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct BroadcasterStagedUpdate {
     message: Option<BroadcasterUpdateMessage>,
     apply_mode: BroadcasterStagedUpdateApplyMode,
-    recovery_commit: bool,
-    recovery_fallback: Option<RawRecoveryFallback>,
-    recovery_stats: Option<RawRecoveryCommitStats>,
+    replacement_ready: bool,
+    recovery_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RawRecoveryCommitStats {
-    pub(crate) id: u64,
-    pub(crate) elapsed_ms: u64,
-    pub(crate) serialized_bytes: usize,
+#[derive(Debug, Clone)]
+pub(crate) struct BroadcasterRecoverySource {
+    recovery_id: u64,
+    partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
 }
 
-#[derive(Debug)]
-struct RawRecoveryFallback {
-    active_partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    pending: RawRecoveryState,
+impl BroadcasterRecoverySource {
+    pub(crate) fn complete_native_block(&self) -> Option<u64> {
+        let partition = self.partitions.get(&BroadcasterBackend::Native)?;
+        complete_broadcaster_partition_block(
+            partition.block_number?,
+            &partition.messages,
+            &partition.sync_statuses,
+        )
+    }
+}
+
+impl BroadcasterSnapshotSource {
+    pub(crate) fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
+        self.partitions
+            .iter()
+            .filter_map(|(backend, partition)| {
+                partition
+                    .block_number
+                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
+            })
+            .collect()
+    }
 }
 
 impl BroadcasterStagedUpdate {
@@ -146,36 +212,28 @@ impl BroadcasterStagedUpdate {
     }
 
     pub(crate) const fn publishes_update(&self) -> bool {
-        self.message.is_some()
+        self.message.is_some() || self.replacement_ready
     }
 
-    pub(crate) const fn is_recovery_commit(&self) -> bool {
-        self.recovery_commit
+    pub(crate) const fn has_replacement_ready(&self) -> bool {
+        self.replacement_ready
     }
 
-    pub(crate) const fn recovery_stats(&self) -> Option<RawRecoveryCommitStats> {
-        self.recovery_stats
+    pub(crate) const fn recovery_id(&self) -> Option<u64> {
+        self.recovery_id
     }
 
-    pub(crate) fn defer_oversized_recovery(&mut self, error: String) {
-        let Some(fallback) = self.recovery_fallback.take() else {
-            return;
-        };
-        let BroadcasterStagedUpdateApplyMode::RawRecovery {
-            partitions,
-            recovery,
-            ..
-        } = &mut self.apply_mode
-        else {
-            return;
-        };
-        *partitions = fallback.active_partitions;
-        let mut pending = fallback.pending;
-        pending.last_error = Some(error);
-        *recovery = Some(pending);
-        self.message = None;
-        self.recovery_commit = false;
-        self.recovery_stats = None;
+    fn recovery_partitions(
+        &self,
+    ) -> Option<&BTreeMap<BroadcasterBackend, BroadcasterPartitionState>> {
+        match &self.apply_mode {
+            BroadcasterStagedUpdateApplyMode::Replacement {
+                partitions,
+                pending: None,
+                ..
+            } if self.replacement_ready => Some(partitions),
+            _ => None,
+        }
     }
 }
 
@@ -186,10 +244,10 @@ enum BroadcasterStagedUpdateApplyMode {
         expected_protocols: BTreeSet<String>,
         next_recovery_id: u64,
     },
-    RawRecovery {
+    Replacement {
         partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
         expected_protocols: BTreeSet<String>,
-        recovery: Option<RawRecoveryState>,
+        pending: Option<UpstreamReplacementState>,
         next_recovery_id: u64,
     },
 }
@@ -206,6 +264,7 @@ struct BroadcasterUpstreamStateData {
     last_error: Option<String>,
     last_disconnect_reason: Option<String>,
     last_update_at: Option<Instant>,
+    last_native_block: Option<u64>,
 }
 
 impl BroadcasterUpstreamState {
@@ -219,6 +278,25 @@ impl BroadcasterUpstreamState {
         let mut guard = self.inner.write().await;
         guard.connected = true;
         guard.last_update_at = Some(Instant::now());
+    }
+
+    pub async fn record_native_progress(&self, block_number: u64) -> bool {
+        let mut guard = self.inner.write().await;
+        if guard
+            .last_native_block
+            .is_some_and(|last_block| block_number <= last_block)
+        {
+            return false;
+        }
+        guard.connected = true;
+        guard.last_native_block = Some(block_number);
+        guard.last_update_at = Some(Instant::now());
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn last_native_block(&self) -> Option<u64> {
+        self.inner.read().await.last_native_block
     }
 
     pub async fn mark_disconnected(&self, reason: impl Into<String>, last_error: Option<String>) {
@@ -268,16 +346,15 @@ struct BroadcasterSnapshotCacheData {
     partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     known_backends: HashMap<String, BroadcasterBackend>,
     expected_protocols: BTreeSet<String>,
-    recovery: Option<RawRecoveryState>,
+    replacement: Option<UpstreamReplacementState>,
     next_recovery_id: u64,
 }
 
 #[derive(Debug, Clone)]
-struct RawRecoveryState {
+struct UpstreamReplacementState {
     id: u64,
     started_at: Instant,
     candidates: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -312,7 +389,7 @@ impl BroadcasterSnapshotCache {
                 partitions: BTreeMap::new(),
                 known_backends: HashMap::new(),
                 expected_protocols: BTreeSet::new(),
-                recovery: None,
+                replacement: None,
                 next_recovery_id: 1,
             })),
         }
@@ -324,12 +401,66 @@ impl BroadcasterSnapshotCache {
         guard.partitions.clear();
         guard.known_backends.clear();
         guard.expected_protocols.clear();
-        guard.recovery = None;
+        guard.replacement = None;
     }
 
     pub async fn relabel_generation(&self, generation: u64) {
         let mut guard = self.inner.write().await;
         Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
+    }
+
+    pub async fn begin_same_generation_recovery(&self) {
+        let mut guard = self.inner.write().await;
+        // Pending candidates chain from the previous connection; the reconnect
+        // stream re-delivers full snapshots, so stale candidates must not survive
+        // into the next alignment attempt.
+        let superseded_recovery_id = guard.replacement.take().map(|pending| pending.id);
+        let id = guard.next_recovery_id;
+        guard.next_recovery_id = guard.next_recovery_id.saturating_add(1);
+        guard.replacement = Some(UpstreamReplacementState {
+            id,
+            started_at: Instant::now(),
+            candidates: BTreeMap::new(),
+        });
+        info!(
+            event = "broadcaster_upstream_recovery_started",
+            recovery_id = id,
+            superseded_recovery_id = ?superseded_recovery_id,
+            reason = "stream_discontinuity",
+            "Starting same-generation recovery after the upstream stream became invalid"
+        );
+    }
+
+    pub async fn begin_same_generation_recovery_from_current(&self) {
+        let mut guard = self.inner.write().await;
+        if guard.replacement.is_some() {
+            return;
+        }
+        let id = guard.next_recovery_id;
+        guard.next_recovery_id = guard.next_recovery_id.saturating_add(1);
+        guard.replacement = Some(UpstreamReplacementState {
+            id,
+            started_at: Instant::now(),
+            candidates: guard.partitions.clone(),
+        });
+        info!(
+            event = "broadcaster_upstream_recovery_started",
+            recovery_id = id,
+            reason = "oversized_live_update",
+            "Starting same-generation recovery from the current authoritative state"
+        );
+    }
+
+    pub async fn reset_same_generation(&self) {
+        let mut guard = self.inner.write().await;
+        guard.partitions.clear();
+        guard.known_backends.clear();
+        guard.expected_protocols.clear();
+        guard.replacement = None;
+    }
+
+    pub(crate) async fn replacement_pending(&self) -> bool {
+        self.inner.read().await.replacement.is_some()
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<BroadcasterUpdateMessage> {
@@ -338,7 +469,7 @@ impl BroadcasterSnapshotCache {
             .message
             .clone()
             .ok_or_else(|| anyhow!("decoded staged update is missing its Redis payload"))?;
-        self.commit_staged_update(staged).await;
+        self.commit_staged_update(staged).await?;
         Ok(message)
     }
 
@@ -348,7 +479,7 @@ impl BroadcasterSnapshotCache {
     ) -> Result<Option<BroadcasterUpdateMessage>> {
         let staged = self.stage_feed_message(feed).await?;
         let message = staged.message.clone();
-        self.commit_staged_update(staged).await;
+        self.commit_staged_update(staged).await?;
         Ok(message)
     }
 
@@ -363,16 +494,11 @@ impl BroadcasterSnapshotCache {
         Ok(BroadcasterStagedUpdate {
             message: Some(message),
             apply_mode: BroadcasterStagedUpdateApplyMode::Decoded,
-            recovery_commit: false,
-            recovery_fallback: None,
-            recovery_stats: None,
+            replacement_ready: false,
+            recovery_id: None,
         })
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "gap staging keeps the wait, defer, and commit decisions together"
-    )]
     pub(crate) async fn stage_feed_message(
         &self,
         feed: &FeedMessage<BlockHeader>,
@@ -383,81 +509,35 @@ impl BroadcasterSnapshotCache {
         let mut expected_protocols = guard.expected_protocols.clone();
         expected_protocols.extend(feed.sync_states.keys().cloned());
         let has_gap = raw_message_has_header_gap(&guard.partitions, &message);
-        let mut recovery = guard.recovery.clone();
-        let mut next_recovery_id = guard.next_recovery_id;
+        let replacement = guard.replacement.clone();
+        let next_recovery_id = guard.next_recovery_id;
 
-        if recovery.is_none() && has_gap {
-            let id = next_recovery_id;
-            next_recovery_id = next_recovery_id.saturating_add(1);
-            recovery = Some(RawRecoveryState {
-                id,
-                started_at: Instant::now(),
-                candidates: guard.partitions.clone(),
-                last_error: None,
-            });
-            info!(
-                event = "broadcaster_upstream_recovery_started",
-                recovery_id = id,
-                expected_protocols = ?expected_protocols,
-                "Tycho header gap detected; staging aligned replacement state"
-            );
+        if replacement.is_none() && has_gap {
+            return Err(anyhow!(
+                "Tycho header gap requires reconnect and a fresh authoritative replacement"
+            ));
         }
 
-        if let Some(mut pending) = recovery {
-            apply_raw_recovery_message(&mut pending.candidates, &message, feed)?;
-            if raw_recovery_is_aligned(&pending.candidates, &expected_protocols) {
-                if let Err(error) =
-                    validate_recovery_lifecycle_diff(&guard.partitions, &pending.candidates)
-                {
-                    warn!(
-                        event = "broadcaster_upstream_recovery_failed",
-                        recovery_id = pending.id,
-                        error = %error,
-                        "Aligned Tycho replacement cannot be applied without rebuilding consumers"
-                    );
-                    pending.last_error = Some(error.to_string());
-                    return Ok(BroadcasterStagedUpdate {
-                        message: None,
-                        apply_mode: BroadcasterStagedUpdateApplyMode::RawRecovery {
-                            partitions: guard.partitions.clone(),
-                            expected_protocols,
-                            recovery: Some(pending),
-                            next_recovery_id,
-                        },
-                        recovery_commit: false,
-                        recovery_fallback: None,
-                        recovery_stats: None,
-                    });
-                }
-                let compact = diff_raw_partitions(&guard.partitions, &pending.candidates)?;
+        if let Some(mut pending) = replacement {
+            apply_replacement_feed_message(&mut pending.candidates, &message, feed)?;
+            if replacement_is_aligned(&pending.candidates, &expected_protocols) {
                 let elapsed_ms = pending.started_at.elapsed().as_millis() as u64;
-                let serialized_bytes = serde_json::to_vec(&compact)?.len();
                 info!(
                     event = "broadcaster_upstream_recovery_aligned",
                     recovery_id = pending.id,
                     elapsed_ms,
-                    serialized_bytes,
-                    "Aligned Tycho replacement state is ready to publish"
+                    "Fresh authoritative Tycho replacement is ready to publish"
                 );
-                let fallback = RawRecoveryFallback {
-                    active_partitions: guard.partitions.clone(),
-                    pending: pending.clone(),
-                };
                 return Ok(BroadcasterStagedUpdate {
-                    message: Some(compact),
-                    apply_mode: BroadcasterStagedUpdateApplyMode::RawRecovery {
+                    message: None,
+                    apply_mode: BroadcasterStagedUpdateApplyMode::Replacement {
                         partitions: pending.candidates,
                         expected_protocols,
-                        recovery: None,
+                        pending: None,
                         next_recovery_id,
                     },
-                    recovery_commit: true,
-                    recovery_fallback: Some(fallback),
-                    recovery_stats: Some(RawRecoveryCommitStats {
-                        id: pending.id,
-                        elapsed_ms,
-                        serialized_bytes,
-                    }),
+                    replacement_ready: true,
+                    recovery_id: Some(pending.id),
                 });
             } else {
                 info!(
@@ -468,15 +548,14 @@ impl BroadcasterSnapshotCache {
                 );
                 return Ok(BroadcasterStagedUpdate {
                     message: None,
-                    apply_mode: BroadcasterStagedUpdateApplyMode::RawRecovery {
+                    apply_mode: BroadcasterStagedUpdateApplyMode::Replacement {
                         partitions: guard.partitions.clone(),
                         expected_protocols,
-                        recovery: Some(pending),
+                        pending: Some(pending),
                         next_recovery_id,
                     },
-                    recovery_commit: false,
-                    recovery_fallback: None,
-                    recovery_stats: None,
+                    replacement_ready: false,
+                    recovery_id: None,
                 });
             }
         }
@@ -488,13 +567,12 @@ impl BroadcasterSnapshotCache {
                 expected_protocols,
                 next_recovery_id,
             },
-            recovery_commit: false,
-            recovery_fallback: None,
-            recovery_stats: None,
+            replacement_ready: false,
+            recovery_id: None,
         })
     }
 
-    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) {
+    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
         let mut guard = self.inner.write().await;
         match staged.apply_mode {
             BroadcasterStagedUpdateApplyMode::Decoded => {
@@ -507,23 +585,24 @@ impl BroadcasterSnapshotCache {
                 next_recovery_id,
             } => {
                 if let Some(message) = staged.message.as_ref() {
-                    apply_raw_update_message(&mut guard.partitions, message);
+                    apply_raw_update_message(&mut guard.partitions, message)?;
                 }
                 guard.expected_protocols = expected_protocols;
                 guard.next_recovery_id = next_recovery_id;
             }
-            BroadcasterStagedUpdateApplyMode::RawRecovery {
+            BroadcasterStagedUpdateApplyMode::Replacement {
                 partitions,
                 expected_protocols,
-                recovery,
+                pending,
                 next_recovery_id,
             } => {
                 guard.partitions = partitions;
                 guard.expected_protocols = expected_protocols;
-                guard.recovery = recovery;
+                guard.replacement = pending;
                 guard.next_recovery_id = next_recovery_id;
             }
         }
+        Ok(())
     }
 
     pub async fn export_snapshot(
@@ -531,13 +610,37 @@ impl BroadcasterSnapshotCache {
         max_payload_bytes: usize,
     ) -> Result<BroadcasterSnapshotExport> {
         let guard = self.inner.read().await;
-        let snapshot_id = guard.snapshot_id.clone();
-        let stream_id = guard.stream_id.clone();
+        let source = BroadcasterSnapshotSource {
+            stream_id: guard.stream_id.clone(),
+            snapshot_id: guard.snapshot_id.clone(),
+            partitions: guard.partitions.clone(),
+        };
+        drop(guard);
+        self.export_snapshot_source(source, max_payload_bytes)
+    }
+
+    pub(crate) async fn pin_snapshot_source(&self) -> Option<BroadcasterSnapshotSource> {
+        let guard = self.inner.read().await;
+        self.is_ready_locked(&guard)
+            .then(|| BroadcasterSnapshotSource {
+                stream_id: guard.stream_id.clone(),
+                snapshot_id: guard.snapshot_id.clone(),
+                partitions: guard.partitions.clone(),
+            })
+    }
+
+    pub(crate) fn export_snapshot_source(
+        &self,
+        source: BroadcasterSnapshotSource,
+        max_payload_bytes: usize,
+    ) -> Result<BroadcasterSnapshotExport> {
+        let snapshot_id = source.snapshot_id;
+        let stream_id = source.stream_id;
         let chunks = build_snapshot_chunks(
             &stream_id,
             &snapshot_id,
             &self.configured_backends,
-            &guard.partitions,
+            &source.partitions,
             max_payload_bytes,
         )?;
         let total_chunks = chunks.len() as u32;
@@ -554,7 +657,7 @@ impl BroadcasterSnapshotCache {
         payloads.extend(chunks.into_iter().map(BroadcasterPayload::SnapshotChunk));
 
         payloads.push(BroadcasterPayload::SnapshotEnd(
-            BroadcasterSnapshotEnd::new(snapshot_id),
+            BroadcasterSnapshotEnd::new(snapshot_id.clone()),
         ));
         for (index, payload) in payloads.iter().enumerate() {
             ensure_payload_fits(&stream_id, index as u64 + 1, payload, max_payload_bytes)
@@ -563,25 +666,81 @@ impl BroadcasterSnapshotCache {
 
         Ok(BroadcasterSnapshotExport {
             stream_id,
-            snapshot_id: guard.snapshot_id.clone(),
+            snapshot_id,
             max_payload_bytes,
             payloads,
         })
     }
 
-    pub(crate) async fn redis_payload_json_size(
+    pub(crate) fn recovery_source(
         &self,
-        payload: BroadcasterPayload,
-    ) -> Result<usize> {
-        let guard = self.inner.read().await;
-        // u64::MAX reserves the largest sequence metadata the active generation can add.
-        let envelope = simulator_core::broadcaster::BroadcasterEnvelope::new(
-            guard.stream_id.clone(),
-            u64::MAX,
-            payload,
-        );
-        let entry = BroadcasterRedisStreamEntry::from_envelope(self.chain_id, &envelope)?;
-        Ok(entry.payload_json.len())
+        staged: &BroadcasterStagedUpdate,
+    ) -> Result<BroadcasterRecoverySource> {
+        let partitions = staged
+            .recovery_partitions()
+            .ok_or_else(|| anyhow!("staged update does not contain a ready replacement"))?;
+        let recovery_id = staged
+            .recovery_id()
+            .ok_or_else(|| anyhow!("ready replacement is missing its recovery identity"))?;
+        Ok(BroadcasterRecoverySource {
+            recovery_id,
+            partitions: partitions.clone(),
+        })
+    }
+
+    pub(crate) async fn pin_recovery_source(&self, recovery_id: u64) -> BroadcasterRecoverySource {
+        BroadcasterRecoverySource {
+            recovery_id,
+            partitions: self.inner.read().await.partitions.clone(),
+        }
+    }
+
+    pub(crate) fn serialize_recovery_source(
+        &self,
+        source: BroadcasterRecoverySource,
+        max_payload_bytes: usize,
+    ) -> Result<String> {
+        let BroadcasterRecoverySource {
+            recovery_id,
+            partitions,
+        } = source;
+        let stream_id = format!("chain-{}-recovery-{recovery_id}", self.chain_id);
+        let snapshot_id = format!("chain-{}-recovery-snapshot-{recovery_id}", self.chain_id);
+        let chunks = build_snapshot_chunks(
+            &stream_id,
+            &snapshot_id,
+            &self.configured_backends,
+            &partitions,
+            max_payload_bytes,
+        )?;
+        let total_chunks = u32::try_from(chunks.len())?;
+        let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
+        payloads.push(BroadcasterPayload::SnapshotStart(
+            BroadcasterSnapshotStart::new(
+                snapshot_id.clone(),
+                self.chain_id,
+                self.configured_backends.clone(),
+                total_chunks,
+            )?,
+        ));
+        payloads.extend(chunks.into_iter().map(BroadcasterPayload::SnapshotChunk));
+        payloads.push(BroadcasterPayload::SnapshotEnd(
+            BroadcasterSnapshotEnd::new(snapshot_id),
+        ));
+
+        let envelopes = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                BroadcasterEnvelope::new(
+                    stream_id.clone(),
+                    u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+                    payload,
+                )
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&envelopes)
+            .context("failed to serialize broadcaster recovery replacement")
     }
 
     pub async fn heartbeat(&self) -> Result<Option<BroadcasterPayload>> {
@@ -601,6 +760,10 @@ impl BroadcasterSnapshotCache {
         self.configured_backends.clone()
     }
 
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
     pub async fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
         let guard = self.inner.read().await;
         self.backend_heads_locked(&guard)
@@ -616,22 +779,26 @@ impl BroadcasterSnapshotCache {
         max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
         snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
+        native_progress_lease: Duration,
     ) -> BroadcasterStatusSnapshot {
         let guard = self.inner.read().await;
         let ready = self.is_ready_locked(&guard);
+        let native_progress_stale = self
+            .configured_backends
+            .contains(&BroadcasterBackend::Native)
+            && upstream
+                .last_update_age_ms
+                .is_none_or(|age_ms| age_ms >= native_progress_lease.as_millis() as u64);
         let readiness = if !upstream.connected {
             BroadcasterReadiness::UpstreamDisconnected
-        } else if ready
-            && guard
-                .recovery
-                .as_ref()
-                .is_some_and(|recovery| recovery.last_error.is_some())
-        {
+        } else if guard.replacement.is_some() {
             BroadcasterReadiness::UpstreamRecovering
-        } else if ready {
-            BroadcasterReadiness::Ready
-        } else {
+        } else if !ready {
             BroadcasterReadiness::SnapshotWarmingUp
+        } else if native_progress_stale {
+            BroadcasterReadiness::NativeProgressStale
+        } else {
+            BroadcasterReadiness::Ready
         };
 
         let backends = self
@@ -654,6 +821,7 @@ impl BroadcasterSnapshotCache {
             readiness,
             chain_id: self.chain_id,
             upstream,
+            recovery: BroadcasterRecoveryStatus::default(),
             snapshot: BroadcasterSnapshotStatus {
                 ready,
                 stream_id: guard.stream_id.clone(),
@@ -673,16 +841,18 @@ impl BroadcasterSnapshotCache {
                 largest_payload_bytes: None,
                 payload_limit_utilization_bps: None,
                 last_export_error: None,
-                recovery_pending: guard.recovery.is_some(),
-                recovery_id: guard.recovery.as_ref().map(|recovery| recovery.id),
-                recovery_error: guard
-                    .recovery
-                    .as_ref()
-                    .and_then(|recovery| recovery.last_error.clone()),
+                recovery_pending: guard.replacement.is_some(),
+                recovery_id: guard.replacement.as_ref().map(|replacement| replacement.id),
+                recovery_error: None,
             },
             snapshot_sessions,
             backends,
             redis_publisher: None,
+            deployment_admission: BroadcasterDeploymentAdmissionSnapshot {
+                admitted: false,
+                phase: BroadcasterDeploymentPhase::Warming,
+                last_error: None,
+            },
         }
     }
 
@@ -835,7 +1005,11 @@ fn collect_snapshot_export_parts(
             }
             BroadcasterPayload::Update(_)
             | BroadcasterPayload::Heartbeat(_)
-            | BroadcasterPayload::Progress(_) => {
+            | BroadcasterPayload::Progress(_)
+            | BroadcasterPayload::RecoveryStart(_)
+            | BroadcasterPayload::RecoveryChunk(_)
+            | BroadcasterPayload::RecoveryCatchUp(_)
+            | BroadcasterPayload::RecoveryCommit(_) => {
                 return Err(anyhow!(
                     "snapshot export contains non-snapshot payload {}",
                     payload.kind().as_str()
@@ -863,17 +1037,20 @@ impl BroadcasterPartitionState {
 fn apply_raw_update_message(
     partitions: &mut BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     message: &BroadcasterUpdateMessage,
-) {
+) -> Result<()> {
     for partition in &message.partitions {
         let partition_state = partitions.entry(partition.backend).or_default();
         partition_state.block_number = Some(partition.block_number);
         partition_state.sync_statuses = partition.sync_statuses.clone();
-        for message in &partition.messages {
+        let mut messages = partition.messages.iter().collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+        for message in messages {
             merge_raw_message(&mut partition_state.messages, message.clone());
-            propagate_touched_vm_accounts(&mut partition_state.messages, message);
+            propagate_touched_vm_accounts(&mut partition_state.messages, message)?;
         }
-        canonicalize_shared_vm_accounts(&mut partition_state.messages);
+        canonicalize_shared_vm_accounts(&mut partition_state.messages)?;
     }
+    Ok(())
 }
 
 fn validate_raw_update_message(
@@ -881,10 +1058,15 @@ fn validate_raw_update_message(
     update: &BroadcasterUpdateMessage,
 ) -> Result<()> {
     for partition in &update.partitions {
-        let mut projected_by_block_and_address = BTreeMap::new();
-        for incoming in &partition.messages {
+        let mut projected_by_block_and_address: BTreeMap<
+            (u64, Bytes),
+            (String, ProjectedVmAccount),
+        > = BTreeMap::new();
+        let mut messages = partition.messages.iter().collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+        for incoming in messages {
             for address in touched_vm_addresses(incoming) {
-                let projected =
+                let mut projected =
                     project_vm_account(partitions, partition.backend, incoming, &address);
                 for existing in partitions
                     .get(&partition.backend)
@@ -899,25 +1081,35 @@ fn validate_raw_update_message(
                     if let Some(existing_account) =
                         existing.message.snapshots.vm_storage.get(&address)
                     {
-                        ensure!(
-                            projected
-                                == ProjectedVmAccount::Materialized(Some(existing_account.clone())),
-                            "conflicting VM account {} values at block {}",
-                            address,
-                            incoming.message.header.number
-                        );
+                        projected = merge_projected_vm_accounts(
+                            projected,
+                            ProjectedVmAccount::Materialized(Some(existing_account.clone())),
+                            &address,
+                            incoming.message.header.number,
+                        )
+                        .map_err(|error| {
+                            anyhow!(
+                                "while reconciling VM protocols {} and {}: {error:#}",
+                                incoming.protocol,
+                                existing.protocol
+                            )
+                        })?;
                     }
                 }
                 let key = (incoming.message.header.number, address.clone());
-                if let Some((protocol, previous)) = projected_by_block_and_address.get(&key) {
-                    ensure!(
-                        previous == &projected,
-                        "conflicting VM account {} values at block {} from protocols {} and {}",
-                        address,
+                if let Some((protocol, previous)) = projected_by_block_and_address.get_mut(&key) {
+                    *previous = merge_projected_vm_accounts(
+                        previous.clone(),
+                        projected,
+                        &address,
                         incoming.message.header.number,
-                        protocol,
-                        incoming.protocol
-                    );
+                    )
+                    .with_context(|| {
+                        format!(
+                            "conflicting VM account {address} values from protocols {protocol} and {}",
+                            incoming.protocol
+                        )
+                    })?;
                 } else {
                     projected_by_block_and_address
                         .insert(key, (incoming.protocol.clone(), projected));
@@ -935,6 +1127,75 @@ enum ProjectedVmAccount {
         update: Option<AccountUpdate>,
         balances: HashMap<Bytes, AccountBalance>,
     },
+}
+
+fn merge_projected_vm_accounts(
+    left: ProjectedVmAccount,
+    right: ProjectedVmAccount,
+    address: &Bytes,
+    block_number: u64,
+) -> Result<ProjectedVmAccount> {
+    match (left, right) {
+        (
+            ProjectedVmAccount::Materialized(Some(left)),
+            ProjectedVmAccount::Materialized(Some(right)),
+        ) => Ok(ProjectedVmAccount::Materialized(Some(
+            merge_shared_vm_accounts(left, right, block_number)?,
+        ))),
+        (ProjectedVmAccount::Materialized(None), ProjectedVmAccount::Materialized(None)) => {
+            Ok(ProjectedVmAccount::Materialized(None))
+        }
+        (
+            left @ ProjectedVmAccount::Residual { .. },
+            right @ ProjectedVmAccount::Residual { .. },
+        ) if left == right => Ok(left),
+        _ => Err(anyhow!(
+            "conflicting VM account {address} values at block {block_number}"
+        )),
+    }
+}
+
+#[expect(
+    deprecated,
+    reason = "creation_tx remains part of Tycho's account identity while it is on the wire"
+)]
+fn merge_shared_vm_accounts(
+    mut left: ResponseAccount,
+    right: ResponseAccount,
+    block_number: u64,
+) -> Result<ResponseAccount> {
+    let address = left.address.clone();
+    ensure!(
+        left.chain == right.chain
+            && left.address == right.address
+            && left.native_balance == right.native_balance
+            && left.code == right.code
+            && left.code_hash == right.code_hash
+            && left.balance_modify_tx == right.balance_modify_tx
+            && left.code_modify_tx == right.code_modify_tx
+            && left.creation_tx == right.creation_tx,
+        "conflicting VM account {address} values at block {block_number}"
+    );
+    merge_vm_account_map(&mut left.slots, right.slots);
+    merge_vm_account_map(&mut left.token_balances, right.token_balances);
+    left.title = deterministic_account_title(left.title, right.title);
+    Ok(left)
+}
+
+fn merge_vm_account_map(target: &mut HashMap<Bytes, Bytes>, incoming: HashMap<Bytes, Bytes>) {
+    // Tycho's protocol-local account views can disagree on an overlapping value.
+    // Sorted protocol order gives the shared VM database one stable winner.
+    for (key, value) in incoming {
+        target.entry(key).or_insert(value);
+    }
+}
+
+fn deterministic_account_title(left: String, right: String) -> String {
+    match (left.is_empty(), right.is_empty()) {
+        (true, false) => right,
+        (false, true) | (true, true) => left,
+        (false, false) => left.min(right),
+    }
 }
 
 fn touched_vm_addresses(message: &BroadcasterProtocolMessage) -> BTreeSet<Bytes> {
@@ -1052,42 +1313,27 @@ fn find_raw_protocol_message_mut<'a>(
         .find(|message| message.protocol == protocol)
 }
 
-fn apply_raw_recovery_message(
+fn apply_replacement_feed_message(
     candidates: &mut BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     update: &BroadcasterUpdateMessage,
     feed: &FeedMessage<BlockHeader>,
 ) -> Result<()> {
+    ensure!(
+        !raw_message_has_header_gap(candidates, update),
+        "fresh Tycho replacement became discontinuous before it aligned"
+    );
     validate_raw_update_message(candidates, update)?;
     for partition in &update.partitions {
         let candidate_partition = candidates.entry(partition.backend).or_default();
         candidate_partition.block_number = Some(partition.block_number);
         candidate_partition.sync_statuses = partition.sync_statuses.clone();
-        for incoming in &partition.messages {
-            let previous = candidate_partition
-                .messages
-                .iter()
-                .find(|message| message.protocol == incoming.protocol);
-            if previous.is_some_and(|previous| {
-                raw_header_is_discontinuous(&previous.message.header, &incoming.message.header)
-            }) {
-                let previous =
-                    previous.ok_or_else(|| anyhow!("gap message missing previous state"))?;
-                validate_raw_replacement_coverage(previous, incoming)?;
-                let mut replacement = incoming.clone();
-                compact_raw_state_sync_message(&mut replacement.message);
-                if let Some(existing) = candidate_partition
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.protocol == incoming.protocol)
-                {
-                    *existing = replacement;
-                }
-            } else {
-                merge_raw_message(&mut candidate_partition.messages, incoming.clone());
-            }
-            propagate_touched_vm_accounts(&mut candidate_partition.messages, incoming);
+        let mut messages = partition.messages.iter().collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+        for incoming in messages {
+            merge_raw_message(&mut candidate_partition.messages, incoming.clone());
+            propagate_touched_vm_accounts(&mut candidate_partition.messages, incoming)?;
         }
-        canonicalize_shared_vm_accounts(&mut candidate_partition.messages);
+        canonicalize_shared_vm_accounts(&mut candidate_partition.messages)?;
     }
 
     for (protocol, sync_state) in &feed.sync_states {
@@ -1116,7 +1362,7 @@ fn apply_raw_recovery_message(
 fn propagate_touched_vm_accounts(
     messages: &mut [BroadcasterProtocolMessage],
     incoming: &BroadcasterProtocolMessage,
-) {
+) -> Result<()> {
     let mut touched = incoming
         .message
         .snapshots
@@ -1145,21 +1391,30 @@ fn propagate_touched_vm_accounts(
             }
             continue;
         }
-        if let Some(snapshot_account) = incoming.message.snapshots.vm_storage.get(&address) {
-            for message in messages.iter().filter(|message| {
-                message.protocol != incoming.protocol
-                    && message.message.header.number == incoming.message.header.number
-            }) {
-                if let Some(existing) = message.message.snapshots.vm_storage.get(&address) {
-                    debug_assert_eq!(existing, snapshot_account);
-                }
-            }
-        }
-        let canonical = messages
+        let mut same_block = messages
             .iter()
-            .find(|message| message.protocol == incoming.protocol)
-            .and_then(|message| message.message.snapshots.vm_storage.get(&address))
-            .cloned();
+            .filter(|message| message.message.header.number == incoming.message.header.number)
+            .filter_map(|message| {
+                message
+                    .message
+                    .snapshots
+                    .vm_storage
+                    .get(&address)
+                    .cloned()
+                    .map(|account| (message.protocol.as_str(), account))
+            })
+            .collect::<Vec<_>>();
+        same_block.sort_by_key(|(protocol, _)| *protocol);
+        let canonical = same_block
+            .into_iter()
+            .map(|(_, account)| account)
+            .try_fold(None, |canonical, account| match canonical {
+                Some(canonical) => {
+                    merge_shared_vm_accounts(canonical, account, incoming.message.header.number)
+                        .map(Some)
+                }
+                None => Ok(Some(account)),
+            })?;
         if let Some(canonical) = canonical {
             for message in messages
                 .iter_mut()
@@ -1173,9 +1428,10 @@ fn propagate_touched_vm_accounts(
             }
         }
     }
+    Ok(())
 }
 
-fn canonicalize_shared_vm_accounts(messages: &mut [BroadcasterProtocolMessage]) {
+fn canonicalize_shared_vm_accounts(messages: &mut [BroadcasterProtocolMessage]) -> Result<()> {
     let addresses = messages
         .iter()
         .flat_map(|message| message.message.snapshots.vm_storage.keys().cloned())
@@ -1187,15 +1443,32 @@ fn canonicalize_shared_vm_accounts(messages: &mut [BroadcasterProtocolMessage]) 
             .map(|message| message.message.header.number)
             .max()
             .unwrap_or_default();
-        let latest = messages
+        let mut latest = messages
             .iter()
             .filter(|message| message.message.header.number == latest_block)
-            .filter_map(|message| message.message.snapshots.vm_storage.get(&address))
+            .filter_map(|message| {
+                message
+                    .message
+                    .snapshots
+                    .vm_storage
+                    .get(&address)
+                    .cloned()
+                    .map(|account| (message.protocol.as_str(), account))
+            })
             .collect::<Vec<_>>();
-        let Some(canonical) = latest.first().cloned().cloned() else {
+        latest.sort_by_key(|(protocol, _)| *protocol);
+        let canonical = latest.into_iter().map(|(_, account)| account).try_fold(
+            None,
+            |canonical, account| match canonical {
+                Some(canonical) => {
+                    merge_shared_vm_accounts(canonical, account, latest_block).map(Some)
+                }
+                None => Ok(Some(account)),
+            },
+        )?;
+        let Some(canonical) = canonical else {
             continue;
         };
-        debug_assert!(latest.iter().all(|account| *account == &canonical));
         for message in messages
             .iter_mut()
             .filter(|message| message.message.snapshots.vm_storage.contains_key(&address))
@@ -1207,58 +1480,10 @@ fn canonicalize_shared_vm_accounts(messages: &mut [BroadcasterProtocolMessage]) 
                 .insert(address.clone(), canonical.clone());
         }
     }
-}
-
-fn validate_raw_replacement_coverage(
-    previous: &BroadcasterProtocolMessage,
-    replacement: &BroadcasterProtocolMessage,
-) -> Result<()> {
-    let deltas = replacement.message.deltas.as_ref();
-    for component_id in previous.message.snapshots.states.keys() {
-        let covered = replacement
-            .message
-            .snapshots
-            .states
-            .contains_key(component_id)
-            || replacement
-                .message
-                .removed_components
-                .contains_key(component_id)
-            || deltas.is_some_and(|deltas| {
-                deltas
-                    .deleted_protocol_components
-                    .contains_key(component_id)
-            });
-        ensure!(
-            covered,
-            "Tycho gap message for protocol {} is not an authoritative replacement; missing component {}",
-            replacement.protocol,
-            component_id
-        );
-    }
-    for address in previous.message.snapshots.vm_storage.keys() {
-        let covered = replacement
-            .message
-            .snapshots
-            .vm_storage
-            .contains_key(address)
-            || deltas.is_some_and(|deltas| {
-                deltas
-                    .account_updates
-                    .get(address)
-                    .is_some_and(|update| matches!(update.change, ChangeType::Deletion))
-            });
-        ensure!(
-            covered,
-            "Tycho gap message for protocol {} is not an authoritative replacement; missing account {}",
-            replacement.protocol,
-            address
-        );
-    }
     Ok(())
 }
 
-fn raw_recovery_is_aligned(
+fn replacement_is_aligned(
     candidates: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     expected_protocols: &BTreeSet<String>,
 ) -> bool {
@@ -1273,9 +1498,15 @@ fn raw_recovery_is_aligned(
         || messages
             .iter()
             .any(|message| !expected_protocols.contains(&message.protocol))
-        || messages
-            .iter()
-            .any(|message| !matches!(message.sync_state, SynchronizerState::Ready(_)))
+        || candidates.values().any(|partition| {
+            partition.block_number.is_none_or(|block_number| {
+                complete_broadcaster_partition_block(
+                    block_number,
+                    &partition.messages,
+                    &partition.sync_statuses,
+                ) != Some(block_number)
+            })
+        })
     {
         return false;
     }
@@ -1286,211 +1517,6 @@ fn raw_recovery_is_aligned(
         message.message.header.number == first.message.header.number
             && message.message.header.hash == first.message.header.hash
     })
-}
-
-fn diff_raw_partitions(
-    active: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    candidates: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-) -> Result<BroadcasterUpdateMessage> {
-    let mut partitions = Vec::new();
-    for (backend, candidate) in candidates {
-        let active_partition = active.get(backend);
-        let messages = candidate
-            .messages
-            .iter()
-            .map(|current| {
-                diff_raw_protocol_message(
-                    active_partition.and_then(|partition| {
-                        partition
-                            .messages
-                            .iter()
-                            .find(|message| message.protocol == current.protocol)
-                    }),
-                    current,
-                )
-            })
-            .collect::<Vec<_>>();
-        partitions.push(BroadcasterUpdatePartition::with_messages(
-            *backend,
-            candidate.block_number.unwrap_or_default(),
-            messages,
-            candidate.sync_statuses.clone(),
-        ));
-    }
-    BroadcasterUpdateMessage::new(partitions).map_err(Into::into)
-}
-
-fn diff_raw_protocol_message(
-    previous: Option<&BroadcasterProtocolMessage>,
-    current: &BroadcasterProtocolMessage,
-) -> BroadcasterProtocolMessage {
-    let mut snapshots = Snapshot::default();
-    let mut removed_components = HashMap::new();
-    let mut deltas = diff_bootstrap_residue(
-        previous.and_then(|message| message.message.deltas.as_ref()),
-        current.message.deltas.as_ref(),
-    );
-
-    match previous {
-        Some(previous) => {
-            if let Some(previous_deltas) = previous.message.deltas.as_ref() {
-                let current_deltas = current.message.deltas.as_ref();
-                for (component_id, component) in &previous_deltas.new_protocol_components {
-                    let still_residual = current_deltas.is_some_and(|deltas| {
-                        deltas.new_protocol_components.get(component_id) == Some(component)
-                    });
-                    if !still_residual
-                        && !current.message.snapshots.states.contains_key(component_id)
-                    {
-                        removed_components.insert(component_id.clone(), component.clone());
-                    }
-                }
-            }
-            for (component_id, state) in &current.message.snapshots.states {
-                if previous.message.snapshots.states.get(component_id) != Some(state) {
-                    snapshots.states.insert(component_id.clone(), state.clone());
-                }
-            }
-            for (component_id, state) in &previous.message.snapshots.states {
-                if !current.message.snapshots.states.contains_key(component_id) {
-                    removed_components.insert(component_id.clone(), state.component.clone());
-                }
-            }
-            for (address, account) in &current.message.snapshots.vm_storage {
-                if previous.message.snapshots.vm_storage.get(address) != Some(account) {
-                    snapshots
-                        .vm_storage
-                        .insert(address.clone(), account.clone());
-                }
-            }
-            for (address, account) in &previous.message.snapshots.vm_storage {
-                if !current.message.snapshots.vm_storage.contains_key(address) {
-                    let changes = deltas.get_or_insert_with(BlockChanges::default);
-                    changes.account_updates.insert(
-                        address.clone(),
-                        AccountUpdate::new(
-                            address.clone(),
-                            account.chain,
-                            HashMap::new(),
-                            None,
-                            None,
-                            ChangeType::Deletion,
-                        ),
-                    );
-                }
-            }
-        }
-        None => snapshots = current.message.snapshots.clone(),
-    }
-
-    if deltas
-        .as_ref()
-        .is_some_and(|changes| !block_changes_has_bootstrap_residue(changes))
-    {
-        deltas = None;
-    }
-    BroadcasterProtocolMessage::new(
-        current.protocol.clone(),
-        current.sync_state.clone(),
-        StateSyncMessage {
-            header: current.message.header.clone(),
-            snapshots,
-            deltas,
-            removed_components,
-        },
-    )
-}
-
-fn validate_recovery_lifecycle_diff(
-    active: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    candidates: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-) -> Result<()> {
-    for (backend, active_partition) in active {
-        let Some(candidate_partition) = candidates.get(backend) else {
-            continue;
-        };
-        let materialized_accounts = candidate_partition
-            .messages
-            .iter()
-            .flat_map(|message| message.message.snapshots.vm_storage.keys().cloned())
-            .collect::<HashSet<_>>();
-        let residual_accounts = candidate_partition
-            .messages
-            .iter()
-            .filter_map(|message| message.message.deltas.as_ref())
-            .flat_map(|deltas| deltas.account_updates.keys().cloned())
-            .collect::<HashSet<_>>();
-        for previous in &active_partition.messages {
-            let Some(deltas) = previous.message.deltas.as_ref() else {
-                continue;
-            };
-            for (address, update) in &deltas.account_updates {
-                if matches!(update.change, ChangeType::Creation)
-                    && !materialized_accounts.contains(address)
-                    && !residual_accounts.contains(address)
-                {
-                    return Err(anyhow!(
-                        "recovery cannot remove unresolved VM account creation {} on backend {} without rebuilding consumers",
-                        address,
-                        backend
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn diff_bootstrap_residue(
-    previous: Option<&BlockChanges>,
-    current: Option<&BlockChanges>,
-) -> Option<BlockChanges> {
-    let current = current?;
-    let mut diff = empty_block_changes_fragment(current);
-    let previous = previous.cloned().unwrap_or_default();
-
-    diff.new_tokens = changed_map_entries(&previous.new_tokens, &current.new_tokens);
-    diff.account_updates = changed_map_entries(&previous.account_updates, &current.account_updates);
-    diff.state_updates = changed_map_entries(&previous.state_updates, &current.state_updates);
-    diff.new_protocol_components = changed_map_entries(
-        &previous.new_protocol_components,
-        &current.new_protocol_components,
-    );
-    diff.deleted_protocol_components = changed_map_entries(
-        &previous.deleted_protocol_components,
-        &current.deleted_protocol_components,
-    );
-    diff.component_balances =
-        changed_map_entries(&previous.component_balances, &current.component_balances);
-    diff.account_balances =
-        changed_map_entries(&previous.account_balances, &current.account_balances);
-    diff.component_tvl = changed_map_entries(&previous.component_tvl, &current.component_tvl);
-    diff.dci_update.new_entrypoints = changed_map_entries(
-        &previous.dci_update.new_entrypoints,
-        &current.dci_update.new_entrypoints,
-    );
-    diff.dci_update.new_entrypoint_params = changed_map_entries(
-        &previous.dci_update.new_entrypoint_params,
-        &current.dci_update.new_entrypoint_params,
-    );
-    diff.dci_update.trace_results = changed_map_entries(
-        &previous.dci_update.trace_results,
-        &current.dci_update.trace_results,
-    );
-
-    block_changes_has_bootstrap_residue(&diff).then_some(diff)
-}
-
-fn changed_map_entries<K, V>(previous: &HashMap<K, V>, current: &HashMap<K, V>) -> HashMap<K, V>
-where
-    K: Clone + Eq + std::hash::Hash,
-    V: Clone + PartialEq,
-{
-    current
-        .iter()
-        .filter(|(key, value)| previous.get(*key) != Some(*value))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 fn ensure_configured_update_backends(
@@ -3035,13 +3061,12 @@ mod tests {
             .stage_update(&native_update_state(11, "native-1", 2))
             .await?;
 
-        let committed: () = cache.commit_staged_update(staged).await;
+        cache.commit_staged_update(staged).await?;
 
         let export = cache.export_snapshot(8_388_608).await?;
         let chunks = snapshot_chunks(&export);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].partitions[0].states[0].component_id, "native-1");
-        assert_eq!(committed, ());
         Ok(())
     }
 
@@ -4194,6 +4219,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         let rfq_status = status
@@ -4219,6 +4245,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(status.readiness, BroadcasterReadiness::Ready);
@@ -4276,6 +4303,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(
@@ -4289,6 +4317,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(warming.readiness, BroadcasterReadiness::SnapshotWarmingUp);
@@ -4300,6 +4329,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);
@@ -4759,7 +4789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_recovery_waits_for_aligned_protocol_candidates_and_publishes_compact_diff(
+    async fn fresh_replacement_waits_for_aligned_protocol_candidates_before_publication(
     ) -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let block_10 = linked_header(10, 10, 9);
@@ -4781,6 +4811,7 @@ mod tests {
         );
         assert!(cache.apply_feed_message(&initial).await?.is_some());
         let before = serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?;
+        cache.begin_same_generation_recovery().await;
 
         let block_12 = linked_header(12, 12, 11);
         let first_replacement = raw_feed(
@@ -4812,18 +4843,13 @@ mod tests {
                 ("uniswap_v3", block_12.clone()),
             ],
         );
-        let compact = cache
-            .apply_feed_message(&second_replacement)
-            .await?
-            .ok_or_else(|| anyhow!("aligned recovery should publish"))?;
-        let changed_states = compact
-            .partitions
-            .iter()
-            .flat_map(|partition| &partition.messages)
-            .map(|message| message.message.snapshots.states.len())
-            .sum::<usize>();
-        assert_eq!(changed_states, 1);
-        assert!(serde_json::to_vec(&compact)?.len() < serde_json::to_vec(&initial)?.len());
+        assert!(
+            cache
+                .apply_feed_message(&second_replacement)
+                .await?
+                .is_none(),
+            "aligned replacement publication is owned by the service recovery worker"
+        );
         let after = cache.export_snapshot(8_388_608).await?;
         assert!(after.payloads.iter().any(|payload| match payload {
             BroadcasterPayload::SnapshotChunk(chunk) => chunk
@@ -4833,6 +4859,205 @@ mod tests {
                 .any(|message| message.message.header == block_12),
             _ => false,
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_mid_recovery_discards_stale_candidates_and_aligns_from_fresh_snapshot(
+    ) -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    (
+                        "uniswap_v2",
+                        raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                    ),
+                    (
+                        "uniswap_v3",
+                        raw_snapshot_message("uniswap_v3", block_10.clone(), 2),
+                    ),
+                ],
+                vec![
+                    ("uniswap_v2", block_10.clone()),
+                    ("uniswap_v3", block_10.clone()),
+                ],
+            ))
+            .await?;
+        cache.begin_same_generation_recovery().await;
+
+        let block_12 = linked_header(12, 12, 11);
+        let first_replacement = raw_feed(
+            vec![(
+                "uniswap_v2",
+                raw_snapshot_message("uniswap_v2", block_12.clone(), 9),
+            )],
+            vec![("uniswap_v2", block_12), ("uniswap_v3", block_10.clone())],
+        );
+        assert!(cache
+            .apply_feed_message(&first_replacement)
+            .await?
+            .is_none());
+        assert!(cache.replacement_pending().await);
+
+        cache.begin_same_generation_recovery().await;
+        let block_15 = linked_header(15, 15, 14);
+        let fresh_replacement = raw_feed(
+            vec![
+                (
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_15.clone(), 11),
+                ),
+                (
+                    "uniswap_v3",
+                    raw_snapshot_message("uniswap_v3", block_15.clone(), 12),
+                ),
+            ],
+            vec![
+                ("uniswap_v2", block_15.clone()),
+                ("uniswap_v3", block_15.clone()),
+            ],
+        );
+        let fresh_result = cache.apply_feed_message(&fresh_replacement).await;
+        assert!(
+            fresh_result.is_ok(),
+            "fresh Tycho replacement must align after reconnect: {fresh_result:?}"
+        );
+        assert!(fresh_result?.is_none());
+        assert!(!cache.replacement_pending().await);
+        let snapshot = cache.export_snapshot(8_388_608).await?;
+        assert!(snapshot.payloads.iter().any(|payload| match payload {
+            BroadcasterPayload::SnapshotChunk(chunk) => chunk
+                .partitions
+                .iter()
+                .flat_map(|partition| &partition.messages)
+                .any(|message| message.message.header == block_15),
+            _ => false,
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rearming_recovery_supersedes_pending_replacement_with_new_id() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                )],
+                vec![("uniswap_v2", block_10)],
+            ))
+            .await?;
+
+        cache.begin_same_generation_recovery().await;
+        let first_status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(first_status.snapshot.recovery_pending);
+        assert_eq!(first_status.snapshot.recovery_id, Some(1));
+
+        cache.begin_same_generation_recovery().await;
+        let second_status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(second_status.snapshot.recovery_pending);
+        assert_eq!(second_status.snapshot.recovery_id, Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_from_current_recovery_discards_seeded_candidates() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    (
+                        "uniswap_v2",
+                        raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                    ),
+                    (
+                        "uniswap_v3",
+                        raw_snapshot_message("uniswap_v3", block_10.clone(), 2),
+                    ),
+                ],
+                vec![("uniswap_v2", block_10.clone()), ("uniswap_v3", block_10)],
+            ))
+            .await?;
+        cache.begin_same_generation_recovery_from_current().await;
+        cache.begin_same_generation_recovery().await;
+
+        let block_15 = linked_header(15, 15, 14);
+        let fresh_replacement = raw_feed(
+            vec![
+                (
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_15.clone(), 11),
+                ),
+                (
+                    "uniswap_v3",
+                    raw_snapshot_message("uniswap_v3", block_15.clone(), 12),
+                ),
+            ],
+            vec![("uniswap_v2", block_15.clone()), ("uniswap_v3", block_15)],
+        );
+        let fresh_result = cache.apply_feed_message(&fresh_replacement).await;
+        assert!(
+            fresh_result.is_ok(),
+            "fresh Tycho replacement must discard seeded candidates: {fresh_result:?}"
+        );
+        assert!(fresh_result?.is_none());
+        assert!(!cache.replacement_pending().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_replacement_rejects_partial_block_candidate() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_10.clone(), 1),
+                )],
+                vec![("uniswap_v2", block_10)],
+            ))
+            .await?;
+        let before = serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?;
+        cache.begin_same_generation_recovery().await;
+
+        let mut partial_block_12 = linked_header(12, 12, 11);
+        partial_block_12.partial_block_index = Some(0);
+        let partial_replacement = raw_feed(
+            vec![(
+                "uniswap_v2",
+                raw_snapshot_message("uniswap_v2", partial_block_12.clone(), 2),
+            )],
+            vec![("uniswap_v2", partial_block_12)],
+        );
+        assert!(cache
+            .apply_feed_message(&partial_replacement)
+            .await?
+            .is_none());
+        assert!(cache.replacement_pending().await);
+        assert_eq!(
+            serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?,
+            before
+        );
         Ok(())
     }
 
@@ -4853,7 +5078,6 @@ mod tests {
         let cache = BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Native]);
         let clean = BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Native]);
         let block_10 = linked_header(10, 10, 9);
-        let block_11 = linked_header(11, 11, 10);
         let block_12 = linked_header(12, 12, 11);
         let initial = raw_feed(
             PROTOCOLS
@@ -4880,27 +5104,19 @@ mod tests {
                 .collect(),
         );
         cache.apply_feed_message(&initial).await?;
+        cache.begin_same_generation_recovery().await;
 
-        let contiguous_delta = |header: BlockHeader| StateSyncMessage {
-            header,
-            snapshots: Snapshot::default(),
-            deltas: Some(BlockChanges::default()),
-            removed_components: HashMap::new(),
-        };
         let first = raw_feed(
-            vec![
-                (
-                    PROTOCOLS[0],
-                    raw_snapshot_message_with_residue(PROTOCOLS[0], block_12.clone(), 9),
-                ),
-                (PROTOCOLS[4], contiguous_delta(block_11.clone())),
-            ],
+            vec![(
+                PROTOCOLS[0],
+                raw_snapshot_message_with_residue(PROTOCOLS[0], block_12.clone(), 9),
+            )],
             vec![
                 (PROTOCOLS[0], block_12.clone()),
                 (PROTOCOLS[1], block_10.clone()),
                 (PROTOCOLS[2], block_10.clone()),
                 (PROTOCOLS[3], block_10.clone()),
-                (PROTOCOLS[4], block_11.clone()),
+                (PROTOCOLS[4], block_10.clone()),
             ],
         );
         assert!(cache.apply_feed_message(&first).await?.is_none());
@@ -4921,7 +5137,7 @@ mod tests {
                 (PROTOCOLS[1], block_12.clone()),
                 (PROTOCOLS[2], block_12.clone()),
                 (PROTOCOLS[3], block_10.clone()),
-                (PROTOCOLS[4], block_11.clone()),
+                (PROTOCOLS[4], block_10.clone()),
             ],
         );
         assert!(cache.apply_feed_message(&second).await?.is_none());
@@ -4932,31 +5148,20 @@ mod tests {
                     PROTOCOLS[3],
                     raw_snapshot_message(PROTOCOLS[3], block_12.clone(), 4),
                 ),
-                (PROTOCOLS[4], contiguous_delta(block_12.clone())),
+                (
+                    PROTOCOLS[4],
+                    raw_snapshot_message(PROTOCOLS[4], block_12.clone(), 5),
+                ),
             ],
             PROTOCOLS
                 .iter()
                 .map(|protocol| (*protocol, block_12.clone()))
                 .collect(),
         );
-        let compact = cache
-            .apply_feed_message(&third)
-            .await?
-            .ok_or_else(|| anyhow!("five aligned candidates should publish once"))?;
-        assert_eq!(
-            compact
-                .partitions
-                .iter()
-                .flat_map(|partition| &partition.messages)
-                .map(|message| message.message.snapshots.states.len())
-                .sum::<usize>(),
-            1
+        assert!(
+            cache.apply_feed_message(&third).await?.is_none(),
+            "aligned replacement is published by the service recovery worker"
         );
-        assert!(compact
-            .partitions
-            .iter()
-            .flat_map(|partition| &partition.messages)
-            .all(|message| message.message.deltas.is_none()));
 
         let clean_feed = raw_feed(
             PROTOCOLS
@@ -4988,8 +5193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_recovery_rejects_incomplete_authoritative_snapshot_without_mutating_cache(
-    ) -> Result<()> {
+    async fn header_gap_requires_reconnect_without_mutating_cache() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let block_10 = linked_header(10, 10, 9);
         let initial = raw_feed(
@@ -5021,115 +5225,11 @@ mod tests {
             vec![("uniswap_v2", block_12)],
         );
         let Err(error) = cache.apply_feed_message(&incomplete).await else {
-            return Err(anyhow!("incomplete replacement should fail"));
+            return Err(anyhow!("header gap should require a reconnect"));
         };
         assert!(error
             .to_string()
-            .contains("not an authoritative replacement"));
-        assert_eq!(
-            serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?,
-            before
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn raw_recovery_diff_removes_previous_only_component_creation_residue() {
-        let component_id = "pending-component";
-        let header = linked_header(12, 12, 11);
-        let mut previous_changes = BlockChanges::default();
-        let component = raw_component(component_id, "uniswap_v2", 3);
-        previous_changes
-            .new_protocol_components
-            .insert(component_id.to_string(), component.clone());
-        let previous = BroadcasterProtocolMessage::new(
-            "uniswap_v2",
-            SynchronizerState::Ready(header.clone()),
-            StateSyncMessage {
-                header: header.clone(),
-                snapshots: Snapshot::default(),
-                deltas: Some(previous_changes),
-                removed_components: HashMap::new(),
-            },
-        );
-        let current = BroadcasterProtocolMessage::new(
-            "uniswap_v2",
-            SynchronizerState::Ready(header.clone()),
-            StateSyncMessage {
-                header,
-                snapshots: Snapshot::default(),
-                deltas: None,
-                removed_components: HashMap::new(),
-            },
-        );
-
-        let diff = super::diff_raw_protocol_message(Some(&previous), &current);
-
-        assert_eq!(
-            diff.message.removed_components.get(component_id),
-            Some(&component)
-        );
-    }
-
-    #[tokio::test]
-    async fn raw_recovery_defers_unrepresentable_account_creation_removal() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
-        let block_10 = linked_header(10, 10, 9);
-        let component_id = "vm:curve-pool";
-        let address = DtoBytes::from([62u8; 20]);
-        let mut initial_changes = BlockChanges::default();
-        initial_changes.account_updates.insert(
-            address.clone(),
-            account_update(address.clone(), ChangeType::Creation, 1, None),
-        );
-        let initial = StateSyncMessage {
-            header: block_10.clone(),
-            snapshots: Snapshot {
-                states: HashMap::from([(
-                    component_id.to_string(),
-                    raw_component_with_state(component_id, 1),
-                )]),
-                vm_storage: HashMap::new(),
-            },
-            deltas: Some(initial_changes),
-            removed_components: HashMap::new(),
-        };
-        cache
-            .apply_feed_message(&raw_feed(
-                vec![("vm:curve", initial)],
-                vec![("vm:curve", block_10)],
-            ))
-            .await?;
-        let before = serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?;
-
-        let block_12 = linked_header(12, 12, 11);
-        let replacement = StateSyncMessage {
-            header: block_12.clone(),
-            snapshots: Snapshot {
-                states: HashMap::from([(
-                    component_id.to_string(),
-                    raw_component_with_state(component_id, 1),
-                )]),
-                vm_storage: HashMap::new(),
-            },
-            deltas: None,
-            removed_components: HashMap::new(),
-        };
-        assert!(cache
-            .apply_feed_message(&raw_feed(
-                vec![("vm:curve", replacement)],
-                vec![("vm:curve", block_12)],
-            ))
-            .await?
-            .is_none());
-
-        let guard = cache.inner.read().await;
-        let recovery_error = guard
-            .recovery
-            .as_ref()
-            .and_then(|recovery| recovery.last_error.as_deref());
-        assert!(recovery_error.is_some_and(|error| error.contains("without rebuilding consumers")));
-        drop(guard);
+            .contains("requires reconnect and a fresh authoritative replacement"));
         assert_eq!(
             serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?,
             before
@@ -5202,6 +5302,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_cache_unions_sparse_shared_vm_accounts_at_same_block() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+        let block = linked_header(10, 10, 9);
+        let address = DtoBytes::from([43u8; 20]);
+        let first_slot = DtoBytes::from([1u8; 32]);
+        let second_slot = DtoBytes::from([2u8; 32]);
+        let first_token = DtoBytes::from([3u8; 20]);
+        let second_token = DtoBytes::from([4u8; 20]);
+        let mut first = raw_response_account(address.clone(), 0, 0);
+        first.title = "Curve pool token".to_string();
+        first
+            .slots
+            .insert(first_slot.clone(), DtoBytes::from([11u8; 32]));
+        first
+            .token_balances
+            .insert(first_token.clone(), DtoBytes::from([12u8; 32]));
+        let mut second = first.clone();
+        second.title = "Balancer token".to_string();
+        second.slots = HashMap::from([(second_slot.clone(), DtoBytes::from([21u8; 32]))]);
+        second.token_balances = HashMap::from([(second_token.clone(), DtoBytes::from([22u8; 32]))]);
+        let message = |account| StateSyncMessage {
+            header: block.clone(),
+            snapshots: Snapshot {
+                states: HashMap::new(),
+                vm_storage: HashMap::from([(address.clone(), account)]),
+            },
+            deltas: None,
+            removed_components: HashMap::new(),
+        };
+
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    ("vm:curve", message(first)),
+                    ("vm:balancer_v2", message(second)),
+                ],
+                vec![("vm:curve", block.clone()), ("vm:balancer_v2", block)],
+            ))
+            .await?;
+
+        let export = cache.export_snapshot(8_388_608).await?;
+        let accounts = vm_account_fragments(&export, &address);
+        assert_eq!(accounts.len(), 2);
+        for account in accounts {
+            assert_eq!(account.title, "Balancer token");
+            assert_eq!(account.slots.len(), 2);
+            assert_eq!(
+                account.slots.get(&first_slot),
+                Some(&DtoBytes::from([11u8; 32]))
+            );
+            assert_eq!(
+                account.slots.get(&second_slot),
+                Some(&DtoBytes::from([21u8; 32]))
+            );
+            assert_eq!(account.token_balances.len(), 2);
+            assert_eq!(
+                account.token_balances.get(&first_token),
+                Some(&DtoBytes::from([12u8; 32]))
+            );
+            assert_eq!(
+                account.token_balances.get(&second_token),
+                Some(&DtoBytes::from([22u8; 32]))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_cache_uses_protocol_order_for_conflicting_snapshot_slots() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+        let block = linked_header(10, 10, 9);
+        let address = DtoBytes::from([44u8; 20]);
+        let slot = DtoBytes::from([1u8; 32]);
+        let mut curve = raw_response_account(address.clone(), 0, 0);
+        curve.slots.insert(slot.clone(), DtoBytes::from([31u8; 32]));
+        let mut balancer = curve.clone();
+        balancer
+            .slots
+            .insert(slot.clone(), DtoBytes::from([21u8; 32]));
+        let message = |account| StateSyncMessage {
+            header: block.clone(),
+            snapshots: Snapshot {
+                states: HashMap::new(),
+                vm_storage: HashMap::from([(address.clone(), account)]),
+            },
+            deltas: None,
+            removed_components: HashMap::new(),
+        };
+
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![
+                    ("vm:curve", message(curve)),
+                    ("vm:balancer_v2", message(balancer)),
+                ],
+                vec![("vm:curve", block.clone()), ("vm:balancer_v2", block)],
+            ))
+            .await?;
+
+        let export = cache.export_snapshot(8_388_608).await?;
+        for account in vm_account_fragments(&export, &address) {
+            assert_eq!(
+                account.slots.get(&slot),
+                Some(&DtoBytes::from([21u8; 32])),
+                "lexicographically first protocol owns overlapping snapshot values"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn raw_cache_rejects_conflicting_shared_vm_account_at_same_block() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
         let block = linked_header(10, 10, 9);
@@ -5235,7 +5446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_cache_rejects_staggered_same_block_vm_account_delta_conflict() -> Result<()> {
+    async fn raw_cache_resolves_staggered_vm_delta_overlap_by_protocol_order() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
         let block_10 = linked_header(10, 10, 9);
         let block_11 = linked_header(11, 11, 10);
@@ -5263,42 +5474,42 @@ mod tests {
             ))
             .await?;
 
-        let delta_message = |slot_seed| StateSyncMessage {
-            header: block_11.clone(),
-            snapshots: Snapshot::default(),
-            deltas: Some(BlockChanges {
-                account_updates: HashMap::from([(
-                    address.clone(),
-                    account_update(address.clone(), ChangeType::Update, slot_seed, None),
-                )]),
-                ..Default::default()
-            }),
-            removed_components: HashMap::new(),
+        let delta_message = |slot_value| {
+            let mut update = account_update(address.clone(), ChangeType::Update, 7, None);
+            update.slots =
+                HashMap::from([(DtoBytes::from([7u8; 32]), DtoBytes::from([slot_value; 32]))]);
+            StateSyncMessage {
+                header: block_11.clone(),
+                snapshots: Snapshot::default(),
+                deltas: Some(BlockChanges {
+                    account_updates: HashMap::from([(address.clone(), update)]),
+                    ..Default::default()
+                }),
+                removed_components: HashMap::new(),
+            }
         };
         assert!(cache
             .apply_feed_message(&raw_feed(
-                vec![("vm:curve", delta_message(7))],
+                vec![("vm:curve", delta_message(8))],
                 vec![("vm:curve", block_11.clone()), ("vm:balancer_v2", block_10),],
             ))
             .await?
             .is_some());
-        let before_conflict =
-            serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?;
-
-        let conflicting = raw_feed(
-            vec![("vm:balancer_v2", delta_message(8))],
+        let overlapping = raw_feed(
+            vec![("vm:balancer_v2", delta_message(9))],
             vec![("vm:curve", block_11.clone()), ("vm:balancer_v2", block_11)],
         );
-        let Err(error) = cache.apply_feed_message(&conflicting).await else {
-            return Err(anyhow!(
-                "staggered same-block account conflict should fail staging"
-            ));
-        };
-        assert!(error.to_string().contains("conflicting VM account"));
-        assert_eq!(
-            serde_json::to_value(cache.export_snapshot(8_388_608).await?.payloads)?,
-            before_conflict
-        );
+        assert!(cache.apply_feed_message(&overlapping).await?.is_some());
+
+        let slot = DtoBytes::from([7u8; 32]);
+        let export = cache.export_snapshot(8_388_608).await?;
+        for account in vm_account_fragments(&export, &address) {
+            assert_eq!(
+                account.slots.get(&slot),
+                Some(&DtoBytes::from([9u8; 32])),
+                "balancer sorts before curve and owns the shared delta value"
+            );
+        }
         Ok(())
     }
 

@@ -1,9 +1,9 @@
 use reqwest::{Client, StatusCode};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use simulator_core::broadcaster::BroadcasterTokenSnapshotResponse;
+use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterTokenSnapshotResponse};
 use tracing::{debug, info, warn};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{
@@ -21,6 +21,7 @@ use crate::config::{
     MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
+use crate::metrics::emit_simulator_health_snapshot;
 use crate::models::state::{
     AppState, BroadcasterSubscriptionStatus, RfqClientConfig, StateStore, VmStreamStatus,
 };
@@ -33,10 +34,12 @@ use crate::stream::StreamSupervisorConfig;
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const TOKEN_SNAPSHOT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const OPTIONAL_BACKEND_STALE_SECS: u64 = 300;
 
 pub struct SimulatorServiceParts {
     pub config: AppConfig,
     pub runtime: SimulatorRuntime,
+    pub supervisors: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Runtime-owned simulator services exposed to the RPC shell.
@@ -93,11 +96,12 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     let tokens = load_token_store(&config).await?;
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
     let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
+    spawn_health_snapshot_task(app_state.clone());
     let supervisor_cfg = build_supervisor_config(&config);
     let redis_config = load_broadcaster_redis_config();
 
     log_rebuild_config(&config);
-    spawn_broadcaster_subscription_task(
+    let supervisors = spawn_broadcaster_subscription_task(
         &config,
         &redis_config,
         &supervisor_cfg,
@@ -108,6 +112,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     Ok(SimulatorServiceParts {
         config,
         runtime: SimulatorRuntime::new(app_state),
+        supervisors,
     })
 }
 
@@ -147,6 +152,68 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
         loop {
             ticker.tick().await;
             maybe_log_memory_snapshot("service", "periodic", None, memory_cfg, false);
+        }
+    });
+}
+
+fn spawn_health_snapshot_task(app_state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_millis(app_state.native_progress_lease_ms()));
+        let mut previous_status = None;
+        let mut previous_backends = BTreeMap::new();
+        loop {
+            ticker.tick().await;
+            let snapshot = app_state.status_snapshot().await;
+            if previous_status != Some(snapshot.status) {
+                let previous = previous_status
+                    .map(|status: crate::models::state::SimulatorServiceStatus| status.label());
+                if snapshot.status == crate::models::state::SimulatorServiceStatus::Ready {
+                    info!(
+                        event = "simulator_readiness_changed",
+                        from = previous,
+                        to = snapshot.status.label(),
+                        "Simulator native readiness opened"
+                    );
+                } else {
+                    warn!(
+                        event = "simulator_readiness_changed",
+                        from = previous,
+                        to = snapshot.status.label(),
+                        error = snapshot
+                            .backends
+                            .first()
+                            .and_then(|backend| backend.last_error.as_deref()),
+                        "Simulator native readiness closed"
+                    );
+                }
+                previous_status = Some(snapshot.status);
+            }
+            for backend in &snapshot.backends {
+                if previous_backends.get(&backend.kind) != Some(&backend.readiness) {
+                    if backend.readiness == crate::models::state::SimulatorBackendReadiness::Ready {
+                        info!(
+                            event = "simulator_backend_recovered",
+                            backend = backend.kind.label(),
+                            status = backend.readiness.label(),
+                            "Simulator backend became available"
+                        );
+                    } else {
+                        warn!(
+                            event = "simulator_backend_degraded",
+                            backend = backend.kind.label(),
+                            status = backend.readiness.label(),
+                            reason = backend
+                                .reason
+                                .map(crate::models::state::SimulatorReadinessReason::label),
+                            error = backend.last_error.as_deref(),
+                            "Simulator backend became unavailable"
+                        );
+                    }
+                    previous_backends.insert(backend.kind, backend.readiness);
+                }
+            }
+            emit_simulator_health_snapshot(&snapshot);
         }
     });
 }
@@ -350,9 +417,10 @@ fn build_app_state(
     resources: &StreamResources,
 ) -> AppState {
     let chain = config.chain_profile.chain;
-    let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
+    let native_progress_lease =
+        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
-    let configured_vm_pools = !config.chain_profile.vm_protocols.is_empty();
+    let configured_vm_pools = !shared_db_protocols(&config.chain_profile).is_empty();
     let configured_rfq_pools = !config.chain_profile.rfq_protocols.is_empty();
     // VM is only effective when enabled and the selected chain exposes VM protocols.
     let effective_vm_enabled = config.enable_vm_pools && configured_vm_pools;
@@ -390,7 +458,8 @@ fn build_app_state(
         },
         enable_vm_pools: effective_vm_enabled,
         enable_rfq_pools: effective_rfq_enabled,
-        readiness_stale,
+        native_progress_lease,
+        optional_backend_stale: Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -411,7 +480,7 @@ fn log_erc4626_capability(config: &AppConfig) {
 
 fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(config.readiness_stale_secs),
+        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -426,7 +495,7 @@ fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
 }
 fn log_rebuild_config(config: &AppConfig) {
     let effective_vm_enabled =
-        config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+        config.enable_vm_pools && !shared_db_protocols(&config.chain_profile).is_empty();
     let effective_rfq_enabled =
         config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(
@@ -444,17 +513,46 @@ fn spawn_broadcaster_subscription_task(
     supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
-) {
-    let controls = broadcaster_subscription_controls(config, resources, app_state);
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut supervisors = Vec::new();
+    for controls in broadcaster_subscription_controls(config, resources, app_state) {
+        let (scope, backend) = match &controls {
+            BroadcasterSubscriptionControls::Native(_) => {
+                ("native", BroadcasterSubscriptionBackend::Native)
+            }
+            BroadcasterSubscriptionControls::Vm(_) => ("vm", BroadcasterSubscriptionBackend::Vm),
+            BroadcasterSubscriptionControls::Rfq(_) => ("rfq", BroadcasterSubscriptionBackend::Rfq),
+        };
+        let mut backend_supervisor_cfg = supervisor_cfg.clone();
+        backend_supervisor_cfg.readiness_stale =
+            subscription_readiness_stale(backend, &config.chain_profile);
+        supervisors.push(spawn_broadcaster_subscription_supervisor(
+            scope,
+            config,
+            redis_config,
+            &backend_supervisor_cfg,
+            vec![controls],
+        ));
+    }
+    supervisors
+}
+
+fn spawn_broadcaster_subscription_supervisor(
+    scope: &'static str,
+    config: &AppConfig,
+    redis_config: &BroadcasterRedisConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    controls: Vec<BroadcasterSubscriptionControls>,
+) -> tokio::task::JoinHandle<()> {
     let backend_count = controls.len();
     let base_url = config.tycho_broadcaster_url.clone();
     let expected_chain_id = config.chain_profile.chain.id();
     let redis_config = redis_config.clone();
     let supervisor_cfg = supervisor_cfg.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         info!(
-            backend_count,
-            "Starting broadcaster Redis subscription supervisor..."
+            scope,
+            backend_count, "Starting broadcaster Redis subscription supervisor..."
         );
         supervise_broadcaster_redis_subscription(
             base_url,
@@ -465,7 +563,11 @@ fn spawn_broadcaster_subscription_task(
         )
         .await;
     });
-    debug!("Broadcaster Redis subscription supervisor task spawned");
+    debug!(
+        scope,
+        "Broadcaster Redis subscription supervisor task spawned"
+    );
+    handle
 }
 
 #[cfg(test)]
@@ -481,6 +583,20 @@ enum BroadcasterSubscriptionBackend {
     Native,
     Vm,
     Rfq,
+}
+
+fn subscription_readiness_stale(
+    backend: BroadcasterSubscriptionBackend,
+    profile: &crate::config::ChainProfile,
+) -> Duration {
+    match backend {
+        BroadcasterSubscriptionBackend::Native => {
+            Duration::from_secs(profile.native_progress_lease_secs)
+        }
+        BroadcasterSubscriptionBackend::Vm | BroadcasterSubscriptionBackend::Rfq => {
+            Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS)
+        }
+    }
 }
 
 impl BroadcasterSubscriptionBackend {
@@ -547,7 +663,7 @@ fn native_broadcaster_subscription_controls(
         state_store: Arc::clone(&resources.native_state_store),
         stream_health: Arc::clone(&resources.native_stream_health),
         tokens: Arc::clone(&app_state.tokens),
-        protocols: config.chain_profile.native_protocols.clone(),
+        protocols: core_native_protocols(&config.chain_profile),
     })
 }
 
@@ -561,10 +677,51 @@ fn vm_broadcaster_subscription_controls(
         state_store: Arc::clone(&resources.vm_state_store),
         stream_health: Arc::clone(&resources.vm_stream_health),
         tokens: Arc::clone(&app_state.tokens),
-        protocols: config.chain_profile.vm_protocols.clone(),
+        protocols: shared_db_protocols(&config.chain_profile),
         vm_stream: Arc::clone(&resources.vm_stream),
         simulation_rebuild_gate: app_state.vm_simulation_rebuild_gate(),
+        wire_backend: shared_db_wire_backend(&config.chain_profile),
+        recovery_guard_held: false,
     })
+}
+
+fn core_native_protocols(profile: &crate::config::ChainProfile) -> Vec<String> {
+    profile
+        .native_protocols
+        .iter()
+        .filter(|protocol| protocol.as_str() != "uniswap_v4")
+        .cloned()
+        .collect()
+}
+
+fn shared_db_native_protocols(profile: &crate::config::ChainProfile) -> Vec<String> {
+    profile
+        .native_protocols
+        .iter()
+        .filter(|protocol| protocol.as_str() == "uniswap_v4")
+        .cloned()
+        .collect()
+}
+
+fn shared_db_protocols(profile: &crate::config::ChainProfile) -> Vec<String> {
+    let native_protocols = shared_db_native_protocols(profile);
+    if native_protocols.is_empty() {
+        profile.vm_protocols.clone()
+    } else {
+        debug_assert!(
+            profile.vm_protocols.is_empty(),
+            "one shared database subscription cannot consume both native and VM wire partitions"
+        );
+        native_protocols
+    }
+}
+
+fn shared_db_wire_backend(profile: &crate::config::ChainProfile) -> BroadcasterBackend {
+    if shared_db_native_protocols(profile).is_empty() {
+        BroadcasterBackend::Vm
+    } else {
+        BroadcasterBackend::Native
+    }
 }
 
 fn rfq_broadcaster_subscription_controls(
@@ -590,11 +747,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::broadcaster::redis_subscription::BroadcasterSubscriptionControls;
     use crate::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
     use crate::models::tokens::TokenStore;
     use anyhow::{anyhow, Result};
     use simulator_core::broadcaster::{
-        BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
+        BroadcasterBackend, BroadcasterTokenDto, BroadcasterTokenLookupResponse,
+        BroadcasterTokenSnapshotResponse,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -602,9 +761,9 @@ mod tests {
     use tycho_simulation::tycho_common::{models::token::Token, models::Chain, Bytes};
 
     use super::{
-        broadcaster_subscription_plan, build_app_state, create_stream_resources,
-        enabled_broadcaster_subscription_backends, load_token_store,
-        BroadcasterSubscriptionBackend,
+        broadcaster_subscription_controls, broadcaster_subscription_plan, build_app_state,
+        create_stream_resources, enabled_broadcaster_subscription_backends, load_token_store,
+        subscription_readiness_stale, BroadcasterSubscriptionBackend,
     };
 
     struct TokenAuthority {
@@ -804,12 +963,10 @@ mod tests {
 
         AppConfig {
             chain_profile,
-            tycho_url: "http://localhost:4242".to_string(),
             tycho_broadcaster_url: "http://127.0.0.1:3001".to_string(),
             bebop_url: "https://example.com/bebop".to_string(),
             hashflow_filename: "./hashflow.csv".to_string(),
             liquorice_url: Some("https://example.com/liquorice".to_string()),
-            api_key: "test-api-key".to_string(),
             rpc_url: rpc_url.map(str::to_string),
             tvl_threshold: 100.0,
             tvl_keep_threshold: 20.0,
@@ -831,7 +988,6 @@ mod tests {
             stream_restart_backoff_min_ms: 500,
             stream_restart_backoff_max_ms: 30_000,
             stream_restart_backoff_jitter_pct: 0.2,
-            readiness_stale_secs: 300,
             slippage: SlippageConfig::default(),
             memory: MemoryConfig {
                 purge_enabled: true,
@@ -874,6 +1030,8 @@ mod tests {
             ],
             vm_protocols: Vec::new(),
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
+            native_progress_lease_secs: 5,
+            recovery_max_buffered_native_blocks: 64,
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
             erc4626_pair_policies: Vec::new(),
@@ -893,6 +1051,8 @@ mod tests {
             ],
             vm_protocols: vec!["vm:curve".to_string()],
             rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
+            native_progress_lease_secs: 25,
+            recovery_max_buffered_native_blocks: 8,
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
@@ -905,7 +1065,6 @@ mod tests {
         let authority =
             TokenAuthority::spawn(vec![test_token(&token_address, Chain::Ethereum)]).await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_url = authority.base_url.clone();
         config.tycho_broadcaster_url = authority.base_url.clone();
 
         let store = load_token_store(&config).await?;
@@ -937,7 +1096,6 @@ mod tests {
         let authority =
             TokenAuthority::spawn(vec![test_token(&cached_address, Chain::Ethereum)]).await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_url = authority.base_url.clone();
         config.tycho_broadcaster_url = authority.base_url.clone();
 
         let store = load_token_store(&config).await?;
@@ -1089,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn build_app_state_disables_effective_vm_but_keeps_rfq_for_base_profile() {
+    fn build_app_state_enables_guarded_v4_and_rfq_for_base_profile() {
         let config = build_test_config(base_chain_profile(), true, true, None);
         let tokens = build_test_token_store(Chain::Base);
         let resources = create_stream_resources(Arc::clone(&tokens));
@@ -1097,7 +1255,7 @@ mod tests {
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
         assert_eq!(app_state.chain, Chain::Base);
-        assert!(!app_state.enable_vm_pools);
+        assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
         assert_eq!(app_state.rfq_client_config.tvl_threshold, 100.0);
         assert_eq!(app_state.rfq_client_config.bebop_user, "bebop-user");
@@ -1109,6 +1267,26 @@ mod tests {
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
+        assert_eq!(app_state.native_progress_lease, Duration::from_secs(5));
+        assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Native,
+                &config.chain_profile
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            subscription_readiness_stale(BroadcasterSubscriptionBackend::Vm, &config.chain_profile),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Rfq,
+                &config.chain_profile
+            ),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -1122,13 +1300,38 @@ mod tests {
             broadcaster_subscription_plan(&app_state),
             vec![
                 BroadcasterSubscriptionBackend::Native,
+                BroadcasterSubscriptionBackend::Vm,
                 BroadcasterSubscriptionBackend::Rfq
             ]
         );
         assert_eq!(
             enabled_broadcaster_subscription_backends(&app_state),
-            vec!["native", "rfq"]
+            vec!["native", "vm", "rfq"]
         );
+    }
+
+    #[test]
+    fn base_v4_uses_guarded_store_over_native_wire_partition() -> Result<()> {
+        let config = build_test_config(base_chain_profile(), true, false, None);
+        let tokens = build_test_token_store(Chain::Base);
+        let resources = create_stream_resources(Arc::clone(&tokens));
+        let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
+        let controls = broadcaster_subscription_controls(&config, &resources, &app_state);
+
+        let BroadcasterSubscriptionControls::Native(native) = &controls[0] else {
+            return Err(anyhow!("first Base subscription should be core native"));
+        };
+        assert!(!native
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "uniswap_v4"));
+
+        let BroadcasterSubscriptionControls::Vm(v4) = &controls[1] else {
+            return Err(anyhow!("second Base subscription should be guarded v4"));
+        };
+        assert_eq!(v4.protocols, vec!["uniswap_v4"]);
+        assert_eq!(v4.wire_backend, BroadcasterBackend::Native);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1165,5 +1368,14 @@ mod tests {
         );
         assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);
+        assert_eq!(app_state.native_progress_lease, Duration::from_secs(25));
+        assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Native,
+                &config.chain_profile
+            ),
+            Duration::from_secs(25)
+        );
     }
 }

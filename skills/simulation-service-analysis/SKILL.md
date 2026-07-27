@@ -1,6 +1,6 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the local broadcaster plus simulator stack, wait for /status health and native readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the local broadcaster plus simulator stack, inspect /status and wait for /ready, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
   short-description: DSolver Simulator local analysis
 ---
@@ -33,7 +33,7 @@ metadata:
 
 - Reuses the existing local simulator if it is already responding, otherwise starts the local broadcaster plus simulator stack with the repo lifecycle scripts.
 - Starts helper-managed Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://`, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster or Redis URLs are treated as externally managed.
-- Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
+- Reads `/status` for service state, then waits on `/ready` for native readiness and adds VM and RFQ checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
 - Builds the balanced `/encode` route matrix from live `/simulate` prep hops, covering 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain.
@@ -41,7 +41,7 @@ metadata:
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus simulator and broadcaster log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
-- Top-level `/status.status` is service health; nested `backends.*.status` carries backend readiness.
+- `/status` is always-live state reporting. `/ready` carries the HTTP readiness result, and nested `backends.*.status` explains backend state.
 
 ## Behavior model
 
@@ -73,19 +73,19 @@ scripts/verify_broadcaster_redis.sh --repo .
 
 Manual VM-ready wait when you want to confirm the service itself before rerunning the analyzer:
 ```bash
-scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --timeout 600
+scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1 --require-vm-ready --timeout 600
 ```
 
 `scripts/wait_ready.sh` still waits for native readiness by default. Use the VM and RFQ flags only when those backends also matter.
 
 Manual RFQ-ready wait when RFQ pools are enabled:
 ```bash
-scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 8453 --require-rfq-ready --timeout 600
+scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 8453 --require-rfq-ready --timeout 600
 ```
 
 Manual combined VM and RFQ wait for Ethereum when both backends matter:
 ```bash
-scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600
+scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600
 ```
 
 Write to a custom directory:

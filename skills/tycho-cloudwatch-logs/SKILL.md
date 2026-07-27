@@ -53,8 +53,10 @@ Start with `references/queries.md` for copyable ERC4626 pair filters built on to
 | block-updates | Track block height progress. |
 | block-updates-window | Track block height progress (oldest to newest in the window). |
 | block-updates-count | Count block updates in the window (with first/last timestamp). |
-| readiness | Confirm readiness events. |
+| readiness | Inspect broadcaster, simulator, and backend readiness transitions. |
 | resync | Inspect resync lifecycle. |
+| broadcaster-recovery | Inspect private recovery start, phase changes, commit, retries, and failure. |
+| broadcaster-redis | Inspect Redis append, replay, rebootstrapping, promotion, and writer-fencing failures. |
 | stream-health | Stream startup and errors. |
 | stream-supervision | Stream supervision and restart lifecycle. |
 | vm-rebuild | VM rebuild lifecycle. |

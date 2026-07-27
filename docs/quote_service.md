@@ -99,13 +99,12 @@ The current classification logic is:
 
 ## Readiness and gating
 
-`GET /status` is the readiness contract used by scripts and deploy checks.
+`GET /status` is the liveness view and always returns HTTP `200`. `GET /ready` is the readiness contract used by scripts and deploy checks.
 
 Service health and native readiness:
 
-- `status="ready"` with HTTP `200` means the service is healthy
-- `status="warming_up"` with HTTP `503` means native state is still loading
-- `status="stale"` with HTTP `503` means native state was ready before but is now stale
+- `/ready` returns HTTP `200` with `status="ready"` when native traffic can be served
+- `/ready` returns HTTP `503` while native state is warming, recovering, disconnected, or stale
 - `backends.native.status="ready"` means native state is ready and recent enough
 - `backends.native.status="warming_up"` means the native subscriber, snapshot bootstrap, or state store is still loading
 - `backends.native.status="stale"` means native updates are past the readiness freshness window
@@ -170,6 +169,7 @@ Practical client rule:
 Important failure kinds include:
 
 - `warm_up`
+- `stale_native_state`
 - `token_validation`
 - `token_coverage`
 - `timeout`
@@ -179,6 +179,11 @@ Important failure kinds include:
 - `inconsistent_result`
 - `internal`
 - `invalid_request`
+
+Native pool rows computed against a superseded native version are dropped and reported through
+`stale_native_state`. A natively-routed request that consistently runs longer than one native
+update interval will always be fenced, so operators must keep the request timeout below that
+interval. VM/RFQ-only requests are never fenced.
 
 `meta.pool_results` is the per-pool anomaly layer.
 

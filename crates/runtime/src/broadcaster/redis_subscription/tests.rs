@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use tokio::sync::RwLock;
@@ -16,7 +17,7 @@ use tycho_simulation::{
     },
     tycho_client::feed::{
         synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
-        BlockHeader, FeedMessage, SynchronizerState,
+        BlockHeader, SynchronizerState,
     },
     tycho_common::{
         dto::{
@@ -35,9 +36,10 @@ use super::processor::{
 };
 use super::snapshot::RawSnapshotReassembly;
 use super::{
-    apply_replay_batch, continue_redis_generation_handoff, mark_redis_replay_checkpoints,
-    mark_redis_transport_failed, process_broadcaster_redis_subscription, redis_transport_error,
-    replay_error_exit, reset_outer_backoff_after_catch_up, subscription_exit_requires_rebuild,
+    apply_recovery_message, apply_replay_batch, committed_recovery_complete_native_block,
+    mark_redis_replay_checkpoints, mark_redis_transport_failed,
+    process_broadcaster_redis_subscription, redis_transport_error, replay_error_exit,
+    reset_outer_backoff_after_catch_up, subscription_exit_requires_rebuild,
     BroadcasterSubscriptionControls, NativeBroadcasterSubscriptionControls,
     PreparedBroadcasterRedisSubscription, RedisRetrySleeper, ReplayPollSource,
     SubscriptionExitReason, VmBroadcasterSubscriptionControls,
@@ -49,16 +51,16 @@ use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
 use crate::stream::StreamSupervisorConfig;
 use broadcaster_replay_client::{
-    BroadcasterReplayClientError, GenerationHandoffCandidate, ReplayBatch, ReplayBatchItem,
-    ReplayCheckpoint, ReplayMessage, ReplayPoll,
+    BroadcasterReplayClientError, ReplayBatch, ReplayCheckpoint, ReplayMessage, ReplayPoll,
 };
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
-    BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
-    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk,
-    BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
-    BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
-    BroadcasterUpdatePartition,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
+    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+    BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk, BroadcasterRecoveryCommit,
+    BroadcasterRecoveryManifest, BroadcasterRecoveryStart, BroadcasterRedisReplayBoundary,
+    BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
+    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
+    BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -297,6 +299,8 @@ impl TestControls {
             protocols: vec!["vm:curve".to_string()],
             vm_stream: Arc::clone(&self.vm_stream),
             simulation_rebuild_gate: Arc::clone(&self.vm_simulation_rebuild_gate),
+            wire_backend: BroadcasterBackend::Vm,
+            recovery_guard_held: false,
         })
     }
 
@@ -340,7 +344,7 @@ fn replay_data_errors_keep_state_invalidating_reason() {
 
 #[tokio::test]
 async fn transient_redis_failures_preserve_checkpoint_and_reset_backoffs() -> Result<()> {
-    let (controls, prepared) = prepared_native_handoff_subscription().await?;
+    let (controls, prepared) = prepared_native_replay_subscription().await?;
     let source = FakeReplayPollSource::new([
         FakeReplayPoll::RetryableServerError,
         FakeReplayPoll::Batch,
@@ -398,7 +402,7 @@ async fn transient_redis_failures_preserve_checkpoint_and_reset_backoffs() -> Re
 
 #[tokio::test]
 async fn permanent_redis_command_failure_stops_without_rebuilding_state() -> Result<()> {
-    let (controls, prepared) = prepared_native_handoff_subscription().await?;
+    let (controls, prepared) = prepared_native_replay_subscription().await?;
     let source = FakeReplayPollSource::new([FakeReplayPoll::PermanentCommandError]);
     let sleeper = RecordingRetrySleeper::default();
     let cfg = redis_test_supervisor_config();
@@ -508,12 +512,12 @@ impl ReplayPollSource for FakeReplayPollSource {
                     Chain::Ethereum.id(),
                 );
                 Ok(ReplayPoll::Batch(ReplayBatch {
-                    items: vec![ReplayBatchItem::Message(ReplayMessage {
+                    items: vec![ReplayMessage {
                         entry_id: "7-104".to_string(),
                         entry,
                         envelope,
                         checkpoint_after,
-                    })],
+                    }],
                     caught_up_after_batch: false,
                 }))
             }
@@ -524,6 +528,40 @@ impl ReplayPollSource for FakeReplayPollSource {
                 message: "bad payload".to_string(),
             }),
         }
+    }
+}
+
+struct RecoveryThenGapPollSource {
+    start: std::sync::Mutex<Option<ReplayMessage>>,
+}
+
+impl RecoveryThenGapPollSource {
+    fn new(start: ReplayMessage) -> Self {
+        Self {
+            start: std::sync::Mutex::new(Some(start)),
+        }
+    }
+}
+
+impl ReplayPollSource for RecoveryThenGapPollSource {
+    async fn read_next<'a>(
+        &'a self,
+        _checkpoint: &'a ReplayCheckpoint,
+    ) -> std::result::Result<ReplayPoll, BroadcasterReplayClientError> {
+        let start = self
+            .start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(start) = start {
+            return Ok(ReplayPoll::Batch(ReplayBatch {
+                items: vec![start],
+                caught_up_after_batch: false,
+            }));
+        }
+        Err(BroadcasterReplayClientError::RedisGap {
+            message: "recovery transaction was trimmed before commit".to_string(),
+        })
     }
 }
 
@@ -591,8 +629,40 @@ async fn redis_replay_boundary_rebases_processor_after_http_snapshot() -> Result
 
     let snapshot = controls.native_subscription.snapshot().await;
     assert!(snapshot.redis_gap_reason.is_none());
-    assert_eq!(controls.native_state_store.current_block().await, 14);
+    assert_eq!(controls.native_state_store.current_block().await, 10);
     Ok(())
+}
+
+#[tokio::test]
+async fn redis_entry_applies_one_exact_publisher_version() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    bootstrap(&mut processor).await?;
+    let envelope = update_envelope_at(4)?;
+    let mut entry = redis_entry_for_scope(&envelope, "native");
+    entry.state_version = 41;
+
+    processor.observe_redis_delta(&entry, &envelope).await?;
+
+    assert_eq!(controls.native_state_store.state_version().await, 41);
+    assert_eq!(controls.native_state_store.current_block().await, 12);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_copy_awaits_the_current_token_snapshot() {
+    let controls = TestControls::new();
+    let token = dummy_token(44, "LATE");
+    controls.token_store.insert_batch([token.clone()]).await;
+
+    let recovery = controls.native().recovery_copy().await;
+    let pin = recovery.state_store().pin().await;
+
+    assert_eq!(
+        pin.token(&token.address).map(|token| token.symbol),
+        Some("LATE".to_string())
+    );
 }
 
 #[tokio::test]
@@ -610,7 +680,7 @@ async fn redis_replay_skips_foreign_backend_scope_without_sequence_gap() -> Resu
 
     processor.observe(heartbeat_envelope_at(5)?).await?;
 
-    assert_eq!(controls.native_state_store.current_block().await, 14);
+    assert_eq!(controls.native_state_store.current_block().await, 10);
     assert_eq!(controls.native_state_store.total_states().await, 1);
     assert_eq!(controls.rfq_state_store.total_states().await, 0);
     Ok(())
@@ -674,135 +744,272 @@ async fn redis_replay_status_checkpoint_does_not_move_behind_backend_boundary() 
 }
 
 #[tokio::test]
-async fn redis_generation_handoff_accepts_marker() -> Result<()> {
-    let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
-
-    continue_redis_generation_handoff(
-        &mut prepared,
-        &handoff_candidate(
-            "stream-7",
-            "7-103",
-            vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
-        )?,
-    )
-    .await
-    .map_err(|error| anyhow!(error))?;
-
-    let snapshot = controls.native_subscription.snapshot().await;
-    assert_eq!(snapshot.restart_count, 0);
-    assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
-    assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
-    assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("8-1"));
-    assert!(!snapshot.redis_replay_caught_up);
-    let status_boundary = snapshot
-        .redis_replay_boundary
-        .as_ref()
-        .ok_or_else(|| anyhow!("handoff should publish the new Redis boundary"))?;
-    assert_eq!(status_boundary.stream_id, "stream-8");
-    assert_eq!(status_boundary.snapshot_id, "snapshot-8");
-    assert_eq!(status_boundary.generation, 8);
-    assert_eq!(status_boundary.exclusive_message_seq, 1);
-    Ok(())
-}
-
-#[tokio::test]
-async fn redis_replay_batch_applies_update_after_generation_handoff() -> Result<()> {
-    let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
-    let old_boundary = redis_boundary("stream-7", "snapshot-7", 7, 103)?;
-    let new_boundary = redis_boundary("stream-8", "snapshot-8", 8, 1)?;
-    let update_boundary = redis_boundary("stream-8", "snapshot-8", 8, 2)?;
-    let update = update_envelope_for_stream("stream-8", 2, 71)?;
-    let mut update_entry = redis_entry_for_scope(&update, "native");
-    update_entry.snapshot_id = Some("snapshot-8".to_string());
-    let mut checkpoint = ReplayCheckpoint::new(old_boundary, Chain::Ethereum.id());
-
-    apply_replay_batch(
-        &mut prepared,
-        &mut checkpoint,
-        vec![
-            ReplayBatchItem::GenerationHandoff(handoff_candidate(
-                "stream-7",
-                "7-103",
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test keeps the full private assembly and atomic commit proof in one scenario"
+)]
+async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+    let mut checkpoint = ReplayCheckpoint::new(
+        redis_boundary("stream-7", "snapshot-7", 7, 103)?,
+        Chain::Ethereum.id(),
+    );
+    let replacement = recovery_snapshot_json(80)?;
+    let digest = format!("{:x}", keccak256(replacement.as_bytes()));
+    let target_state_version = 104;
+    let mut chunk_encoded_bytes = 1_u64;
+    loop {
+        let candidate = recovery_replay_message(
+            105,
+            BroadcasterPayload::RecoveryChunk(BroadcasterRecoveryChunk::new(
+                "recovery-1",
+                target_state_version,
+                vec![BroadcasterBackend::Native],
+                0,
+                chunk_encoded_bytes,
+                digest.clone(),
+                replacement.clone(),
             )?),
-            ReplayBatchItem::Message(ReplayMessage {
-                entry_id: "8-2".to_string(),
-                entry: update_entry,
-                envelope: update,
-                checkpoint_after: ReplayCheckpoint::new(update_boundary, Chain::Ethereum.id()),
-            }),
-        ],
-    )
-    .await
-    .map_err(|exit| anyhow!(exit.message))?;
+        )?;
+        let actual = u64::try_from(super::replay_entry_encoded_size(
+            &prepared.replay_boundary.stream_key,
+            prepared.redis_maxlen,
+            &candidate.entry,
+        )?)?;
+        if actual == chunk_encoded_bytes {
+            break;
+        }
+        chunk_encoded_bytes = actual;
+    }
+    let manifest = BroadcasterRecoveryManifest::new(
+        "recovery-1",
+        target_state_version,
+        vec![BroadcasterBackend::Native],
+        u64::try_from(replacement.len())?,
+        vec![chunk_encoded_bytes],
+        vec![digest.clone()],
+        digest.clone(),
+        0,
+        106,
+    )?;
+    let start = recovery_replay_message(
+        104,
+        BroadcasterPayload::RecoveryStart(BroadcasterRecoveryStart::new(manifest)?),
+    )?;
+    let request_generation_before_recovery = controls.native_state_store.request_generation().await;
+    apply_replay_batch(&mut prepared, &mut checkpoint, vec![start])
+        .await
+        .map_err(|exit| anyhow!(exit.message))?;
 
-    assert_eq!(controls.native_state_store.current_block().await, 71);
-    assert_eq!(checkpoint.entry_id(), "8-2");
-    assert_eq!(prepared.replay_boundary, new_boundary);
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert!(
+        controls.native_state_store.request_generation().await > request_generation_before_recovery,
+        "RecoveryStart must fence requests before assembling private replacement state"
+    );
+    assert!(
+        !controls
+            .native_subscription
+            .snapshot()
+            .await
+            .bootstrap_complete
+    );
+
+    let chunk = recovery_replay_message(
+        105,
+        BroadcasterPayload::RecoveryChunk(BroadcasterRecoveryChunk::new(
+            "recovery-1",
+            target_state_version,
+            vec![BroadcasterBackend::Native],
+            0,
+            chunk_encoded_bytes,
+            digest.clone(),
+            replacement,
+        )?),
+    )?;
+    apply_replay_batch(&mut prepared, &mut checkpoint, vec![chunk])
+        .await
+        .map_err(|exit| anyhow!(exit.message))?;
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+
+    let commit = recovery_replay_message(
+        106,
+        BroadcasterPayload::RecoveryCommit(BroadcasterRecoveryCommit::new(
+            "recovery-1",
+            target_state_version,
+            vec![BroadcasterBackend::Native],
+            digest,
+            0,
+            106,
+        )?),
+    )?;
+    apply_replay_batch(&mut prepared, &mut checkpoint, vec![commit])
+        .await
+        .map_err(|exit| anyhow!(exit.message))?;
+
+    assert_eq!(controls.native_state_store.current_block().await, 80);
     assert_eq!(
+        controls.native_state_store.state_version().await,
+        target_state_version
+    );
+    assert!(
         controls
             .native_subscription
             .snapshot()
             .await
-            .redis_replay_checkpoint
-            .as_deref(),
-        Some("8-2")
+            .bootstrap_complete
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn redis_generation_handoff_rejects_invalid_proofs_before_applying_state() -> Result<()> {
-    let invalid_messages = [
-        ("missing handoff", handoff_candidate_without_proof()?),
-        (
-            "missing backend head",
-            handoff_candidate("stream-7", "7-103", Vec::new())?,
-        ),
-        (
-            "extra backend head",
-            handoff_candidate(
-                "stream-7",
-                "7-103",
-                vec![
-                    BroadcasterBackendHead::new(BroadcasterBackend::Native, 70),
-                    BroadcasterBackendHead::new(BroadcasterBackend::Vm, 11),
-                ],
-            )?,
-        ),
-        (
-            "base head mismatch",
-            handoff_candidate(
-                "stream-7",
-                "7-103",
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 69)],
-            )?,
-        ),
-    ];
+async fn malformed_or_incomplete_recovery_never_exposes_candidate_state() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+    let (start, _, commit) = recovery_messages(&prepared, "recovery-malformed", 104, 80, 104)?;
+    apply_recovery_message(&mut prepared, &start).await?;
 
-    for (invalid, candidate) in invalid_messages {
-        let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
-        let error = continue_redis_generation_handoff(&mut prepared, &candidate)
-            .await
-            .err()
-            .ok_or_else(|| anyhow!("{invalid} should fail closed"))?;
+    let Err(incomplete_error) = apply_recovery_message(&mut prepared, &commit).await else {
+        return Err(anyhow!("commit without its declared chunk must fail"));
+    };
+    assert!(incomplete_error
+        .to_string()
+        .contains("before every declared fragment"));
+    assert_eq!(controls.native_state_store.current_block().await, 70);
 
-        assert!(
-            error.to_string().contains("Redis replay gap"),
-            "{invalid} should return a Redis replay gap: {error}"
-        );
-        assert_eq!(controls.native_state_store.current_block().await, 70);
-        let snapshot = controls.native_subscription.snapshot().await;
-        assert_eq!(snapshot.restart_count, 0);
-        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-7"));
-        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-7"));
-        assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("7-103"));
-        let boundary = snapshot
-            .redis_replay_boundary
+    let (start, mut corrupt, _) = recovery_messages(&prepared, "recovery-corrupt", 107, 81, 107)?;
+    apply_recovery_message(&mut prepared, &start).await?;
+    let BroadcasterPayload::RecoveryChunk(corrupt_chunk) = &mut corrupt.envelope.payload else {
+        return Err(anyhow!("test fixture must contain a recovery chunk"));
+    };
+    corrupt_chunk.payload_fragment.push('x');
+    let Err(corrupt_error) = apply_recovery_message(&mut prepared, &corrupt).await else {
+        return Err(anyhow!("corrupt recovery fragment must fail"));
+    };
+    assert!(corrupt_error.to_string().contains("digest"));
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reordered_recovery_chunk_is_rejected_before_private_assembly_changes() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+    let (mut start, mut chunk, _) =
+        recovery_messages(&prepared, "recovery-reordered", 104, 80, 104)?;
+    let BroadcasterPayload::RecoveryStart(start_payload) = &mut start.envelope.payload else {
+        return Err(anyhow!("test fixture must contain RecoveryStart"));
+    };
+    let first_chunk_bytes = start_payload.manifest.chunk_encoded_bytes[0];
+    let first_chunk_digest = start_payload.manifest.chunk_digests[0].clone();
+    start_payload
+        .manifest
+        .chunk_encoded_bytes
+        .push(first_chunk_bytes);
+    start_payload
+        .manifest
+        .chunk_digests
+        .push(first_chunk_digest);
+    start_payload.manifest.chunk_count = 2;
+    start_payload.manifest.commit_watermark =
+        start_payload.manifest.commit_watermark.saturating_add(1);
+    let BroadcasterPayload::RecoveryChunk(chunk_payload) = &mut chunk.envelope.payload else {
+        return Err(anyhow!("test fixture must contain RecoveryChunk"));
+    };
+    chunk_payload.chunk_index = 1;
+
+    apply_recovery_message(&mut prepared, &start).await?;
+    let Err(error) = apply_recovery_message(&mut prepared, &chunk).await else {
+        return Err(anyhow!(
+            "second recovery chunk must not arrive before the first"
+        ));
+    };
+
+    assert!(error.to_string().contains("arrived out of order"));
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert!(prepared
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.chunks.is_empty()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn newer_recovery_supersedes_private_orphan_and_rejects_old_tail() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+    let (old_start, old_chunk, _) = recovery_messages(&prepared, "recovery-old", 104, 80, 104)?;
+    let (new_start, _, _) = recovery_messages(&prepared, "recovery-new", 107, 81, 107)?;
+
+    apply_recovery_message(&mut prepared, &old_start).await?;
+    apply_recovery_message(&mut prepared, &new_start).await?;
+
+    assert_eq!(
+        prepared
+            .recovery
             .as_ref()
-            .ok_or_else(|| anyhow!("old Redis boundary should remain visible"))?;
-        assert_eq!(boundary.generation, 7);
-    }
+            .map(|recovery| recovery.manifest.recovery_id.as_str()),
+        Some("recovery-new")
+    );
+    let Err(error) = apply_recovery_message(&mut prepared, &old_chunk).await else {
+        return Err(anyhow!("superseded recovery tail must be rejected"));
+    };
+    assert!(error.to_string().contains("recovery identity"));
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    Ok(())
+}
+
+#[tokio::test]
+async fn producer_crash_before_or_after_commit_is_replayed_on_consumer_restart() -> Result<()> {
+    let (_, prepared_fixture) = prepared_native_replay_subscription().await?;
+    let retained = recovery_messages(&prepared_fixture, "recovery-restart", 104, 80, 104)?;
+    drop(prepared_fixture);
+
+    let (controls, mut restarted) = prepared_native_replay_subscription().await?;
+    apply_recovery_message(&mut restarted, &retained.0).await?;
+    apply_recovery_message(&mut restarted, &retained.1).await?;
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    drop(restarted);
+
+    let (controls, mut restarted_again) = prepared_native_replay_subscription().await?;
+    apply_recovery_message(&mut restarted_again, &retained.0).await?;
+    apply_recovery_message(&mut restarted_again, &retained.1).await?;
+    apply_recovery_message(&mut restarted_again, &retained.2).await?;
+
+    assert_eq!(controls.native_state_store.current_block().await, 80);
+    assert_eq!(controls.native_state_store.state_version().await, 104);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trimmed_recovery_transaction_forces_http_fallback_without_exposure() -> Result<()> {
+    let (controls, prepared) = prepared_native_replay_subscription().await?;
+    let (start, _, _) = recovery_messages(&prepared, "recovery-trimmed", 104, 80, 104)?;
+    let source = RecoveryThenGapPollSource::new(start);
+    let sleeper = RecordingRetrySleeper::default();
+
+    let (exit, mut rebuilds, caught_up_once) = process_broadcaster_redis_subscription(
+        &source,
+        prepared,
+        &redis_test_supervisor_config(),
+        &sleeper,
+    )
+    .await;
+
+    assert_eq!(exit.reason, SubscriptionExitReason::RedisGap);
+    assert!(subscription_exit_requires_rebuild(exit.reason));
+    assert!(!caught_up_once);
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert!(
+        !controls
+            .native_subscription
+            .snapshot()
+            .await
+            .bootstrap_complete
+    );
+
+    let native_controls = controls.native();
+    let rebuild = rebuilds.get_mut(0).and_then(Option::take);
+    let continued = handle_subscription_reset(&native_controls, Some(exit.message), rebuild).await;
+    assert!(continued.is_none());
+    assert!(!controls.native_state_store.is_ready());
+    assert_eq!(controls.native_state_store.current_block().await, 0);
     Ok(())
 }
 
@@ -815,13 +1022,150 @@ fn redis_entry_for_scope(
         chain_id: Chain::Ethereum.id(),
         stream_id: envelope.stream_id.clone(),
         message_seq: envelope.message_seq,
+        state_version: envelope.message_seq,
         kind: envelope.kind(),
         snapshot_id: Some("snapshot-1".to_string()),
         backend_scope: backend_scope.to_string(),
         block_number: None,
         observed_timestamp_ms: None,
+        published_at_ms: 1,
         payload_json: String::new(),
     }
+}
+
+fn recovery_snapshot_json(block_number: u64) -> Result<String> {
+    let snapshot_id = "recovery-snapshot-1";
+    let stream_id = "recovery-stream-1";
+    let envelopes = vec![
+        BroadcasterEnvelope::new(
+            stream_id,
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                snapshot_id,
+                Chain::Ethereum.id(),
+                vec![BroadcasterBackend::Native],
+                1,
+            )?),
+        ),
+        BroadcasterEnvelope::new(
+            stream_id,
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                snapshot_id,
+                0,
+                vec![BroadcasterSnapshotPartition::new(
+                    BroadcasterBackend::Native,
+                    block_number,
+                    Vec::new(),
+                    BTreeMap::new(),
+                )],
+            )?),
+        ),
+        BroadcasterEnvelope::new(
+            stream_id,
+            3,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new(snapshot_id)),
+        ),
+    ];
+    serde_json::to_string(&envelopes).map_err(Into::into)
+}
+
+fn recovery_messages(
+    prepared: &PreparedBroadcasterRedisSubscription,
+    recovery_id: &str,
+    target_state_version: u64,
+    block_number: u64,
+    start_seq: u64,
+) -> Result<(ReplayMessage, ReplayMessage, ReplayMessage)> {
+    let replacement = recovery_snapshot_json(block_number)?;
+    let digest = format!("{:x}", keccak256(replacement.as_bytes()));
+    let chunk_seq = start_seq.saturating_add(1);
+    let commit_seq = start_seq.saturating_add(2);
+    let mut chunk_encoded_bytes = 1_u64;
+    loop {
+        let candidate = recovery_replay_message(
+            chunk_seq,
+            BroadcasterPayload::RecoveryChunk(BroadcasterRecoveryChunk::new(
+                recovery_id,
+                target_state_version,
+                vec![BroadcasterBackend::Native],
+                0,
+                chunk_encoded_bytes,
+                digest.clone(),
+                replacement.clone(),
+            )?),
+        )?;
+        let actual = u64::try_from(super::replay_entry_encoded_size(
+            &prepared.replay_boundary.stream_key,
+            prepared.redis_maxlen,
+            &candidate.entry,
+        )?)?;
+        if actual == chunk_encoded_bytes {
+            break;
+        }
+        chunk_encoded_bytes = actual;
+    }
+    let manifest = BroadcasterRecoveryManifest::new(
+        recovery_id,
+        target_state_version,
+        vec![BroadcasterBackend::Native],
+        u64::try_from(replacement.len())?,
+        vec![chunk_encoded_bytes],
+        vec![digest.clone()],
+        digest.clone(),
+        0,
+        commit_seq,
+    )?;
+    let start = recovery_replay_message(
+        start_seq,
+        BroadcasterPayload::RecoveryStart(BroadcasterRecoveryStart::new(manifest)?),
+    )?;
+    let chunk = recovery_replay_message(
+        chunk_seq,
+        BroadcasterPayload::RecoveryChunk(BroadcasterRecoveryChunk::new(
+            recovery_id,
+            target_state_version,
+            vec![BroadcasterBackend::Native],
+            0,
+            chunk_encoded_bytes,
+            digest.clone(),
+            replacement,
+        )?),
+    )?;
+    let commit = recovery_replay_message(
+        commit_seq,
+        BroadcasterPayload::RecoveryCommit(BroadcasterRecoveryCommit::new(
+            recovery_id,
+            target_state_version,
+            vec![BroadcasterBackend::Native],
+            digest,
+            0,
+            commit_seq,
+        )?),
+    )?;
+    Ok((start, chunk, commit))
+}
+
+fn recovery_replay_message(message_seq: u64, payload: BroadcasterPayload) -> Result<ReplayMessage> {
+    let state_version = match &payload {
+        BroadcasterPayload::RecoveryStart(start) => start.manifest.target_state_version,
+        BroadcasterPayload::RecoveryChunk(chunk) => chunk.target_state_version,
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => catch_up.target_state_version,
+        BroadcasterPayload::RecoveryCommit(commit) => commit.target_state_version,
+        _ => message_seq,
+    };
+    let envelope = BroadcasterEnvelope::new("stream-7", message_seq, payload);
+    let boundary = redis_boundary("stream-7", "snapshot-7", 7, message_seq)?;
+    Ok(ReplayMessage {
+        entry_id: boundary.exclusive_entry_id(),
+        entry: BroadcasterRedisStreamEntry::from_envelope(
+            Chain::Ethereum.id(),
+            &envelope,
+            state_version,
+        )?,
+        envelope,
+        checkpoint_after: ReplayCheckpoint::new(boundary, Chain::Ethereum.id()),
+    })
 }
 
 fn native_component() -> ProtocolComponent {
@@ -847,6 +1191,7 @@ fn replay_boundary(exclusive_message_seq: u64) -> Result<BroadcasterRedisReplayB
         "snapshot-1",
         1,
         exclusive_message_seq,
+        exclusive_message_seq,
     )
     .map_err(Into::into)
 }
@@ -863,11 +1208,12 @@ fn redis_boundary(
         snapshot_id,
         generation,
         exclusive_message_seq,
+        exclusive_message_seq,
     )
     .map_err(Into::into)
 }
 
-async fn prepared_native_handoff_subscription(
+async fn prepared_native_replay_subscription(
 ) -> Result<(TestControls, PreparedBroadcasterRedisSubscription)> {
     let controls = TestControls::new();
     let old_boundary = redis_boundary("stream-7", "snapshot-7", 7, 103)?;
@@ -885,6 +1231,8 @@ async fn prepared_native_handoff_subscription(
         }],
         replay_boundary: old_boundary.clone(),
         expected_chain_id: Chain::Ethereum.id(),
+        recovery: None,
+        redis_maxlen: None,
     };
     Ok((controls, prepared))
 }
@@ -934,50 +1282,6 @@ async fn bootstrap_native_stream(
             BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new(snapshot_id)),
         ))
         .await
-}
-
-fn handoff_candidate(
-    previous_stream_id: &str,
-    previous_entry_id: &str,
-    base_heads: Vec<BroadcasterBackendHead>,
-) -> Result<GenerationHandoffCandidate> {
-    generation_handoff_candidate(Some(BroadcasterGenerationHandoff::new(
-        previous_stream_id,
-        previous_entry_id,
-        base_heads,
-    )?))
-}
-
-fn handoff_candidate_without_proof() -> Result<GenerationHandoffCandidate> {
-    generation_handoff_candidate(None)
-}
-
-fn generation_handoff_candidate(
-    handoff: Option<BroadcasterGenerationHandoff>,
-) -> Result<GenerationHandoffCandidate> {
-    let progress = match handoff {
-        Some(handoff) => BroadcasterProgress::new_with_handoff(
-            Chain::Ethereum.id(),
-            "snapshot-8",
-            vec![BroadcasterBackend::Native],
-            "active_writer_promoted",
-            handoff,
-        )?,
-        None => BroadcasterProgress::new(
-            Chain::Ethereum.id(),
-            "snapshot-8",
-            vec![BroadcasterBackend::Native],
-            "active_writer_promoted",
-        )?,
-    };
-    let envelope = BroadcasterEnvelope::new("stream-8", 1, BroadcasterPayload::Progress(progress));
-    let boundary = redis_boundary("stream-8", "snapshot-8", 8, 1)?;
-    Ok(GenerationHandoffCandidate {
-        entry: BroadcasterRedisStreamEntry::from_envelope(Chain::Ethereum.id(), &envelope)?,
-        envelope,
-        boundary: boundary.clone(),
-        checkpoint_after: ReplayCheckpoint::new(boundary, Chain::Ethereum.id()),
-    })
 }
 
 fn vm_component() -> ProtocolComponent {
@@ -1139,6 +1443,7 @@ fn update_envelope_for_stream(
     message_seq: u64,
     block_number: u64,
 ) -> Result<BroadcasterEnvelope> {
+    let header = raw_block_header(block_number, block_number as u8);
     Ok(BroadcasterEnvelope::new(
         stream_id,
         message_seq,
@@ -1153,10 +1458,35 @@ fn update_envelope_for_stream(
                     Box::new(DummySim(3)),
                 )],
                 Vec::new(),
-                BTreeMap::new(),
+                BTreeMap::from([(
+                    "uniswap_v2".to_string(),
+                    BroadcasterProtocolSyncStatus::from_synchronizer_state(
+                        &SynchronizerState::Ready(header),
+                    ),
+                )]),
             ),
         ])?),
     ))
+}
+
+fn partial_native_update_envelope(
+    message_seq: u64,
+    block_number: u64,
+) -> Result<BroadcasterEnvelope> {
+    let mut envelope = update_envelope_for_stream("stream-1", message_seq, block_number)?;
+    let BroadcasterPayload::Update(update) = &mut envelope.payload else {
+        return Err(anyhow!("expected native update payload"));
+    };
+    let status = update.partitions[0]
+        .sync_statuses
+        .get_mut("uniswap_v2")
+        .ok_or_else(|| anyhow!("native sync status missing"))?;
+    status
+        .block
+        .as_mut()
+        .ok_or_else(|| anyhow!("native sync block missing"))?
+        .partial_block_index = Some(0);
+    Ok(envelope)
 }
 
 fn rfq_update_envelope(block_number: u64) -> Result<BroadcasterEnvelope> {
@@ -1793,6 +2123,7 @@ async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Re
         compacted_export.snapshot_id.clone(),
         1,
         0,
+        0,
     )?);
     for (index, payload) in compacted_export.payloads.into_iter().enumerate() {
         compacted_processor
@@ -1841,261 +2172,6 @@ async fn raw_cache_compaction_matches_consumer_state_transition() -> Result<()> 
 }
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the full reconnect sequence stays in one cross-layer regression"
-)]
-async fn five_protocol_recovery_keeps_consumer_live_on_one_compact_redis_update() -> Result<()> {
-    const PROTOCOLS: [&str; 5] = [
-        "uniswap_v2",
-        "uniswap_v3",
-        "uniswap_v4",
-        "pancakeswap_v3",
-        "aerodrome_slipstreams",
-    ];
-    let cache = BroadcasterSnapshotCache::new_with_initial_generation(
-        8453,
-        vec![BroadcasterBackend::Native],
-        7,
-    );
-    let header = |number, hash, parent| BlockHeader {
-        hash: Bytes::from([hash; 32]),
-        number,
-        parent_hash: Bytes::from([parent; 32]),
-        revert: false,
-        timestamp: number * 10,
-        partial_block_index: None,
-    };
-    let protocol_message = |protocol: &str, block: BlockHeader, seed: u8| {
-        let protocol_index = PROTOCOLS
-            .iter()
-            .position(|candidate| *candidate == protocol)
-            .unwrap_or_default();
-        let component_id = format!("0x{:040x}", protocol_index + 1);
-        let mut component = raw_component_with_state(&component_id);
-        component.component.protocol_system = protocol.to_string();
-        component.component.protocol_type_name = protocol.to_string();
-        component
-            .state
-            .attributes
-            .insert("value".to_string(), Bytes::from([seed; 32]));
-        StateSyncMessage {
-            header: block,
-            snapshots: Snapshot {
-                states: HashMap::from([(component_id, component)]),
-                vm_storage: HashMap::new(),
-            },
-            deltas: None,
-            removed_components: HashMap::new(),
-        }
-    };
-    let feed = |entries: Vec<(&str, StateSyncMessage<BlockHeader>)>,
-                statuses: Vec<(&str, BlockHeader)>| FeedMessage {
-        state_msgs: entries
-            .into_iter()
-            .map(|(protocol, message)| (protocol.to_string(), message))
-            .collect(),
-        sync_states: statuses
-            .into_iter()
-            .map(|(protocol, block)| (protocol.to_string(), SynchronizerState::Ready(block)))
-            .collect(),
-    };
-    let block_10 = header(10, 10, 9);
-    let initial = feed(
-        PROTOCOLS
-            .iter()
-            .enumerate()
-            .map(|(index, protocol)| {
-                (
-                    *protocol,
-                    protocol_message(protocol, block_10.clone(), index as u8 + 1),
-                )
-            })
-            .collect(),
-        PROTOCOLS
-            .iter()
-            .map(|protocol| (*protocol, block_10.clone()))
-            .collect(),
-    );
-    cache.apply_feed_message(&initial).await?;
-    let export = cache.export_snapshot(8_388_608).await?;
-    let initial_stream_id = export.stream_id.clone();
-    let initial_snapshot_id = export.snapshot_id.clone();
-    let boundary = BroadcasterRedisReplayBoundary::new(
-        "broadcaster:test",
-        export.stream_id.clone(),
-        export.snapshot_id.clone(),
-        7,
-        103,
-    )?;
-
-    let controls = TestControls::new();
-    let mut decoder = TychoStreamDecoder::new();
-    for protocol in PROTOCOLS {
-        decoder.register_decoder::<StatefulSim>(protocol);
-    }
-    let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
-        8453,
-        controls.native(),
-        Arc::new(decoder),
-        None,
-    );
-    processor.set_bootstrap_redis_replay_boundary(boundary.clone());
-    for (index, payload) in export.payloads.into_iter().enumerate() {
-        processor
-            .observe(BroadcasterEnvelope::new(
-                export.stream_id.clone(),
-                index as u64 + 1,
-                payload,
-            ))
-            .await?;
-    }
-    assert!(processor.bootstrap_complete());
-    processor.align_redis_replay_boundary(&boundary)?;
-    assert_eq!(processor.next_message_seq(), Some(104));
-
-    let block_12 = header(12, 12, 11);
-    let first = feed(
-        PROTOCOLS[..2]
-            .iter()
-            .enumerate()
-            .map(|(index, protocol)| {
-                (
-                    *protocol,
-                    protocol_message(protocol, block_12.clone(), if index == 0 { 9 } else { 2 }),
-                )
-            })
-            .collect(),
-        PROTOCOLS
-            .iter()
-            .enumerate()
-            .map(|(index, protocol)| {
-                (
-                    *protocol,
-                    if index < 2 {
-                        block_12.clone()
-                    } else {
-                        block_10.clone()
-                    },
-                )
-            })
-            .collect(),
-    );
-    assert!(cache.apply_feed_message(&first).await?.is_none());
-    assert_eq!(processor.next_message_seq(), Some(104));
-
-    let second = feed(
-        PROTOCOLS[2..]
-            .iter()
-            .enumerate()
-            .map(|(index, protocol)| {
-                (
-                    *protocol,
-                    protocol_message(protocol, block_12.clone(), index as u8 + 3),
-                )
-            })
-            .collect(),
-        PROTOCOLS
-            .iter()
-            .map(|protocol| (*protocol, block_12.clone()))
-            .collect(),
-    );
-    let compact = cache
-        .apply_feed_message(&second)
-        .await?
-        .ok_or_else(|| anyhow!("aligned recovery should emit one compact update"))?;
-    assert_eq!(
-        compact
-            .partitions
-            .iter()
-            .flat_map(|partition| &partition.messages)
-            .map(|message| message.message.snapshots.states.len())
-            .sum::<usize>(),
-        1
-    );
-
-    let clean_cache = BroadcasterSnapshotCache::new_with_initial_generation(
-        8453,
-        vec![BroadcasterBackend::Native],
-        7,
-    );
-    let clean_block_12 = feed(
-        PROTOCOLS
-            .iter()
-            .enumerate()
-            .map(|(index, protocol)| {
-                (
-                    *protocol,
-                    protocol_message(
-                        protocol,
-                        block_12.clone(),
-                        if index == 0 { 9 } else { index as u8 + 1 },
-                    ),
-                )
-            })
-            .collect(),
-        PROTOCOLS
-            .iter()
-            .map(|protocol| (*protocol, block_12.clone()))
-            .collect(),
-    );
-    clean_cache.apply_feed_message(&clean_block_12).await?;
-    let recovered_export = cache.export_snapshot(8_388_608).await?;
-    let clean_export = clean_cache.export_snapshot(8_388_608).await?;
-    assert_eq!(boundary.generation, 7);
-    assert_eq!(recovered_export.stream_id, initial_stream_id);
-    assert_eq!(recovered_export.snapshot_id, initial_snapshot_id);
-    assert_eq!(clean_export.stream_id, initial_stream_id);
-    assert_eq!(clean_export.snapshot_id, initial_snapshot_id);
-    assert_eq!(
-        serde_json::to_vec(&recovered_export.payloads)?,
-        serde_json::to_vec(&clean_export.payloads)?,
-        "recovered cache export must match a clean block-12 cache"
-    );
-
-    let envelope = BroadcasterEnvelope::new(
-        boundary.stream_id.clone(),
-        104,
-        BroadcasterPayload::Update(compact),
-    );
-    let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
-    processor.observe_redis_delta(&entry, &envelope).await?;
-    controls
-        .native_subscription
-        .mark_redis_catch_up_checkpoint("7-104")
-        .await;
-
-    assert!(processor.bootstrap_complete());
-    assert_eq!(processor.next_message_seq(), Some(105));
-    let subscription = controls.native_subscription.snapshot().await;
-    assert!(subscription.bootstrap_complete);
-    assert!(subscription.redis_replay_caught_up);
-    assert_eq!(subscription.restart_count, 0);
-    assert_eq!(
-        subscription.stream_id.as_deref(),
-        Some(boundary.stream_id.as_str())
-    );
-    assert_eq!(
-        subscription.snapshot_id.as_deref(),
-        Some(boundary.snapshot_id.as_str())
-    );
-    assert_eq!(subscription.redis_replay_boundary.as_ref(), Some(&boundary));
-    assert_eq!(controls.native_state_store.current_block().await, 12);
-    let updated = controls
-        .native_state_store
-        .pool_by_id("0x0000000000000000000000000000000000000001")
-        .await
-        .ok_or_else(|| anyhow!("updated consumer pool missing"))?;
-    let state = updated
-        .0
-        .as_any()
-        .downcast_ref::<StatefulSim>()
-        .ok_or_else(|| anyhow!("unexpected consumer state type"))?;
-    assert_eq!(state.attributes["value"], Bytes::from([9u8; 32]));
-    Ok(())
-}
-
-#[tokio::test]
 async fn snapshot_bootstrap_populates_native_and_vm_separately() -> Result<()> {
     let controls = TestControls::new();
     let mut native_processor =
@@ -2136,12 +2212,12 @@ async fn snapshot_bootstrap_populates_native_and_vm_separately() -> Result<()> {
         .native_stream_health
         .last_update_age_ms()
         .await
-        .is_some());
+        .is_none());
     assert!(controls
         .vm_stream_health
         .last_update_age_ms()
         .await
-        .is_some());
+        .is_none());
     Ok(())
 }
 
@@ -2311,12 +2387,12 @@ async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> R
             .await
     );
     assert_eq!(controls.vm_state_store.current_block().await, 21);
-    assert_eq!(controls.vm_stream_health.last_block().await, 21);
+    assert_eq!(controls.vm_stream_health.last_block().await, 0);
     assert!(controls
         .vm_stream_health
         .last_update_age_ms()
         .await
-        .is_some());
+        .is_none());
     Ok(())
 }
 
@@ -2361,7 +2437,7 @@ async fn http_snapshot_bootstrap_decodes_unsplit_raw_message() -> Result<()> {
             .await
     );
     assert_eq!(controls.vm_state_store.current_block().await, 30);
-    assert_eq!(controls.vm_stream_health.last_block().await, 30);
+    assert_eq!(controls.vm_stream_health.last_block().await, 0);
 
     let snapshot = controls.vm_subscription.snapshot().await;
     assert!(snapshot.connected);
@@ -2396,7 +2472,7 @@ async fn snapshot_start_rejects_unexpected_chain_id_before_applying_state() -> R
 }
 
 #[tokio::test]
-async fn heartbeat_refreshes_backend_blocks_without_new_state() -> Result<()> {
+async fn heartbeat_does_not_refresh_backend_progress_without_state() -> Result<()> {
     let controls = TestControls::new();
     let mut native_processor =
         BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
@@ -2408,8 +2484,8 @@ async fn heartbeat_refreshes_backend_blocks_without_new_state() -> Result<()> {
     native_processor.observe(heartbeat_envelope()?).await?;
     vm_processor.observe(heartbeat_envelope()?).await?;
 
-    assert_eq!(controls.native_state_store.current_block().await, 14);
-    assert_eq!(controls.vm_state_store.current_block().await, 15);
+    assert_eq!(controls.native_state_store.current_block().await, 10);
+    assert_eq!(controls.vm_state_store.current_block().await, 11);
     assert!(controls.native_state_store.has_pool("pool-native").await);
     assert!(controls.vm_state_store.has_pool("pool-vm").await);
     Ok(())
@@ -2432,6 +2508,74 @@ async fn live_update_keeps_native_and_vm_partitioned() -> Result<()> {
     assert_eq!(controls.vm_state_store.current_block().await, 11);
     assert!(controls.native_state_store.has_pool("pool-native").await);
     assert!(controls.vm_state_store.has_pool("pool-vm").await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_and_unknown_native_updates_do_not_renew_consumer_progress() -> Result<()> {
+    let controls = TestControls::new();
+    let mut native_processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    controls.native_stream_health.mark_started().await;
+    bootstrap(&mut native_processor).await?;
+
+    native_processor.observe(update_envelope_at(4)?).await?;
+    assert_eq!(controls.native_stream_health.last_block().await, 12);
+    native_processor
+        .observe(partial_native_update_envelope(5, 13)?)
+        .await?;
+
+    assert_eq!(controls.native_state_store.current_block().await, 13);
+    assert_eq!(controls.native_stream_health.last_block().await, 12);
+    let unknown = BroadcasterUpdatePartition::new(
+        BroadcasterBackend::Native,
+        14,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    assert_eq!(unknown.complete_native_block(), None);
+    Ok(())
+}
+
+#[test]
+fn recovery_progress_uses_complete_replacement_not_partial_catch_up() -> Result<()> {
+    let BroadcasterPayload::Update(mut replacement_update) = update_envelope_at(4)?.payload else {
+        return Err(anyhow!("expected complete native replacement update"));
+    };
+    let replacement_partition = replacement_update
+        .partitions
+        .pop()
+        .ok_or_else(|| anyhow!("complete native replacement partition missing"))?;
+    let replacement_partition = BroadcasterSnapshotPartition::new(
+        replacement_partition.backend,
+        replacement_partition.block_number,
+        Vec::new(),
+        replacement_partition.sync_statuses,
+    );
+    let snapshot = vec![BroadcasterEnvelope::new(
+        "recovery-stream",
+        2,
+        BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+            "recovery-snapshot",
+            0,
+            vec![replacement_partition],
+        )?),
+    )];
+    let BroadcasterPayload::Update(partial_update) = partial_native_update_envelope(5, 13)?.payload
+    else {
+        return Err(anyhow!("expected partial native catch-up update"));
+    };
+    let buffer_a = BTreeMap::from([(
+        0,
+        BroadcasterRecoveryCatchUp::new("recovery-partial", 104, 0, partial_update)?,
+    )]);
+
+    assert_eq!(
+        committed_recovery_complete_native_block(&snapshot, &buffer_a),
+        Some(12)
+    );
     Ok(())
 }
 
@@ -2688,12 +2832,12 @@ async fn native_processor_ignores_vm_partitions() -> Result<()> {
     assert!(processor.bootstrap_complete());
     assert!(broadcaster_snapshot.bootstrap_complete);
     assert!(broadcaster_snapshot.connected);
-    assert_eq!(controls.native_stream_health.last_block().await, 10);
+    assert_eq!(controls.native_stream_health.last_block().await, 0);
     assert!(controls
         .native_stream_health
         .last_update_age_ms()
         .await
-        .is_some());
+        .is_none());
     Ok(())
 }
 

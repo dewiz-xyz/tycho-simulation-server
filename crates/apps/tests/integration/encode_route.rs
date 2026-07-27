@@ -677,7 +677,8 @@ async fn build_app_state_and_request(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -787,7 +788,8 @@ async fn setup_timeout_app(
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -978,7 +980,7 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.readiness_stale = Duration::from_millis(1);
+    state.native_progress_lease = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
@@ -1082,6 +1084,31 @@ async fn encode_route_rejects_vm_route_when_vm_is_rebuilding() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn encode_route_rejects_base_v4_route_while_shared_database_rebuilds() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        chain: Chain::Base,
+        request_pool_protocol: "uniswap_v4",
+        component_protocol_system: "uniswap_v4",
+        component_protocol_type_name: "uniswap_v4_pool",
+        vm_pool: true,
+        enable_vm_pools: true,
+        vm_rebuilding: true,
+        request_id: "req-base-v4-rebuilding",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: VM state rebuilding for requested route"
+    );
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
     let config = EncodeFixtureConfig {
@@ -1094,7 +1121,7 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.readiness_stale = Duration::from_millis(1);
+    state.optional_backend_stale = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     state.native_stream_health.record_update(42).await;
     let app = create_router(SimulatorRuntime::new(state));
@@ -1600,7 +1627,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),

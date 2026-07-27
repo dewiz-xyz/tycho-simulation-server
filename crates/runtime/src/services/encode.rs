@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
-use crate::models::state::AppState;
+use crate::models::state::{AppState, PublishedStatePin};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
@@ -101,6 +101,10 @@ pub struct EncodeComputation {
     pub reset_approval: bool,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "request validation, pinning, resimulation, and final fencing stay visible in one request flow"
+)]
 async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
@@ -138,6 +142,14 @@ async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
+    let native_pin = if uses_native {
+        Some(state.native_state_store.pin().await)
+    } else {
+        None
+    };
+    let native_request_generation = native_pin
+        .as_ref()
+        .map(PublishedStatePin::request_generation);
     let rebuild_guard = state
         .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
         .await;
@@ -147,7 +159,7 @@ async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
-    let resimulated = resimulate::resimulate_route(
+    let resimulated = resimulate::resimulate_route_with_native_pin(
         &state,
         &normalized,
         chain,
@@ -155,6 +167,7 @@ async fn encode_route(
         &token_out,
         allowlist,
         rebuild_guard,
+        native_pin,
     )
     .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
@@ -191,6 +204,13 @@ async fn encode_route(
     )?;
 
     let debug = response::build_debug(&state, &request).await;
+    if let Some(native_request_generation) = native_request_generation {
+        ensure_native_encode_current(
+            state
+                .native_request_is_current(native_request_generation)
+                .await,
+        )?;
+    }
 
     Ok(EncodeComputation {
         response: RouteEncodeResponse {
@@ -201,4 +221,24 @@ async fn encode_route(
         amount_out_delta,
         reset_approval,
     })
+}
+
+fn ensure_native_encode_current(native_is_current: bool) -> Result<(), EncodeError> {
+    if native_is_current {
+        return Ok(());
+    }
+    Err(EncodeError::unavailable(
+        "Native state changed while the route was being encoded; retry against the current version",
+    ))
+}
+
+#[cfg(test)]
+mod version_fence_tests {
+    use super::ensure_native_encode_current;
+
+    #[test]
+    fn native_encode_fence_rejects_stale_requests() {
+        assert!(ensure_native_encode_current(true).is_ok());
+        assert!(ensure_native_encode_current(false).is_err());
+    }
 }

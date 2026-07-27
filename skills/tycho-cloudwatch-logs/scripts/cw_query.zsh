@@ -22,7 +22,8 @@ Usage: cw_query.zsh [--since 30m] [--until now] [--limit 100]
                    [--log-group "/ecs/tycho-simulator"]
 
 Presets: block-updates, block-updates-window, block-updates-count,
-         readiness, resync, stream-health, stream-supervision,
+         readiness, resync, broadcaster-recovery, broadcaster-redis,
+         stream-health, stream-supervision,
          vm-rebuild, startup, server, timeouts, router-timeouts,
          simulate-requests, simulate-completions, simulate-successes, token-metadata,
          token-rpc-fetch, state-anomalies, vm-pools, tvl-thresholds,
@@ -77,9 +78,20 @@ QUERY
       cat <<QUERY
 fields @timestamp, @logStream
 | parse @message '"message":"*"' as msg
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"from":"?(?<from>[^",}]+)"?/
+| parse @message /"to":"?(?<to>[^",}]+)"?/
+| parse @message /"backend":"(?<backend>[^"]+)"/
+| parse @message /"status":"(?<backend_status>[^"]+)"/
+| parse @message /"reason":"?(?<reason>[^",}]+)"?/
+| parse @message /"error":"(?<error>[^"]+)"/
 | filter msg like /Service ready:/
+  or event = "broadcaster_readiness_changed"
+  or event = "simulator_readiness_changed"
+  or event = "simulator_backend_recovered"
+  or event = "simulator_backend_degraded"
 | sort @timestamp desc
-| display @timestamp, msg, @logStream
+| display @timestamp, event, from, to, backend, backend_status, reason, error, msg, @logStream
 | limit ${limit}
 QUERY
       ;;
@@ -93,6 +105,44 @@ fields @timestamp, @logStream
 | filter msg like /Resync/
 | sort @timestamp desc
 | display @timestamp, event, resync_id, duration_ms, msg, @logStream
+| limit ${limit}
+QUERY
+      ;;
+    broadcaster-recovery)
+      cat <<QUERY
+fields @timestamp, @logStream
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"recovery_id":"?(?<recovery_id>[^",}]+)"?/
+| parse @message /"work_id":(?<work_id>[0-9]+)/
+| parse @message /"elapsed_ms":(?<elapsed_ms>[0-9]+)/
+| parse @message /"encoded_bytes":(?<encoded_bytes>[0-9]+)/
+| parse @message /"chunk_count":(?<chunk_count>[0-9]+)/
+| parse @message /"buffer_a_count":(?<buffer_a_count>[0-9]+)/
+| parse @message /"buffer_b_count":(?<buffer_b_count>[0-9]+)/
+| parse @message /"distinct_native_blocks":(?<distinct_native_blocks>[0-9]+)/
+| parse @message /"error":"(?<error>[^"]+)"/
+| filter event like /^broadcaster_(upstream_)?recovery_/
+| sort @timestamp desc
+| display @timestamp, event, recovery_id, work_id, elapsed_ms, encoded_bytes, chunk_count, buffer_a_count, buffer_b_count, distinct_native_blocks, error, @logStream
+| limit ${limit}
+QUERY
+      ;;
+    broadcaster-redis)
+      cat <<QUERY
+fields @timestamp, @logStream
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"operation":"(?<operation>[^"]+)"/
+| parse @message /"reason":"(?<reason>[^"]+)"/
+| parse @message /"error":"(?<error>[^"]+)"/
+| parse @message /"stream_id":"(?<stream_id>[^"]+)"/
+| filter event = "redis_stream_append_failed"
+  or event = "broadcaster_writer_fence_lost"
+  or event = "redis_writer_promoted"
+  or @message like /Redis replay gap/
+  or @message like /BroadcasterRedisTransportFailure/
+  or @message like /BroadcasterRedisRebootstrap/
+| sort @timestamp desc
+| display @timestamp, event, operation, reason, stream_id, error, @logStream
 | limit ${limit}
 QUERY
       ;;

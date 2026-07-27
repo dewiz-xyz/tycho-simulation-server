@@ -140,7 +140,7 @@ for field in string_fields:
     if not isinstance(value, str) or not value:
         raise SystemExit(f"broadcaster replay_boundary is missing {field}")
 
-for field in ["generation", "exclusiveMessageSeq"]:
+for field in ["generation", "exclusiveMessageSeq", "stateVersion"]:
     value = boundary.get(field)
     if not isinstance(value, int) or value < 0:
         raise SystemExit(f"broadcaster replay_boundary has invalid {field}")
@@ -260,7 +260,14 @@ for kind, backend in sorted(backends.items()):
     boundary = subscription.get("redis_replay_boundary")
     if not isinstance(boundary, dict):
         raise SystemExit(f"simulator /status backend {kind} has no redis_replay_boundary")
-    for field in ["streamKey", "streamId", "snapshotId", "generation", "exclusiveMessageSeq"]:
+    for field in [
+        "streamKey",
+        "streamId",
+        "snapshotId",
+        "generation",
+        "exclusiveMessageSeq",
+        "stateVersion",
+    ]:
         if field not in boundary:
             raise SystemExit(f"simulator /status backend {kind} replay boundary is missing {field}")
     checkpoint = subscription.get("redis_replay_checkpoint")
@@ -316,6 +323,10 @@ if [[ -z "${BROADCASTER_REDIS_URL:-}" ]]; then
 fi
 if [[ -z "${BROADCASTER_REDIS_STREAM_KEY:-}" ]]; then
   echo "BROADCASTER_REDIS_STREAM_KEY is required." >&2
+  exit 2
+fi
+if [[ "${BROADCASTER_REDIS_MAXLEN:-5000}" != "5000" ]]; then
+  echo "BROADCASTER_REDIS_MAXLEN must be 5000 for the shared broadcaster retention contract." >&2
   exit 2
 fi
 
@@ -385,5 +396,6 @@ echo "Broadcaster status URL: $status_url"
 echo "Simulator status URL: $simulator_status_url"
 echo "Redis stream key: $BROADCASTER_REDIS_STREAM_KEY"
 echo "Redis stream entries: $stream_len"
+echo "Redis retention target: ${BROADCASTER_REDIS_MAXLEN:-5000}"
 echo "Replay boundary checkpoint: $boundary_entry_id"
 echo "Simulator replay backends: $checked_backends"

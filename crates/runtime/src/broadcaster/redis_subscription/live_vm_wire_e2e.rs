@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use broadcaster_replay_client::{
-    BroadcasterReplayClient, BroadcasterReplayConfig, ReplayBatchItem, ReplayCheckpoint, ReplayPoll,
+    BroadcasterReplayClient, BroadcasterReplayConfig, ReplayCheckpoint, ReplayMessage, ReplayPoll,
 };
 use futures::StreamExt;
 use num_bigint::BigUint;
@@ -129,6 +129,8 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
         }],
         replay_boundary,
         expected_chain_id: EXPECTED_CHAIN_ID,
+        recovery: None,
+        redis_maxlen: None,
     };
 
     poll_live_redis_until_quotes(
@@ -195,6 +197,8 @@ async fn build_vm_controls(
         protocols: protocols.clone(),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
         simulation_rebuild_gate: Arc::new(RwLock::new(())),
+        wire_backend: BroadcasterBackend::Vm,
+        recovery_guard_held: false,
     });
 
     Ok((controls, state_store, protocols))
@@ -602,16 +606,14 @@ impl RequiredProtocolEvidence {
         &mut self,
         state_store: &StateStore,
         evidence_decoder: &TychoStreamDecoder<BlockHeader>,
-        items: &[ReplayBatchItem],
+        items: &[ReplayMessage],
     ) {
-        for item in items {
-            if let ReplayBatchItem::Message(message) = item {
-                if let Err(error) = self
-                    .observe_live_envelope(state_store, evidence_decoder, &message.envelope)
-                    .await
-                {
-                    println!("failed to decode live VM evidence: {error:#}");
-                }
+        for message in items {
+            if let Err(error) = self
+                .observe_live_envelope(state_store, evidence_decoder, &message.envelope)
+                .await
+            {
+                println!("failed to decode live VM evidence: {error:#}");
             }
         }
     }

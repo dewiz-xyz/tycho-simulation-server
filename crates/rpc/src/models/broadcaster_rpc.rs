@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use runtime::broadcaster::redis_publisher::BroadcasterRedisPublisherStatus;
+use runtime::broadcaster::redis_publisher::{
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterRedisPublisherStatus,
+};
 use runtime::broadcaster::state::{
-    BroadcasterBackendStatus, BroadcasterSnapshotSessionsSnapshot, BroadcasterSnapshotStatus,
-    BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
+    BroadcasterBackendStatus, BroadcasterRecoveryStatus, BroadcasterSnapshotSessionsSnapshot,
+    BroadcasterSnapshotStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
 
@@ -14,11 +16,13 @@ pub struct BroadcasterStatusPayload {
     pub status: &'static str,
     pub chain_id: u64,
     pub upstream: BroadcasterUpstreamPayload,
+    pub recovery: BroadcasterRecoveryPayload,
     pub snapshot: BroadcasterSnapshotPayload,
     pub snapshot_sessions: BroadcasterSnapshotSessionsPayload,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    pub deployment_admission: BroadcasterDeploymentAdmissionPayload,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -27,6 +31,7 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
             status: snapshot.readiness.as_str(),
             chain_id: snapshot.chain_id,
             upstream: snapshot.upstream.into(),
+            recovery: snapshot.recovery.into(),
             snapshot: snapshot.snapshot.into(),
             snapshot_sessions: snapshot.snapshot_sessions.into(),
             backends: snapshot
@@ -40,6 +45,67 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                 })
                 .collect(),
             redis_publisher: snapshot.redis_publisher,
+            deployment_admission: snapshot.deployment_admission.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterDeploymentAdmissionPayload {
+    pub admitted: bool,
+    pub phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<BroadcasterDeploymentAdmissionSnapshot> for BroadcasterDeploymentAdmissionPayload {
+    fn from(snapshot: BroadcasterDeploymentAdmissionSnapshot) -> Self {
+        Self {
+            admitted: snapshot.admitted,
+            phase: snapshot.phase.as_str(),
+            last_error: snapshot.last_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterRecoveryPayload {
+    pub active: bool,
+    pub phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    pub attempt: u8,
+    pub buffer_a_count: usize,
+    pub buffer_b_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_buffered_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_encoded_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_chunk_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<BroadcasterRecoveryStatus> for BroadcasterRecoveryPayload {
+    fn from(status: BroadcasterRecoveryStatus) -> Self {
+        Self {
+            active: status.active,
+            phase: status.phase,
+            age_ms: status.age_ms,
+            attempt: status.attempt,
+            buffer_a_count: status.buffer_a_count,
+            buffer_b_count: status.buffer_b_count,
+            oldest_buffered_age_ms: status.oldest_buffered_age_ms,
+            last_outcome: status.last_outcome,
+            last_duration_ms: status.last_duration_ms,
+            last_encoded_bytes: status.last_encoded_bytes,
+            last_chunk_count: status.last_chunk_count,
+            last_error: status.last_error,
         }
     }
 }

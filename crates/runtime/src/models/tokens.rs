@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::{header, Client, ClientBuilder, Response};
@@ -27,6 +28,7 @@ fn native_token_address() -> Bytes {
 #[derive(Debug)]
 pub struct TokenStore {
     tokens: RwLock<HashMap<Bytes, Token>>,
+    initial_tokens: Arc<HashMap<Bytes, Token>>,
     inflight: Mutex<InflightMap>,
     fetch_semaphore: Semaphore,
     fetch_source: TokenFetchSource,
@@ -86,8 +88,10 @@ impl TokenStore {
         chain: Chain,
         fetch_timeout: Duration,
     ) -> Self {
+        let initial_tokens = Arc::new(initial.clone());
         Self {
             tokens: RwLock::new(initial),
+            initial_tokens,
             inflight: Mutex::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(16),
             fetch_source,
@@ -99,6 +103,10 @@ impl TokenStore {
 
     pub async fn snapshot(&self) -> HashMap<Bytes, Token> {
         self.tokens.read().await.clone()
+    }
+
+    pub(crate) fn initial_snapshot(&self) -> HashMap<Bytes, Token> {
+        self.initial_tokens.as_ref().clone()
     }
 
     pub async fn get(&self, address: &Bytes) -> Option<Token> {

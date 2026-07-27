@@ -6,9 +6,13 @@ use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
 use crate::broadcaster::redis_publisher::{
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, TokioRedisStreamWriter,
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterRedisPublisher,
+    BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
+    BroadcasterRedisPublisherStatus, TokioRedisStreamWriter,
 };
-use crate::broadcaster::service::{BroadcasterServiceState, SnapshotSessionError};
+use crate::broadcaster::service::{
+    BroadcasterServiceState, SnapshotBoundaryRetention, SnapshotSessionError,
+};
 use crate::broadcaster::state::{
     BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterStatusSnapshot,
     BroadcasterUpstreamState,
@@ -18,6 +22,7 @@ use crate::config::{
     MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
+use crate::metrics::emit_broadcaster_health_snapshot;
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{TokenStore, TokenStoreError};
 use crate::services::rfq_tokens::{load_rfq_token_stores, RfqTokenStoreConfig};
@@ -42,6 +47,7 @@ pub struct BroadcasterAppState {
     tokens: Arc<TokenStore>,
     chain_id: u64,
     snapshot_session_ttl: Duration,
+    last_reported_readiness: Arc<tokio::sync::Mutex<Option<BroadcasterReadiness>>>,
 }
 
 impl BroadcasterAppState {
@@ -60,6 +66,7 @@ impl BroadcasterAppState {
             tokens,
             chain_id,
             snapshot_session_ttl,
+            last_reported_readiness: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -88,11 +95,47 @@ impl BroadcasterAppState {
     }
 
     pub async fn status_snapshot(&self) -> BroadcasterStatusSnapshot {
+        let redis_status = self.redis_publisher.status_snapshot().await;
+        self.snapshot_with_redis_status(redis_status).await
+    }
+
+    pub async fn readiness_snapshot(&self) -> BroadcasterStatusSnapshot {
+        let redis_status = self.redis_publisher.verified_status_snapshot().await;
+        let mut snapshot = self.snapshot_with_redis_status(redis_status).await;
+        if !snapshot.deployment_admission.admitted
+            && snapshot.readiness == BroadcasterReadiness::Ready
+        {
+            snapshot.readiness = BroadcasterReadiness::SnapshotWarmingUp;
+        }
+        if snapshot.deployment_admission.admitted
+            && snapshot
+                .redis_publisher
+                .as_ref()
+                .is_some_and(|publisher| publisher.mode == "active")
+        {
+            let retention = self.raw_service.snapshot_boundary_is_retained().await;
+            if !retention.is_retained() {
+                snapshot.snapshot.exportable = false;
+                if snapshot.readiness == BroadcasterReadiness::Ready {
+                    snapshot.readiness = BroadcasterReadiness::SnapshotUnexportable;
+                }
+                if let SnapshotBoundaryRetention::InspectionFailed(error) = retention {
+                    snapshot.snapshot.last_export_error = Some(error);
+                }
+            }
+        }
+        self.log_readiness_transition(&snapshot).await;
+        snapshot
+    }
+
+    async fn snapshot_with_redis_status(
+        &self,
+        redis_status: BroadcasterRedisPublisherStatus,
+    ) -> BroadcasterStatusSnapshot {
         let mut snapshot = self.raw_service.status_snapshot().await;
         if let Some(rfq_service) = &self.rfq_service {
             snapshot = combine_status_snapshots(snapshot, rfq_service.status_snapshot().await);
         }
-        let redis_status = self.redis_publisher.verified_status_snapshot().await;
         let redis_readiness = redis_readiness(redis_status.mode);
         match snapshot.readiness {
             BroadcasterReadiness::Ready => snapshot.readiness = redis_readiness,
@@ -105,11 +148,50 @@ impl BroadcasterAppState {
             _ => {}
         }
         snapshot.redis_publisher = Some(redis_status);
+        snapshot.deployment_admission = self.redis_publisher.deployment_admission_snapshot();
         snapshot
+    }
+
+    async fn log_readiness_transition(&self, snapshot: &BroadcasterStatusSnapshot) {
+        let mut previous = self.last_reported_readiness.lock().await;
+        let previous_value = *previous;
+        if previous_value != Some(snapshot.readiness) {
+            let previous_readiness = previous_value.map(BroadcasterReadiness::as_str);
+            if snapshot.readiness == BroadcasterReadiness::Ready {
+                tracing::info!(
+                    event = "broadcaster_readiness_changed",
+                    from = previous_readiness,
+                    to = snapshot.readiness.as_str(),
+                    "Broadcaster readiness opened"
+                );
+            } else {
+                tracing::warn!(
+                    event = "broadcaster_readiness_changed",
+                    from = previous_readiness,
+                    to = snapshot.readiness.as_str(),
+                    error = snapshot
+                        .upstream
+                        .last_error
+                        .as_deref()
+                        .or_else(|| snapshot.redis_publisher.as_ref()?.last_error.as_deref())
+                        .or(snapshot.snapshot.last_export_error.as_deref()),
+                    "Broadcaster readiness closed"
+                );
+            }
+            *previous = Some(snapshot.readiness);
+        }
+    }
+
+    pub fn deployment_admission_snapshot(&self) -> BroadcasterDeploymentAdmissionSnapshot {
+        self.redis_publisher.deployment_admission_snapshot()
     }
 
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.redis_publisher.begin_shutdown();
     }
 
     pub async fn lookup_tokens(
@@ -148,6 +230,7 @@ impl BroadcasterAppState {
 pub struct BroadcasterServiceParts {
     pub config: BroadcasterConfig,
     pub app_state: BroadcasterAppState,
+    pub supervisors: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
@@ -161,7 +244,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
+    let redis_publisher = build_redis_publisher(&config, heartbeat_interval).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -172,65 +255,70 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         .as_ref()
         .map(|_| BroadcasterUpstreamState::default());
     let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
-    let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+    let recovery_retry_backoff = Duration::from_millis(config.stream_restart_backoff_min_ms);
+    let native_progress_lease =
+        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
+    let raw_service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
         config.tuning.snapshot_max_payload_bytes,
         raw_cache,
         raw_upstream_state,
         Arc::clone(&redis_publisher),
         Arc::clone(&publication_gate),
+        recovery_retry_backoff,
+        native_progress_lease,
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
+    let mut supervisors = Vec::new();
 
-    let rfq_service =
-        if let (Some(rfq_cache), Some(rfq_upstream_state)) = (rfq_cache, rfq_upstream_state) {
-            let service = BroadcasterServiceState::with_lifecycle_gate(
-                config.tuning.snapshot_max_payload_bytes,
-                rfq_cache,
-                rfq_upstream_state,
-                Arc::clone(&redis_publisher),
-                Arc::clone(&publication_gate),
-            );
-            let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
-                tokens: Arc::clone(&tokens),
-                chain,
-                token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
-                protocols: &config.chain_profile.rfq_protocols,
-                bebop_url: &config.bebop_url,
-                hashflow_filename: &config.hashflow_filename,
-                liquorice_url: config.liquorice_url.as_deref(),
-                liquorice_user: &config.liquorice_user,
-                liquorice_key: &config.liquorice_key,
-            })
-            .await?;
-            spawn_broadcaster_rfq_stream_task(
-                &config,
-                supervisor_cfg.clone(),
-                service.clone(),
-                vec![raw_service.clone(), service.clone()],
-                vec![service.clone()],
-                rfq_token_stores,
-            );
-            Some(service)
-        } else {
-            None
-        };
+    let rfq_service = if let (Some(rfq_cache), Some(rfq_upstream_state)) =
+        (rfq_cache, rfq_upstream_state)
+    {
+        let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
+            config.tuning.snapshot_max_payload_bytes,
+            rfq_cache,
+            rfq_upstream_state,
+            Arc::clone(&redis_publisher),
+            Arc::clone(&publication_gate),
+            recovery_retry_backoff,
+            native_progress_lease,
+        );
+        let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
+            tokens: Arc::clone(&tokens),
+            chain,
+            token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
+            protocols: &config.chain_profile.rfq_protocols,
+            bebop_url: &config.bebop_url,
+            hashflow_filename: &config.hashflow_filename,
+            liquorice_url: config.liquorice_url.as_deref(),
+            liquorice_user: &config.liquorice_user,
+            liquorice_key: &config.liquorice_key,
+        })
+        .await?;
+        supervisors.push(spawn_broadcaster_rfq_stream_task(
+            &config,
+            supervisor_cfg.clone(),
+            service.clone(),
+            rfq_token_stores,
+        ));
+        Some(service)
+    } else {
+        None
+    };
     let generation_services = match &rfq_service {
         Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
         None => vec![raw_service.clone()],
     };
-    // New broadcasters start passive and warm their caches first. This task is
-    // the local promotion loop; /status stays non-ready until it wins the fence.
+    // New broadcasters warm their caches while passive. Readiness stays closed
+    // until this local promotion loop wins the writer fence.
     spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
-    spawn_snapshot_export_preflight_task(generation_services.clone(), Duration::from_secs(60));
-    spawn_broadcaster_stream_task(
+    spawn_snapshot_artifact_refresh_task(generation_services.clone(), Duration::from_secs(5 * 60));
+    supervisors.push(spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
         Arc::clone(&raw_health),
         raw_service.clone(),
-        generation_services.clone(),
-        vec![raw_service.clone()],
-    );
+    ));
     spawn_heartbeat_task(generation_services, heartbeat_interval);
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
     let app_state = BroadcasterAppState::with_snapshot_session_ttl(
@@ -241,30 +329,19 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         snapshot_session_ttl,
         redis_publisher,
     );
+    spawn_broadcaster_health_snapshot_task(app_state.clone(), heartbeat_interval);
 
-    Ok(BroadcasterServiceParts { config, app_state })
+    Ok(BroadcasterServiceParts {
+        config,
+        app_state,
+        supervisors,
+    })
 }
 
 fn combine_status_snapshots(
     mut raw: BroadcasterStatusSnapshot,
     rfq: BroadcasterStatusSnapshot,
 ) -> BroadcasterStatusSnapshot {
-    raw.readiness = combine_readiness(raw.readiness, rfq.readiness);
-    raw.upstream.connected = raw.upstream.connected && rfq.upstream.connected;
-    raw.upstream.restart_count = raw
-        .upstream
-        .restart_count
-        .saturating_add(rfq.upstream.restart_count);
-    raw.upstream.last_error = raw.upstream.last_error.or(rfq.upstream.last_error);
-    raw.upstream.last_disconnect_reason = raw
-        .upstream
-        .last_disconnect_reason
-        .or(rfq.upstream.last_disconnect_reason);
-    raw.upstream.last_update_age_ms = raw
-        .upstream
-        .last_update_age_ms
-        .max(rfq.upstream.last_update_age_ms);
-    raw.snapshot.ready = raw.snapshot.ready && rfq.snapshot.ready;
     raw.snapshot
         .configured_backends
         .extend(rfq.snapshot.configured_backends);
@@ -286,30 +363,6 @@ fn combine_status_snapshots(
     raw
 }
 
-fn combine_readiness(
-    left: BroadcasterReadiness,
-    right: BroadcasterReadiness,
-) -> BroadcasterReadiness {
-    if readiness_priority(left) >= readiness_priority(right) {
-        left
-    } else {
-        right
-    }
-}
-
-const fn readiness_priority(readiness: BroadcasterReadiness) -> u8 {
-    match readiness {
-        BroadcasterReadiness::Ready => 0,
-        BroadcasterReadiness::UpstreamRecovering => 1,
-        BroadcasterReadiness::SnapshotUnexportable => 2,
-        BroadcasterReadiness::RedisPublisherPassive => 3,
-        BroadcasterReadiness::RedisPublisherRetired => 4,
-        BroadcasterReadiness::RedisPublisherUnhealthy => 5,
-        BroadcasterReadiness::SnapshotWarmingUp => 6,
-        BroadcasterReadiness::UpstreamDisconnected => 7,
-    }
-}
-
 fn redis_readiness(mode: &str) -> BroadcasterReadiness {
     match mode {
         "active" => BroadcasterReadiness::Ready,
@@ -320,7 +373,7 @@ fn redis_readiness(mode: &str) -> BroadcasterReadiness {
 }
 
 async fn build_redis_publisher(
-    chain_id: u64,
+    config: &BroadcasterConfig,
     heartbeat_interval: Duration,
 ) -> Result<Arc<BroadcasterRedisPublisher>> {
     let redis_config = load_broadcaster_redis_config();
@@ -328,8 +381,9 @@ async fn build_redis_publisher(
     let publisher = Arc::new(BroadcasterRedisPublisher::new(
         BroadcasterRedisPublisherConfig::from_redis_config(
             &redis_config,
-            chain_id,
+            config.chain_profile.chain.id(),
             heartbeat_interval,
+            config.chain_profile.recovery_max_buffered_native_blocks,
         ),
         writer,
     ));
@@ -393,7 +447,7 @@ fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
 
 fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(config.readiness_stale_secs),
+        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -412,9 +466,7 @@ fn spawn_broadcaster_stream_task(
     supervisor_cfg: StreamSupervisorConfig,
     health: Arc<StreamHealth>,
     service: BroadcasterServiceState,
-    generation_services: Vec<BroadcasterServiceState>,
-    cache_reset_services: Vec<BroadcasterServiceState>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tycho_url = config.tycho_url.clone();
     let api_key = config.api_key.clone();
@@ -446,24 +498,18 @@ fn spawn_broadcaster_stream_task(
             },
             health,
             supervisor_cfg,
-            BroadcasterStreamControls {
-                service,
-                generation_services,
-                cache_reset_services,
-            },
+            BroadcasterStreamControls { service },
         )
         .await;
-    });
+    })
 }
 
 fn spawn_broadcaster_rfq_stream_task(
     config: &BroadcasterConfig,
     supervisor_cfg: StreamSupervisorConfig,
     service: BroadcasterServiceState,
-    generation_services: Vec<BroadcasterServiceState>,
-    cache_reset_services: Vec<BroadcasterServiceState>,
     token_stores: RFQTokenStores,
-) {
+) -> tokio::task::JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
@@ -491,14 +537,10 @@ fn spawn_broadcaster_rfq_stream_task(
             },
             health,
             supervisor_cfg,
-            BroadcasterStreamControls {
-                service,
-                generation_services,
-                cache_reset_services,
-            },
+            BroadcasterStreamControls { service },
         )
         .await;
-    });
+    })
 }
 
 fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
@@ -509,17 +551,23 @@ fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Durati
             ticker.tick().await;
             for service in &services {
                 if let Err(error) = service.broadcast_heartbeat().await {
-                    let error = error.to_string();
-                    info!(error = %error, "Resetting broadcaster generation after heartbeat error");
-                    BroadcasterServiceState::handle_shared_generation_reset(
-                        &services,
-                        "heartbeat_error",
-                        Some(error),
-                    )
-                    .await;
+                    info!(
+                        error = %error,
+                        "Broadcaster heartbeat failed; keeping the current generation unready"
+                    );
                     break;
                 }
             }
+        }
+    });
+}
+
+fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            emit_broadcaster_health_snapshot(&app_state.status_snapshot().await);
         }
     });
 }
@@ -528,11 +576,42 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
+        let mut refreshing_recovered_snapshot = false;
         loop {
             ticker.tick().await;
-            match BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
-                .await
-            {
+            let mode = services[0].publisher_mode().await;
+            let result = match mode {
+                BroadcasterRedisPublisherMode::Passive => {
+                    BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
+                        .await
+                }
+                BroadcasterRedisPublisherMode::Unhealthy => {
+                    BroadcasterServiceState::recover_shared_publisher_when_paused(
+                        &services,
+                        "active_writer_recovered",
+                    )
+                    .await
+                }
+                BroadcasterRedisPublisherMode::Active => {
+                    if refreshing_recovered_snapshot {
+                        if let Err(error) =
+                            BroadcasterServiceState::run_snapshot_export_preflight(&services).await
+                        {
+                            info!(
+                                error = %error,
+                                "Recovered broadcaster snapshot refresh is not ready"
+                            );
+                        }
+                        if services[0].has_current_snapshot_artifact().await {
+                            refreshing_recovered_snapshot = false;
+                            info!("Recovered broadcaster snapshot artifact is ready");
+                        }
+                    }
+                    continue;
+                }
+                BroadcasterRedisPublisherMode::Retired => return,
+            };
+            match result {
                 Ok(Some(boundary)) => {
                     info!(
                         stream_id = boundary.stream_id.as_str(),
@@ -540,7 +619,8 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
                         generation = boundary.generation,
                         "Broadcaster active writer promoted"
                     );
-                    return;
+                    refreshing_recovered_snapshot =
+                        mode == BroadcasterRedisPublisherMode::Unhealthy;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -551,13 +631,13 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
     });
 }
 
-fn spawn_snapshot_export_preflight_task(
+fn spawn_snapshot_artifact_refresh_task(
     services: Vec<BroadcasterServiceState>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
+        let _ = BroadcasterServiceState::run_snapshot_export_preflight(&services).await;
         let mut ticker = tokio::time::interval(interval);
-        // Promotion performs the first check once every cache is ready.
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -574,8 +654,7 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterBackend;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
-    use super::{combine_readiness, raw_configured_backends, rfq_configured_backends};
-    use crate::broadcaster::state::BroadcasterReadiness;
+    use super::{raw_configured_backends, rfq_configured_backends};
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
 
     fn test_config() -> BroadcasterConfig {
@@ -585,6 +664,8 @@ mod tests {
                 native_protocols: vec!["uniswap_v2".to_string()],
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec!["rfq:bebop".to_string()],
+                native_progress_lease_secs: 25,
+                recovery_max_buffered_native_blocks: 8,
                 native_token_protocol_allowlist: Vec::new(),
                 reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),
@@ -609,7 +690,6 @@ mod tests {
             stream_restart_backoff_min_ms: 500,
             stream_restart_backoff_max_ms: 30_000,
             stream_restart_backoff_jitter_pct: 0.2,
-            readiness_stale_secs: 300,
             memory: MemoryConfig {
                 purge_enabled: true,
                 snapshots_enabled: false,
@@ -658,51 +738,5 @@ mod tests {
         config.enable_rfq_pools = false;
 
         assert_eq!(rfq_configured_backends(&config), None);
-    }
-
-    #[test]
-    fn readiness_combination_uses_operational_priority() {
-        let cases = [
-            (
-                BroadcasterReadiness::SnapshotWarmingUp,
-                BroadcasterReadiness::UpstreamRecovering,
-                BroadcasterReadiness::SnapshotWarmingUp,
-            ),
-            (
-                BroadcasterReadiness::SnapshotWarmingUp,
-                BroadcasterReadiness::SnapshotUnexportable,
-                BroadcasterReadiness::SnapshotWarmingUp,
-            ),
-            (
-                BroadcasterReadiness::RedisPublisherPassive,
-                BroadcasterReadiness::SnapshotUnexportable,
-                BroadcasterReadiness::RedisPublisherPassive,
-            ),
-            (
-                BroadcasterReadiness::RedisPublisherUnhealthy,
-                BroadcasterReadiness::UpstreamRecovering,
-                BroadcasterReadiness::RedisPublisherUnhealthy,
-            ),
-            (
-                BroadcasterReadiness::UpstreamRecovering,
-                BroadcasterReadiness::Ready,
-                BroadcasterReadiness::UpstreamRecovering,
-            ),
-            (
-                BroadcasterReadiness::SnapshotUnexportable,
-                BroadcasterReadiness::UpstreamRecovering,
-                BroadcasterReadiness::SnapshotUnexportable,
-            ),
-            (
-                BroadcasterReadiness::UpstreamDisconnected,
-                BroadcasterReadiness::SnapshotWarmingUp,
-                BroadcasterReadiness::UpstreamDisconnected,
-            ),
-        ];
-
-        for (left, right, expected) in cases {
-            assert_eq!(combine_readiness(left, right), expected);
-            assert_eq!(combine_readiness(right, left), expected);
-        }
     }
 }

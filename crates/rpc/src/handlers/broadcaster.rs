@@ -17,8 +17,33 @@ pub async fn status(
     State(state): State<BroadcasterAppState>,
 ) -> (StatusCode, Json<BroadcasterStatusPayload>) {
     let snapshot = state.status_snapshot().await;
-    let status_code = readiness_status_code(snapshot.readiness);
+    let status_code = bridge_status_code(snapshot.readiness);
+    (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
+}
 
+pub async fn ready(
+    State(state): State<BroadcasterAppState>,
+) -> (StatusCode, Json<BroadcasterStatusPayload>) {
+    let snapshot = state.readiness_snapshot().await;
+    let status_code = if snapshot.readiness == BroadcasterReadiness::Ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
+}
+
+pub async fn deployment_ready(
+    State(state): State<BroadcasterAppState>,
+) -> (StatusCode, Json<BroadcasterStatusPayload>) {
+    let admission = state.deployment_admission_snapshot();
+    let mut snapshot = state.status_snapshot().await;
+    snapshot.deployment_admission = admission.clone();
+    let status_code = if admission.admitted {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
 }
 
@@ -92,7 +117,7 @@ pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Respons
     (StatusCode::OK, Json(state.token_snapshot().await)).into_response()
 }
 
-fn readiness_status_code(readiness: BroadcasterReadiness) -> StatusCode {
+fn bridge_status_code(readiness: BroadcasterReadiness) -> StatusCode {
     match readiness {
         BroadcasterReadiness::Ready
         | BroadcasterReadiness::UpstreamRecovering
@@ -101,7 +126,8 @@ fn readiness_status_code(readiness: BroadcasterReadiness) -> StatusCode {
         | BroadcasterReadiness::RedisPublisherRetired
         | BroadcasterReadiness::RedisPublisherUnhealthy
         | BroadcasterReadiness::SnapshotWarmingUp
-        | BroadcasterReadiness::UpstreamDisconnected => StatusCode::SERVICE_UNAVAILABLE,
+        | BroadcasterReadiness::UpstreamDisconnected
+        | BroadcasterReadiness::NativeProgressStale => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -137,29 +163,10 @@ fn snapshot_session_error_response(error: SnapshotSessionError) -> Response {
             StatusCode::RANGE_NOT_SATISFIABLE,
             "snapshot payload index out of range",
         ),
+        SnapshotSessionError::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "snapshot payload fetch capacity reached",
+        ),
     };
     (status, Json(json!({ "error": message }))).into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn warming_readiness_returns_service_unavailable() {
-        assert_eq!(
-            readiness_status_code(BroadcasterReadiness::SnapshotWarmingUp),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn degraded_readiness_keeps_status_available() {
-        for readiness in [
-            BroadcasterReadiness::UpstreamRecovering,
-            BroadcasterReadiness::SnapshotUnexportable,
-        ] {
-            assert_eq!(readiness_status_code(readiness), StatusCode::OK);
-        }
-    }
 }

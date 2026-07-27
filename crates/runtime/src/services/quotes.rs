@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -22,7 +23,7 @@ use crate::models::messages::{
     QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
 use crate::models::protocol::ProtocolKind;
-use crate::models::state::{AppState, SimulationRebuildGuard};
+use crate::models::state::{AppState, PublishedStatePin, SimulationRebuildGuard};
 use crate::models::tokens::TokenStoreError;
 
 use super::simulation_executor::{SimulationExecutionError, SimulationExecutor};
@@ -332,12 +333,19 @@ struct PreparedQuoteExecution {
     cancel_token: CancellationToken,
 }
 
+struct NativeFence {
+    request_generation: u64,
+    native_pool_ids: HashSet<String>,
+}
+
 struct QuoteRequestRunner {
     state: AppState,
     request: AmountOutRequest,
     run: QuoteRunState,
     cancel: Option<CancellationToken>,
     readiness_wait: Duration,
+    native_pin: Option<PublishedStatePin>,
+    native_pool_ids: HashSet<String>,
 }
 
 fn pool_descriptor(id: String, component: &ProtocolComponent) -> PoolDescriptor {
@@ -375,10 +383,61 @@ pub async fn get_amounts_out(
     request: AmountOutRequest,
     cancel: Option<CancellationToken>,
 ) -> QuoteComputation {
-    QuoteRequestRunner::new(state, request, cancel)
-        .await
-        .run()
-        .await
+    let runner = QuoteRequestRunner::new(state.clone(), request, cancel).await;
+    let (mut computation, native_fence) = runner.run().await;
+    if let Some(native_fence) = native_fence.filter(|fence| {
+        computation
+            .responses
+            .iter()
+            .any(|response| fence.native_pool_ids.contains(&response.pool))
+    }) {
+        // The fence covers simulated native outputs only: pinned token metadata is
+        // version-independent, native routes reject mid-request updates, and VM/RFQ-only
+        // requests never consult native request freshness.
+        if !state
+            .native_request_is_current(native_fence.request_generation)
+            .await
+        {
+            discard_stale_native_responses(&mut computation, &native_fence.native_pool_ids);
+        }
+    }
+    computation
+}
+
+fn discard_stale_native_responses(
+    computation: &mut QuoteComputation,
+    native_pool_ids: &HashSet<String>,
+) {
+    let response_count = computation.responses.len();
+    computation
+        .responses
+        .retain(|response| !native_pool_ids.contains(&response.pool));
+    let dropped = response_count - computation.responses.len();
+    if dropped == 0 {
+        return;
+    }
+
+    computation.meta.failures.push(make_failure(
+        QuoteFailureKind::StaleNativeState,
+        format!(
+            "Native state changed while the quote was running; dropped {dropped} native pool \
+             result(s), retry against the current version"
+        ),
+        None,
+    ));
+    computation.meta.status = QuoteStatus::Ready;
+    if computation.responses.is_empty() {
+        computation.meta.result_quality = QuoteResultQuality::RequestLevelFailure;
+        computation.meta.partial_kind = None;
+    } else {
+        computation.meta.result_quality = QuoteResultQuality::Partial;
+        computation.meta.partial_kind = Some(match computation.meta.partial_kind {
+            None | Some(QuotePartialKind::PoolCoverage) => QuotePartialKind::PoolCoverage,
+            Some(QuotePartialKind::AmountLadders | QuotePartialKind::Mixed) => {
+                QuotePartialKind::Mixed
+            }
+        });
+    }
 }
 
 impl QuoteRequestRunner {
@@ -420,10 +479,12 @@ impl QuoteRequestRunner {
             },
             cancel,
             readiness_wait: Duration::from_secs(2),
+            native_pin: None,
+            native_pool_ids: HashSet::new(),
         }
     }
 
-    async fn run(mut self) -> QuoteComputation {
+    async fn run(mut self) -> (QuoteComputation, Option<NativeFence>) {
         if self.is_cancelled() {
             self.run.classification.mark_request_degradation();
             self.push_failure(make_failure(
@@ -431,35 +492,46 @@ impl QuoteRequestRunner {
                 "Quote request cancelled before execution".to_string(),
                 None,
             ));
-            return self.finish(RequestExit::new(
-                QuoteStatus::Ready,
-                QuoteResultQuality::RequestLevelFailure,
-            ));
+            return (
+                self.finish(RequestExit::new(
+                    QuoteStatus::Ready,
+                    QuoteResultQuality::RequestLevelFailure,
+                )),
+                None,
+            );
         }
         let pair = match self.parse_pair() {
             Ok(pair) => pair,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => return (self.finish(exit), None),
         };
         if let Err(exit) = self.ensure_ready().await {
-            return self.finish(exit);
+            return (self.finish(exit), None);
         }
         let (token_in_ref, token_out_ref) = match self.load_tokens(&pair).await {
             Ok(tokens) => tokens,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => return (self.finish(exit), None),
         };
         let amounts_in = match self.parse_amounts() {
             Ok(amounts) => amounts,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => return (self.finish(exit), None),
         };
         let prepared = match self
             .prepare_execution(&pair, token_in_ref, token_out_ref, amounts_in)
             .await
         {
             Ok(prepared) => prepared,
-            Err(exit) => return self.finish(exit),
+            Err(exit) => return (self.finish(exit), None),
         };
         self.execute_pool_quotes(prepared).await;
-        self.finish_current_state()
+        let fence = if self.native_pool_ids.is_empty() {
+            None
+        } else {
+            self.native_pin.as_ref().map(|pin| NativeFence {
+                request_generation: pin.request_generation(),
+                native_pool_ids: std::mem::take(&mut self.native_pool_ids),
+            })
+        };
+        (self.finish_current_state(), fence)
     }
 
     fn finish(self, exit: RequestExit) -> QuoteComputation {
@@ -598,6 +670,8 @@ impl QuoteRequestRunner {
 
     async fn ensure_ready(&mut self) -> Result<(), RequestExit> {
         if self.state.is_ready().await {
+            self.native_pin = Some(self.state.native_state_store.pin().await);
+            self.refresh_meta_snapshot().await;
             return Ok(());
         }
         let ready = self.state.wait_for_readiness(self.readiness_wait).await;
@@ -616,18 +690,35 @@ impl QuoteRequestRunner {
                 QuoteResultQuality::RequestLevelFailure,
             ));
         }
+        self.native_pin = Some(self.state.native_state_store.pin().await);
         self.refresh_meta_snapshot().await;
         Ok(())
     }
 
     async fn refresh_meta_snapshot(&mut self) {
-        self.run.meta.block_number = self.state.current_block().await;
+        let native_pin = self.native_pin.as_ref();
+        self.run.meta.block_number = native_pin
+            .map(PublishedStatePin::current_block)
+            .unwrap_or_default();
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
         self.run.meta.rfq_update_timestamp = self.state.current_rfq_update_timestamp().await;
-        self.run.meta.total_pools = Some(self.state.total_pools().await);
+        let native_pools = native_pin.map(PublishedStatePin::total_states).unwrap_or(0);
+        let (vm_pools, rfq_pools) = tokio::join!(
+            self.state.vm_state_store.total_states(),
+            self.state.rfq_state_store.total_states()
+        );
+        self.run.meta.total_pools = Some(native_pools + vm_pools + rfq_pools);
     }
 
     async fn load_tokens(&mut self, pair: &RequestPair) -> Result<(Token, Token), RequestExit> {
+        if let Some(pin) = self.native_pin.as_ref() {
+            if let (Some(token_in), Some(token_out)) = (
+                pin.token(&pair.token_in_bytes),
+                pin.token(&pair.token_out_bytes),
+            ) {
+                return Ok((token_in, token_out));
+            }
+        }
         let (token_in_res, token_out_res) = tokio::join!(
             self.state.tokens.ensure(&pair.token_in_bytes),
             self.state.tokens.ensure(&pair.token_out_bytes)
@@ -752,7 +843,7 @@ impl QuoteRequestRunner {
             self.run.metrics.skipped_rfq_unavailable = true;
         }
         self.refresh_meta_snapshot().await;
-        let mut candidates = self.load_candidate_sets(pair, vm_ready, rfq_ready).await;
+        let mut candidates = self.load_candidate_sets(pair, vm_ready, rfq_ready).await?;
         candidates.rfq_candidates = filter_directional_rfq_candidates(
             candidates.rfq_candidates,
             &token_in_ref,
@@ -764,6 +855,11 @@ impl QuoteRequestRunner {
             expected_len,
             &mut candidates,
         )?;
+        self.native_pool_ids = candidates
+            .native_candidates
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
         Ok(PreparedQuoteExecution {
             token_in: Arc::new(token_in_ref),
             token_out: Arc::new(token_out_ref),
@@ -786,12 +882,20 @@ impl QuoteRequestRunner {
         pair: &RequestPair,
         vm_ready: bool,
         rfq_ready: bool,
-    ) -> CandidateSets {
-        let native_candidates = self
-            .state
-            .native_state_store
+    ) -> Result<CandidateSets, RequestExit> {
+        let Some(native_pin) = self.native_pin.as_ref() else {
+            self.push_failure(make_failure(
+                QuoteFailureKind::Internal,
+                "Native state pin missing after readiness".to_string(),
+                None,
+            ));
+            return Err(RequestExit::new(
+                QuoteStatus::InternalError,
+                QuoteResultQuality::RequestLevelFailure,
+            ));
+        };
+        let native_candidates = native_pin
             .matching_pools_by_addresses(&pair.token_in_bytes, &pair.token_out_bytes)
-            .await
             .into_iter()
             .map(|(id, (pool_state, component))| (id, pool_state, component))
             .collect();
@@ -824,11 +928,11 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
-        CandidateSets {
+        Ok(CandidateSets {
             native_candidates,
             vm_candidates,
             rfq_candidates,
-        }
+        })
     }
 
     fn prepare_candidate_metadata(
@@ -2352,6 +2456,7 @@ fn is_liquidity_like_failure(failure: &QuoteFailure) -> bool {
                     .contains("all pools returned zero amounts")
         }
         QuoteFailureKind::WarmUp
+        | QuoteFailureKind::StaleNativeState
         | QuoteFailureKind::TokenValidation
         | QuoteFailureKind::TokenCoverage
         | QuoteFailureKind::Timeout
@@ -2564,7 +2669,7 @@ mod tests {
     use super::*;
 
     use std::any::Any;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2593,6 +2698,119 @@ mod tests {
 
     fn default_calls() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    fn fence_test_response(pool: &str) -> AmountOutResponse {
+        AmountOutResponse {
+            pool: pool.to_string(),
+            pool_name: pool.to_string(),
+            pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+            amounts_out: vec!["1".to_string()],
+            slippage: vec![1],
+            limit_max_in: None,
+            gas_used: vec![1],
+            block_number: 1,
+        }
+    }
+
+    fn fence_test_computation(
+        pools: &[&str],
+        result_quality: QuoteResultQuality,
+        partial_kind: Option<QuotePartialKind>,
+    ) -> QuoteComputation {
+        QuoteComputation {
+            responses: pools.iter().map(|pool| fence_test_response(pool)).collect(),
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality,
+                partial_kind,
+                block_number: 1,
+                vm_block_number: Some(2),
+                rfq_update_timestamp: Some(3),
+                matching_pools: pools.len(),
+                candidate_pools: pools.len(),
+                total_pools: Some(pools.len()),
+                auction_id: None,
+                pool_results: Vec::new(),
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+            metrics: QuoteMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn stale_native_fence_preserves_vm_and_rfq_responses() {
+        let mut computation = fence_test_computation(
+            &["native-pool", "vm-pool"],
+            QuoteResultQuality::Complete,
+            None,
+        );
+
+        discard_stale_native_responses(
+            &mut computation,
+            &HashSet::from(["native-pool".to_string()]),
+        );
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "vm-pool");
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::PoolCoverage)
+        );
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::StaleNativeState
+        ));
+        assert!(computation.meta.failures[0].message.contains("dropped 1"));
+    }
+
+    #[test]
+    fn stale_native_fence_drops_all_native_responses_with_ready_status() {
+        let mut computation = fence_test_computation(
+            &["native-pool-1", "native-pool-2"],
+            QuoteResultQuality::Complete,
+            None,
+        );
+
+        discard_stale_native_responses(
+            &mut computation,
+            &HashSet::from(["native-pool-1".to_string(), "native-pool-2".to_string()]),
+        );
+
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert!(!matches!(computation.meta.status, QuoteStatus::WarmingUp));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::RequestLevelFailure
+        );
+        assert!(computation.meta.partial_kind.is_none());
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::StaleNativeState
+        ));
+    }
+
+    #[test]
+    fn stale_native_fence_upgrades_amount_ladders_partial_to_mixed() {
+        let mut computation = fence_test_computation(
+            &["native-pool", "vm-pool"],
+            QuoteResultQuality::Partial,
+            Some(QuotePartialKind::AmountLadders),
+        );
+
+        discard_stale_native_responses(
+            &mut computation,
+            &HashSet::from(["native-pool".to_string()]),
+        );
+
+        assert_eq!(computation.meta.partial_kind, Some(QuotePartialKind::Mixed));
     }
 
     #[test]
@@ -3126,9 +3344,9 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            native_stream_health: Arc::new(StreamHealth::new()),
-            vm_stream_health: Arc::new(StreamHealth::new()),
-            rfq_stream_health: Arc::new(StreamHealth::new()),
+            native_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            vm_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
+            rfq_stream_health: Arc::new(StreamHealth::ready_for_test(1)),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: config.enable_vm_pools,
@@ -3136,7 +3354,8 @@ mod tests {
             },
             enable_vm_pools: config.enable_vm_pools,
             enable_rfq_pools: config.enable_rfq_pools,
-            readiness_stale: Duration::from_secs(120),
+            native_progress_lease: Duration::from_secs(120),
+            optional_backend_stale: Duration::from_secs(120),
             request_timeout: config.request_timeout,
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -3161,6 +3380,7 @@ mod tests {
             "stream:test".to_string(),
             "chain-1-stream-1".to_string(),
             "chain-1-snapshot-1".to_string(),
+            1,
             1,
             1,
         )
@@ -4462,6 +4682,104 @@ mod tests {
         assert_eq!(computation.meta.vm_block_number, Some(2));
         assert_eq!(computation.meta.total_pools, Some(2));
         assert!(computation.meta.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vm_only_quote_returns_no_native_fence() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "vm-pool",
+            "0x0000000000000000000000000000000000000015",
+            "vm:curve",
+            "curve_pool",
+            fixture.pair_tokens(),
+            Box::new(LinearAmountSim { multiplier: 1 }),
+        );
+        fixture
+            .vm_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request = fixture.request("req-vm-only-no-native-fence", &["10"]);
+
+        let (computation, native_fence) = QuoteRequestRunner::new(app_state, request, None)
+            .await
+            .run()
+            .await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "vm-pool");
+        assert!(native_fence.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_quote_is_still_fenced_when_generation_advances() {
+        let fixture = BasicQuoteFixture::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "native-pool",
+            "0x0000000000000000000000000000000000000016",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(DelayedAmountOrderSim {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-native-generation-advance", &["10"]);
+        let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native quote should begin before the timeout");
+        fixture
+            .native_state_store
+            .apply_update(Update::new(2, HashMap::new(), HashMap::new()))
+            .await;
+
+        let computation = quote_task.await.expect("quote task should not panic");
+        assert!(computation
+            .responses
+            .iter()
+            .all(|response| response.pool != "native-pool"));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::StaleNativeState)));
     }
 
     #[tokio::test]
@@ -6198,6 +6516,61 @@ mod tests {
             runner.run.pool_results[0].outcome,
             PoolOutcomeKind::InternalError
         ));
+
+        let mut computation = runner.finish(exit);
+        let meta_before =
+            serde_json::to_value(&computation.meta).expect("quote metadata should serialize");
+        discard_stale_native_responses(&mut computation, &HashSet::from(["pool-1".to_string()]));
+        assert_eq!(
+            serde_json::to_value(&computation.meta).expect("quote metadata should serialize"),
+            meta_before
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_metadata_is_refreshed_from_the_pinned_native_version() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let pinned = fixture.native_state_store.pin().await;
+
+        let token_a =
+            Bytes::from_str("0x0000000000000000000000000000000000000005").expect("valid address");
+        let token_b =
+            Bytes::from_str("0x0000000000000000000000000000000000000006").expect("valid address");
+        let mut newer_states = HashMap::new();
+        let mut newer_pairs = HashMap::new();
+        insert_pool_state(
+            &mut newer_states,
+            &mut newer_pairs,
+            "pool-newer",
+            "0x0000000000000000000000000000000000000011",
+            "uniswap_v2",
+            "uniswap_v2",
+            vec![make_token(&token_a, "NEW1"), make_token(&token_b, "NEW2")],
+            Box::new(LimitCountingSim {
+                max_in: BigUint::from(1_000u32),
+                calls: default_calls(),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(2, newer_states, newer_pairs))
+            .await;
+
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-pinned-meta", &["1"]);
+        let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
+        runner.native_pin = Some(pinned);
+        runner.refresh_meta_snapshot().await;
+
+        assert_eq!(runner.run.meta.block_number, 1);
+        assert_eq!(runner.run.meta.total_pools, Some(1));
     }
 
     #[tokio::test]

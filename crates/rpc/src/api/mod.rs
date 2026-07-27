@@ -20,7 +20,11 @@ use runtime::{
     simulator_service::SimulatorRuntime,
 };
 
-use crate::handlers::{encode::encode, quote::simulate, readiness::status};
+use crate::handlers::{
+    encode::encode,
+    quote::simulate,
+    readiness::{ready, status},
+};
 use crate::metrics::{
     emit_simulate_completion, emit_simulate_result_quality, emit_simulate_timeout, TimeoutKind,
 };
@@ -82,6 +86,7 @@ pub fn create_router(runtime: SimulatorRuntime) -> Router {
                 })),
         )
         .route("/status", get(status))
+        .route("/ready", get(ready))
         .with_state(SimulatorRouterState::new(runtime))
 }
 

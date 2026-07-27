@@ -73,6 +73,7 @@ pub enum PoolOutcomeKind {
 #[derive(Debug, Clone, Copy)]
 pub enum QuoteFailureKind {
     WarmUp,
+    StaleNativeState,
     TokenValidation,
     TokenCoverage,
     Timeout,
@@ -88,6 +89,7 @@ impl QuoteFailureKind {
     pub const fn label(self) -> &'static str {
         match self {
             QuoteFailureKind::WarmUp => "warm_up",
+            QuoteFailureKind::StaleNativeState => "stale_native_state",
             QuoteFailureKind::TokenValidation => "token_validation",
             QuoteFailureKind::TokenCoverage => "token_coverage",
             QuoteFailureKind::Timeout => "timeout",
@@ -118,6 +120,7 @@ impl<'de> Deserialize<'de> for QuoteFailureKind {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "warm_up" => Ok(Self::WarmUp),
+            "stale_native_state" => Ok(Self::StaleNativeState),
             "token_validation" => Ok(Self::TokenValidation),
             "token_coverage" => Ok(Self::TokenCoverage),
             "timeout" => Ok(Self::Timeout),
@@ -309,8 +312,8 @@ pub struct EncodeErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        AmountOutResponse, PoolOutcomeKind, QuoteMeta, QuotePartialKind, QuoteResultQuality,
-        QuoteStatus, RouteEncodeRequest,
+        AmountOutResponse, PoolOutcomeKind, QuoteFailureKind, QuoteMeta, QuotePartialKind,
+        QuoteResultQuality, QuoteStatus, RouteEncodeRequest,
     };
     use anyhow::Result;
 
@@ -324,6 +327,15 @@ mod tests {
             serde_json::to_string(&QuoteResultQuality::NoResults)?,
             "\"no_results\""
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_native_state_failure_kind_round_trips() -> Result<()> {
+        let serialized = serde_json::to_string(&QuoteFailureKind::StaleNativeState)?;
+        assert_eq!(serialized, "\"stale_native_state\"");
+        let deserialized: QuoteFailureKind = serde_json::from_str(&serialized)?;
+        assert!(matches!(deserialized, QuoteFailureKind::StaleNativeState));
         Ok(())
     }
 

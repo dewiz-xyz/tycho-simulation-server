@@ -61,9 +61,9 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Language | Rust 2021 |
 | Runtime | Axum + Tokio |
 | Binary | `dsolver-simulator-service` |
-| Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
+| Endpoints | `GET /status`, `GET /ready`, `POST /simulate`, `POST /encode` |
 | Supported chains | Defined in `simulator-manifest.toml` |
-| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_URL` |
+| Required inputs | `CHAIN_ID`, `TYCHO_BROADCASTER_URL`, Redis connection settings; the broadcaster also requires `TYCHO_API_KEY` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
@@ -72,7 +72,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 ```bash
 cp .env.example .env
 scripts/start_server.sh --repo . --chain-id 1
-scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1
+scripts/wait_ready.sh --url http://localhost:3000/ready --expect-chain-id 1
 ```
 
 Use the explicit `-p ... --bin ...` form for local runs and builds so it's always clear which
@@ -83,7 +83,7 @@ For manual service runs, start `dsolver-tycho-broadcaster-service` first on the 
 
 Required runtime inputs:
 
-- `TYCHO_API_KEY` for Tycho access
+- `TYCHO_API_KEY` for the broadcaster's Tycho access; the simulator does not use it
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
 - `TYCHO_BROADCASTER_URL` pointing at the active broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
 - `BROADCASTER_REDIS_URL` and `BROADCASTER_REDIS_STREAM_KEY` for the Redis stream that carries broadcaster deltas after each HTTP snapshot replay boundary
@@ -99,7 +99,7 @@ Common optional inputs:
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
 - `BROADCASTER_SNAPSHOT_SESSION_TTL_SECS` to set how long an unattached snapshot session can wait before cleanup
 - `BROADCASTER_REDIS_BLOCK_MS`, `BROADCASTER_REDIS_READ_COUNT`, and `BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS` to tune Redis stream reads and append retries
-- `BROADCASTER_REDIS_MAXLEN` to cap retained Redis delta entries and force simulators to fail readiness if replay data is trimmed before catch-up
+- `BROADCASTER_REDIS_MAXLEN` caps retained Redis entries (default `5000`) and forces simulators to rebootstrap if replay data is trimmed before catch-up
 - `TOKEN_SNAPSHOT_TIMEOUT_MS` for the simulator's startup load of the full broadcaster token snapshot
 - `TOKEN_REFRESH_TIMEOUT_MS` for RFQ provider token bootstrap and later single-token lookup misses
 - timeout and stream-health knobs from `crates/runtime/src/config/mod.rs`
@@ -107,11 +107,11 @@ Common optional inputs:
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
 
-## Runtime Handoff Contract
+## Runtime Continuity Contract
 
 The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
 
-The shared `broadcaster-replay-client` crate owns that bootstrap and Redis replay contract, so simulator and external consumers use the same checkpoint, gap detection, and handoff rules.
+The shared `broadcaster-replay-client` crate owns that bootstrap and Redis replay contract, so simulator and external consumers use the same checkpoint, gap detection, and recovery rules.
 
 Broadcaster deployments use four modes:
 
@@ -120,13 +120,14 @@ Broadcaster deployments use four modes:
 - `Retired` rejects appends and snapshot sessions after it has been replaced.
 - `Unhealthy` fails closed until it recovers or is replaced.
 
-Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. During active broadcaster handoff, a simulator may continue across Redis generations only when the first new-generation progress marker carries a valid Redis handoff proof; otherwise it fails closed and creates a fresh HTTP snapshot session from the current active broadcaster. Shared generation resets after append failure still omit handoff proof and always rebootstrap. The handoff uses independent `XREAD` positions per simulator process; it does not use Redis consumer groups or per-deployment stream keys.
+Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. A same-process reconnect keeps the writer generation and publishes a private full-replacement recovery transaction through the existing Redis stream. Consumers expose that replacement only after its commit, then apply ordered catch-up entries. Invalid, incomplete, or trimmed recovery data fails closed and falls back to a fresh HTTP bootstrap. Each simulator uses its own `XREAD` position; the design does not use Redis consumer groups or per-deployment stream keys.
 
 ## API Surface
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
-- `GET /status` reports overall service health plus nested backend readiness, native/VM block progress, RFQ cursor/freshness, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
+- `GET /status` is a liveness endpoint that always reports the current state with HTTP `200`.
+- `GET /ready` uses HTTP `200` or `503` for native traffic readiness and includes the same backend detail.
 
 `/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
@@ -190,10 +191,10 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 
 ## Readiness And Timeouts
 
-`GET /status` is the readiness source of truth:
+`GET /status` is the liveness view and always returns `200 OK`. `GET /ready` is the readiness source of truth:
 
-- `200 OK` with `status="ready"` when the service is healthy
-- `503 Service Unavailable` with `status="warming_up"` while native readiness is not ready
+- `200 OK` from `/ready` with `status="ready"` when native traffic can be served
+- `503 Service Unavailable` from `/ready` while native readiness is not ready
 - `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
 - `backends.native.status="warming_up"` while initial native state is still loading
 - `backends.native.status="stale"` when native updates are past the readiness freshness window
@@ -213,7 +214,7 @@ Timeout behavior differs by endpoint:
 - `/simulate` request-guard timeouts return `200 OK` with a contract-valid payload whose `meta.status=ready`, `meta.result_quality=request_level_failure`, and `meta.failures` includes a `timeout`
 - `/simulate` router-boundary timeouts also return `200 OK` with `result_quality=request_level_failure`
 - `/encode` router-boundary timeouts return `408 Request Timeout` with `{ "error": "..." }`, plus `requestId` when it is available
-- `/status` is not wrapped in the router timeout layer
+- `/status` and `/ready` are not wrapped in the router timeout layer
 
 For ops, `/encode` timeout and failure logs include stable `encode_error_kind` and `failure_stage` fields so CloudWatch queries can separate validation, readiness, normalization, resimulation, encoding, `handler_timeout`, and `router_timeout` paths.
 
@@ -267,14 +268,14 @@ run should usually finish in about 10 minutes, and it fails after 20 minutes.
 Container builds:
 
 ```bash
-docker build -f Dockerfile.simulator-service -t dsolver-simulator-service .
-docker build -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
+docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.simulator-service -t dsolver-simulator-service .
+docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
 ```
 
 Useful helpers:
 
 - `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
-- `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
+- `scripts/wait_ready.sh` to poll `/ready` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
 - `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, available Redis stream history, and simulator catch-up status
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report

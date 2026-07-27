@@ -22,7 +22,7 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
-use crate::models::state::{AppState, RfqClientConfig, SimulationRebuildGuard};
+use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
 use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::services::stream_builder::{
     ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
@@ -57,6 +57,7 @@ struct RouteResimulator<'a> {
     token_cache: TokenCache<'a>,
     pool_cache: HashMap<String, CachedPoolEntry>,
     rebuild_guard: Arc<SimulationRebuildGuard>,
+    native_pin: Option<PublishedStatePin>,
 }
 
 struct SwapSimulationRequest {
@@ -68,7 +69,8 @@ struct SwapSimulationRequest {
     rebuild_guard: Option<Arc<SimulationRebuildGuard>>,
 }
 
-pub(super) async fn resimulate_route(
+#[cfg(test)]
+async fn resimulate_route(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
@@ -77,7 +79,36 @@ pub(super) async fn resimulate_route(
     native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
 ) -> Result<ResimulatedRouteInternal, EncodeError> {
-    let mut resimulator = RouteResimulator::new(state, normalized, chain, rebuild_guard);
+    let native_pin = Some(state.native_state_store.pin().await);
+    resimulate_route_with_native_pin(
+        state,
+        normalized,
+        chain,
+        request_token_in,
+        request_token_out,
+        native_token_protocol_allowlist,
+        rebuild_guard,
+        native_pin,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route, chain, token, guard, and pinned-state inputs remain explicit at the request boundary"
+)]
+pub(super) async fn resimulate_route_with_native_pin(
+    state: &AppState,
+    normalized: &NormalizedRouteInternal,
+    chain: Chain,
+    request_token_in: &Bytes,
+    request_token_out: &Bytes,
+    native_token_protocol_allowlist: &[String],
+    rebuild_guard: Arc<SimulationRebuildGuard>,
+    native_pin: Option<PublishedStatePin>,
+) -> Result<ResimulatedRouteInternal, EncodeError> {
+    let mut resimulator =
+        RouteResimulator::new(state, normalized, chain, rebuild_guard, native_pin);
 
     // Resimulate in hop-depth order to match build_route_swaps execution order.
     for hop_index in 0..resimulator.max_hop_depth() {
@@ -100,6 +131,7 @@ impl<'a> RouteResimulator<'a> {
         normalized: &'a NormalizedRouteInternal,
         chain: Chain,
         rebuild_guard: Arc<SimulationRebuildGuard>,
+        native_pin: Option<PublishedStatePin>,
     ) -> Self {
         Self {
             state,
@@ -109,6 +141,7 @@ impl<'a> RouteResimulator<'a> {
             token_cache: TokenCache::new(state),
             pool_cache: HashMap::new(),
             rebuild_guard,
+            native_pin,
         }
     }
 
@@ -209,8 +242,13 @@ impl<'a> RouteResimulator<'a> {
         )?;
         let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
-        let token_in = self.token_cache.get(&sim_token_in).await?;
-        let token_out = self.token_cache.get(&sim_token_out).await?;
+        let native_pin = pool_entry
+            .backend
+            .is_native()
+            .then_some(self.native_pin.as_ref())
+            .flatten();
+        let token_in = self.token_cache.get(&sim_token_in, native_pin).await?;
+        let token_out = self.token_cache.get(&sim_token_out, native_pin).await?;
         let (pre_state, result) = simulate_swap(SwapSimulationRequest {
             pool_state: Arc::clone(&pool_entry.pool_state),
             amount_in_for_sim: allocated.amount_in.clone(),
@@ -250,6 +288,20 @@ impl<'a> RouteResimulator<'a> {
     async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, EncodeError> {
         if let Some(entry) = self.pool_cache.get(pool_id) {
             return Ok(entry.clone());
+        }
+
+        if let Some((pool_state, component)) = self
+            .native_pin
+            .as_ref()
+            .and_then(|pin| pin.pool_by_id(pool_id))
+        {
+            let entry = CachedPoolEntry {
+                backend: PoolBackend::from_component(component.as_ref()),
+                pool_state,
+                component,
+            };
+            self.pool_cache.insert(pool_id.to_string(), entry.clone());
+            return Ok(entry);
         }
 
         if let Some((uses_vm, uses_rfq)) = self
@@ -648,9 +700,20 @@ impl<'a> TokenCache<'a> {
         }
     }
 
-    async fn get(&mut self, address: &Bytes) -> Result<Token, EncodeError> {
+    async fn get(
+        &mut self,
+        address: &Bytes,
+        native_pin: Option<&PublishedStatePin>,
+    ) -> Result<Token, EncodeError> {
         if let Some(token) = self.cache.get(address) {
             return Ok(token.clone());
+        }
+        if let Some(native_pin) = native_pin {
+            let token = native_pin
+                .token(address)
+                .ok_or_else(|| EncodeError::invalid("Token not found"))?;
+            self.cache.insert(address.clone(), token.clone());
+            return Ok(token);
         }
         let token = self
             .state
@@ -1439,7 +1502,7 @@ mod tests {
         );
         let mut cache = TokenCache::new(&app_state);
 
-        let err = match cache.get(&missing_token.address).await {
+        let err = match cache.get(&missing_token.address, None).await {
             Ok(_) => panic!("Expected token cache miss to fail when RPC fetch is unavailable"),
             Err(err) => err,
         };
@@ -1449,5 +1512,74 @@ mod tests {
             crate::services::encode::EncodeErrorKind::Simulation
         );
         assert!(err.message().contains("Token lookup failed"));
+    }
+
+    #[tokio::test]
+    async fn native_token_cache_uses_metadata_from_the_pinned_version() {
+        let address = "0x0000000000000000000000000000000000000001";
+        let second_address = "0x0000000000000000000000000000000000000002";
+        let address_bytes = dummy_token(address).address;
+        let second_address_bytes = dummy_token(second_address).address;
+        let pinned_token = Token::new(&address_bytes, "PINNED", 18, 0, &[], Chain::Ethereum, 100);
+        let paired_token = Token::new(
+            &second_address_bytes,
+            "PAIR",
+            18,
+            0,
+            &[],
+            Chain::Ethereum,
+            100,
+        );
+        let tokens_store = token_store_with_tokens(Vec::<Token>::new());
+        let native_state_store = Arc::new(crate::models::state::StateStore::new_private(
+            Arc::clone(&tokens_store),
+        ));
+        let vm_state_store = Arc::new(crate::models::state::StateStore::new(Arc::clone(
+            &tokens_store,
+        )));
+        let rfq_state_store = Arc::new(crate::models::state::StateStore::new(Arc::clone(
+            &tokens_store,
+        )));
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-native".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "pool-native".to_string(),
+            component_with_tokens(
+                "0x0000000000000000000000000000000000000009",
+                vec![pinned_token.clone(), paired_token],
+            ),
+        );
+        native_state_store
+            .apply_update(Update::new(1, states, pairs))
+            .await;
+        let native_pin = native_state_store.pin().await;
+        let app_state = test_app_state(
+            tokens_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig::default(),
+        );
+        let mut cache = TokenCache::new(&app_state);
+
+        let from_pin = match cache.get(&address_bytes, Some(&native_pin)).await {
+            Ok(token) => token,
+            Err(error) => panic!("pinned token should exist: {}", error.message()),
+        };
+
+        assert_eq!(from_pin.symbol, "PINNED");
+        assert_eq!(from_pin.decimals, 18);
+        assert!(
+            !app_state
+                .tokens
+                .snapshot()
+                .await
+                .contains_key(&address_bytes),
+            "the proof requires token metadata to remain absent from the global store"
+        );
     }
 }

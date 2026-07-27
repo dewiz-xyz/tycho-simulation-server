@@ -484,6 +484,7 @@ async fn ensure_server_ready(
     args: &CliArgs,
 ) -> Result<LifecycleState> {
     let status_url = status_url(&args.base_url);
+    let ready_url = ready_url(&args.base_url);
     let mut started_server = false;
 
     match fetch_readiness_snapshot(client, &status_url).await {
@@ -504,7 +505,7 @@ async fn ensure_server_ready(
     }
 
     let readiness_result = async {
-        wait_for_readiness(scripts, &status_url, args.chain_id, false, false)?;
+        wait_for_readiness(scripts, &ready_url, args.chain_id, false, false)?;
         let mut snapshot = fetch_readiness_snapshot(client, &status_url)
             .await
             .context("failed to fetch readiness after wait_ready")?;
@@ -523,7 +524,7 @@ async fn ensure_server_ready(
 
         if require_vm || require_rfq {
             let wait_label = readiness_wait_label(require_vm, require_rfq);
-            wait_for_readiness(scripts, &status_url, args.chain_id, require_vm, require_rfq)?;
+            wait_for_readiness(scripts, &ready_url, args.chain_id, require_vm, require_rfq)?;
             snapshot = fetch_readiness_snapshot(client, &status_url)
                 .await
                 .with_context(|| format!("failed to fetch readiness after {wait_label}"))?;
@@ -2349,7 +2350,7 @@ fn stop_server(scripts: &ScriptPaths, repo: &Path) -> Result<()> {
 
 fn wait_for_readiness(
     scripts: &ScriptPaths,
-    status_url: &str,
+    ready_url: &str,
     chain_id: u64,
     require_vm: bool,
     require_rfq: bool,
@@ -2360,7 +2361,7 @@ fn wait_for_readiness(
         (false, true) => DEFAULT_RFQ_READY_TIMEOUT_SECS,
         (false, false) => DEFAULT_READY_TIMEOUT_SECS,
     };
-    let args = build_wait_ready_args(status_url, timeout_secs, chain_id, require_vm, require_rfq);
+    let args = build_wait_ready_args(ready_url, timeout_secs, chain_id, require_vm, require_rfq);
     run_script(&scripts.wait_ready, &args).map(|_| ())
 }
 
@@ -2420,7 +2421,7 @@ fn snapshot_native_ready(snapshot: &ReadinessSnapshot) -> bool {
 }
 
 fn build_wait_ready_args(
-    status_url: &str,
+    ready_url: &str,
     timeout_secs: u64,
     chain_id: u64,
     require_vm: bool,
@@ -2428,7 +2429,7 @@ fn build_wait_ready_args(
 ) -> Vec<String> {
     let mut args = vec![
         "--url".to_string(),
-        status_url.to_string(),
+        ready_url.to_string(),
         "--timeout".to_string(),
         timeout_secs.to_string(),
         "--expect-chain-id".to_string(),
@@ -2925,6 +2926,10 @@ fn status_url(base_url: &str) -> String {
     format!("{base_url}/status")
 }
 
+fn ready_url(base_url: &str) -> String {
+    format!("{base_url}/ready")
+}
+
 fn simulate_url(base_url: &str) -> String {
     format!("{base_url}/simulate")
 }
@@ -3186,12 +3191,12 @@ mod tests {
     #[test]
     fn build_wait_ready_args_supports_vm_and_rfq_requirements() {
         let rfq_only_args =
-            build_wait_ready_args("http://localhost:3000/status", 600, 1, false, true);
+            build_wait_ready_args("http://localhost:3000/ready", 600, 1, false, true);
         assert!(rfq_only_args.iter().any(|arg| arg == "--require-rfq-ready"));
         assert!(!rfq_only_args.iter().any(|arg| arg == "--require-vm-ready"));
 
         let vm_and_rfq_args =
-            build_wait_ready_args("http://localhost:3000/status", 600, 1, true, true);
+            build_wait_ready_args("http://localhost:3000/ready", 600, 1, true, true);
         assert!(vm_and_rfq_args
             .iter()
             .any(|arg| arg == "--require-vm-ready"));
