@@ -120,6 +120,74 @@ async fn passive_publisher_skips_appends_and_has_no_replay_boundary() -> Result<
 }
 
 #[tokio::test]
+async fn status_snapshot_returns_cached_state_while_append_holds_inner() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = Arc::new(BroadcasterRedisPublisher::new(
+        publisher_config(),
+        Arc::new(writer.clone()),
+    ));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+    assert_eq!(publisher.status_snapshot().await.mode, "active");
+    writer.block_message_seq(2).await;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let publish = tokio::spawn({
+        let publisher = Arc::clone(&publisher);
+        async move {
+            publisher
+                .publish_accepted_payload(BroadcasterPayload::Update(update))
+                .await
+        }
+    });
+    writer.wait_for_blocked_append().await;
+
+    let status = timeout(Duration::from_millis(100), publisher.status_snapshot())
+        .await
+        .map_err(|_| anyhow!("status snapshot blocked on an in-flight append"))?;
+    assert_eq!(status.mode, "active");
+    let verified = timeout(
+        Duration::from_millis(100),
+        publisher.verified_status_snapshot(),
+    )
+    .await
+    .map_err(|_| anyhow!("verified status snapshot blocked on an in-flight append"))?;
+    assert_eq!(verified.mode, "active");
+
+    writer.release_blocked_append();
+    publish.await??;
+    assert_eq!(publisher.status_snapshot().await.append_success_count, 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_status_bounds_fence_verification() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+    assert_eq!(publisher.status_snapshot().await.mode, "active");
+    writer.block_next_verify().await;
+
+    let status = publisher.verified_status_snapshot().await;
+
+    assert_eq!(status.mode, "active");
+    assert!(status.last_error.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn startup_handoff_preserves_cross_backend_publication_order_until_admission() -> Result<()> {
     let native_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let rfq_cache = ready_cache(BroadcasterBackend::Rfq, 20, "rfq-1").await?;
@@ -1929,6 +1997,7 @@ struct FakeRedisWriterState {
     conflict_next_append_replies: usize,
     append_delay: Option<Duration>,
     blocked_message_seq: Option<u64>,
+    block_next_verify: bool,
     stall_after_record_message_seq: Option<u64>,
     fail_next_inspects: usize,
     append_attempt_count: usize,
@@ -1965,6 +2034,10 @@ impl FakeRedisWriter {
 
     async fn block_message_seq(&self, message_seq: u64) {
         self.inner.lock().await.blocked_message_seq = Some(message_seq);
+    }
+
+    async fn block_next_verify(&self) {
+        self.inner.lock().await.block_next_verify = true;
     }
 
     async fn stall_after_record_message_seq(&self, message_seq: u64) {
@@ -2143,6 +2216,31 @@ impl RedisStreamWriter for FakeRedisWriter {
                 return Err(anyhow!("planned Redis renew failure"));
             }
             Ok(())
+        })
+    }
+
+    fn verify_writer<'a>(
+        &'a self,
+        command: super::RedisVerifyCommand<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let block = {
+                let mut guard = self.inner.lock().await;
+                let block = guard.block_next_verify;
+                guard.block_next_verify = false;
+                block
+            };
+            if block {
+                futures::future::pending::<()>().await;
+            }
+            self.renew_writer(super::RedisRenewCommand {
+                writer_key: command.writer_key,
+                writer_generation_key: command.writer_generation_key,
+                writer_token: command.writer_token,
+                generation: command.generation,
+                lease_ttl: command.lease_ttl,
+            })
+            .await
         })
     }
 

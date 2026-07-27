@@ -33,6 +33,8 @@ use simulator_core::broadcaster::{
     BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
 };
 
+const SNAPSHOT_BOUNDARY_RETENTION_CACHE_TTL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotSessionError {
     NotFound,
@@ -306,6 +308,26 @@ struct BroadcasterSnapshotArtifact {
     encoded_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnapshotBoundaryRetention {
+    Retained,
+    NotRetained,
+    InspectionFailed(String),
+}
+
+impl SnapshotBoundaryRetention {
+    pub(crate) fn is_retained(&self) -> bool {
+        matches!(self, Self::Retained)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedSnapshotBoundaryRetention {
+    boundary: BroadcasterRedisReplayBoundary,
+    checked_at: Instant,
+    verdict: SnapshotBoundaryRetention,
+}
+
 #[derive(Debug)]
 struct BroadcasterSnapshotCandidate {
     chain_id: u64,
@@ -340,6 +362,7 @@ pub struct BroadcasterServiceState {
     snapshot_sessions: BroadcasterSnapshotSessionRegistry,
     snapshot_preflight: Arc<RwLock<BroadcasterSnapshotPreflightState>>,
     snapshot_artifact: Arc<RwLock<Option<Arc<BroadcasterSnapshotArtifact>>>>,
+    snapshot_boundary_retention: Arc<Mutex<Option<CachedSnapshotBoundaryRetention>>>,
     snapshot_refresh_active: Arc<AtomicBool>,
     recovery_publication: Arc<Mutex<RecoveryPublicationState>>,
     recovery_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -415,6 +438,7 @@ impl BroadcasterServiceState {
             snapshot_sessions: BroadcasterSnapshotSessionRegistry::new(),
             snapshot_preflight: Arc::new(RwLock::new(BroadcasterSnapshotPreflightState::default())),
             snapshot_artifact: Arc::new(RwLock::new(None)),
+            snapshot_boundary_retention: Arc::new(Mutex::new(None)),
             snapshot_refresh_active: Arc::new(AtomicBool::new(false)),
             recovery_publication: Arc::new(Mutex::new(RecoveryPublicationState::default())),
             recovery_workers: Arc::new(Mutex::new(Vec::new())),
@@ -713,6 +737,45 @@ impl BroadcasterServiceState {
             return false;
         };
         artifact_matches_current_boundary(&artifact, &boundary)
+    }
+
+    pub(crate) async fn snapshot_boundary_is_retained(&self) -> SnapshotBoundaryRetention {
+        let Some(artifact) = self.snapshot_artifact.read().await.clone() else {
+            return SnapshotBoundaryRetention::NotRetained;
+        };
+        let Some(current_boundary) = self.redis_publisher.status_snapshot().await.replay_boundary
+        else {
+            return SnapshotBoundaryRetention::NotRetained;
+        };
+        if !artifact_matches_current_boundary(&artifact, &current_boundary) {
+            return SnapshotBoundaryRetention::NotRetained;
+        }
+
+        {
+            let cached = self.snapshot_boundary_retention.lock().await;
+            if let Some(cached) = cached.as_ref().filter(|cached| {
+                cached.boundary == artifact.redis_replay_boundary
+                    && cached.checked_at.elapsed() < SNAPSHOT_BOUNDARY_RETENTION_CACHE_TTL
+            }) {
+                return cached.verdict.clone();
+            }
+        }
+
+        let verdict = match self
+            .redis_publisher
+            .replay_boundary_is_retained(&artifact.redis_replay_boundary)
+            .await
+        {
+            Ok(true) => SnapshotBoundaryRetention::Retained,
+            Ok(false) => SnapshotBoundaryRetention::NotRetained,
+            Err(error) => SnapshotBoundaryRetention::InspectionFailed(format!("{error:#}")),
+        };
+        *self.snapshot_boundary_retention.lock().await = Some(CachedSnapshotBoundaryRetention {
+            boundary: artifact.redis_replay_boundary.clone(),
+            checked_at: Instant::now(),
+            verdict: verdict.clone(),
+        });
+        verdict
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<()> {
@@ -1412,14 +1475,10 @@ impl BroadcasterServiceState {
         let Some(current_boundary) = publisher_status.replay_boundary else {
             return Ok(None);
         };
-        match services[0]
-            .redis_publisher
-            .replay_boundary_is_retained(&artifact.redis_replay_boundary)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(error) => {
+        match services[0].snapshot_boundary_is_retained().await {
+            SnapshotBoundaryRetention::Retained => {}
+            SnapshotBoundaryRetention::NotRetained => return Ok(None),
+            SnapshotBoundaryRetention::InspectionFailed(error) => {
                 warn!(
                     error = %error,
                     "Refusing broadcaster snapshot session without retained Redis replay boundary"
@@ -2743,6 +2802,53 @@ mod tests {
             Some(12),
             "a partial catch-up must not replace the complete recovery progress block"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_status_snapshot_responds_during_slow_recovery_publication() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let (service, _publisher) = ready_feed_service_with_writer(writer.clone()).await?;
+        writer.delay_recovery_commit(Duration::from_secs(1)).await;
+        let Err(gap_error) = service.apply_feed_message(&raw_feed(12, 12, 11)).await else {
+            return Err(anyhow!("header gap must force reconnect"));
+        };
+        service
+            .mark_stream_disconnected("gap", Some(gap_error.to_string()))
+            .await;
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let kinds = writer
+                    .appends()
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>();
+                if kinds.contains(&BroadcasterMessageKind::RecoveryChunk)
+                    && !kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("recovery did not reach its delayed commit"))?;
+
+        let status = timeout(Duration::from_millis(100), service.status_snapshot())
+            .await
+            .map_err(|_| anyhow!("service status snapshot blocked on recovery publication"))?;
+        assert!(status.recovery.active);
+
+        timeout(Duration::from_secs(2), async {
+            while service.recovery_status().await.active {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("slow recovery did not complete"))?;
         Ok(())
     }
 

@@ -34,6 +34,7 @@ const STALE_WRITER_MESSAGE: &str = "stale Redis broadcaster writer";
 // Keep this in sync with the writer fence errors returned by the Lua scripts.
 pub(super) const MISSING_FENCE_MESSAGE: &str = "missing Redis broadcaster writer fence";
 const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const RECOVERY_REDIS_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LIVE_REDIS_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -667,6 +668,8 @@ pub struct BroadcasterRedisPublisher {
     writer_generation_key: String,
     writer_token: String,
     inner: Arc<Mutex<BroadcasterRedisPublisherState>>,
+    // Leaf-level cache lock; never hold it across an await.
+    last_status: std::sync::Mutex<BroadcasterRedisPublisherStatus>,
     recovery_gate: Arc<Mutex<PublisherRecoveryGate>>,
     recovery_coordinator: Arc<Mutex<()>>,
     next_recovery_id: Arc<AtomicU64>,
@@ -909,6 +912,19 @@ impl BroadcasterRedisPublisher {
             BroadcasterDeploymentAdmissionSnapshot::new(deployment_phase, None),
         );
         let initial_state_version = state_version_base(generation);
+        let initial_status = BroadcasterRedisPublisherStatus {
+            healthy: mode.is_healthy(),
+            mode: mode.as_str(),
+            stream_key: config.stream_key.clone(),
+            stream_id: stream_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            latest_entry_id: None,
+            replay_boundary: None,
+            append_success_count: 0,
+            append_failure_count: 0,
+            retry_exhaustion_count: 0,
+            last_error: None,
+        };
         Self {
             config,
             writer,
@@ -930,6 +946,7 @@ impl BroadcasterRedisPublisher {
                 last_error: None,
                 startup_handoff: None,
             })),
+            last_status: std::sync::Mutex::new(initial_status),
             recovery_gate: Arc::new(Mutex::new(PublisherRecoveryGate::default())),
             recovery_coordinator: Arc::new(Mutex::new(())),
             next_recovery_id: Arc::new(AtomicU64::new(1)),
@@ -1536,25 +1553,29 @@ impl BroadcasterRedisPublisher {
         &self,
         boundary: &BroadcasterRedisReplayBoundary,
     ) -> Result<bool> {
-        let guard = self.inner.lock().await;
-        ensure_active_publisher(&guard)?;
-        if boundary.generation != guard.generation
-            || boundary.stream_id != guard.stream_id
-            || boundary.snapshot_id != guard.snapshot_id
+        let status = self.status_snapshot().await;
+        let Some(current_boundary) = status.replay_boundary.as_ref() else {
+            return Ok(false);
+        };
+        if status.mode != BroadcasterRedisPublisherMode::Active.as_str()
+            || boundary.generation != current_boundary.generation
+            || boundary.stream_id != status.stream_id
+            || boundary.snapshot_id != status.snapshot_id
         {
             return Ok(false);
         }
-        let inspection = self
-            .writer
-            .inspect_writer(RedisInspectCommand {
+        let inspection = timeout(
+            STATUS_VERIFY_TIMEOUT,
+            self.writer.inspect_writer(RedisInspectCommand {
                 stream_key: &self.config.stream_key,
                 writer_key: &self.writer_key,
                 writer_generation_key: &self.writer_generation_key,
                 writer_token: &self.writer_token,
-                generation: guard.generation,
-            })
-            .await;
-        let inspection = inspection?;
+                generation: boundary.generation,
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("Redis replay-boundary inspection timed out"))??;
         if inspection.generation != boundary.generation {
             return Ok(false);
         }
@@ -1633,19 +1654,49 @@ impl BroadcasterRedisPublisher {
         )
     }
 
+    #[expect(
+        clippy::unused_async,
+        reason = "status snapshots keep the same future-based API as verified snapshots"
+    )]
     pub async fn status_snapshot(&self) -> BroadcasterRedisPublisherStatus {
-        let guard = self.inner.lock().await;
-        self.status_snapshot_locked(&guard)
+        let Ok(guard) = self.inner.try_lock() else {
+            // Long appends and recoveries verify their own writer fence while holding state.
+            return self.cached_status();
+        };
+        let status = self.status_snapshot_locked(&guard);
+        self.cache_status(status.clone());
+        status
     }
 
     pub async fn verified_status_snapshot(&self) -> BroadcasterRedisPublisherStatus {
-        let mut guard = self.inner.lock().await;
+        let Ok(mut guard) = self.inner.try_lock() else {
+            // Long appends and recoveries verify their own writer fence while holding state.
+            return self.cached_status();
+        };
         if guard.mode == BroadcasterRedisPublisherMode::Active && guard.last_error.is_none() {
-            let _ = self
-                .verify_writer_fence_locked(&mut guard, "status snapshot", false)
-                .await;
+            let _ = timeout(
+                STATUS_VERIFY_TIMEOUT,
+                self.verify_writer_fence_locked(&mut guard, "status snapshot", false),
+            )
+            .await;
         }
-        self.status_snapshot_locked(&guard)
+        let status = self.status_snapshot_locked(&guard);
+        self.cache_status(status.clone());
+        status
+    }
+
+    fn cached_status(&self) -> BroadcasterRedisPublisherStatus {
+        self.last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cache_status(&self, status: BroadcasterRedisPublisherStatus) {
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
     }
 
     fn status_snapshot_locked(

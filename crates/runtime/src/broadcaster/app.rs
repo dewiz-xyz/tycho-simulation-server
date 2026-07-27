@@ -6,10 +6,13 @@ use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
 use crate::broadcaster::redis_publisher::{
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
-    TokioRedisStreamWriter,
+    BroadcasterDeploymentAdmissionSnapshot, BroadcasterRedisPublisher,
+    BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
+    BroadcasterRedisPublisherStatus, TokioRedisStreamWriter,
 };
-use crate::broadcaster::service::{BroadcasterServiceState, SnapshotSessionError};
+use crate::broadcaster::service::{
+    BroadcasterServiceState, SnapshotBoundaryRetention, SnapshotSessionError,
+};
 use crate::broadcaster::state::{
     BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterStatusSnapshot,
     BroadcasterUpstreamState,
@@ -92,11 +95,47 @@ impl BroadcasterAppState {
     }
 
     pub async fn status_snapshot(&self) -> BroadcasterStatusSnapshot {
+        let redis_status = self.redis_publisher.status_snapshot().await;
+        self.snapshot_with_redis_status(redis_status).await
+    }
+
+    pub async fn readiness_snapshot(&self) -> BroadcasterStatusSnapshot {
+        let redis_status = self.redis_publisher.verified_status_snapshot().await;
+        let mut snapshot = self.snapshot_with_redis_status(redis_status).await;
+        if !snapshot.deployment_admission.admitted
+            && snapshot.readiness == BroadcasterReadiness::Ready
+        {
+            snapshot.readiness = BroadcasterReadiness::SnapshotWarmingUp;
+        }
+        if snapshot.deployment_admission.admitted
+            && snapshot
+                .redis_publisher
+                .as_ref()
+                .is_some_and(|publisher| publisher.mode == "active")
+        {
+            let retention = self.raw_service.snapshot_boundary_is_retained().await;
+            if !retention.is_retained() {
+                snapshot.snapshot.exportable = false;
+                if snapshot.readiness == BroadcasterReadiness::Ready {
+                    snapshot.readiness = BroadcasterReadiness::SnapshotUnexportable;
+                }
+                if let SnapshotBoundaryRetention::InspectionFailed(error) = retention {
+                    snapshot.snapshot.last_export_error = Some(error);
+                }
+            }
+        }
+        self.log_readiness_transition(&snapshot).await;
+        snapshot
+    }
+
+    async fn snapshot_with_redis_status(
+        &self,
+        redis_status: BroadcasterRedisPublisherStatus,
+    ) -> BroadcasterStatusSnapshot {
         let mut snapshot = self.raw_service.status_snapshot().await;
         if let Some(rfq_service) = &self.rfq_service {
             snapshot = combine_status_snapshots(snapshot, rfq_service.status_snapshot().await);
         }
-        let redis_status = self.redis_publisher.verified_status_snapshot().await;
         let redis_readiness = redis_readiness(redis_status.mode);
         match snapshot.readiness {
             BroadcasterReadiness::Ready => snapshot.readiness = redis_readiness,
@@ -110,11 +149,10 @@ impl BroadcasterAppState {
         }
         snapshot.redis_publisher = Some(redis_status);
         snapshot.deployment_admission = self.redis_publisher.deployment_admission_snapshot();
-        if !snapshot.deployment_admission.admitted
-            && snapshot.readiness == BroadcasterReadiness::Ready
-        {
-            snapshot.readiness = BroadcasterReadiness::SnapshotWarmingUp;
-        }
+        snapshot
+    }
+
+    async fn log_readiness_transition(&self, snapshot: &BroadcasterStatusSnapshot) {
         let mut previous = self.last_reported_readiness.lock().await;
         let previous_value = *previous;
         if previous_value != Some(snapshot.readiness) {
@@ -131,17 +169,21 @@ impl BroadcasterAppState {
                     event = "broadcaster_readiness_changed",
                     from = previous_readiness,
                     to = snapshot.readiness.as_str(),
-                    error = snapshot.upstream.last_error.as_deref().or_else(|| snapshot
-                        .redis_publisher
-                        .as_ref()?
+                    error = snapshot
+                        .upstream
                         .last_error
-                        .as_deref()),
+                        .as_deref()
+                        .or_else(|| snapshot.redis_publisher.as_ref()?.last_error.as_deref())
+                        .or(snapshot.snapshot.last_export_error.as_deref()),
                     "Broadcaster readiness closed"
                 );
             }
             *previous = Some(snapshot.readiness);
         }
-        snapshot
+    }
+
+    pub fn deployment_admission_snapshot(&self) -> BroadcasterDeploymentAdmissionSnapshot {
+        self.redis_publisher.deployment_admission_snapshot()
     }
 
     pub fn chain_id(&self) -> u64 {

@@ -24,7 +24,7 @@ pub async fn status(
 pub async fn ready(
     State(state): State<BroadcasterAppState>,
 ) -> (StatusCode, Json<BroadcasterStatusPayload>) {
-    let snapshot = state.status_snapshot().await;
+    let snapshot = state.readiness_snapshot().await;
     let status_code = if snapshot.readiness == BroadcasterReadiness::Ready {
         StatusCode::OK
     } else {
@@ -36,8 +36,10 @@ pub async fn ready(
 pub async fn deployment_ready(
     State(state): State<BroadcasterAppState>,
 ) -> (StatusCode, Json<BroadcasterStatusPayload>) {
-    let snapshot = state.status_snapshot().await;
-    let status_code = if snapshot.deployment_admission.admitted {
+    let admission = state.deployment_admission_snapshot();
+    let mut snapshot = state.status_snapshot().await;
+    snapshot.deployment_admission = admission.clone();
+    let status_code = if admission.admitted {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE

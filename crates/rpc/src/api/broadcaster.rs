@@ -50,14 +50,16 @@ mod tests {
             BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
         },
         broadcaster::service::BroadcasterServiceState,
-        broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
+        broadcaster::state::{
+            BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterUpstreamState,
+        },
         models::tokens::TokenStore,
     };
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
     use tokio::{
-        sync::{Barrier, Mutex},
+        sync::{Barrier, Mutex, Notify},
         task::JoinHandle,
-        time::sleep,
+        time::{sleep, timeout},
     };
     use tower::ServiceExt;
     use tycho_simulation::{
@@ -262,11 +264,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn status_fences_stale_active_publisher_before_reporting_ready() -> Result<()> {
+    async fn ready_fences_stale_active_publisher_before_reporting_ready() -> Result<()> {
         let writer = RpcFakeRedisWriter::healthy();
         let app = create_broadcaster_router(build_stale_active_state(writer).await?);
 
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app, "/ready").await?;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "redis_publisher_retired");
@@ -275,6 +277,86 @@ mod tests {
         assert!(body["redis_publisher"]["replay_boundary"].is_null());
         assert_eq!(body["deployment_admission"]["admitted"], false);
         assert_eq!(body["deployment_admission"]["phase"], "retired");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deployment_ready_responds_while_publisher_mutex_is_held() -> Result<()> {
+        let writer = RpcFakeRedisWriter::healthy();
+        let (state, service) = build_state_with_redis_and_service(writer.clone()).await?;
+        assert_eq!(state.status_snapshot().await.readiness.as_str(), "ready");
+        writer.block_next_append().await;
+        let heartbeat = tokio::spawn(async move { service.broadcast_heartbeat().await });
+        writer.wait_for_blocked_append().await;
+
+        let (status, body) = timeout(
+            Duration::from_millis(100),
+            get_json(create_broadcaster_router(state), "/deployment-ready"),
+        )
+        .await
+        .map_err(|_| anyhow!("deployment readiness blocked on the publisher mutex"))??;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployment_admission"]["admitted"], true);
+        writer.release_blocked_append();
+        heartbeat.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_boundary_keeps_readiness_and_session_admission_in_agreement() -> Result<()> {
+        let writer = RpcFakeRedisWriter::healthy();
+        let state = build_state_with_redis(writer.clone()).await?;
+
+        let first = state.readiness_snapshot().await;
+        let second = state.readiness_snapshot().await;
+        let session = state.create_snapshot_session().await?;
+
+        assert_eq!(first.readiness, BroadcasterReadiness::Ready);
+        assert!(first.snapshot.exportable);
+        assert_eq!(second.readiness, BroadcasterReadiness::Ready);
+        assert!(session.is_some());
+        assert_eq!(
+            writer.inspect_count().await,
+            1,
+            "the retained-boundary verdict should be reused within the cache window"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trimmed_boundary_closes_readiness_and_session_admission() -> Result<()> {
+        let writer = RpcFakeRedisWriter::healthy();
+        let state = build_state_with_redis(writer.clone()).await?;
+        writer.set_first_entry_sequence(3).await;
+
+        let readiness = state.readiness_snapshot().await;
+        let session = state.create_snapshot_session().await?;
+
+        assert_eq!(
+            readiness.readiness,
+            BroadcasterReadiness::SnapshotUnexportable
+        );
+        assert!(!readiness.snapshot.exportable);
+        assert!(session.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_inspection_error_closes_readiness_and_session_admission() -> Result<()> {
+        let writer = RpcFakeRedisWriter::healthy();
+        let state = build_state_with_redis(writer.clone()).await?;
+        writer.fail_next_inspect().await;
+
+        let readiness = state.readiness_snapshot().await;
+        let session = state.create_snapshot_session().await?;
+
+        assert_eq!(
+            readiness.readiness,
+            BroadcasterReadiness::SnapshotUnexportable
+        );
+        assert!(!readiness.snapshot.exportable);
+        assert!(session.is_none());
         Ok(())
     }
 
@@ -811,6 +893,12 @@ mod tests {
     }
 
     async fn build_state_with_redis(writer: RpcFakeRedisWriter) -> Result<BroadcasterAppState> {
+        Ok(build_state_with_redis_and_service(writer).await?.0)
+    }
+
+    async fn build_state_with_redis_and_service(
+        writer: RpcFakeRedisWriter,
+    ) -> Result<(BroadcasterAppState, BroadcasterServiceState)> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let upstream = BroadcasterUpstreamState::default();
         let (publisher, gate) = publisher_and_gate(writer);
@@ -828,14 +916,15 @@ mod tests {
             "active_writer_promoted",
         )
         .await?;
-        Ok(BroadcasterAppState::with_snapshot_session_ttl(
-            service,
+        let app_state = BroadcasterAppState::with_snapshot_session_ttl(
+            service.clone(),
             None,
             token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
             Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
-        ))
+        );
+        Ok((app_state, service))
     }
 
     async fn build_stale_active_state(writer: RpcFakeRedisWriter) -> Result<BroadcasterAppState> {
@@ -1000,6 +1089,8 @@ mod tests {
     struct RpcFakeRedisWriter {
         fail_after_successes: Option<usize>,
         state: Arc<Mutex<RpcFakeRedisWriterState>>,
+        append_started: Arc<Notify>,
+        append_release: Arc<Notify>,
     }
 
     #[derive(Debug, Default)]
@@ -1007,21 +1098,59 @@ mod tests {
         append_count: usize,
         active_token: Option<String>,
         active_generation: u64,
+        first_entry_sequence: u64,
+        fail_next_inspects: usize,
+        inspect_count: usize,
+        block_next_append: bool,
     }
 
     impl RpcFakeRedisWriter {
         fn healthy() -> Self {
             Self {
                 fail_after_successes: None,
-                state: Arc::new(Mutex::new(RpcFakeRedisWriterState::default())),
+                state: Arc::new(Mutex::new(RpcFakeRedisWriterState {
+                    first_entry_sequence: 1,
+                    ..Default::default()
+                })),
+                append_started: Arc::new(Notify::new()),
+                append_release: Arc::new(Notify::new()),
             }
         }
 
         fn failing_after_first_append() -> Self {
             Self {
                 fail_after_successes: Some(1),
-                state: Arc::new(Mutex::new(RpcFakeRedisWriterState::default())),
+                state: Arc::new(Mutex::new(RpcFakeRedisWriterState {
+                    first_entry_sequence: 1,
+                    ..Default::default()
+                })),
+                append_started: Arc::new(Notify::new()),
+                append_release: Arc::new(Notify::new()),
             }
+        }
+
+        async fn set_first_entry_sequence(&self, sequence: u64) {
+            self.state.lock().await.first_entry_sequence = sequence;
+        }
+
+        async fn fail_next_inspect(&self) {
+            self.state.lock().await.fail_next_inspects = 1;
+        }
+
+        async fn inspect_count(&self) -> usize {
+            self.state.lock().await.inspect_count
+        }
+
+        async fn block_next_append(&self) {
+            self.state.lock().await.block_next_append = true;
+        }
+
+        async fn wait_for_blocked_append(&self) {
+            self.append_started.notified().await;
+        }
+
+        fn release_blocked_append(&self) {
+            self.append_release.notify_one();
         }
     }
 
@@ -1060,6 +1189,16 @@ mod tests {
             command: runtime::broadcaster::redis_publisher::RedisAppendCommand<'a>,
         ) -> futures::future::BoxFuture<'a, Result<String>> {
             Box::pin(async move {
+                let blocked = {
+                    let mut state = self.state.lock().await;
+                    let blocked = state.block_next_append;
+                    state.block_next_append = false;
+                    blocked
+                };
+                if blocked {
+                    self.append_started.notify_one();
+                    self.append_release.notified().await;
+                }
                 let mut state = self.state.lock().await;
                 if state.active_token.as_deref() != Some(command.writer_token)
                     || state.active_generation != command.generation
@@ -1090,6 +1229,41 @@ mod tests {
                     bail!("stale Redis broadcaster writer token");
                 }
                 Ok(())
+            })
+        }
+
+        fn inspect_writer<'a>(
+            &'a self,
+            command: runtime::broadcaster::redis_publisher::RedisInspectCommand<'a>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<runtime::broadcaster::redis_publisher::RedisWriterInspection>,
+        > {
+            Box::pin(async move {
+                let mut state = self.state.lock().await;
+                if state.active_token.as_deref() != Some(command.writer_token)
+                    || state.active_generation != command.generation
+                {
+                    bail!("stale Redis broadcaster writer token");
+                }
+                state.inspect_count = state.inspect_count.saturating_add(1);
+                if state.fail_next_inspects > 0 {
+                    state.fail_next_inspects -= 1;
+                    bail!("planned Redis inspect failure");
+                }
+                Ok(
+                    runtime::broadcaster::redis_publisher::RedisWriterInspection {
+                        generation: state.active_generation,
+                        first_entry_id: Some(format!(
+                            "{}-{}",
+                            state.active_generation, state.first_entry_sequence
+                        )),
+                        last_entry_id: Some(format!(
+                            "{}-{}",
+                            state.active_generation, state.append_count
+                        )),
+                    },
+                )
             })
         }
     }
