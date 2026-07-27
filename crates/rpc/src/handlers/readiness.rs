@@ -5,8 +5,8 @@ use serde::Serialize;
 use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
 use crate::models::state::{
-    AppState, NativeReadiness, SimulatorBackendStatusSnapshot,
-    SimulatorBackendSubscriptionSnapshot, SimulatorReadinessReason, SimulatorStatusSnapshot,
+    AppState, SimulatorBackendStatusSnapshot, SimulatorBackendSubscriptionSnapshot,
+    SimulatorReadinessReason, SimulatorServiceStatus, SimulatorStatusSnapshot,
 };
 
 #[derive(Serialize)]
@@ -123,12 +123,13 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<StatusPa
 }
 
 pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusPayload>) {
-    let status_code = if state.native_readiness().await == NativeReadiness::Ready {
+    let snapshot = state.status_snapshot().await;
+    let status_code = if snapshot.status == SimulatorServiceStatus::Ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status_code, Json(state.status_snapshot().await.into()))
+    (status_code, Json(snapshot.into()))
 }
 
 #[cfg(test)]
@@ -138,7 +139,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{status, StatusPayload};
+    use super::{ready, status, StatusPayload};
     use crate::config::SlippageConfig;
     use crate::models::state::{
         AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
@@ -280,7 +281,8 @@ mod tests {
             },
             enable_vm_pools,
             enable_rfq_pools,
-            readiness_stale: Duration::from_secs(120),
+            native_progress_lease: Duration::from_secs(120),
+            optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
             rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -311,7 +313,7 @@ mod tests {
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
         state.native_stream_health.record_update(1).await;
-        state.readiness_stale = Duration::ZERO;
+        state.native_progress_lease = Duration::ZERO;
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -321,6 +323,25 @@ mod tests {
         assert_eq!(payload.backends["native"].pool_count, 1);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn ready_status_code_matches_the_returned_status_snapshot() {
+        let ready_state = test_state(false, false);
+        seed_native_ready_store(&ready_state).await;
+        ready_state.native_stream_health.record_update(1).await;
+
+        let (ready_code, Json(ready_payload)) = ready(State(ready_state)).await;
+        assert_eq!(ready_code, StatusCode::OK);
+        assert_eq!(ready_payload.status, "ready");
+
+        let mut stale_state = test_state(false, false);
+        seed_native_ready_store(&stale_state).await;
+        stale_state.native_stream_health.record_update(1).await;
+        stale_state.native_progress_lease = Duration::ZERO;
+        let (stale_code, Json(stale_payload)) = ready(State(stale_state)).await;
+        assert_eq!(stale_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stale_payload.status, "stale");
     }
 
     #[tokio::test]
@@ -455,6 +476,7 @@ mod tests {
             "stream-test",
             "snapshot-test",
             2,
+            12,
             12,
         )
         .unwrap_or_else(|err| unreachable!("valid replay boundary: {err}"));

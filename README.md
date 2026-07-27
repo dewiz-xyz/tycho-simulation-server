@@ -63,7 +63,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Binary | `dsolver-simulator-service` |
 | Endpoints | `GET /status`, `GET /ready`, `POST /simulate`, `POST /encode` |
 | Supported chains | Defined in `simulator-manifest.toml` |
-| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_URL` |
+| Required inputs | `CHAIN_ID`, `TYCHO_BROADCASTER_URL`, Redis connection settings; the broadcaster also requires `TYCHO_API_KEY` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
@@ -83,7 +83,7 @@ For manual service runs, start `dsolver-tycho-broadcaster-service` first on the 
 
 Required runtime inputs:
 
-- `TYCHO_API_KEY` for Tycho access
+- `TYCHO_API_KEY` for the broadcaster's Tycho access; the simulator does not use it
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
 - `TYCHO_BROADCASTER_URL` pointing at the active broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
 - `BROADCASTER_REDIS_URL` and `BROADCASTER_REDIS_STREAM_KEY` for the Redis stream that carries broadcaster deltas after each HTTP snapshot replay boundary

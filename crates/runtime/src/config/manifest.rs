@@ -49,6 +49,7 @@ pub(crate) struct ResolvedChainProfile {
     pub(crate) native_protocols: Vec<String>,
     pub(crate) vm_protocols: Vec<String>,
     pub(crate) rfq_protocols: Vec<String>,
+    pub(crate) native_progress_lease_secs: u64,
     pub(crate) native_token_protocol_allowlist: Vec<String>,
     pub(crate) reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub(crate) erc4626_pair_policies: Vec<Erc4626PairPolicy>,
@@ -64,6 +65,7 @@ struct ChainRegistryEntry {
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
+    native_progress_lease_secs: u64,
     route_policy_id: String,
 }
 
@@ -122,6 +124,7 @@ struct RawChain {
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
+    native_progress_lease_secs: u64,
     route_policy: String,
 }
 
@@ -178,6 +181,7 @@ pub(crate) fn resolve_chain_config(
             native_protocols: chain.native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
+            native_progress_lease_secs: chain.native_progress_lease_secs,
             native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
             reset_allowance_tokens,
             erc4626_pair_policies: route_policy.erc4626_pair_policies.clone(),
@@ -355,6 +359,12 @@ fn validate_chains(
                 route_policy_id
             );
         }
+        if chain.native_progress_lease_secs == 0 {
+            bail!(
+                "chain {} native_progress_lease_secs must be greater than zero",
+                chain.chain_id
+            );
+        }
 
         let native_protocols = validate_backend_protocol_refs(
             chain.chain_id,
@@ -388,6 +398,7 @@ fn validate_chains(
                 native_protocols,
                 vm_protocols,
                 rfq_protocols,
+                native_progress_lease_secs: chain.native_progress_lease_secs,
                 route_policy_id: route_policy_id.to_string(),
             },
         );

@@ -147,7 +147,9 @@ async fn encode_route(
     } else {
         None
     };
-    let native_version = native_pin.as_ref().map(PublishedStatePin::version);
+    let native_request_generation = native_pin
+        .as_ref()
+        .map(PublishedStatePin::request_generation);
     let rebuild_guard = state
         .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
         .await;
@@ -202,15 +204,12 @@ async fn encode_route(
     )?;
 
     let debug = response::build_debug(&state, &request).await;
-    if let Some(native_version) = native_version {
-        let availability = state.encode_availability(true, false, false).await;
-        if availability.availability_message().is_some()
-            || state.native_state_store.state_version().await != native_version
-        {
-            return Err(EncodeError::unavailable(
-                "Native state changed while the route was being encoded; retry against the current version",
-            ));
-        }
+    if let Some(native_request_generation) = native_request_generation {
+        ensure_native_encode_current(
+            state
+                .native_request_is_current(native_request_generation)
+                .await,
+        )?;
     }
 
     Ok(EncodeComputation {
@@ -222,4 +221,24 @@ async fn encode_route(
         amount_out_delta,
         reset_approval,
     })
+}
+
+fn ensure_native_encode_current(native_is_current: bool) -> Result<(), EncodeError> {
+    if native_is_current {
+        return Ok(());
+    }
+    Err(EncodeError::unavailable(
+        "Native state changed while the route was being encoded; retry against the current version",
+    ))
+}
+
+#[cfg(test)]
+mod version_fence_tests {
+    use super::ensure_native_encode_current;
+
+    #[test]
+    fn native_encode_fence_rejects_stale_requests() {
+        assert!(ensure_native_encode_current(true).is_ok());
+        assert!(ensure_native_encode_current(false).is_err());
+    }
 }

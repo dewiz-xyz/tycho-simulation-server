@@ -377,23 +377,34 @@ pub async fn get_amounts_out(
     cancel: Option<CancellationToken>,
 ) -> QuoteComputation {
     let runner = QuoteRequestRunner::new(state.clone(), request, cancel).await;
-    let (mut computation, native_version) = runner.run().await;
-    if let Some(native_version) = native_version {
-        let version_is_current = state.native_state_store.state_version().await == native_version;
-        if !state.is_ready().await || !version_is_current {
-            computation.responses.clear();
-            computation.meta.status = QuoteStatus::WarmingUp;
-            computation.meta.result_quality = QuoteResultQuality::RequestLevelFailure;
-            computation.meta.partial_kind = None;
-            computation.meta.failures.push(make_failure(
-                QuoteFailureKind::WarmUp,
-                "Native state changed while the quote was running; retry against the current version"
-                    .to_string(),
-                None,
-            ));
-        }
+    let (mut computation, native_request_generation) = runner.run().await;
+    if let Some(native_request_generation) =
+        native_request_generation.filter(|_| !computation.responses.is_empty())
+    {
+        preserve_only_current_successes(
+            &mut computation,
+            state
+                .native_request_is_current(native_request_generation)
+                .await,
+        );
     }
     computation
+}
+
+fn preserve_only_current_successes(computation: &mut QuoteComputation, state_is_current: bool) {
+    if computation.responses.is_empty() || state_is_current {
+        return;
+    }
+    computation.responses.clear();
+    computation.meta.status = QuoteStatus::WarmingUp;
+    computation.meta.result_quality = QuoteResultQuality::RequestLevelFailure;
+    computation.meta.partial_kind = None;
+    computation.meta.failures.push(make_failure(
+        QuoteFailureKind::WarmUp,
+        "Native state changed while the quote was running; retry against the current version"
+            .to_string(),
+        None,
+    ));
 }
 
 impl QuoteRequestRunner {
@@ -465,15 +476,21 @@ impl QuoteRequestRunner {
         let (token_in_ref, token_out_ref) = match self.load_tokens(&pair).await {
             Ok(tokens) => tokens,
             Err(exit) => {
-                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
-                return (self.finish(exit), version);
+                let generation = self
+                    .native_pin
+                    .as_ref()
+                    .map(PublishedStatePin::request_generation);
+                return (self.finish(exit), generation);
             }
         };
         let amounts_in = match self.parse_amounts() {
             Ok(amounts) => amounts,
             Err(exit) => {
-                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
-                return (self.finish(exit), version);
+                let generation = self
+                    .native_pin
+                    .as_ref()
+                    .map(PublishedStatePin::request_generation);
+                return (self.finish(exit), generation);
             }
         };
         let prepared = match self
@@ -482,13 +499,19 @@ impl QuoteRequestRunner {
         {
             Ok(prepared) => prepared,
             Err(exit) => {
-                let version = self.native_pin.as_ref().map(PublishedStatePin::version);
-                return (self.finish(exit), version);
+                let generation = self
+                    .native_pin
+                    .as_ref()
+                    .map(PublishedStatePin::request_generation);
+                return (self.finish(exit), generation);
             }
         };
         self.execute_pool_quotes(prepared).await;
-        let version = self.native_pin.as_ref().map(PublishedStatePin::version);
-        (self.finish_current_state(), version)
+        let generation = self
+            .native_pin
+            .as_ref()
+            .map(PublishedStatePin::request_generation);
+        (self.finish_current_state(), generation)
     }
 
     fn finish(self, exit: RequestExit) -> QuoteComputation {
@@ -3192,7 +3215,8 @@ mod tests {
             },
             enable_vm_pools: config.enable_vm_pools,
             enable_rfq_pools: config.enable_rfq_pools,
-            readiness_stale: Duration::from_secs(120),
+            native_progress_lease: Duration::from_secs(120),
+            optional_backend_stale: Duration::from_secs(120),
             request_timeout: config.request_timeout,
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -3217,6 +3241,7 @@ mod tests {
             "stream:test".to_string(),
             "chain-1-stream-1".to_string(),
             "chain-1-snapshot-1".to_string(),
+            1,
             1,
             1,
         )
@@ -5636,7 +5661,7 @@ mod tests {
         );
         let request = fixture.request("req-linear-soft-ladder-slippage", &["100", "200", "300"]);
 
-        let computation = get_amounts_out(app_state, request, None).await;
+        let mut computation = get_amounts_out(app_state, request, None).await;
 
         assert_eq!(computation.responses.len(), 1);
         assert_eq!(
@@ -5645,6 +5670,15 @@ mod tests {
         );
         assert_eq!(computation.responses[0].slippage, vec![1, 1, 1]);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        preserve_only_current_successes(&mut computation, false);
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::WarmingUp));
+        assert!(computation
+            .meta
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, QuoteFailureKind::WarmUp)));
     }
 
     #[tokio::test]
@@ -6254,6 +6288,18 @@ mod tests {
             runner.run.pool_results[0].outcome,
             PoolOutcomeKind::InternalError
         ));
+
+        let mut computation = runner.finish(exit);
+        preserve_only_current_successes(&mut computation, false);
+        assert!(matches!(
+            computation.meta.status,
+            QuoteStatus::InternalError
+        ));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::RequestLevelFailure
+        );
+        assert_eq!(computation.meta.failures.len(), 1);
     }
 
     #[tokio::test]

@@ -1574,10 +1574,11 @@ mod tests {
         assert_eq!(from_pin.symbol, "PINNED");
         assert_eq!(from_pin.decimals, 18);
         assert!(
-            app_state
+            !app_state
                 .tokens
-                .try_snapshot()
-                .is_some_and(|tokens| !tokens.contains_key(&address_bytes)),
+                .snapshot()
+                .await
+                .contains_key(&address_bytes),
             "the proof requires token metadata to remain absent from the global store"
         );
     }

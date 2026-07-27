@@ -899,7 +899,8 @@ mod tests {
                 "streamId": "chain-8453-stream-2",
                 "snapshotId": "chain-8453-snapshot-2",
                 "generation": 2,
-                "exclusiveMessageSeq": 14
+                "exclusiveMessageSeq": 14,
+                "stateVersion": 562949953421314_u64
             },
             "redis_replay_checkpoint": "2-16",
             "redis_replay_caught_up": true,
@@ -913,6 +914,10 @@ mod tests {
             "dsolver:broadcaster:local:8453:events"
         );
         assert_eq!(value["redis_replay_boundary"]["exclusiveMessageSeq"], 14);
+        assert_eq!(
+            value["redis_replay_boundary"]["stateVersion"],
+            562949953421314_u64
+        );
         assert_eq!(value["redis_replay_checkpoint"], "2-16");
         assert!(value["redis_replay_caught_up"].as_bool().unwrap_or(false));
         assert!(value.get("redis_gap_reason").is_none());
@@ -1006,7 +1011,8 @@ mod tests {
                 "streamId": "chain-8453-stream-2",
                 "snapshotId": "chain-8453-snapshot-2",
                 "generation": 2,
-                "exclusiveMessageSeq": 14
+                "exclusiveMessageSeq": 14,
+                "stateVersion": 562949953421314_u64
             },
             "redis_replay_checkpoint": "2-16",
             "redis_replay_caught_up": true,

@@ -20,7 +20,6 @@ const DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES: &str = "8388608";
 const DEFAULT_BROADCASTER_REDIS_BLOCK_MS: &str = "5000";
 const DEFAULT_BROADCASTER_REDIS_READ_COUNT: &str = "128";
 const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
-pub const NATIVE_PROGRESS_LEASE_SECS: u64 = 5;
 
 /// Per-chain runtime profile resolved from `CHAIN_ID`.
 #[derive(Clone, Debug)]
@@ -29,6 +28,8 @@ pub struct ChainProfile {
     pub native_protocols: Vec<String>,
     pub vm_protocols: Vec<String>,
     pub rfq_protocols: Vec<String>,
+    /// Only a strictly newer complete native block renews this lease.
+    pub native_progress_lease_secs: u64,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
     pub native_token_protocol_allowlist: Vec<String>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
@@ -76,6 +77,7 @@ pub fn load_config() -> AppConfig {
         native_protocols: resolved_chain.chain_profile.native_protocols,
         vm_protocols: resolved_chain.chain_profile.vm_protocols,
         rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
+        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
         native_token_protocol_allowlist: resolved_chain
             .chain_profile
             .native_token_protocol_allowlist,
@@ -166,6 +168,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         native_protocols: resolved_chain.chain_profile.native_protocols,
         vm_protocols: resolved_chain.chain_profile.vm_protocols,
         rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
+        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
         native_token_protocol_allowlist: resolved_chain
             .chain_profile
             .native_token_protocol_allowlist,
@@ -1025,14 +1028,19 @@ mod tests {
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
+        assert_eq!(chain.chain_profile.native_progress_lease_secs, 25);
+        assert!(!chain
+            .chain_profile
+            .native_protocols
+            .contains(&"uniswap_v4".to_string()));
         assert!(chain
             .chain_profile
             .native_protocols
             .contains(&"rocketpool".to_string()));
-        assert!(chain
-            .chain_profile
-            .vm_protocols
-            .contains(&"vm:curve".to_string()));
+        assert_eq!(
+            chain.chain_profile.vm_protocols,
+            vec!["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
+        );
         assert!(chain
             .chain_profile
             .rfq_protocols
@@ -1061,6 +1069,7 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
+        assert_eq!(chain.chain_profile.native_progress_lease_secs, 5);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile
@@ -1113,6 +1122,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
+native_progress_lease_secs = 25
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1130,6 +1140,36 @@ route_policy = "default"
     }
 
     #[test]
+    fn parse_manifest_requires_native_progress_lease() {
+        let manifest = r#"
+[[protocols]]
+id = "uniswap_v2"
+backend = "native"
+
+[[route_policies]]
+id = "default"
+native_token_protocol_allowlist = []
+reset_allowance_tokens = []
+
+[[chains]]
+chain_id = 1
+tycho_url = "tycho"
+bebop_url = "bebop"
+hashflow_filename = "./hashflow.csv"
+native_protocols = ["uniswap_v2"]
+vm_protocols = []
+rfq_protocols = []
+route_policy = "default"
+"#;
+
+        let error = manifest::parse_manifest_registries(manifest)
+            .err()
+            .unwrap_or_else(|| unreachable!("missing native progress lease must fail"));
+
+        assert!(format!("{error:#}").contains("native_progress_lease_secs"));
+    }
+
+    #[test]
     fn parse_manifest_rejects_unknown_route_policy_references() {
         let manifest = r#"
 [[protocols]]
@@ -1143,6 +1183,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
+native_progress_lease_secs = 25
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1173,6 +1214,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
+native_progress_lease_secs = 25
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1203,6 +1245,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 999999
+native_progress_lease_secs = 25
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1243,6 +1286,7 @@ allow_share_to_asset = false
 
 [[chains]]
 chain_id = 1
+native_progress_lease_secs = 25
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1277,6 +1321,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
+native_progress_lease_secs = 25
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
 hashflow_filename = " ./hashflow.csv "
@@ -1322,6 +1367,7 @@ route_policy = " default "
             native_protocols: ethereum.native_protocols,
             vm_protocols: ethereum.vm_protocols,
             rfq_protocols: ethereum.rfq_protocols,
+            native_progress_lease_secs: ethereum.native_progress_lease_secs,
             native_token_protocol_allowlist: ethereum.native_token_protocol_allowlist,
             reset_allowance_tokens: ethereum.reset_allowance_tokens,
             erc4626_pair_policies: ethereum.erc4626_pair_policies,
@@ -1331,6 +1377,7 @@ route_policy = " default "
             native_protocols: base.native_protocols,
             vm_protocols: base.vm_protocols,
             rfq_protocols: base.rfq_protocols,
+            native_progress_lease_secs: base.native_progress_lease_secs,
             native_token_protocol_allowlist: base.native_token_protocol_allowlist,
             reset_allowance_tokens: base.reset_allowance_tokens,
             erc4626_pair_policies: base.erc4626_pair_policies,

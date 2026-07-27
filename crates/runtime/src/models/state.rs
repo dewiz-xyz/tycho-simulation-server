@@ -48,7 +48,8 @@ pub struct AppState {
     pub configured_backends: ConfiguredBackends,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
-    pub readiness_stale: Duration,
+    pub native_progress_lease: Duration,
+    pub optional_backend_stale: Duration,
     pub request_timeout: Duration,
     pub vm_simulation_rebuild_gate: Arc<RwLock<()>>,
     pub rfq_simulation_rebuild_gate: Arc<RwLock<()>>,
@@ -588,9 +589,10 @@ impl AppState {
         let last_update_age_ms = self.native_update_age_ms().await;
         let stream_restart_count = self.native_stream_health.restart_count().await;
         let stream_last_error = self.native_stream_health.last_error().await;
-        let readiness = if subscription_reason.is_some() || !self.native_state_store.is_ready() {
+        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
+        let readiness = if subscription_reason.is_some() || !state_ready || !requests_allowed {
             SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+        } else if is_update_stale(last_update_age_ms, self.native_progress_lease_ms()) {
             SimulatorBackendReadiness::Stale
         } else {
             SimulatorBackendReadiness::Ready
@@ -633,7 +635,7 @@ impl AppState {
             SimulatorBackendReadiness::Rebuilding
         } else if subscription_reason.is_some() || !self.vm_state_store.is_ready() {
             SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+        } else if is_update_stale(last_update_age_ms, self.optional_backend_stale_ms()) {
             SimulatorBackendReadiness::Stale
         } else {
             SimulatorBackendReadiness::Ready
@@ -682,7 +684,7 @@ impl AppState {
             SimulatorBackendReadiness::Disabled
         } else if subscription_reason.is_some() || !self.rfq_state_store.is_ready() {
             SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
+        } else if is_update_stale(last_update_age_ms, self.optional_backend_stale_ms()) {
             SimulatorBackendReadiness::Stale
         } else {
             SimulatorBackendReadiness::Ready
@@ -747,8 +749,12 @@ impl AppState {
         matches!(self.native_readiness().await, NativeReadiness::Ready)
     }
 
-    pub fn readiness_stale_ms(&self) -> u64 {
-        self.readiness_stale.as_millis() as u64
+    pub fn optional_backend_stale_ms(&self) -> u64 {
+        self.optional_backend_stale.as_millis() as u64
+    }
+
+    pub fn native_progress_lease_ms(&self) -> u64 {
+        self.native_progress_lease.as_millis() as u64
     }
 
     pub async fn native_update_age_ms(&self) -> Option<u64> {
@@ -768,15 +774,34 @@ impl AppState {
             return NativeReadiness::WarmingUp;
         }
 
-        if !self.native_state_store.is_ready() {
+        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
+        if !state_ready || !requests_allowed {
             return NativeReadiness::WarmingUp;
         }
 
-        if is_update_stale(self.native_update_age_ms().await, self.readiness_stale_ms()) {
+        if is_update_stale(
+            self.native_update_age_ms().await,
+            self.native_progress_lease_ms(),
+        ) {
             NativeReadiness::Stale
         } else {
             NativeReadiness::Ready
         }
+    }
+
+    pub(crate) async fn native_request_is_current(&self, pinned_generation: u64) -> bool {
+        if !self.native_broadcaster_bootstrap_ready().await {
+            return false;
+        }
+        if is_update_stale(
+            self.native_update_age_ms().await,
+            self.native_progress_lease_ms(),
+        ) {
+            return false;
+        }
+        let (state_ready, requests_allowed, current_generation) =
+            self.native_state_store.request_snapshot().await;
+        state_ready && requests_allowed && current_generation == pinned_generation
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
@@ -796,7 +821,10 @@ impl AppState {
             return VmReadiness::WarmingUp;
         }
 
-        if is_update_stale(self.vm_update_age_ms().await, self.readiness_stale_ms()) {
+        if is_update_stale(
+            self.vm_update_age_ms().await,
+            self.optional_backend_stale_ms(),
+        ) {
             VmReadiness::Stale
         } else {
             VmReadiness::Ready
@@ -816,7 +844,10 @@ impl AppState {
             return RfqReadiness::WarmingUp;
         }
 
-        if is_update_stale(self.rfq_update_age_ms().await, self.readiness_stale_ms()) {
+        if is_update_stale(
+            self.rfq_update_age_ms().await,
+            self.optional_backend_stale_ms(),
+        ) {
             RfqReadiness::Stale
         } else {
             RfqReadiness::Ready
@@ -1082,6 +1113,8 @@ pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
 #[derive(Clone)]
 struct PublishedStateStore {
     version: u64,
+    request_generation: u64,
+    requests_allowed: bool,
     shards: HashMap<ProtocolKind, HashMap<String, PoolEntry>>,
     id_to_kind: HashMap<String, ProtocolKind>,
     token_index: HashMap<Bytes, HashSet<String>>,
@@ -1100,6 +1133,8 @@ impl PublishedStateStore {
 
         Self {
             version: 0,
+            request_generation: 0,
+            requests_allowed: false,
             shards,
             id_to_kind: HashMap::new(),
             token_index: HashMap::new(),
@@ -1117,8 +1152,13 @@ pub(crate) struct PublishedStatePin {
 }
 
 impl PublishedStatePin {
+    #[cfg(test)]
     pub(crate) fn version(&self) -> u64 {
         self.state.version
+    }
+
+    pub(crate) fn request_generation(&self) -> u64 {
+        self.state.request_generation
     }
 
     pub(crate) fn current_block(&self) -> u64 {
@@ -1200,15 +1240,28 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn new(tokens: Arc<TokenStore>) -> Self {
-        Self::new_with_token_publication(tokens, true)
+        let initial_tokens = tokens.initial_snapshot();
+        Self::new_with_token_publication(tokens, initial_tokens, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_private(tokens: Arc<TokenStore>) -> Self {
-        Self::new_with_token_publication(tokens, false)
+        let initial_tokens = tokens.initial_snapshot();
+        Self::new_with_token_publication(tokens, initial_tokens, false)
     }
 
-    fn new_with_token_publication(tokens: Arc<TokenStore>, publish_tokens_to_store: bool) -> Self {
-        let initial_tokens = tokens.try_snapshot().unwrap_or_default();
+    pub(crate) fn new_private_with_snapshot(
+        tokens: Arc<TokenStore>,
+        initial_tokens: HashMap<Bytes, Token>,
+    ) -> Self {
+        Self::new_with_token_publication(tokens, initial_tokens, false)
+    }
+
+    fn new_with_token_publication(
+        tokens: Arc<TokenStore>,
+        initial_tokens: HashMap<Bytes, Token>,
+        publish_tokens_to_store: bool,
+    ) -> Self {
         let wrapped_native_token = tokens.wrapped_native_token();
         let (ready_tx, _) = watch::channel(false);
         StateStore {
@@ -1231,6 +1284,37 @@ impl StateStore {
 
     pub(crate) async fn state_version(&self) -> u64 {
         self.published.read().await.version
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn request_generation(&self) -> u64 {
+        self.published.read().await.request_generation
+    }
+
+    pub(crate) async fn fence_requests(&self) {
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (*current).clone();
+        replacement.requests_allowed = false;
+        self.publish(replacement).await;
+    }
+
+    async fn request_snapshot(&self) -> (bool, bool, u64) {
+        let current = self.published.read().await;
+        (
+            current.ready,
+            current.requests_allowed,
+            current.request_generation,
+        )
+    }
+
+    pub(crate) async fn align_bootstrap_state_version(&self, state_version: u64) {
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (*current).clone();
+        replacement.version = state_version;
+        replacement.requests_allowed = replacement.ready;
+        self.publish(replacement).await;
     }
 
     pub async fn reset(&self) {
@@ -1272,26 +1356,63 @@ impl StateStore {
         rebuild_indexes(&mut replacement);
         replacement.version = current.version.saturating_add(1);
         replacement.ready = !replacement.id_to_kind.is_empty();
+        replacement.requests_allowed = replacement.ready;
         self.publish(replacement).await;
     }
 
     pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
         let _guard = self.update_guard.lock().await;
         let current = Arc::clone(&*self.published.read().await);
+        let state_version = current.version.saturating_add(1);
+        self.apply_update_locked(&mut update, current, state_version)
+            .await
+    }
+
+    pub(crate) async fn apply_update_at_version(
+        &self,
+        mut update: Update,
+        state_version: u64,
+    ) -> anyhow::Result<UpdateMetrics> {
+        let _guard = self.update_guard.lock().await;
+        let current = Arc::clone(&*self.published.read().await);
+        anyhow::ensure!(
+            state_version > current.version,
+            "state version {state_version} must be newer than published version {}",
+            current.version
+        );
+        Ok(self
+            .apply_update_locked(&mut update, current, state_version)
+            .await)
+    }
+
+    async fn apply_update_locked(
+        &self,
+        update: &mut Update,
+        current: Arc<PublishedStateStore>,
+        state_version: u64,
+    ) -> UpdateMetrics {
         let mut replacement = (*current).clone();
-        replacement.version = current.version.saturating_add(1);
+        replacement.version = state_version;
         let block_number = update.block_number_or_timestamp;
         replacement.block_number = block_number;
         let mut stats = UpdateAccumulator::default();
 
         apply_new_pairs(
             &mut replacement,
-            update.new_pairs,
+            std::mem::take(&mut update.new_pairs),
             &mut update.states,
             &mut stats,
         );
-        apply_state_updates(&mut replacement, update.states, &mut stats);
-        apply_removed_pairs(&mut replacement, update.removed_pairs, &mut stats);
+        apply_state_updates(
+            &mut replacement,
+            std::mem::take(&mut update.states),
+            &mut stats,
+        );
+        apply_removed_pairs(
+            &mut replacement,
+            std::mem::take(&mut update.removed_pairs),
+            &mut stats,
+        );
         if self.publish_tokens_to_store && !stats.tokens_to_cache.is_empty() {
             self.tokens
                 .insert_batch(stats.tokens_to_cache.iter().cloned())
@@ -1305,6 +1426,7 @@ impl StateStore {
         }
         let total_pairs = replacement.id_to_kind.len();
         replacement.ready = total_pairs > 0;
+        replacement.requests_allowed = replacement.ready;
         self.publish(replacement).await;
 
         UpdateMetrics {
@@ -1322,9 +1444,11 @@ impl StateStore {
         }
     }
 
-    async fn publish(&self, replacement: PublishedStateStore) {
+    async fn publish(&self, mut replacement: PublishedStateStore) {
+        let current = Arc::clone(&*self.published.read().await);
+        replacement.request_generation = current.request_generation.saturating_add(1);
         let ready = replacement.ready;
-        let previous_ready = self.published.read().await.ready;
+        let previous_ready = current.ready;
         *self.published.write().await = Arc::new(replacement);
         if previous_ready != ready {
             self.ready_tx.send_replace(ready);
@@ -1344,6 +1468,7 @@ impl StateStore {
         );
         let mut replacement = (*candidate.state).clone();
         replacement.version = target_version;
+        replacement.requests_allowed = replacement.ready;
         let tokens = replacement.tokens.values().cloned().collect::<Vec<_>>();
         self.publish(replacement).await;
         self.tokens.insert_batch(tokens).await;
@@ -1795,6 +1920,7 @@ mod tests {
             "snapshot-2",
             1,
             exclusive_message_seq,
+            exclusive_message_seq,
         )
         .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
     }
@@ -1833,7 +1959,8 @@ mod tests {
             },
             enable_vm_pools: flags.enable_vm_pools,
             enable_rfq_pools: flags.enable_rfq_pools,
-            readiness_stale: Duration::from_secs(120),
+            native_progress_lease: Duration::from_secs(120),
+            optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -2104,7 +2231,7 @@ mod tests {
         ready_state.native_stream_health.record_update(1).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Ready);
 
-        ready_state.readiness_stale = Duration::ZERO;
+        ready_state.native_progress_lease = Duration::ZERO;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Stale);
     }
 
@@ -2142,6 +2269,41 @@ mod tests {
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn native_request_generation_survives_wire_version_realignment() {
+        let state = build_readiness_test_state(false, false).await;
+        state.native_stream_health.record_update(1).await;
+        let pinned = state.native_state_store.pin().await;
+        let wire_version = pinned.version();
+
+        assert!(
+            state
+                .native_request_is_current(pinned.request_generation())
+                .await
+        );
+
+        state.native_state_store.fence_requests().await;
+        assert!(!state.is_ready().await);
+        assert!(
+            !state
+                .native_request_is_current(pinned.request_generation())
+                .await
+        );
+
+        state
+            .native_state_store
+            .align_bootstrap_state_version(wire_version)
+            .await;
+        assert_eq!(state.native_state_store.state_version().await, wire_version);
+        assert!(state.is_ready().await);
+        assert!(
+            !state
+                .native_request_is_current(pinned.request_generation())
+                .await,
+            "realigning to the same wire version must not recreate an old request fence"
+        );
     }
 
     #[tokio::test]
@@ -2368,7 +2530,7 @@ mod tests {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
         }
-        state.readiness_stale = Duration::ZERO;
+        state.optional_backend_stale = Duration::ZERO;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
     }
@@ -2657,7 +2819,7 @@ mod tests {
         assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
         assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
-        state.readiness_stale = Duration::ZERO;
+        state.optional_backend_stale = Duration::ZERO;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);

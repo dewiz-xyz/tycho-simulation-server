@@ -677,7 +677,8 @@ async fn build_app_state_and_request(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -787,7 +788,8 @@ async fn setup_timeout_app(
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -978,7 +980,7 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.readiness_stale = Duration::from_millis(1);
+    state.native_progress_lease = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
@@ -1119,7 +1121,7 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.readiness_stale = Duration::from_millis(1);
+    state.optional_backend_stale = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     state.native_stream_health.record_update(42).await;
     let app = create_router(SimulatorRuntime::new(state));
@@ -1625,7 +1627,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        readiness_stale: Duration::from_secs(120),
+        native_progress_lease: Duration::from_secs(120),
+        optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),

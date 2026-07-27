@@ -18,7 +18,7 @@ use crate::broadcaster::redis_subscription::{
 };
 use crate::config::{
     init_logging, load_broadcaster_redis_config, load_config, AppConfig, BroadcasterRedisConfig,
-    MemoryConfig, NATIVE_PROGRESS_LEASE_SECS,
+    MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_simulator_health_snapshot;
@@ -34,6 +34,7 @@ use crate::stream::StreamSupervisorConfig;
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const TOKEN_SNAPSHOT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const OPTIONAL_BACKEND_STALE_SECS: u64 = 300;
 
 pub struct SimulatorServiceParts {
     pub config: AppConfig,
@@ -157,7 +158,8 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
 
 fn spawn_health_snapshot_task(app_state: AppState) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(NATIVE_PROGRESS_LEASE_SECS));
+        let mut ticker =
+            tokio::time::interval(Duration::from_millis(app_state.native_progress_lease_ms()));
         let mut previous_status = None;
         let mut previous_backends = BTreeMap::new();
         loop {
@@ -415,7 +417,8 @@ fn build_app_state(
     resources: &StreamResources,
 ) -> AppState {
     let chain = config.chain_profile.chain;
-    let readiness_stale = Duration::from_secs(NATIVE_PROGRESS_LEASE_SECS);
+    let native_progress_lease =
+        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
     let configured_vm_pools = !shared_db_protocols(&config.chain_profile).is_empty();
     let configured_rfq_pools = !config.chain_profile.rfq_protocols.is_empty();
@@ -455,7 +458,8 @@ fn build_app_state(
         },
         enable_vm_pools: effective_vm_enabled,
         enable_rfq_pools: effective_rfq_enabled,
-        readiness_stale,
+        native_progress_lease,
+        optional_backend_stale: Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -476,7 +480,7 @@ fn log_erc4626_capability(config: &AppConfig) {
 
 fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(NATIVE_PROGRESS_LEASE_SECS),
+        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -512,16 +516,21 @@ fn spawn_broadcaster_subscription_task(
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut supervisors = Vec::new();
     for controls in broadcaster_subscription_controls(config, resources, app_state) {
-        let scope = match &controls {
-            BroadcasterSubscriptionControls::Native(_) => "native",
-            BroadcasterSubscriptionControls::Vm(_) => "vm",
-            BroadcasterSubscriptionControls::Rfq(_) => "rfq",
+        let (scope, backend) = match &controls {
+            BroadcasterSubscriptionControls::Native(_) => {
+                ("native", BroadcasterSubscriptionBackend::Native)
+            }
+            BroadcasterSubscriptionControls::Vm(_) => ("vm", BroadcasterSubscriptionBackend::Vm),
+            BroadcasterSubscriptionControls::Rfq(_) => ("rfq", BroadcasterSubscriptionBackend::Rfq),
         };
+        let mut backend_supervisor_cfg = supervisor_cfg.clone();
+        backend_supervisor_cfg.readiness_stale =
+            subscription_readiness_stale(backend, &config.chain_profile);
         supervisors.push(spawn_broadcaster_subscription_supervisor(
             scope,
             config,
             redis_config,
-            supervisor_cfg,
+            &backend_supervisor_cfg,
             vec![controls],
         ));
     }
@@ -574,6 +583,20 @@ enum BroadcasterSubscriptionBackend {
     Native,
     Vm,
     Rfq,
+}
+
+fn subscription_readiness_stale(
+    backend: BroadcasterSubscriptionBackend,
+    profile: &crate::config::ChainProfile,
+) -> Duration {
+    match backend {
+        BroadcasterSubscriptionBackend::Native => {
+            Duration::from_secs(profile.native_progress_lease_secs)
+        }
+        BroadcasterSubscriptionBackend::Vm | BroadcasterSubscriptionBackend::Rfq => {
+            Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS)
+        }
+    }
 }
 
 impl BroadcasterSubscriptionBackend {
@@ -740,7 +763,7 @@ mod tests {
     use super::{
         broadcaster_subscription_controls, broadcaster_subscription_plan, build_app_state,
         create_stream_resources, enabled_broadcaster_subscription_backends, load_token_store,
-        BroadcasterSubscriptionBackend,
+        subscription_readiness_stale, BroadcasterSubscriptionBackend,
     };
 
     struct TokenAuthority {
@@ -1007,6 +1030,7 @@ mod tests {
             ],
             vm_protocols: Vec::new(),
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
+            native_progress_lease_secs: 5,
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
             erc4626_pair_policies: Vec::new(),
@@ -1026,6 +1050,7 @@ mod tests {
             ],
             vm_protocols: vec!["vm:curve".to_string()],
             rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
+            native_progress_lease_secs: 25,
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
@@ -1240,6 +1265,26 @@ mod tests {
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
+        assert_eq!(app_state.native_progress_lease, Duration::from_secs(5));
+        assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Native,
+                &config.chain_profile
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            subscription_readiness_stale(BroadcasterSubscriptionBackend::Vm, &config.chain_profile),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Rfq,
+                &config.chain_profile
+            ),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -1321,5 +1366,14 @@ mod tests {
         );
         assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);
+        assert_eq!(app_state.native_progress_lease, Duration::from_secs(25));
+        assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
+        assert_eq!(
+            subscription_readiness_stale(
+                BroadcasterSubscriptionBackend::Native,
+                &config.chain_profile
+            ),
+            Duration::from_secs(25)
+        );
     }
 }
