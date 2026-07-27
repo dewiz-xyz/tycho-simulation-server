@@ -108,6 +108,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"
@@ -133,6 +134,7 @@ route_policy = "ethereum"
 [[chains]]
 chain_id = 8453
 native_progress_lease_secs = 5
+recovery_max_buffered_native_blocks = 64
 tycho_url = "tycho-base-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"

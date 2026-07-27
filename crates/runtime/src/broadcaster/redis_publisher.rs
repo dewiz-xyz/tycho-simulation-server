@@ -36,10 +36,8 @@ pub(super) const MISSING_FENCE_MESSAGE: &str = "missing Redis broadcaster writer
 const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const RECOVERY_REDIS_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LIVE_REDIS_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECOVERY_FRAGMENT_TARGET_BYTES: usize = 3_500_000;
-const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
 const MAX_PENDING_RECOVERY_PAYLOADS: usize = 1024;
 pub(crate) const STARTUP_HANDOFF_ABORT_AFTER: Duration = Duration::from_secs(60);
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
@@ -250,6 +248,7 @@ pub struct BroadcasterRedisPublisherConfig {
     pub append_retry_window: Duration,
     pub maxlen: Option<u64>,
     pub writer_lease_ttl: Duration,
+    pub recovery_max_buffered_native_blocks: usize,
 }
 
 #[derive(Debug)]
@@ -323,6 +322,7 @@ impl BroadcasterRedisPublisherConfig {
         redis_config: &BroadcasterRedisConfig,
         chain_id: u64,
         heartbeat_interval: Duration,
+        recovery_max_buffered_native_blocks: usize,
     ) -> Self {
         Self {
             stream_key: redis_config.stream_key.clone(),
@@ -330,6 +330,7 @@ impl BroadcasterRedisPublisherConfig {
             append_retry_window: Duration::from_millis(redis_config.append_retry_window_ms),
             maxlen: redis_config.maxlen,
             writer_lease_ttl: writer_lease_ttl_for_heartbeat_interval(heartbeat_interval),
+            recovery_max_buffered_native_blocks,
         }
     }
 }
@@ -890,6 +891,10 @@ impl BroadcasterRedisPublisher {
         Self::new_with_mode(config, writer, 1, BroadcasterRedisPublisherMode::Passive)
     }
 
+    pub(crate) fn recovery_max_buffered_native_blocks(&self) -> usize {
+        self.config.recovery_max_buffered_native_blocks
+    }
+
     fn new_with_mode(
         config: BroadcasterRedisPublisherConfig,
         writer: Arc<dyn RedisStreamWriter>,
@@ -1024,13 +1029,15 @@ impl BroadcasterRedisPublisher {
             .filter(|buffer| buffer.id == id)
             .ok_or_else(|| anyhow!("startup handoff candidate is no longer current"))?;
         if buffer.started_at.elapsed() >= STARTUP_HANDOFF_ABORT_AFTER
-            || buffer.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+            || buffer.complete_native_blocks.len()
+                >= self.config.recovery_max_buffered_native_blocks
         {
             buffer.cancelled = true;
         }
         anyhow::ensure!(
             !buffer.cancelled,
-            "startup handoff exceeded the 64-block or 60-second bound"
+            "startup handoff exceeded the configured {} native-block or 60-second bound",
+            self.config.recovery_max_buffered_native_blocks
         );
         anyhow::ensure!(!buffer.frozen, "startup handoff is already frozen");
         buffer.frozen = true;
@@ -1098,7 +1105,7 @@ impl BroadcasterRedisPublisher {
             trim_queued_target_backends(&mut gate.pending_payloads, backends);
         }
         gate.complete_native_blocks = queued_complete_native_blocks(&gate.pending_payloads);
-        if gate.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS {
+        if gate.complete_native_blocks.len() >= self.config.recovery_max_buffered_native_blocks {
             cancelled.store(true, Ordering::Release);
         }
         gate.open_recovery_id = Some(recovery_id.clone());
@@ -1116,7 +1123,8 @@ impl BroadcasterRedisPublisher {
             }
             if let Some(block_number) = complete_native_block(&payload) {
                 recovery_gate.complete_native_blocks.insert(block_number);
-                if recovery_gate.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+                if recovery_gate.complete_native_blocks.len()
+                    >= self.config.recovery_max_buffered_native_blocks
                 {
                     if let Some(cancelled) = &recovery_gate.cancelled {
                         cancelled.store(true, Ordering::Release);
@@ -1152,7 +1160,7 @@ impl BroadcasterRedisPublisher {
                     }
                     if buffer.started_at.elapsed() >= STARTUP_HANDOFF_ABORT_AFTER
                         || buffer.complete_native_blocks.len()
-                            >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+                            >= self.config.recovery_max_buffered_native_blocks
                     {
                         buffer.cancelled = true;
                         buffer.payloads.clear();

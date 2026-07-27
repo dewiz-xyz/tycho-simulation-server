@@ -244,7 +244,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
+    let redis_publisher = build_redis_publisher(&config, heartbeat_interval).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -373,7 +373,7 @@ fn redis_readiness(mode: &str) -> BroadcasterReadiness {
 }
 
 async fn build_redis_publisher(
-    chain_id: u64,
+    config: &BroadcasterConfig,
     heartbeat_interval: Duration,
 ) -> Result<Arc<BroadcasterRedisPublisher>> {
     let redis_config = load_broadcaster_redis_config();
@@ -381,8 +381,9 @@ async fn build_redis_publisher(
     let publisher = Arc::new(BroadcasterRedisPublisher::new(
         BroadcasterRedisPublisherConfig::from_redis_config(
             &redis_config,
-            chain_id,
+            config.chain_profile.chain.id(),
             heartbeat_interval,
+            config.chain_profile.recovery_max_buffered_native_blocks,
         ),
         writer,
     ));
@@ -664,6 +665,7 @@ mod tests {
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec!["rfq:bebop".to_string()],
                 native_progress_lease_secs: 25,
+                recovery_max_buffered_native_blocks: 8,
                 native_token_protocol_allowlist: Vec::new(),
                 reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),

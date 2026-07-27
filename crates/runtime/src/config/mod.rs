@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use simulator_core::broadcaster::BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 mod logging;
@@ -14,9 +15,6 @@ pub use logging::init_logging;
 pub(crate) use manifest::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
 pub use memory::MemoryConfig;
 
-// 8 MiB per serialized snapshot payload: big enough for efficient HTTP transfer, small enough
-// that retrying one failed chunk stays cheap.
-const DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES: &str = "8388608";
 const DEFAULT_BROADCASTER_REDIS_BLOCK_MS: &str = "5000";
 const DEFAULT_BROADCASTER_REDIS_READ_COUNT: &str = "128";
 const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
@@ -30,6 +28,7 @@ pub struct ChainProfile {
     pub rfq_protocols: Vec<String>,
     /// Only a strictly newer complete native block renews this lease.
     pub native_progress_lease_secs: u64,
+    pub recovery_max_buffered_native_blocks: usize,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
     pub native_token_protocol_allowlist: Vec<String>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
@@ -78,6 +77,9 @@ pub fn load_config() -> AppConfig {
         vm_protocols: resolved_chain.chain_profile.vm_protocols,
         rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
         native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
+        recovery_max_buffered_native_blocks: resolved_chain
+            .chain_profile
+            .recovery_max_buffered_native_blocks,
         native_token_protocol_allowlist: resolved_chain
             .chain_profile
             .native_token_protocol_allowlist,
@@ -169,6 +171,9 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         vm_protocols: resolved_chain.chain_profile.vm_protocols,
         rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
         native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
+        recovery_max_buffered_native_blocks: resolved_chain
+            .chain_profile
+            .recovery_max_buffered_native_blocks,
         native_token_protocol_allowlist: resolved_chain
             .chain_profile
             .native_token_protocol_allowlist,
@@ -572,10 +577,8 @@ fn validate_redis_port(port: Option<&str>) {
 }
 
 fn load_broadcaster_tuning() -> BroadcasterTuning {
-    let snapshot_max_payload_bytes = parse_env_or_default(
-        "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES",
-        DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES,
-    );
+    let snapshot_max_payload_bytes = optional_parsed_env("BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES")
+        .unwrap_or(BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES);
     let heartbeat_interval_secs = parse_env_or_default("BROADCASTER_HEARTBEAT_INTERVAL_SECS", "5");
     let token_min_quality = parse_env_or_default("BROADCASTER_TOKEN_MIN_QUALITY", "0");
     let snapshot_session_ttl_secs =
@@ -584,6 +587,10 @@ fn load_broadcaster_tuning() -> BroadcasterTuning {
     assert!(
         snapshot_max_payload_bytes > 0,
         "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES must be > 0"
+    );
+    assert!(
+        snapshot_max_payload_bytes <= BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
+        "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES must be <= {BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES} bytes"
     );
     assert!(
         heartbeat_interval_secs > 0,
@@ -1029,6 +1036,7 @@ mod tests {
         );
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
         assert_eq!(chain.chain_profile.native_progress_lease_secs, 25);
+        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
         assert!(!chain
             .chain_profile
             .native_protocols
@@ -1070,6 +1078,7 @@ mod tests {
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
         assert_eq!(chain.chain_profile.native_progress_lease_secs, 5);
+        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile
@@ -1123,6 +1132,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1153,6 +1163,7 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1170,6 +1181,24 @@ route_policy = "default"
     }
 
     #[test]
+    fn parse_manifest_rejects_zero_recovery_buffer_limit() {
+        let manifest = fs::read_to_string(manifest_path())
+            .unwrap_or_else(|_| unreachable!("expected checked-in manifest"));
+        let manifest = manifest.replacen(
+            "recovery_max_buffered_native_blocks = 8",
+            "recovery_max_buffered_native_blocks = 0",
+            1,
+        );
+
+        let error = manifest::parse_manifest_registries(&manifest)
+            .err()
+            .unwrap_or_else(|| unreachable!("zero recovery buffer limit must fail"));
+
+        assert!(format!("{error:#}")
+            .contains("chain 1 recovery_max_buffered_native_blocks must be greater than zero"));
+    }
+
+    #[test]
     fn parse_manifest_rejects_unknown_route_policy_references() {
         let manifest = r#"
 [[protocols]]
@@ -1184,6 +1213,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1215,6 +1245,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1246,6 +1277,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 999999
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1287,6 +1319,7 @@ allow_share_to_asset = false
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1322,6 +1355,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 native_progress_lease_secs = 25
+recovery_max_buffered_native_blocks = 8
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
 hashflow_filename = " ./hashflow.csv "
@@ -1368,6 +1402,7 @@ route_policy = " default "
             vm_protocols: ethereum.vm_protocols,
             rfq_protocols: ethereum.rfq_protocols,
             native_progress_lease_secs: ethereum.native_progress_lease_secs,
+            recovery_max_buffered_native_blocks: ethereum.recovery_max_buffered_native_blocks,
             native_token_protocol_allowlist: ethereum.native_token_protocol_allowlist,
             reset_allowance_tokens: ethereum.reset_allowance_tokens,
             erc4626_pair_policies: ethereum.erc4626_pair_policies,
@@ -1378,6 +1413,7 @@ route_policy = " default "
             vm_protocols: base.vm_protocols,
             rfq_protocols: base.rfq_protocols,
             native_progress_lease_secs: base.native_progress_lease_secs,
+            recovery_max_buffered_native_blocks: base.recovery_max_buffered_native_blocks,
             native_token_protocol_allowlist: base.native_token_protocol_allowlist,
             reset_allowance_tokens: base.reset_allowance_tokens,
             erc4626_pair_policies: base.erc4626_pair_policies,
@@ -1624,6 +1660,66 @@ route_policy = " default "
         assert_eq!(tuning.heartbeat_interval_secs, 5);
         assert_eq!(tuning.token_min_quality, 0);
         assert_eq!(tuning.snapshot_session_ttl_secs, 300);
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_accepts_snapshot_envelope_ceiling() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+        std::env::set_var(
+            "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES",
+            BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES.to_string(),
+        );
+
+        let tuning = load_broadcaster_tuning();
+
+        assert_eq!(
+            tuning.snapshot_max_payload_bytes,
+            BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES
+        );
+        clear_broadcaster_tuning_env();
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_accepts_snapshot_limit_below_ceiling() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+        std::env::set_var(
+            "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES",
+            (BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES - 1).to_string(),
+        );
+
+        let tuning = load_broadcaster_tuning();
+
+        assert_eq!(
+            tuning.snapshot_max_payload_bytes,
+            BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES - 1
+        );
+        clear_broadcaster_tuning_env();
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_rejects_snapshot_limit_above_ceiling() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+        std::env::set_var(
+            "BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES",
+            (BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES + 1).to_string(),
+        );
+
+        let message = match std::panic::catch_unwind(load_broadcaster_tuning) {
+            Ok(_) => unreachable!("snapshot limit above the ceiling must fail"),
+            Err(panic) => panic_message(panic),
+        };
+
+        assert!(message.contains("BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES must be <= 8388608 bytes"));
+        clear_broadcaster_tuning_env();
     }
 
     #[test]

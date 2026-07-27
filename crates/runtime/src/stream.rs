@@ -863,6 +863,7 @@ mod tests {
                 append_retry_window: Duration::from_millis(10),
                 maxlen: None,
                 writer_lease_ttl: Duration::from_secs(30),
+                recovery_max_buffered_native_blocks: 64,
             },
             Arc::new(FailAppendRedisWriter),
         ));
@@ -941,6 +942,7 @@ mod tests {
                 append_retry_window: Duration::from_millis(10),
                 maxlen: None,
                 writer_lease_ttl: Duration::from_secs(30),
+                recovery_max_buffered_native_blocks: 64,
             },
             Arc::new(StreamTestRedisWriter),
         ))

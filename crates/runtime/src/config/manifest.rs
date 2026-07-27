@@ -50,6 +50,7 @@ pub(crate) struct ResolvedChainProfile {
     pub(crate) vm_protocols: Vec<String>,
     pub(crate) rfq_protocols: Vec<String>,
     pub(crate) native_progress_lease_secs: u64,
+    pub(crate) recovery_max_buffered_native_blocks: usize,
     pub(crate) native_token_protocol_allowlist: Vec<String>,
     pub(crate) reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub(crate) erc4626_pair_policies: Vec<Erc4626PairPolicy>,
@@ -66,6 +67,7 @@ struct ChainRegistryEntry {
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
     native_progress_lease_secs: u64,
+    recovery_max_buffered_native_blocks: usize,
     route_policy_id: String,
 }
 
@@ -125,6 +127,7 @@ struct RawChain {
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
     native_progress_lease_secs: u64,
+    recovery_max_buffered_native_blocks: usize,
     route_policy: String,
 }
 
@@ -182,6 +185,7 @@ pub(crate) fn resolve_chain_config(
             vm_protocols: chain.vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
             native_progress_lease_secs: chain.native_progress_lease_secs,
+            recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
             native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
             reset_allowance_tokens,
             erc4626_pair_policies: route_policy.erc4626_pair_policies.clone(),
@@ -365,6 +369,12 @@ fn validate_chains(
                 chain.chain_id
             );
         }
+        if chain.recovery_max_buffered_native_blocks == 0 {
+            bail!(
+                "chain {} recovery_max_buffered_native_blocks must be greater than zero",
+                chain.chain_id
+            );
+        }
 
         let native_protocols = validate_backend_protocol_refs(
             chain.chain_id,
@@ -399,6 +409,7 @@ fn validate_chains(
                 vm_protocols,
                 rfq_protocols,
                 native_progress_lease_secs: chain.native_progress_lease_secs,
+                recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
                 route_policy_id: route_policy_id.to_string(),
             },
         );

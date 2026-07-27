@@ -19,6 +19,9 @@ mod redis_streams;
 
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 
+// Producers and consumers must agree on the largest snapshot response they can exchange.
+pub const BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcasterBackend {

@@ -275,7 +275,9 @@ async fn startup_handoff_overflow_discards_private_work_and_allows_retry() -> Re
             "64 native blocks must cancel the private startup candidate"
         ));
     };
-    assert!(error.to_string().contains("64-block or 60-second bound"));
+    assert!(error
+        .to_string()
+        .contains("configured 64 native-block or 60-second bound"));
     publisher
         .abort_startup_handoff(handoff_id, error.to_string())
         .await;
@@ -1166,15 +1168,17 @@ async fn redis_verification_pause_notifies_feeds_and_resumes_after_recovery() ->
 }
 
 #[tokio::test]
-async fn sibling_native_queue_cancels_recovery_at_sixty_four_blocks() -> Result<()> {
+async fn configured_native_block_limit_cancels_publisher_recovery_queue() -> Result<()> {
     let writer = FakeRedisWriter::default();
-    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
+    let mut config = publisher_config();
+    config.recovery_max_buffered_native_blocks = 3;
+    let publisher = BroadcasterRedisPublisher::new(config, Arc::new(writer));
     let cancelled = Arc::new(AtomicBool::new(false));
     publisher
         .begin_recovery(&[BroadcasterBackend::Rfq], Arc::clone(&cancelled))
         .await;
 
-    for block_number in 1..=64 {
+    for block_number in 1..=3 {
         let message = BroadcasterUpdateMessage::from_tycho_update(
             &update(
                 BroadcasterBackend::Native,
@@ -1190,7 +1194,7 @@ async fn sibling_native_queue_cancels_recovery_at_sixty_four_blocks() -> Result<
 
     assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
     let (current, maximum, oldest_age_ms) = publisher.pending_recovery_payload_stats().await;
-    assert_eq!((current, maximum), (64, 64));
+    assert_eq!((current, maximum), (3, 3));
     assert!(oldest_age_ms.is_some());
     Ok(())
 }
@@ -2372,6 +2376,7 @@ fn publisher_config() -> BroadcasterRedisPublisherConfig {
         append_retry_window: Duration::from_millis(10),
         maxlen: None,
         writer_lease_ttl: Duration::from_secs(30),
+        recovery_max_buffered_native_blocks: 64,
     }
 }
 

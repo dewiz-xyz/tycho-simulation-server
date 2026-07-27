@@ -20,7 +20,7 @@ use crate::broadcaster::redis_publisher::{
     format_redis_snapshot_id, format_redis_stream_id, BroadcasterDeploymentPhase,
     BroadcasterRecoveryTransaction, BroadcasterRedisPublisher, BroadcasterRedisPublisherMode,
     OversizedRedisEntry, RecoveryCommitAdoptionUncertain, RecoveryPublicationCancelled,
-    SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES, STARTUP_HANDOFF_ABORT_AFTER,
+    STARTUP_HANDOFF_ABORT_AFTER,
 };
 use crate::broadcaster::state::{
     combine_snapshot_exports, BroadcasterReadiness, BroadcasterRecoverySource,
@@ -31,6 +31,7 @@ use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapsho
 use simulator_core::broadcaster::{
     BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
     BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
+    BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
 };
 
 const SNAPSHOT_BOUNDARY_RETENTION_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -219,7 +220,6 @@ impl BroadcasterSnapshotSessionRegistry {
 const MAX_SNAPSHOT_SESSIONS: usize = 128;
 const MAX_CONCURRENT_SNAPSHOT_FETCHES: usize = 64;
 const MAX_RETAINED_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
-const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
 const RECOVERY_WARN_AFTER: Duration = Duration::from_secs(30);
 const RECOVERY_ABORT_AFTER: Duration = Duration::from_secs(60);
 const RECOVERY_MAX_LOCAL_FAILURES: u8 = 1;
@@ -898,7 +898,8 @@ impl BroadcasterServiceState {
             );
         }
         if elapsed >= RECOVERY_ABORT_AFTER
-            || recovery.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+            || recovery.complete_native_blocks.len()
+                >= self.redis_publisher.recovery_max_buffered_native_blocks()
         {
             recovery.cancelled.store(true, Ordering::Release);
         }
@@ -1006,7 +1007,7 @@ impl BroadcasterServiceState {
             let replacement_complete_native_block = source.complete_native_block();
             let cache = self.cache.clone();
             let replacement = tokio::task::spawn_blocking(move || {
-                cache.serialize_recovery_source(source, SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES)
+                cache.serialize_recovery_source(source, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES)
             })
             .await;
             let replacement_json = match replacement {
@@ -2331,13 +2332,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_cancels_after_sixty_four_distinct_native_blocks() -> Result<()> {
+    async fn configured_native_block_limit_cancels_service_recovery_buffer() -> Result<()> {
+        let mut publisher_config = publisher_config();
+        publisher_config.recovery_max_buffered_native_blocks = 3;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
             BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
             BroadcasterUpstreamState::default(),
             Arc::new(BroadcasterRedisPublisher::new(
-                publisher_config(),
+                publisher_config,
                 Arc::new(ServiceFakeRedisWriter::default()),
             )),
             Arc::new(Mutex::new(())),
@@ -2349,7 +2352,7 @@ mod tests {
             recovery.started_at = tokio::time::Instant::now();
         }
 
-        for block in 1..=64 {
+        for block in 1..=3 {
             assert!(
                 service
                     .buffer_recovery_update(native_buffer_update(block)?)
@@ -2358,7 +2361,7 @@ mod tests {
         }
 
         let recovery = service.recovery_publication.lock().await;
-        assert_eq!(recovery.complete_native_blocks.len(), 64);
+        assert_eq!(recovery.complete_native_blocks.len(), 3);
         assert!(recovery.cancelled.load(Ordering::Acquire));
         Ok(())
     }
@@ -4428,6 +4431,7 @@ mod tests {
             append_retry_window: Duration::from_millis(10),
             maxlen: None,
             writer_lease_ttl: Duration::from_secs(30),
+            recovery_max_buffered_native_blocks: 64,
         }
     }
 
