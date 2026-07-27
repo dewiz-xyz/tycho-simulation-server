@@ -255,8 +255,9 @@ struct RecoveryPublicationState {
     warned: bool,
     complete_native_blocks: HashSet<u64>,
     buffer_a: Vec<simulator_core::broadcaster::BroadcasterUpdateMessage>,
-    buffer_b: Vec<simulator_core::broadcaster::BroadcasterUpdateMessage>,
+    buffer_a_oldest_at: Option<Instant>,
     cancelled: Arc<AtomicBool>,
+    publisher_recovery_id: Option<String>,
     fatal_error: Option<String>,
     max_buffer_a_count: usize,
     max_buffer_b_count: usize,
@@ -276,8 +277,9 @@ impl Default for RecoveryPublicationState {
             warned: false,
             complete_native_blocks: HashSet::new(),
             buffer_a: Vec::new(),
-            buffer_b: Vec::new(),
+            buffer_a_oldest_at: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            publisher_recovery_id: None,
             fatal_error: None,
             max_buffer_a_count: 0,
             max_buffer_b_count: 0,
@@ -312,7 +314,8 @@ pub struct BroadcasterServiceState {
     recovery_publication: Arc<Mutex<RecoveryPublicationState>>,
     recovery_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     recovery_retry_backoff: Duration,
-    next_recovery_publication_id: Arc<AtomicU64>,
+    native_progress_lease: Duration,
+    next_recovery_source_id: Arc<AtomicU64>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
     // This gate keeps snapshot export and recovery source capture atomic with
     // respect to accepted updates and replay-boundary capture.
@@ -355,6 +358,26 @@ impl BroadcasterServiceState {
         lifecycle_gate: Arc<Mutex<()>>,
         recovery_retry_backoff: Duration,
     ) -> Self {
+        Self::with_lifecycle_gate_and_recovery_backoff_and_lease(
+            snapshot_max_payload_bytes,
+            cache,
+            upstream,
+            redis_publisher,
+            lifecycle_gate,
+            recovery_retry_backoff,
+            Duration::from_secs(5),
+        )
+    }
+
+    pub fn with_lifecycle_gate_and_recovery_backoff_and_lease(
+        snapshot_max_payload_bytes: usize,
+        cache: BroadcasterSnapshotCache,
+        upstream: BroadcasterUpstreamState,
+        redis_publisher: Arc<BroadcasterRedisPublisher>,
+        lifecycle_gate: Arc<Mutex<()>>,
+        recovery_retry_backoff: Duration,
+        native_progress_lease: Duration,
+    ) -> Self {
         Self {
             snapshot_max_payload_bytes,
             cache,
@@ -366,7 +389,8 @@ impl BroadcasterServiceState {
             recovery_publication: Arc::new(Mutex::new(RecoveryPublicationState::default())),
             recovery_workers: Arc::new(Mutex::new(Vec::new())),
             recovery_retry_backoff,
-            next_recovery_publication_id: Arc::new(AtomicU64::new(1)),
+            native_progress_lease,
+            next_recovery_source_id: Arc::new(AtomicU64::new(1)),
             redis_publisher,
             lifecycle_gate,
         }
@@ -427,7 +451,8 @@ impl BroadcasterServiceState {
         recovery.work_id = recovery.work_id.saturating_add(1);
         recovery.phase = RecoveryPublicationPhase::Idle;
         recovery.buffer_a.clear();
-        recovery.buffer_b.clear();
+        recovery.buffer_a_oldest_at = None;
+        recovery.publisher_recovery_id = None;
         recovery.complete_native_blocks.clear();
         recovery.fatal_error = None;
         drop(recovery);
@@ -459,6 +484,8 @@ impl BroadcasterServiceState {
     }
 
     async fn recovery_status(&self) -> BroadcasterRecoveryStatus {
+        let (publisher_buffer_count, _, publisher_oldest_age_ms) =
+            self.redis_publisher.pending_recovery_payload_stats().await;
         let recovery = self.recovery_publication.lock().await;
         let active = recovery.phase.is_active();
         let age_ms = (active || recovery.phase == RecoveryPublicationPhase::Fatal)
@@ -473,10 +500,16 @@ impl BroadcasterServiceState {
                 recovery.local_failures
             },
             buffer_a_count: recovery.buffer_a.len(),
-            buffer_b_count: recovery.buffer_b.len(),
-            oldest_buffered_age_ms: (!recovery.buffer_a.is_empty()
-                || !recovery.buffer_b.is_empty())
-            .then(|| recovery.started_at.elapsed().as_millis() as u64),
+            buffer_b_count: publisher_buffer_count,
+            oldest_buffered_age_ms: [
+                recovery
+                    .buffer_a_oldest_at
+                    .map(|accepted_at| accepted_at.elapsed().as_millis() as u64),
+                publisher_oldest_age_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .max(),
             last_outcome: recovery.last_outcome,
             last_duration_ms: recovery.last_duration_ms,
             last_encoded_bytes: recovery.last_encoded_bytes,
@@ -513,6 +546,20 @@ impl BroadcasterServiceState {
 
     pub(crate) async fn redis_publisher_is_retired(&self) -> bool {
         self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Retired
+    }
+
+    pub(crate) async fn wait_for_shared_publisher_resume(&self) {
+        self.redis_publisher.wait_for_feeds_resumed().await;
+    }
+
+    pub(crate) fn shared_publisher_pause_epoch(&self) -> u64 {
+        self.redis_publisher.feed_pause_epoch()
+    }
+
+    pub(crate) async fn wait_for_shared_publisher_pause_after(&self, pause_epoch: u64) {
+        self.redis_publisher
+            .wait_for_feed_pause_after(pause_epoch)
+            .await;
     }
 
     pub async fn promote_when_ready(
@@ -572,14 +619,82 @@ impl BroadcasterServiceState {
         }
     }
 
+    pub(crate) async fn publisher_mode(&self) -> BroadcasterRedisPublisherMode {
+        self.redis_publisher.mode().await
+    }
+
+    pub(crate) async fn recover_shared_publisher_when_paused(
+        services: &[Self],
+        reason: impl Into<String>,
+    ) -> Result<Option<BroadcasterRedisReplayBoundary>> {
+        anyhow::ensure!(
+            !services.is_empty(),
+            "broadcaster writer recovery requires at least one service"
+        );
+        ensure_shared_lifecycle(services, "broadcaster writer recovery")?;
+        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Unhealthy
+            || !services[0].redis_publisher.feeds_are_paused()
+        {
+            return Ok(None);
+        }
+
+        let gate = services[0].lifecycle_gate.lock().await;
+        for service in services {
+            if service.upstream.snapshot().await.connected
+                || service.recovery_publication.lock().await.phase.is_active()
+            {
+                return Ok(None);
+            }
+        }
+        if services[0].redis_publisher.mode().await != BroadcasterRedisPublisherMode::Unhealthy {
+            return Ok(None);
+        }
+
+        let mut base_heads = Vec::new();
+        for service in services {
+            base_heads.extend(service.cache.backend_heads().await);
+        }
+        anyhow::ensure!(
+            !base_heads.is_empty(),
+            "broadcaster writer recovery requires a retained backend head"
+        );
+        let boundary = services[0]
+            .redis_publisher
+            .recover_writer(base_heads, reason)
+            .await?;
+        for service in services {
+            service.cache.relabel_generation(boundary.generation).await;
+            service
+                .snapshot_sessions
+                .disconnect_all(SessionCloseReason::WriterFenceLost)
+                .await;
+        }
+        drop(gate);
+        Ok(Some(boundary))
+    }
+
+    pub(crate) async fn has_current_snapshot_artifact(&self) -> bool {
+        let Some(artifact) = self.snapshot_artifact.read().await.clone() else {
+            return false;
+        };
+        let Some(boundary) = self.redis_publisher.status_snapshot().await.replay_boundary else {
+            return false;
+        };
+        artifact_matches_current_boundary(&artifact, &boundary)
+    }
+
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<()> {
+        anyhow::ensure!(
+            !self.redis_publisher.feeds_are_paused(),
+            "shared Redis publisher paused every feed until writer verification succeeds"
+        );
         let _gate = self.lifecycle_gate.lock().await;
         let staged = self.cache.stage_update(update).await?;
         if let Some(message) = staged.message() {
             self.publish_to_redis(BroadcasterPayload::Update(message.clone()))
                 .await?;
         }
-        self.cache.commit_staged_update(staged).await;
+        self.cache.commit_staged_update(staged).await?;
         self.upstream.record_update().await;
         Ok(())
     }
@@ -592,6 +707,10 @@ impl BroadcasterServiceState {
         &self,
         feed: &FeedMessage<BlockHeader>,
     ) -> Result<BroadcasterFeedApply> {
+        anyhow::ensure!(
+            !self.redis_publisher.feeds_are_paused(),
+            "shared Redis publisher paused every feed until writer verification succeeds"
+        );
         if let Some(error) = self.recovery_fatal_error().await {
             return Err(anyhow::anyhow!(
                 "broadcaster recovery worker terminated: {error}"
@@ -601,23 +720,27 @@ impl BroadcasterServiceState {
         let staged = self.cache.stage_feed_message(feed).await?;
         let publishes_update = staged.publishes_update();
         let native_progress = (!staged.has_replacement_ready())
-            .then(|| staged.message().and_then(complete_native_block))
+            .then(|| {
+                staged.message().and_then(
+                    simulator_core::broadcaster::BroadcasterUpdateMessage::complete_native_block,
+                )
+            })
             .flatten();
         let mut native_progress_was_published = false;
         if staged.has_replacement_ready() {
             let source = self.cache.recovery_source(&staged)?;
-            self.cache.commit_staged_update(staged).await;
+            self.cache.commit_staged_update(staged).await?;
             self.start_recovery_publication(source).await;
         } else if let Some(message) = staged.message() {
             if self.buffer_recovery_update(message.clone()).await? {
-                self.cache.commit_staged_update(staged).await;
+                self.cache.commit_staged_update(staged).await?;
             } else {
                 if let Err(error) = self
                     .publish_to_redis(BroadcasterPayload::Update(message.clone()))
                     .await
                 {
                     if error.downcast_ref::<OversizedRedisEntry>().is_some() {
-                        self.cache.commit_staged_update(staged).await;
+                        self.cache.commit_staged_update(staged).await?;
                         self.cache
                             .begin_same_generation_recovery_from_current()
                             .await;
@@ -632,11 +755,11 @@ impl BroadcasterServiceState {
                     }
                     return Err(error);
                 }
-                self.cache.commit_staged_update(staged).await;
+                self.cache.commit_staged_update(staged).await?;
                 native_progress_was_published = true;
             }
         } else {
-            self.cache.commit_staged_update(staged).await;
+            self.cache.commit_staged_update(staged).await?;
         }
         if let Some(block_number) = native_progress.filter(|_| native_progress_was_published) {
             self.upstream.record_native_progress(block_number).await;
@@ -665,7 +788,7 @@ impl BroadcasterServiceState {
             return Ok(false);
         }
 
-        if let Some(block_number) = complete_native_block(&update) {
+        if let Some(block_number) = update.complete_native_block() {
             recovery.complete_native_blocks.insert(block_number);
         }
         let elapsed = recovery.started_at.elapsed();
@@ -687,14 +810,13 @@ impl BroadcasterServiceState {
 
         match recovery.phase {
             RecoveryPublicationPhase::Building => {
+                recovery.buffer_a_oldest_at.get_or_insert_with(Instant::now);
                 recovery.buffer_a.push(update);
                 let buffer_a_count = recovery.buffer_a.len();
                 recovery.max_buffer_a_count = recovery.max_buffer_a_count.max(buffer_a_count);
             }
             RecoveryPublicationPhase::Publishing | RecoveryPublicationPhase::Draining => {
-                recovery.buffer_b.push(update);
-                let buffer_b_count = recovery.buffer_b.len();
-                recovery.max_buffer_b_count = recovery.max_buffer_b_count.max(buffer_b_count);
+                return Ok(false);
             }
             RecoveryPublicationPhase::Idle | RecoveryPublicationPhase::Fatal => {}
         }
@@ -702,7 +824,7 @@ impl BroadcasterServiceState {
     }
 
     async fn start_recovery_publication(&self, source: BroadcasterRecoverySource) {
-        let work_id = {
+        let (work_id, cancelled) = {
             let mut recovery = self.recovery_publication.lock().await;
             recovery.cancelled.store(true, Ordering::Release);
             recovery.work_id = recovery.work_id.saturating_add(1);
@@ -712,8 +834,9 @@ impl BroadcasterServiceState {
             recovery.warned = false;
             recovery.complete_native_blocks.clear();
             recovery.buffer_a.clear();
-            recovery.buffer_b.clear();
+            recovery.buffer_a_oldest_at = None;
             recovery.cancelled = Arc::new(AtomicBool::new(false));
+            recovery.publisher_recovery_id = None;
             recovery.fatal_error = None;
             recovery.max_buffer_a_count = 0;
             recovery.max_buffer_b_count = 0;
@@ -721,8 +844,19 @@ impl BroadcasterServiceState {
             recovery.last_duration_ms = None;
             recovery.last_encoded_bytes = None;
             recovery.last_chunk_count = None;
-            recovery.work_id
+            (recovery.work_id, Arc::clone(&recovery.cancelled))
         };
+        let recovery_id = self
+            .redis_publisher
+            .begin_recovery(&self.cache.configured_backends(), cancelled)
+            .await;
+        {
+            let mut recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id || recovery.phase != RecoveryPublicationPhase::Building {
+                return;
+            }
+            recovery.publisher_recovery_id = Some(recovery_id);
+        }
         let service = self.clone();
         let worker = tokio::spawn(async move {
             let result =
@@ -774,6 +908,7 @@ impl BroadcasterServiceState {
     async fn run_recovery_publication(self, work_id: u64, mut source: BroadcasterRecoverySource) {
         loop {
             self.spawn_recovery_bounds_monitor(work_id).await;
+            let replacement_complete_native_block = source.complete_native_block();
             let cache = self.cache.clone();
             let replacement = tokio::task::spawn_blocking(move || {
                 cache.serialize_recovery_source(source, SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES)
@@ -809,7 +944,7 @@ impl BroadcasterServiceState {
                 }
             };
 
-            let (buffer_a, cancelled) = {
+            let (recovery_id, buffer_a, cancelled) = {
                 let mut recovery = self.recovery_publication.lock().await;
                 if recovery.work_id != work_id
                     || recovery.phase != RecoveryPublicationPhase::Building
@@ -831,48 +966,22 @@ impl BroadcasterServiceState {
                     continue;
                 }
                 recovery.phase = RecoveryPublicationPhase::Publishing;
-                (
-                    std::mem::take(&mut recovery.buffer_a),
-                    Arc::clone(&recovery.cancelled),
-                )
-            };
-
-            let boundary = match self.redis_publisher.replay_boundary().await {
-                Ok(boundary) => boundary,
-                Err(error) => {
-                    let Some(retry_source) = self
-                        .handle_external_recovery_failure(work_id, error.to_string())
-                        .await
-                    else {
-                        return;
-                    };
-                    source = retry_source;
-                    continue;
-                }
-            };
-            let publication_id = self
-                .next_recovery_publication_id
-                .fetch_add(1, Ordering::Relaxed);
-            let Some(target_state_version) = boundary
-                .generation
-                .checked_mul(1u64 << 48)
-                .and_then(|base| base.checked_add(publication_id))
-            else {
-                let Some(retry_source) = self
-                    .handle_local_recovery_failure(
+                let buffer_a = std::mem::take(&mut recovery.buffer_a);
+                recovery.buffer_a_oldest_at = None;
+                let Some(recovery_id) = recovery.publisher_recovery_id.clone() else {
+                    drop(recovery);
+                    self.handle_recovery_worker_termination(
                         work_id,
-                        "recovery target state version overflow".to_string(),
+                        "recovery publication has no publisher reservation".to_string(),
                     )
-                    .await
-                else {
+                    .await;
                     return;
                 };
-                source = retry_source;
-                continue;
+                (recovery_id, buffer_a, Arc::clone(&recovery.cancelled))
             };
+
             let transaction = BroadcasterRecoveryTransaction {
-                recovery_id: format!("{}-{work_id}-{publication_id}", boundary.generation),
-                target_state_version,
+                recovery_id,
                 backends: self.cache.configured_backends(),
                 replacement_json,
                 buffer_a,
@@ -941,41 +1050,13 @@ impl BroadcasterServiceState {
                 recovery.phase = RecoveryPublicationPhase::Draining;
             }
 
-            match self.drain_recovery_buffer_b(work_id).await {
-                Ok(true) => {
-                    if let Some(native_head) =
-                        self.cache.backend_heads().await.into_iter().find(|head| {
-                            head.backend == simulator_core::broadcaster::BroadcasterBackend::Native
-                        })
-                    {
-                        self.upstream
-                            .record_native_progress(native_head.block_number)
-                            .await;
-                    }
-                    return;
-                }
-                Ok(false) => {
-                    let Some(retry_source) = self
-                        .handle_local_recovery_failure(
-                            work_id,
-                            "Buffer B exceeded the live Redis entry limit".to_string(),
-                        )
-                        .await
-                    else {
-                        return;
-                    };
-                    source = retry_source;
-                }
-                Err(error) => {
-                    let Some(retry_source) = self
-                        .handle_external_recovery_failure(work_id, format!("{error:#}"))
-                        .await
-                    else {
-                        return;
-                    };
-                    source = retry_source;
-                }
+            if let Some(native_block) = self
+                .finish_recovery_publication(work_id, replacement_complete_native_block)
+                .await
+            {
+                self.upstream.record_native_progress(native_block).await;
             }
+            return;
         }
     }
 
@@ -1027,54 +1108,44 @@ impl BroadcasterServiceState {
         workers.push(monitor);
     }
 
-    async fn drain_recovery_buffer_b(&self, work_id: u64) -> Result<bool> {
-        loop {
-            let batch = {
-                let mut recovery = self.recovery_publication.lock().await;
-                if recovery.work_id != work_id
-                    || recovery.phase != RecoveryPublicationPhase::Draining
-                {
-                    return Ok(true);
-                }
-                if recovery.cancelled.load(Ordering::Acquire) {
-                    return Ok(false);
-                }
-                if recovery.buffer_b.is_empty() {
-                    let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
-                    let encoded_bytes = recovery.last_encoded_bytes.unwrap_or(0);
-                    let chunk_count = recovery.last_chunk_count.unwrap_or(0);
-                    let buffer_a_count = recovery.max_buffer_a_count;
-                    let buffer_b_count = recovery.max_buffer_b_count;
-                    recovery.phase = RecoveryPublicationPhase::Idle;
-                    recovery.complete_native_blocks.clear();
-                    recovery.last_outcome = Some("committed");
-                    recovery.last_duration_ms = Some(duration_ms);
-                    drop(recovery);
-                    emit_broadcaster_recovery_outcome(
-                        "committed",
-                        duration_ms,
-                        encoded_bytes,
-                        chunk_count,
-                        buffer_a_count,
-                        buffer_b_count,
-                    );
-                    return Ok(true);
-                }
-                std::mem::take(&mut recovery.buffer_b)
-            };
-
-            for update in batch {
-                if let Err(error) = self
-                    .publish_to_redis(BroadcasterPayload::Update(update))
-                    .await
-                {
-                    if error.downcast_ref::<OversizedRedisEntry>().is_some() {
-                        return Ok(false);
-                    }
-                    return Err(error);
-                }
-            }
+    async fn finish_recovery_publication(
+        &self,
+        work_id: u64,
+        replacement_complete_native_block: Option<u64>,
+    ) -> Option<u64> {
+        let (_, publisher_max_buffer_count, _) =
+            self.redis_publisher.pending_recovery_payload_stats().await;
+        let mut recovery = self.recovery_publication.lock().await;
+        if recovery.work_id != work_id || recovery.phase != RecoveryPublicationPhase::Draining {
+            return None;
         }
+        let complete_native_block = recovery
+            .complete_native_blocks
+            .iter()
+            .copied()
+            .chain(replacement_complete_native_block)
+            .max();
+        recovery.max_buffer_b_count = recovery.max_buffer_b_count.max(publisher_max_buffer_count);
+        let duration_ms = recovery.started_at.elapsed().as_millis() as u64;
+        let encoded_bytes = recovery.last_encoded_bytes.unwrap_or(0);
+        let chunk_count = recovery.last_chunk_count.unwrap_or(0);
+        let buffer_a_count = recovery.max_buffer_a_count;
+        let buffer_b_count = recovery.max_buffer_b_count;
+        recovery.phase = RecoveryPublicationPhase::Idle;
+        recovery.publisher_recovery_id = None;
+        recovery.complete_native_blocks.clear();
+        recovery.last_outcome = Some("committed");
+        recovery.last_duration_ms = Some(duration_ms);
+        drop(recovery);
+        emit_broadcaster_recovery_outcome(
+            "committed",
+            duration_ms,
+            encoded_bytes,
+            chunk_count,
+            buffer_a_count,
+            buffer_b_count,
+        );
+        complete_native_block
     }
 
     async fn handle_local_recovery_failure(
@@ -1149,11 +1220,23 @@ impl BroadcasterServiceState {
             "Waiting to retry broadcaster recovery without consuming the local attempt allowance"
         );
         loop {
-            {
+            let recovery_cancelled = {
                 let recovery = self.recovery_publication.lock().await;
                 if recovery.work_id != work_id {
                     return None;
                 }
+                recovery.cancelled.load(Ordering::Acquire)
+            };
+            if recovery_cancelled {
+                if let Err(error) = self
+                    .redis_publisher
+                    .pause_feeds_until_writer_verified()
+                    .await
+                {
+                    self.handle_recovery_worker_termination(work_id, format!("{error:#}"))
+                        .await;
+                }
+                return None;
             }
             match self.redis_publisher.mode().await {
                 BroadcasterRedisPublisherMode::Retired => {
@@ -1199,10 +1282,10 @@ impl BroadcasterServiceState {
         recovery.warned = false;
         recovery.complete_native_blocks.clear();
         recovery.buffer_a.clear();
-        recovery.buffer_b.clear();
+        recovery.buffer_a_oldest_at = None;
         recovery.cancelled = Arc::new(AtomicBool::new(false));
-        self.next_recovery_publication_id
-            .fetch_add(1, Ordering::Relaxed)
+        recovery.publisher_recovery_id = None;
+        self.next_recovery_source_id.fetch_add(1, Ordering::Relaxed)
     }
 
     async fn capture_retry_source(
@@ -1212,12 +1295,25 @@ impl BroadcasterServiceState {
     ) -> Option<BroadcasterRecoverySource> {
         let _gate = self.lifecycle_gate.lock().await;
         let source = self.cache.pin_recovery_source(retry_id).await;
+        let cancelled = {
+            let mut recovery = self.recovery_publication.lock().await;
+            if recovery.work_id != work_id || recovery.phase != RecoveryPublicationPhase::Building {
+                return None;
+            }
+            // Anything buffered before this pin is already represented by the replacement.
+            recovery.buffer_a.clear();
+            recovery.buffer_a_oldest_at = None;
+            Arc::clone(&recovery.cancelled)
+        };
+        let recovery_id = self
+            .redis_publisher
+            .begin_recovery(&self.cache.configured_backends(), cancelled)
+            .await;
         let mut recovery = self.recovery_publication.lock().await;
         if recovery.work_id != work_id || recovery.phase != RecoveryPublicationPhase::Building {
             return None;
         }
-        // Anything buffered before this pin is already represented by the replacement.
-        recovery.buffer_a.clear();
+        recovery.publisher_recovery_id = Some(recovery_id);
         Some(source)
     }
 
@@ -1332,10 +1428,11 @@ impl BroadcasterServiceState {
                 self.snapshot_max_payload_bytes,
                 self.upstream.snapshot().await,
                 self.snapshot_sessions.snapshot().await,
+                self.native_progress_lease,
             )
             .await;
+        let artifact_available = self.has_current_snapshot_artifact().await;
         let preflight = self.snapshot_preflight.read().await;
-        let artifact_available = self.snapshot_artifact.read().await.is_some();
         let now = Instant::now();
         snapshot.snapshot.exportable = artifact_available;
         snapshot.snapshot.last_export_check_age_ms = preflight
@@ -1391,15 +1488,16 @@ impl BroadcasterServiceState {
         let _refresh_guard = SnapshotRefreshGuard(Arc::clone(&services[0].snapshot_refresh_active));
         let started_at = Instant::now();
         let result = async {
-            let (chain_id, boundary, captured, recovery_work_id) = {
+            let (chain_id, boundary, captured, recovery_work_ids) = {
                 let _gate = services[0].lifecycle_gate.lock().await;
-                let recovery_work_id = {
-                    let recovery = services[0].recovery_publication.lock().await;
+                let mut recovery_work_ids = Vec::with_capacity(services.len());
+                for service in services {
+                    let recovery = service.recovery_publication.lock().await;
                     if recovery.phase.is_active() {
                         return Ok(None);
                     }
-                    recovery.work_id
-                };
+                    recovery_work_ids.push(recovery.work_id);
+                }
                 let Some(raw_source) = services[0].cache.pin_snapshot_source().await else {
                     return Ok(None);
                 };
@@ -1426,7 +1524,7 @@ impl BroadcasterServiceState {
                         ));
                     }
                 }
-                (chain_id, boundary, captured, recovery_work_id)
+                (chain_id, boundary, captured, recovery_work_ids)
             };
 
             let export = tokio::task::spawn_blocking(move || {
@@ -1443,7 +1541,7 @@ impl BroadcasterServiceState {
             let (artifact, largest_payload_bytes) =
                 build_snapshot_artifact(chain_id, export, boundary)?;
             let artifact = Arc::new(artifact);
-            install_snapshot_artifact_if_current(services, &artifact, recovery_work_id).await?;
+            install_snapshot_artifact_if_current(services, &artifact, &recovery_work_ids).await?;
             Ok(Some((artifact, largest_payload_bytes)))
         }
         .await;
@@ -1525,24 +1623,6 @@ pub(crate) struct BroadcasterFeedApply {
     pub(crate) native_progress: Option<u64>,
 }
 
-fn complete_native_block(
-    message: &simulator_core::broadcaster::BroadcasterUpdateMessage,
-) -> Option<u64> {
-    message
-        .partitions
-        .iter()
-        .find(|partition| {
-            partition.backend == simulator_core::broadcaster::BroadcasterBackend::Native
-        })
-        .filter(|partition| {
-            partition
-                .messages
-                .iter()
-                .all(|message| message.message.header.partial_block_index.is_none())
-        })
-        .map(|partition| partition.block_number)
-}
-
 struct SnapshotRefreshGuard(Arc<AtomicBool>);
 
 impl Drop for SnapshotRefreshGuard {
@@ -1617,13 +1697,19 @@ fn artifact_matches_current_boundary(
 async fn install_snapshot_artifact_if_current(
     services: &[BroadcasterServiceState],
     artifact: &Arc<BroadcasterSnapshotArtifact>,
-    captured_recovery_work_id: u64,
+    captured_recovery_work_ids: &[u64],
 ) -> Result<()> {
     let _gate = services[0].lifecycle_gate.lock().await;
-    let recovery_is_unchanged = {
-        let recovery = services[0].recovery_publication.lock().await;
-        recovery.work_id == captured_recovery_work_id && !recovery.phase.is_active()
-    };
+    anyhow::ensure!(
+        captured_recovery_work_ids.len() == services.len(),
+        "snapshot artifact recovery fence count changed before publication"
+    );
+    let mut recovery_is_unchanged = true;
+    for (service, captured_work_id) in services.iter().zip(captured_recovery_work_ids) {
+        let recovery = service.recovery_publication.lock().await;
+        recovery_is_unchanged &=
+            recovery.work_id == *captured_work_id && !recovery.phase.is_active();
+    }
     anyhow::ensure!(
         recovery_is_unchanged,
         "snapshot artifact crossed a recovery publication boundary"
@@ -1670,7 +1756,7 @@ fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use anyhow::{anyhow, Result};
@@ -1775,22 +1861,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_routes_live_updates_through_buffer_a_then_buffer_b() -> Result<()> {
+    async fn recovery_routes_live_updates_through_buffer_a_then_publisher_gate() -> Result<()> {
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(ServiceFakeRedisWriter::default()),
+        ));
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
             BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
             BroadcasterUpstreamState::default(),
-            Arc::new(BroadcasterRedisPublisher::new(
-                publisher_config(),
-                Arc::new(ServiceFakeRedisWriter::default()),
-            )),
+            Arc::clone(&publisher),
             Arc::new(Mutex::new(())),
         );
         {
             let mut recovery = service.recovery_publication.lock().await;
             recovery.work_id = 1;
             recovery.phase = super::RecoveryPublicationPhase::Building;
-            recovery.started_at = tokio::time::Instant::now();
+            recovery.started_at = tokio::time::Instant::now() - Duration::from_secs(30);
         }
 
         assert!(
@@ -1801,27 +1888,35 @@ mod tests {
         {
             let mut recovery = service.recovery_publication.lock().await;
             assert_eq!(recovery.buffer_a.len(), 1);
-            assert!(recovery.buffer_b.is_empty());
             recovery.phase = super::RecoveryPublicationPhase::Publishing;
         }
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        publisher
+            .begin_recovery(&[BroadcasterBackend::Native], Arc::clone(&cancelled))
+            .await;
+        let buffer_b_update = native_buffer_update(11)?;
         assert!(
-            service
-                .buffer_recovery_update(native_buffer_update(11)?)
+            !service
+                .buffer_recovery_update(buffer_b_update.clone())
                 .await?
         );
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(buffer_b_update))
+            .await?;
         {
             let recovery = service.recovery_publication.lock().await;
             assert_eq!(recovery.buffer_a.len(), 1);
-            assert_eq!(recovery.buffer_b.len(), 1);
         }
         let status = service.recovery_status().await;
         assert!(status.active);
         assert_eq!(status.phase, "publishing");
         assert_eq!(status.buffer_a_count, 1);
         assert_eq!(status.buffer_b_count, 1);
-        assert!(status.age_ms.is_some());
-        assert!(status.oldest_buffered_age_ms.is_some());
+        assert!(status.age_ms.is_some_and(|age_ms| age_ms >= 30_000));
+        assert!(status
+            .oldest_buffered_age_ms
+            .is_some_and(|age_ms| age_ms < 1_000));
         Ok(())
     }
 
@@ -1900,43 +1995,6 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow!("60-second watchdog did not cancel recovery"))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn buffer_b_drains_as_ordered_ordinary_entries() -> Result<()> {
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer.clone()),
-        ));
-        publisher
-            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
-            .await?;
-        let service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
-            BroadcasterUpstreamState::default(),
-            publisher,
-            Arc::new(Mutex::new(())),
-        );
-        {
-            let mut recovery = service.recovery_publication.lock().await;
-            recovery.work_id = 1;
-            recovery.phase = super::RecoveryPublicationPhase::Draining;
-            recovery.buffer_b = vec![native_buffer_update(11)?, native_buffer_update(12)?];
-        }
-
-        assert!(service.drain_recovery_buffer_b(1).await?);
-        let appends = writer.appends().await;
-        assert_eq!(
-            appends
-                .iter()
-                .filter(|entry| entry.kind == BroadcasterMessageKind::Update)
-                .filter_map(|entry| entry.block_number)
-                .collect::<Vec<_>>(),
-            vec![11, 12]
-        );
         Ok(())
     }
 
@@ -2066,7 +2124,7 @@ mod tests {
         let Err(error) = super::install_snapshot_artifact_if_current(
             std::slice::from_ref(&service),
             &artifact,
-            captured_work_id,
+            &[captured_work_id],
         )
         .await
         else {
@@ -2079,6 +2137,51 @@ mod tests {
             .to_string()
             .contains("crossed a recovery publication boundary"));
         assert!(service.snapshot_artifact.read().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_fences_every_shared_publisher_service() -> Result<()> {
+        let primary = ready_service().await?;
+        let secondary = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&primary.redis_publisher),
+            Arc::clone(&primary.lifecycle_gate),
+        );
+        let artifact = primary
+            .snapshot_artifact
+            .write()
+            .await
+            .take()
+            .ok_or_else(|| anyhow!("ready service should have a snapshot artifact"))?;
+        let captured_work_ids = vec![
+            primary.recovery_publication.lock().await.work_id,
+            secondary.recovery_publication.lock().await.work_id,
+        ];
+        {
+            let mut recovery = secondary.recovery_publication.lock().await;
+            recovery.work_id = recovery.work_id.saturating_add(1);
+        }
+
+        let Err(error) = super::install_snapshot_artifact_if_current(
+            &[primary.clone(), secondary.clone()],
+            &artifact,
+            &captured_work_ids,
+        )
+        .await
+        else {
+            return Err(anyhow!(
+                "snapshot must not cross a sibling service recovery boundary"
+            ));
+        };
+
+        assert!(error
+            .to_string()
+            .contains("crossed a recovery publication boundary"));
+        assert!(primary.snapshot_artifact.read().await.is_none());
+        assert!(secondary.snapshot_artifact.read().await.is_none());
         Ok(())
     }
 
@@ -2259,6 +2362,11 @@ mod tests {
                 .is_some(),
             "a retained artifact should bootstrap while recovery entries remain private"
         );
+        assert!(
+            service
+                .apply_feed_message(&partial_raw_feed(13, 13, 12))
+                .await?
+        );
 
         timeout(Duration::from_secs(7), async {
             while !service
@@ -2278,6 +2386,11 @@ mod tests {
                 .last_update_age_ms
                 .is_some_and(|age_ms| age_ms < 500),
             "the five-second lease must start at successful recovery publication"
+        );
+        assert_eq!(
+            service.upstream.last_native_block().await,
+            Some(12),
+            "a partial catch-up must not replace the complete recovery progress block"
         );
         Ok(())
     }
@@ -2602,6 +2715,113 @@ mod tests {
             progress_payload(&marker)?.backends,
             vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_shared_publisher_recovers_generation_and_discards_old_queue() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        let session = service
+            .create_snapshot_session(Duration::from_secs(300))
+            .await?
+            .ok_or_else(|| anyhow!("expected initial snapshot session"))?;
+
+        writer.fail_next_appends(100).await;
+        let failed_update = service
+            .cache
+            .apply_update(&native_only_update(11, "native-2"))
+            .await?;
+        assert!(publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(failed_update))
+            .await
+            .is_err());
+        writer.expire_active_writer().await;
+        service
+            .mark_stream_disconnected("shared_publisher_paused", None)
+            .await;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        publisher
+            .begin_recovery(&[BroadcasterBackend::Native], Arc::clone(&cancelled))
+            .await;
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(native_buffer_update(12)?))
+            .await?;
+        assert_eq!(publisher.pending_recovery_payload_stats().await.0, 1);
+
+        let pause_epoch = service.shared_publisher_pause_epoch();
+        let pause_task = tokio::spawn({
+            let publisher = Arc::clone(&publisher);
+            async move { publisher.pause_feeds_until_writer_verified().await }
+        });
+        service
+            .wait_for_shared_publisher_pause_after(pause_epoch)
+            .await;
+        let boundary = BroadcasterServiceState::recover_shared_publisher_when_paused(
+            std::slice::from_ref(&service),
+            "active_writer_recovered",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("paused unhealthy publisher should recover"))?;
+        timeout(Duration::from_secs(1), pause_task)
+            .await
+            .map_err(|_| anyhow!("feed pause did not observe the recovered writer"))?
+            .map_err(|error| anyhow!("feed pause task failed: {error}"))??;
+
+        assert_eq!(boundary.generation, 2);
+        assert_eq!(boundary.stream_id, "chain-1-stream-2");
+        assert_eq!(publisher.pending_recovery_payload_stats().await.0, 0);
+        assert!(!publisher.feeds_are_paused());
+        assert!(!service.has_current_snapshot_artifact().await);
+        assert_eq!(
+            service.status_snapshot().await.snapshot.stream_id,
+            boundary.stream_id
+        );
+        service.cache.reset_same_generation().await;
+        service
+            .cache
+            .apply_update(&native_only_update(13, "native-3"))
+            .await?;
+        service.mark_upstream_connected().await;
+        service.upstream.record_update().await;
+        let status = service.status_snapshot().await;
+        assert_eq!(status.readiness, BroadcasterReadiness::SnapshotUnexportable);
+        assert!(!status.snapshot.exportable);
+
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        let status = service.status_snapshot().await;
+        assert_eq!(status.readiness, BroadcasterReadiness::Ready);
+        assert!(status.snapshot.exportable);
+        assert!(matches!(
+            service
+                .snapshot_session_payload(session.session_id, 0)
+                .await,
+            Err(SnapshotSessionError::NotFound)
+        ));
         Ok(())
     }
 
@@ -3325,6 +3545,10 @@ mod tests {
         async fn delay_recovery_commit(&self, delay: Duration) {
             self.inner.lock().await.recovery_commit_delay = Some(delay);
         }
+
+        async fn expire_active_writer(&self) {
+            self.inner.lock().await.active_token = None;
+        }
     }
 
     impl RedisStreamWriter for ServiceFakeRedisWriter {
@@ -3379,14 +3603,13 @@ mod tests {
                     tokio::time::sleep(delay).await;
                 }
                 let mut guard = self.inner.lock().await;
-                if guard.active_token.is_some()
-                    && (guard.active_token.as_deref() != Some(command.writer_token)
-                        || guard.active_generation != command.generation)
+                if guard.active_token.is_none() {
+                    return Err(anyhow!("missing Redis broadcaster writer fence"));
+                }
+                if guard.active_token.as_deref() != Some(command.writer_token)
+                    || guard.active_generation != command.generation
                 {
                     return Err(anyhow!("stale Redis broadcaster writer token"));
-                }
-                if guard.active_token.is_none() {
-                    guard.active_generation = guard.active_generation.max(command.generation);
                 }
                 if guard.fail_next_appends > 0 {
                     guard.fail_next_appends -= 1;
@@ -3416,9 +3639,11 @@ mod tests {
         ) -> futures::future::BoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 let guard = self.inner.lock().await;
-                if guard.active_token.is_some()
-                    && (guard.active_token.as_deref() != Some(command.writer_token)
-                        || guard.active_generation != command.generation)
+                if guard.active_token.is_none() {
+                    return Err(anyhow!("missing Redis broadcaster writer fence"));
+                }
+                if guard.active_token.as_deref() != Some(command.writer_token)
+                    || guard.active_generation != command.generation
                 {
                     return Err(anyhow!("stale Redis broadcaster writer token"));
                 }
@@ -3486,6 +3711,7 @@ mod tests {
             stream_id,
             snapshot_id,
             1,
+            0,
             0,
         )
         .unwrap_or_else(|_| unreachable!("valid replay boundary"))
@@ -3562,6 +3788,19 @@ mod tests {
 
     fn raw_feed(number: u64, hash: u8, parent_hash: u8) -> FeedMessage<BlockHeader> {
         raw_feed_with_account_payload(number, hash, parent_hash, "test".to_string())
+    }
+
+    fn partial_raw_feed(number: u64, hash: u8, parent_hash: u8) -> FeedMessage<BlockHeader> {
+        let mut feed = raw_feed(number, hash, parent_hash);
+        for message in feed.state_msgs.values_mut() {
+            message.header.partial_block_index = Some(0);
+        }
+        for sync_state in feed.sync_states.values_mut() {
+            if let SynchronizerState::Ready(header) = sync_state {
+                header.partial_block_index = Some(0);
+            }
+        }
+        feed
     }
 
     fn raw_feed_with_account_payload(

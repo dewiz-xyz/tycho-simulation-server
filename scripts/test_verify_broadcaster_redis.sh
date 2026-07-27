@@ -19,7 +19,7 @@ TYCHO_BROADCASTER_URL=https://broadcaster.example/prod/base
 [[ "$(derive_status_url)" == "https://broadcaster.example/prod/base/status" ]]
 unset TYCHO_BROADCASTER_URL
 
-status_body='{"status":"ready","chain_id":8453,"redis_publisher":{"healthy":true,"mode":"active","stream_key":"dsolver:broadcaster:local:8453:events","stream_id":"chain-8453-stream-2","snapshot_id":"chain-8453-snapshot-2","replay_boundary":{"streamKey":"dsolver:broadcaster:local:8453:events","streamId":"chain-8453-stream-2","snapshotId":"chain-8453-snapshot-2","generation":2,"exclusiveMessageSeq":14}}}'
+status_body='{"status":"ready","chain_id":8453,"redis_publisher":{"healthy":true,"mode":"active","stream_key":"dsolver:broadcaster:local:8453:events","stream_id":"chain-8453-stream-2","snapshot_id":"chain-8453-snapshot-2","replay_boundary":{"streamKey":"dsolver:broadcaster:local:8453:events","streamId":"chain-8453-stream-2","snapshotId":"chain-8453-snapshot-2","generation":2,"exclusiveMessageSeq":14,"stateVersion":562949953421314}}}'
 boundary_json="$(extract_replay_boundary "$status_body")"
 [[ "$(boundary_entry_id "$boundary_json")" == "2-14" ]]
 [[ "$(post_boundary_entry_id "$boundary_json")" == "2-15" ]]
@@ -31,6 +31,11 @@ fi
 
 if extract_replay_boundary "${status_body/exclusiveMessageSeq/missingMessageSeq}" >/dev/null 2>&1; then
   echo "expected missing exclusiveMessageSeq to fail replay boundary parsing" >&2
+  exit 1
+fi
+
+if extract_replay_boundary "${status_body/stateVersion/missingStateVersion}" >/dev/null 2>&1; then
+  echo "expected missing stateVersion to fail replay boundary parsing" >&2
   exit 1
 fi
 
@@ -69,7 +74,7 @@ simulator_status_body() {
   local transport_error="${9:-null}"
 
   cat <<JSON
-{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_replay_checkpoint":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason,"redis_transport_status":$transport_status,"redis_transport_retry_count":0,"redis_transport_last_error":$transport_error}}}}
+{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq,"stateVersion":562949953421314},"redis_replay_checkpoint":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason,"redis_transport_status":$transport_status,"redis_transport_retry_count":0,"redis_transport_last_error":$transport_error}}}}
 JSON
 }
 

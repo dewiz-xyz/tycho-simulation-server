@@ -22,6 +22,8 @@ pub struct BroadcasterRedisStreamEntry {
     pub stream_id: String,
     #[serde(with = "u64_string")]
     pub message_seq: u64,
+    #[serde(with = "u64_string")]
+    pub state_version: u64,
     pub kind: BroadcasterMessageKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
@@ -53,6 +55,7 @@ pub struct BroadcasterRedisReplayBoundary {
     pub snapshot_id: String,
     pub generation: u64,
     pub exclusive_message_seq: u64,
+    pub state_version: u64,
 }
 
 impl BroadcasterRedisReplayBoundary {
@@ -62,6 +65,7 @@ impl BroadcasterRedisReplayBoundary {
         snapshot_id: impl Into<String>,
         generation: u64,
         exclusive_message_seq: u64,
+        state_version: u64,
     ) -> Result<Self, BroadcasterContractError> {
         Ok(Self {
             stream_key: required_redis_field("stream_key", stream_key.into())?,
@@ -69,6 +73,7 @@ impl BroadcasterRedisReplayBoundary {
             snapshot_id: required_redis_field("snapshot_id", snapshot_id.into())?,
             generation: redis_boundary_generation(generation)?,
             exclusive_message_seq,
+            state_version,
         })
     }
 
@@ -91,6 +96,7 @@ impl<'de> Deserialize<'de> for BroadcasterRedisReplayBoundary {
             snapshot_id: String,
             generation: u64,
             exclusive_message_seq: u64,
+            state_version: u64,
         }
 
         let wire = WireBoundary::deserialize(deserializer)?;
@@ -100,6 +106,7 @@ impl<'de> Deserialize<'de> for BroadcasterRedisReplayBoundary {
             wire.snapshot_id,
             wire.generation,
             wire.exclusive_message_seq,
+            wire.state_version,
         )
         .map_err(de::Error::custom)?;
         Ok(boundary)
@@ -110,14 +117,16 @@ impl BroadcasterRedisStreamEntry {
     pub fn from_envelope(
         chain_id: u64,
         envelope: &BroadcasterEnvelope,
+        state_version: u64,
     ) -> Result<Self, BroadcasterContractError> {
-        Self::from_envelope_at(chain_id, envelope, 0)
+        Self::from_envelope_at(chain_id, envelope, 0, state_version)
     }
 
     pub fn from_envelope_at(
         chain_id: u64,
         envelope: &BroadcasterEnvelope,
         published_at_ms: u64,
+        state_version: u64,
     ) -> Result<Self, BroadcasterContractError> {
         ensure_redis_delta_kind(envelope.kind())?;
         let backends = redis_payload_backend_scope(&envelope.payload)?.unwrap_or_default();
@@ -131,6 +140,7 @@ impl BroadcasterRedisStreamEntry {
             chain_id,
             stream_id: required_redis_field("stream_id", envelope.stream_id.clone())?,
             message_seq: envelope.message_seq,
+            state_version,
             kind: envelope.kind(),
             snapshot_id: redis_payload_snapshot_id(&envelope.payload).map(str::to_string),
             backend_scope: redis_backend_scope(backends)?,
@@ -183,6 +193,7 @@ impl BroadcasterRedisStreamEntry {
         }
         ensure_redis_payload_block_number(self.block_number, &envelope.payload)?;
         ensure_redis_payload_observed_timestamp_ms(self.observed_timestamp_ms, &envelope.payload)?;
+        ensure_redis_payload_state_version(self.state_version, &envelope.payload)?;
         Ok(())
     }
 }
@@ -201,6 +212,8 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             stream_id: String,
             #[serde(with = "u64_string")]
             message_seq: u64,
+            #[serde(with = "u64_string")]
+            state_version: u64,
             kind: BroadcasterMessageKind,
             #[serde(default)]
             snapshot_id: Option<String>,
@@ -220,6 +233,7 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             chain_id: wire.chain_id,
             stream_id: wire.stream_id,
             message_seq: wire.message_seq,
+            state_version: wire.state_version,
             kind: wire.kind,
             snapshot_id: wire.snapshot_id,
             backend_scope: wire.backend_scope,
@@ -524,6 +538,34 @@ fn redis_payload_chain_id(payload: &BroadcasterPayload) -> Option<u64> {
     }
 }
 
+fn ensure_redis_payload_state_version(
+    state_version: u64,
+    payload: &BroadcasterPayload,
+) -> Result<(), BroadcasterContractError> {
+    let target_state_version = match payload {
+        BroadcasterPayload::RecoveryStart(start) => Some(start.manifest.target_state_version),
+        BroadcasterPayload::RecoveryChunk(chunk) => Some(chunk.target_state_version),
+        BroadcasterPayload::RecoveryCatchUp(catch_up) => Some(catch_up.target_state_version),
+        BroadcasterPayload::RecoveryCommit(commit) => Some(commit.target_state_version),
+        BroadcasterPayload::Update(_)
+        | BroadcasterPayload::Heartbeat(_)
+        | BroadcasterPayload::Progress(_)
+        | BroadcasterPayload::SnapshotStart(_)
+        | BroadcasterPayload::SnapshotChunk(_)
+        | BroadcasterPayload::SnapshotEnd(_) => None,
+    };
+    if target_state_version.is_none_or(|target| target == state_version) {
+        Ok(())
+    } else {
+        Err(BroadcasterContractError::RedisPayloadJsonInvalid {
+            message: format!(
+                "Redis entry state_version {state_version} does not match recovery target {}",
+                target_state_version.unwrap_or_default()
+            ),
+        })
+    }
+}
+
 fn redis_payload_backend_scope(
     payload: &BroadcasterPayload,
 ) -> Result<Option<Vec<BroadcasterBackend>>, BroadcasterContractError> {
@@ -798,7 +840,7 @@ mod tests {
     #[test]
     fn redis_stream_entry_records_explicit_publication_time() -> Result<()> {
         let envelope = update_envelope("stream-1", 4)?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope_at(8453, &envelope, 1234)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope_at(8453, &envelope, 1234, 7)?;
 
         assert_eq!(entry.published_at_ms, 1234);
         assert_eq!(serde_json::to_value(entry)?["published_at_ms"], "1234");
@@ -812,6 +854,7 @@ mod tests {
             "chain_id": "8453",
             "stream_id": "stream-1",
             "message_seq": "1",
+            "state_version": "1",
             "kind": "update",
             "backend_scope": "native",
             "published_at_ms": "1"
@@ -821,6 +864,19 @@ mod tests {
 
         assert!(error.to_string().contains("missing field `payload_json`"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_deserialization_requires_state_version() -> Result<()> {
+        let mut value = redis_entry_value(&update_envelope("stream-1", 2)?)?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("redis entry should encode as object"))?
+            .remove("state_version");
+
+        let error = redis_entry_decode_error(value, "redis entry without state_version")?;
+        assert!(error.to_string().contains("state_version"));
         Ok(())
     }
 
@@ -1057,6 +1113,7 @@ mod tests {
             "chain-8453-snapshot-7",
             7,
             42,
+            99,
         )?;
 
         let value = serde_json::to_value(&boundary)?;
@@ -1069,6 +1126,7 @@ mod tests {
                 "snapshotId": "chain-8453-snapshot-7",
                 "generation": 7,
                 "exclusiveMessageSeq": 42,
+                "stateVersion": 99,
             })
         );
         assert_eq!(boundary.exclusive_entry_id(), "7-42");
@@ -1087,6 +1145,7 @@ mod tests {
             "generation": 7,
             "exclusiveEntryId": "7-99",
             "exclusiveMessageSeq": 42,
+            "stateVersion": 99,
         });
 
         let Err(error) = serde_json::from_value::<BroadcasterRedisReplayBoundary>(value) else {
@@ -1099,10 +1158,28 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn redis_replay_boundary_requires_state_version() -> Result<()> {
+        let value = serde_json::json!({
+            "streamKey": "dsolver:broadcaster:prod-base:8453:events",
+            "streamId": "chain-8453-stream-7",
+            "snapshotId": "chain-8453-snapshot-7",
+            "generation": 7,
+            "exclusiveMessageSeq": 42,
+        });
+
+        let error = serde_json::from_value::<BroadcasterRedisReplayBoundary>(value)
+            .err()
+            .ok_or_else(|| anyhow!("replay boundary without stateVersion must fail"))?;
+
+        assert!(error.to_string().contains("stateVersion"));
+        Ok(())
+    }
+
     fn redis_entry(
         envelope: &BroadcasterEnvelope,
     ) -> Result<BroadcasterRedisStreamEntry, BroadcasterContractError> {
-        BroadcasterRedisStreamEntry::from_envelope(8453, envelope)
+        BroadcasterRedisStreamEntry::from_envelope(8453, envelope, envelope.message_seq)
     }
 
     fn redis_entry_value(envelope: &BroadcasterEnvelope) -> Result<serde_json::Value> {

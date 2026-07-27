@@ -697,6 +697,13 @@ impl BroadcasterUpdateMessage {
 
         Self::new(partitions)
     }
+
+    pub fn complete_native_block(&self) -> Option<u64> {
+        self.partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Native)
+            .and_then(BroadcasterUpdatePartition::complete_native_block)
+    }
 }
 
 fn sync_state_block_number(state: &SynchronizerState) -> Option<u64> {
@@ -767,6 +774,18 @@ impl BroadcasterUpdatePartition {
         }
     }
 
+    pub fn complete_native_block(&self) -> Option<u64> {
+        (self.backend == BroadcasterBackend::Native)
+            .then(|| {
+                complete_broadcaster_partition_block(
+                    self.block_number,
+                    &self.messages,
+                    &self.sync_statuses,
+                )
+            })
+            .flatten()
+    }
+
     fn is_empty(&self) -> bool {
         self.messages.is_empty()
             && self.new_pairs.is_empty()
@@ -774,6 +793,60 @@ impl BroadcasterUpdatePartition {
             && self.removed_pairs.is_empty()
             && self.sync_statuses.is_empty()
     }
+}
+
+pub fn complete_broadcaster_partition_block(
+    block_number: u64,
+    messages: &[BroadcasterProtocolMessage],
+    sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+) -> Option<u64> {
+    if messages.is_empty() && sync_statuses.is_empty() {
+        return None;
+    }
+
+    let mut expected_hash: Option<Bytes> = None;
+    let mut observe = |number: u64, hash: &Bytes, partial_block_index: Option<u32>| {
+        if number != block_number || partial_block_index.is_some() {
+            return false;
+        }
+        match expected_hash {
+            Some(ref expected) => expected == hash,
+            None => {
+                expected_hash = Some(hash.clone());
+                true
+            }
+        }
+    };
+
+    for message in messages {
+        if !observe(
+            message.message.header.number,
+            &message.message.header.hash,
+            message.message.header.partial_block_index,
+        ) {
+            return None;
+        }
+        let SynchronizerState::Ready(sync_header) = &message.sync_state else {
+            return None;
+        };
+        if !observe(
+            sync_header.number,
+            &sync_header.hash,
+            sync_header.partial_block_index,
+        ) {
+            return None;
+        }
+    }
+    for status in sync_statuses.values() {
+        if status.kind != BroadcasterProtocolSyncStatusKind::Ready {
+            return None;
+        }
+        let block = status.block.as_ref()?;
+        if !observe(block.number, &block.hash, block.partial_block_index) {
+            return None;
+        }
+    }
+    Some(block_number)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2794,6 +2867,7 @@ mod tests {
                 "snapshot-1",
                 1,
                 7,
+                11,
             )?,
             payload_count: 4,
             snapshot_chunk_count: 2,
@@ -3232,6 +3306,7 @@ mod tests {
             "snapshot-1".to_string(),
             1,
             99,
+            0,
         )?;
         tracker.align_live_replay_boundary(&boundary)?;
 

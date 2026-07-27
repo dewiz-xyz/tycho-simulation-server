@@ -6,7 +6,8 @@ use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
 use crate::broadcaster::redis_publisher::{
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, TokioRedisStreamWriter,
+    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
+    TokioRedisStreamWriter,
 };
 use crate::broadcaster::service::{BroadcasterServiceState, SnapshotSessionError};
 use crate::broadcaster::state::{
@@ -15,7 +16,7 @@ use crate::broadcaster::state::{
 };
 use crate::config::{
     init_logging, load_broadcaster_config, load_broadcaster_redis_config, BroadcasterConfig,
-    MemoryConfig, NATIVE_PROGRESS_LEASE_SECS,
+    MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_broadcaster_health_snapshot;
@@ -203,50 +204,55 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         .map(|_| BroadcasterUpstreamState::default());
     let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
     let recovery_retry_backoff = Duration::from_millis(config.stream_restart_backoff_min_ms);
-    let raw_service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff(
+    let native_progress_lease =
+        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
+    let raw_service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
         config.tuning.snapshot_max_payload_bytes,
         raw_cache,
         raw_upstream_state,
         Arc::clone(&redis_publisher),
         Arc::clone(&publication_gate),
         recovery_retry_backoff,
+        native_progress_lease,
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
     let mut supervisors = Vec::new();
 
-    let rfq_service =
-        if let (Some(rfq_cache), Some(rfq_upstream_state)) = (rfq_cache, rfq_upstream_state) {
-            let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff(
-                config.tuning.snapshot_max_payload_bytes,
-                rfq_cache,
-                rfq_upstream_state,
-                Arc::clone(&redis_publisher),
-                Arc::clone(&publication_gate),
-                recovery_retry_backoff,
-            );
-            let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
-                tokens: Arc::clone(&tokens),
-                chain,
-                token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
-                protocols: &config.chain_profile.rfq_protocols,
-                bebop_url: &config.bebop_url,
-                hashflow_filename: &config.hashflow_filename,
-                liquorice_url: config.liquorice_url.as_deref(),
-                liquorice_user: &config.liquorice_user,
-                liquorice_key: &config.liquorice_key,
-            })
-            .await?;
-            supervisors.push(spawn_broadcaster_rfq_stream_task(
-                &config,
-                supervisor_cfg.clone(),
-                service.clone(),
-                rfq_token_stores,
-            ));
-            Some(service)
-        } else {
-            None
-        };
+    let rfq_service = if let (Some(rfq_cache), Some(rfq_upstream_state)) =
+        (rfq_cache, rfq_upstream_state)
+    {
+        let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
+            config.tuning.snapshot_max_payload_bytes,
+            rfq_cache,
+            rfq_upstream_state,
+            Arc::clone(&redis_publisher),
+            Arc::clone(&publication_gate),
+            recovery_retry_backoff,
+            native_progress_lease,
+        );
+        let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
+            tokens: Arc::clone(&tokens),
+            chain,
+            token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
+            protocols: &config.chain_profile.rfq_protocols,
+            bebop_url: &config.bebop_url,
+            hashflow_filename: &config.hashflow_filename,
+            liquorice_url: config.liquorice_url.as_deref(),
+            liquorice_user: &config.liquorice_user,
+            liquorice_key: &config.liquorice_key,
+        })
+        .await?;
+        supervisors.push(spawn_broadcaster_rfq_stream_task(
+            &config,
+            supervisor_cfg.clone(),
+            service.clone(),
+            rfq_token_stores,
+        ));
+        Some(service)
+    } else {
+        None
+    };
     let generation_services = match &rfq_service {
         Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
         None => vec![raw_service.clone()],
@@ -388,7 +394,7 @@ fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
 
 fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(NATIVE_PROGRESS_LEASE_SECS),
+        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -517,11 +523,42 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
+        let mut refreshing_recovered_snapshot = false;
         loop {
             ticker.tick().await;
-            match BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
-                .await
-            {
+            let mode = services[0].publisher_mode().await;
+            let result = match mode {
+                BroadcasterRedisPublisherMode::Passive => {
+                    BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
+                        .await
+                }
+                BroadcasterRedisPublisherMode::Unhealthy => {
+                    BroadcasterServiceState::recover_shared_publisher_when_paused(
+                        &services,
+                        "active_writer_recovered",
+                    )
+                    .await
+                }
+                BroadcasterRedisPublisherMode::Active => {
+                    if refreshing_recovered_snapshot {
+                        if let Err(error) =
+                            BroadcasterServiceState::run_snapshot_export_preflight(&services).await
+                        {
+                            info!(
+                                error = %error,
+                                "Recovered broadcaster snapshot refresh is not ready"
+                            );
+                        }
+                        if services[0].has_current_snapshot_artifact().await {
+                            refreshing_recovered_snapshot = false;
+                            info!("Recovered broadcaster snapshot artifact is ready");
+                        }
+                    }
+                    continue;
+                }
+                BroadcasterRedisPublisherMode::Retired => return,
+            };
+            match result {
                 Ok(Some(boundary)) => {
                     info!(
                         stream_id = boundary.stream_id.as_str(),
@@ -529,7 +566,8 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
                         generation = boundary.generation,
                         "Broadcaster active writer promoted"
                     );
-                    return;
+                    refreshing_recovered_snapshot =
+                        mode == BroadcasterRedisPublisherMode::Unhealthy;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -573,6 +611,7 @@ mod tests {
                 native_protocols: vec!["uniswap_v2".to_string()],
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec!["rfq:bebop".to_string()],
+                native_progress_lease_secs: 25,
                 native_token_protocol_allowlist: Vec::new(),
                 reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),

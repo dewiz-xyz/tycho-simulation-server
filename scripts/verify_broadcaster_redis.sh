@@ -140,7 +140,7 @@ for field in string_fields:
     if not isinstance(value, str) or not value:
         raise SystemExit(f"broadcaster replay_boundary is missing {field}")
 
-for field in ["generation", "exclusiveMessageSeq"]:
+for field in ["generation", "exclusiveMessageSeq", "stateVersion"]:
     value = boundary.get(field)
     if not isinstance(value, int) or value < 0:
         raise SystemExit(f"broadcaster replay_boundary has invalid {field}")
@@ -260,7 +260,14 @@ for kind, backend in sorted(backends.items()):
     boundary = subscription.get("redis_replay_boundary")
     if not isinstance(boundary, dict):
         raise SystemExit(f"simulator /status backend {kind} has no redis_replay_boundary")
-    for field in ["streamKey", "streamId", "snapshotId", "generation", "exclusiveMessageSeq"]:
+    for field in [
+        "streamKey",
+        "streamId",
+        "snapshotId",
+        "generation",
+        "exclusiveMessageSeq",
+        "stateVersion",
+    ]:
         if field not in boundary:
             raise SystemExit(f"simulator /status backend {kind} replay boundary is missing {field}")
     checkpoint = subscription.get("redis_replay_checkpoint")

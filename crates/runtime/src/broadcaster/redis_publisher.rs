@@ -1,5 +1,6 @@
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +10,7 @@ use futures::future::BoxFuture;
 use rand::Rng;
 use redis::streams::StreamRangeReply;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
@@ -34,6 +35,7 @@ pub(crate) const RECOVERY_REDIS_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SNAPSHOT_HTTP_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LIVE_REDIS_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECOVERY_FRAGMENT_TARGET_BYTES: usize = 3_500_000;
+const RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS: usize = 64;
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
 
 // Redis has no native "check active writer, then XADD" command. These small Lua
@@ -49,15 +51,19 @@ local expected_writer_token = ARGV[4]
 local expected_generation = ARGV[5]
 local normal_marker_field_count = tonumber(ARGV[6] or "0")
 
--- A writer replacement may advance the generation only while it owns the
--- current fence. Initial promotion passes no expectation and claims the next
--- Redis generation.
+-- Recovery may reclaim an expired fence, but it must never displace another
+-- writer or reuse a generation after Redis lost its in-memory keys.
 if expected_writer_token ~= "" then
-  if redis.call("GET", writer_key) ~= expected_writer_token then
+  local current_writer_token = redis.call("GET", writer_key)
+  local current_generation = tostring(redis.call("GET", generation_key) or "")
+  if current_writer_token and current_writer_token ~= expected_writer_token then
     return redis.error_reply("stale Redis broadcaster writer token")
   end
-  if tostring(redis.call("GET", generation_key) or "") ~= expected_generation then
+  if current_generation ~= "" and current_generation ~= expected_generation then
     return redis.error_reply("stale Redis broadcaster writer generation")
+  end
+  if current_generation == "" then
+    redis.call("SET", generation_key, expected_generation)
   end
 end
 
@@ -124,10 +130,18 @@ local entry_id = ARGV[5]
 
 -- This is the actual fence. A separate GET before XADD would still leave a
 -- race, so the ownership check and append stay in the same script.
-if redis.call("GET", writer_key) ~= writer_token then
+local current_writer_token = redis.call("GET", writer_key)
+if not current_writer_token then
+  return redis.error_reply("missing Redis broadcaster writer fence")
+end
+if current_writer_token ~= writer_token then
   return redis.error_reply("stale Redis broadcaster writer token")
 end
-if tostring(redis.call("GET", generation_key) or "") ~= generation then
+local current_generation = tostring(redis.call("GET", generation_key) or "")
+if current_generation == "" then
+  return redis.error_reply("missing Redis broadcaster writer generation")
+end
+if current_generation ~= generation then
   return redis.error_reply("stale Redis broadcaster writer generation")
 end
 
@@ -148,10 +162,18 @@ return redis.call(unpack(command))
 "#;
 
 const RENEW_WRITER_SCRIPT: &str = r#"
-if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+local current_writer_token = redis.call("GET", KEYS[1])
+if not current_writer_token then
+  return redis.error_reply("missing Redis broadcaster writer fence")
+end
+if current_writer_token ~= ARGV[1] then
   return redis.error_reply("stale Redis broadcaster writer token")
 end
-if tostring(redis.call("GET", KEYS[2]) or "") ~= ARGV[2] then
+local current_generation = tostring(redis.call("GET", KEYS[2]) or "")
+if current_generation == "" then
+  return redis.error_reply("missing Redis broadcaster writer generation")
+end
+if current_generation ~= ARGV[2] then
   return redis.error_reply("stale Redis broadcaster writer generation")
 end
 redis.call("PEXPIRE", KEYS[1], ARGV[3])
@@ -159,10 +181,18 @@ return "OK"
 "#;
 
 const VERIFY_WRITER_SCRIPT: &str = r#"
-if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+local current_writer_token = redis.call("GET", KEYS[1])
+if not current_writer_token then
+  return redis.error_reply("missing Redis broadcaster writer fence")
+end
+if current_writer_token ~= ARGV[1] then
   return redis.error_reply("stale Redis broadcaster writer token")
 end
-if tostring(redis.call("GET", KEYS[2]) or "") ~= ARGV[2] then
+local current_generation = tostring(redis.call("GET", KEYS[2]) or "")
+if current_generation == "" then
+  return redis.error_reply("missing Redis broadcaster writer generation")
+end
+if current_generation ~= ARGV[2] then
   return redis.error_reply("stale Redis broadcaster writer generation")
 end
 return "OK"
@@ -204,7 +234,6 @@ pub struct BroadcasterRedisPublisherConfig {
 #[derive(Debug)]
 pub(crate) struct BroadcasterRecoveryTransaction {
     pub(crate) recovery_id: String,
-    pub(crate) target_state_version: u64,
     pub(crate) backends: Vec<BroadcasterBackend>,
     pub(crate) replacement_json: String,
     pub(crate) buffer_a: Vec<BroadcasterUpdateMessage>,
@@ -602,6 +631,11 @@ pub struct BroadcasterRedisPublisher {
     writer_generation_key: String,
     writer_token: String,
     inner: Arc<Mutex<BroadcasterRedisPublisherState>>,
+    recovery_gate: Arc<Mutex<PublisherRecoveryGate>>,
+    recovery_coordinator: Arc<Mutex<()>>,
+    next_recovery_id: Arc<AtomicU64>,
+    feed_gate: watch::Sender<FeedGateState>,
+    feed_pause_guard: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for BroadcasterRedisPublisher {
@@ -660,11 +694,34 @@ struct BroadcasterRedisPublisherState {
     stream_id: String,
     snapshot_id: String,
     next_message_seq: u64,
+    committed_state_version: u64,
+    next_state_version: u64,
     latest_entry_id: Option<String>,
     append_success_count: u64,
     append_failure_count: u64,
     retry_exhaustion_count: u64,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PublisherRecoveryGate {
+    open_recovery_id: Option<String>,
+    cancelled: Option<Arc<AtomicBool>>,
+    complete_native_blocks: HashSet<u64>,
+    pending_payloads: VecDeque<QueuedPublisherPayload>,
+    max_pending_payloads: usize,
+}
+
+#[derive(Debug)]
+struct QueuedPublisherPayload {
+    payload: BroadcasterPayload,
+    accepted_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FeedGateState {
+    pause_epoch: u64,
+    paused: bool,
 }
 
 impl BroadcasterRedisPublisherState {
@@ -698,8 +755,18 @@ impl BroadcasterRedisPublisherState {
         self.stream_id = format_redis_stream_id(chain_id, self.generation);
         self.snapshot_id = format_redis_snapshot_id(chain_id, self.generation);
         self.next_message_seq = 2;
+        self.committed_state_version = state_version_base(generation);
+        self.next_state_version = self.committed_state_version;
         self.latest_entry_id = Some(format!("{}-1", self.generation));
         self.last_error = None;
+    }
+
+    fn allocate_state_version(&mut self) -> Result<u64> {
+        self.next_state_version = self
+            .next_state_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Redis broadcaster state version overflow"))?;
+        Ok(self.next_state_version)
     }
 }
 
@@ -721,6 +788,8 @@ impl BroadcasterRedisPublisher {
         let snapshot_id = format_redis_snapshot_id(config.chain_id, generation);
         let writer_key = redis_writer_key(&config.stream_key);
         let writer_generation_key = redis_writer_generation_key(&config.stream_key);
+        let (feed_gate, _) = watch::channel(FeedGateState::default());
+        let initial_state_version = state_version_base(generation);
         Self {
             config,
             writer,
@@ -733,17 +802,71 @@ impl BroadcasterRedisPublisher {
                 stream_id,
                 snapshot_id,
                 next_message_seq: 1,
+                committed_state_version: initial_state_version,
+                next_state_version: initial_state_version,
                 latest_entry_id: None,
                 append_success_count: 0,
                 append_failure_count: 0,
                 retry_exhaustion_count: 0,
                 last_error: None,
             })),
+            recovery_gate: Arc::new(Mutex::new(PublisherRecoveryGate::default())),
+            recovery_coordinator: Arc::new(Mutex::new(())),
+            next_recovery_id: Arc::new(AtomicU64::new(1)),
+            feed_gate,
+            feed_pause_guard: Arc::new(Mutex::new(())),
         }
     }
 
+    pub(crate) async fn begin_recovery(
+        &self,
+        backends: &[BroadcasterBackend],
+        cancelled: Arc<AtomicBool>,
+    ) -> String {
+        // A new reservation cannot supersede a transaction whose commit may still land.
+        let _coordinator = self.recovery_coordinator.lock().await;
+        let recovery_sequence = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
+        let recovery_id = format!("recovery-{recovery_sequence}");
+        let mut gate = self.recovery_gate.lock().await;
+        if gate.open_recovery_id.is_none() {
+            gate.max_pending_payloads = 0;
+        } else {
+            trim_queued_target_backends(&mut gate.pending_payloads, backends);
+        }
+        gate.complete_native_blocks = queued_complete_native_blocks(&gate.pending_payloads);
+        if gate.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS {
+            cancelled.store(true, Ordering::Release);
+        }
+        gate.open_recovery_id = Some(recovery_id.clone());
+        gate.cancelled = Some(cancelled);
+        recovery_id
+    }
+
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
+        let mut recovery_gate = self.recovery_gate.lock().await;
+        if recovery_gate.open_recovery_id.is_some() {
+            if let Some(block_number) = complete_native_block(&payload) {
+                recovery_gate.complete_native_blocks.insert(block_number);
+                if recovery_gate.complete_native_blocks.len() >= RECOVERY_MAX_BUFFERED_NATIVE_BLOCKS
+                {
+                    if let Some(cancelled) = &recovery_gate.cancelled {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                }
+            }
+            recovery_gate
+                .pending_payloads
+                .push_back(QueuedPublisherPayload {
+                    payload,
+                    accepted_at: Instant::now(),
+                });
+            recovery_gate.max_pending_payloads = recovery_gate
+                .max_pending_payloads
+                .max(recovery_gate.pending_payloads.len());
+            return Ok(());
+        }
         let mut guard = self.inner.lock().await;
+        drop(recovery_gate);
         match guard.mode {
             BroadcasterRedisPublisherMode::Passive => return Ok(()),
             BroadcasterRedisPublisherMode::Retired => {
@@ -769,7 +892,7 @@ impl BroadcasterRedisPublisher {
         }
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
-        match self.append_payload_locked(&mut guard, payload).await {
+        match self.append_live_payload_locked(&mut guard, payload).await {
             Ok(_) => Ok(()),
             Err(error) => {
                 if error.downcast_ref::<OversizedRedisEntry>().is_some() {
@@ -796,11 +919,20 @@ impl BroadcasterRedisPublisher {
         transaction: BroadcasterRecoveryTransaction,
         cancelled: &AtomicBool,
     ) -> Result<BroadcasterRecoveryPublication> {
+        let _coordinator = self.recovery_coordinator.lock().await;
         ensure_recovery_not_cancelled(cancelled)?;
         let fragments = prepare_recovery_fragments(&transaction.replacement_json)?;
+        let recovery_id = transaction.recovery_id.clone();
+        let recovery_gate = self.recovery_gate.lock().await;
+        anyhow::ensure!(
+            recovery_gate.open_recovery_id.as_deref() == Some(recovery_id.as_str()),
+            "Redis recovery reservation {recovery_id} is no longer active"
+        );
         let mut guard = self.inner.lock().await;
+        drop(recovery_gate);
         ensure_active_publisher(&guard)?;
         ensure_recovery_not_cancelled(cancelled)?;
+        let target_state_version = guard.allocate_state_version()?;
 
         let chunk_count = fragments.len();
         let buffer_a_count = transaction.buffer_a.len();
@@ -813,6 +945,11 @@ impl BroadcasterRedisPublisher {
 
         let mut chunk_entries = Vec::with_capacity(chunk_count);
         let mut chunk_encoded_bytes = Vec::with_capacity(chunk_count);
+        let recovery_scope = RecoveryEntryScope {
+            recovery_id: &recovery_id,
+            target_state_version,
+            backends: &transaction.backends,
+        };
         for (chunk_index, fragment) in fragments.iter().enumerate() {
             let message_seq = guard
                 .next_message_seq
@@ -823,7 +960,7 @@ impl BroadcasterRedisPublisher {
                 &self.config,
                 &guard.stream_id,
                 message_seq,
-                &transaction,
+                recovery_scope,
                 chunk_index,
                 fragment,
             )?;
@@ -833,8 +970,8 @@ impl BroadcasterRedisPublisher {
 
         let replacement_digest = digest_bytes(transaction.replacement_json.as_bytes());
         let manifest = BroadcasterRecoveryManifest::new(
-            transaction.recovery_id.clone(),
-            transaction.target_state_version,
+            recovery_id.clone(),
+            target_state_version,
             transaction.backends.clone(),
             u64::try_from(transaction.replacement_json.len())?,
             chunk_encoded_bytes,
@@ -851,6 +988,7 @@ impl BroadcasterRedisPublisher {
             &guard.stream_id,
             guard.next_message_seq,
             BroadcasterPayload::RecoveryStart(BroadcasterRecoveryStart::new(manifest)?),
+            target_state_version,
         )?;
         ensure_redis_entry_size(&self.config, &start_entry, RECOVERY_REDIS_ENTRY_MAX_BYTES)?;
 
@@ -863,8 +1001,8 @@ impl BroadcasterRedisPublisher {
                 .and_then(|value| value.checked_add(u64::try_from(block_index).ok()?))
                 .ok_or_else(|| anyhow!("Redis broadcaster Buffer A sequence overflow"))?;
             let catch_up = BroadcasterRecoveryCatchUp::new(
-                transaction.recovery_id.clone(),
-                transaction.target_state_version,
+                recovery_id.clone(),
+                target_state_version,
                 u32::try_from(block_index)?,
                 update,
             )?;
@@ -873,14 +1011,15 @@ impl BroadcasterRedisPublisher {
                 &guard.stream_id,
                 message_seq,
                 BroadcasterPayload::RecoveryCatchUp(catch_up),
+                target_state_version,
             )?;
             ensure_redis_entry_size(&self.config, &entry, RECOVERY_REDIS_ENTRY_MAX_BYTES)?;
             buffer_a_entries.push(entry);
         }
 
         let commit = BroadcasterRecoveryCommit::new(
-            transaction.recovery_id.clone(),
-            transaction.target_state_version,
+            recovery_id.clone(),
+            target_state_version,
             transaction.backends.clone(),
             replacement_digest,
             u32::try_from(buffer_a_count)?,
@@ -891,6 +1030,7 @@ impl BroadcasterRedisPublisher {
             &guard.stream_id,
             commit_watermark,
             BroadcasterPayload::RecoveryCommit(commit),
+            target_state_version,
         )?;
         ensure_redis_entry_size(&self.config, &commit_entry, RECOVERY_REDIS_ENTRY_MAX_BYTES)?;
 
@@ -931,11 +1071,13 @@ impl BroadcasterRedisPublisher {
         }
         let commit_entry_id =
             commit_entry_id.ok_or_else(|| anyhow!("Redis recovery committed no entries"))?;
+        guard.committed_state_version = target_state_version;
+        self.drain_pending_payloads_locked(&mut guard).await?;
         let replay_boundary = self.replay_boundary_locked(&guard)?;
 
         Ok(BroadcasterRecoveryPublication {
-            recovery_id: transaction.recovery_id,
-            target_state_version: transaction.target_state_version,
+            recovery_id,
+            target_state_version,
             commit_entry_id,
             replay_boundary,
             encoded_bytes,
@@ -955,7 +1097,20 @@ impl BroadcasterRedisPublisher {
         reason: impl Into<String>,
     ) -> Result<BroadcasterRedisReplayBoundary> {
         let backends = backends_from_base_heads(&base_heads);
-        self.promote_locked(backends, reason.into()).await
+        self.promote_locked(backends, reason.into(), false).await
+    }
+
+    pub(crate) async fn recover_writer(
+        &self,
+        base_heads: Vec<BroadcasterBackendHead>,
+        reason: impl Into<String>,
+    ) -> Result<BroadcasterRedisReplayBoundary> {
+        let backends = backends_from_base_heads(&base_heads);
+        let boundary = self.promote_locked(backends, reason.into(), true).await?;
+        // Everything queued behind the lost generation is superseded by the
+        // fresh upstream replacements built after feeds resume.
+        *self.recovery_gate.lock().await = PublisherRecoveryGate::default();
+        Ok(boundary)
     }
 
     pub async fn renew_lease(&self) -> Result<()> {
@@ -1051,6 +1206,66 @@ impl BroadcasterRedisPublisher {
 
     pub async fn mode(&self) -> BroadcasterRedisPublisherMode {
         self.inner.lock().await.mode
+    }
+
+    pub(crate) fn feeds_are_paused(&self) -> bool {
+        self.feed_gate.borrow().paused
+    }
+
+    pub(crate) fn feed_pause_epoch(&self) -> u64 {
+        self.feed_gate.borrow().pause_epoch
+    }
+
+    pub(crate) async fn wait_for_feed_pause_after(&self, pause_epoch: u64) {
+        let mut feed_gate = self.feed_gate.subscribe();
+        loop {
+            if feed_gate.borrow_and_update().pause_epoch > pause_epoch {
+                return;
+            }
+            if feed_gate.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) async fn wait_for_feeds_resumed(&self) {
+        let mut feed_gate = self.feed_gate.subscribe();
+        while feed_gate.borrow_and_update().paused {
+            if feed_gate.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) async fn pause_feeds_until_writer_verified(&self) -> Result<()> {
+        let _pause_guard = self.feed_pause_guard.lock().await;
+        self.feed_gate.send_modify(|state| {
+            state.pause_epoch = state.pause_epoch.saturating_add(1);
+            state.paused = true;
+        });
+        loop {
+            if self.mode().await == BroadcasterRedisPublisherMode::Retired {
+                return Err(anyhow!(
+                    "Redis broadcaster writer was fenced while feeds were paused"
+                ));
+            }
+            if self.renew_lease().await.is_ok() {
+                self.feed_gate.send_modify(|state| state.paused = false);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub(crate) async fn pending_recovery_payload_stats(&self) -> (usize, usize, Option<u64>) {
+        let gate = self.recovery_gate.lock().await;
+        (
+            gate.pending_payloads.len(),
+            gate.max_pending_payloads,
+            gate.pending_payloads
+                .front()
+                .map(|queued| queued.accepted_at.elapsed().as_millis() as u64),
+        )
     }
 
     pub async fn status_snapshot(&self) -> BroadcasterRedisPublisherStatus {
@@ -1163,15 +1378,21 @@ impl BroadcasterRedisPublisher {
         &self,
         backends: Vec<BroadcasterBackend>,
         reason: String,
+        recovering: bool,
     ) -> Result<BroadcasterRedisReplayBoundary> {
         let mut guard = self.inner.lock().await;
-        if guard.mode == BroadcasterRedisPublisherMode::Retired {
+        if guard.mode == BroadcasterRedisPublisherMode::Retired
+            || (recovering && guard.mode != BroadcasterRedisPublisherMode::Unhealthy)
+        {
             return Err(anyhow!(
-                "Redis broadcaster publisher is retired; this process cannot promote a writer generation"
+                "Redis broadcaster publisher cannot promote a writer generation from mode {}",
+                guard.mode.as_str()
             ));
         }
         let normal_marker_fields =
             generation_marker_template_fields(self.config.chain_id, backends, reason.clone())?;
+        let expected_writer_token = recovering.then_some(self.writer_token.as_str());
+        let expected_generation = recovering.then_some(guard.generation);
         let promotion = self
             .writer
             .promote(RedisPromotionCommand {
@@ -1180,8 +1401,8 @@ impl BroadcasterRedisPublisher {
                 writer_generation_key: &self.writer_generation_key,
                 maxlen: self.config.maxlen,
                 writer_token: &self.writer_token,
-                expected_writer_token: None,
-                expected_generation: None,
+                expected_writer_token,
+                expected_generation,
                 lease_ttl: self.config.writer_lease_ttl,
                 normal_marker_fields: &normal_marker_fields,
             })
@@ -1213,17 +1434,24 @@ impl BroadcasterRedisPublisher {
         self.replay_boundary_locked(&guard)
     }
 
-    async fn append_payload_locked(
+    async fn append_live_payload_locked(
         &self,
         guard: &mut BroadcasterRedisPublisherState,
         payload: BroadcasterPayload,
     ) -> Result<(BroadcasterRedisStreamEntry, String)> {
+        let advances_state = matches!(payload, BroadcasterPayload::Update(_));
+        let state_version = if advances_state {
+            guard.allocate_state_version()?
+        } else {
+            guard.committed_state_version
+        };
         let message_seq = guard.next_message_seq;
         let envelope = BroadcasterEnvelope::new(guard.stream_id.clone(), message_seq, payload);
         let entry = BroadcasterRedisStreamEntry::from_envelope_at(
             self.config.chain_id,
             &envelope,
             current_time_ms(),
+            state_version,
         )?;
         let limit = if matches!(
             entry.kind,
@@ -1238,6 +1466,9 @@ impl BroadcasterRedisPublisher {
         };
         ensure_redis_entry_size(&self.config, &entry, limit)?;
         let entry_id = self.append_entry_locked(guard, entry.clone()).await?;
+        if advances_state {
+            guard.committed_state_version = state_version;
+        }
         debug!(
             event = "redis_stream_append",
             stream_key = self.config.stream_key.as_str(),
@@ -1248,6 +1479,39 @@ impl BroadcasterRedisPublisher {
             "Redis broadcaster stream entry appended"
         );
         Ok((entry, entry_id))
+    }
+
+    async fn drain_pending_payloads_locked(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+    ) -> Result<()> {
+        loop {
+            let queued = {
+                let mut recovery_gate = self.recovery_gate.lock().await;
+                match recovery_gate.pending_payloads.pop_front() {
+                    Some(queued) => queued,
+                    None => {
+                        recovery_gate.open_recovery_id = None;
+                        recovery_gate.cancelled = None;
+                        recovery_gate.complete_native_blocks.clear();
+                        return Ok(());
+                    }
+                }
+            };
+            let payload = normalize_live_payload(queued.payload, &guard.snapshot_id)?;
+            if let Err(error) = self
+                .append_live_payload_locked(guard, payload.clone())
+                .await
+            {
+                self.recovery_gate.lock().await.pending_payloads.push_front(
+                    QueuedPublisherPayload {
+                        payload,
+                        accepted_at: queued.accepted_at,
+                    },
+                );
+                return Err(error);
+            }
+        }
     }
 
     async fn append_entry_locked(
@@ -1289,6 +1553,7 @@ impl BroadcasterRedisPublisher {
             guard.snapshot_id.clone(),
             guard.generation,
             guard.next_message_seq.saturating_sub(1),
+            guard.committed_state_version,
         )
         .map_err(Into::into)
     }
@@ -1373,6 +1638,37 @@ impl BroadcasterRedisPublisher {
     }
 }
 
+fn trim_queued_target_backends(
+    pending_payloads: &mut VecDeque<QueuedPublisherPayload>,
+    backends: &[BroadcasterBackend],
+) {
+    pending_payloads.retain_mut(|queued| {
+        let BroadcasterPayload::Update(update) = &mut queued.payload else {
+            return true;
+        };
+        update
+            .partitions
+            .retain(|partition| !backends.contains(&partition.backend));
+        !update.partitions.is_empty()
+    });
+}
+
+fn queued_complete_native_blocks(
+    pending_payloads: &VecDeque<QueuedPublisherPayload>,
+) -> HashSet<u64> {
+    pending_payloads
+        .iter()
+        .filter_map(|queued| complete_native_block(&queued.payload))
+        .collect()
+}
+
+fn complete_native_block(payload: &BroadcasterPayload) -> Option<u64> {
+    let BroadcasterPayload::Update(update) = payload else {
+        return None;
+    };
+    update.complete_native_block()
+}
+
 fn normalize_live_payload(
     payload: BroadcasterPayload,
     snapshot_id: &str,
@@ -1412,6 +1708,13 @@ struct PreparedRecoveryFragment {
     digest: String,
 }
 
+#[derive(Clone, Copy)]
+struct RecoveryEntryScope<'a> {
+    recovery_id: &'a str,
+    target_state_version: u64,
+    backends: &'a [BroadcasterBackend],
+}
+
 fn prepare_recovery_fragments(replacement_json: &str) -> Result<Vec<PreparedRecoveryFragment>> {
     if replacement_json.is_empty() {
         return Err(anyhow!(
@@ -1447,16 +1750,16 @@ fn build_recovery_chunk_entry(
     config: &BroadcasterRedisPublisherConfig,
     stream_id: &str,
     message_seq: u64,
-    transaction: &BroadcasterRecoveryTransaction,
+    recovery_scope: RecoveryEntryScope<'_>,
     chunk_index: usize,
     fragment: &PreparedRecoveryFragment,
 ) -> Result<(BroadcasterRedisStreamEntry, usize)> {
     let mut encoded_bytes = 1usize;
     for _ in 0..4 {
         let chunk = BroadcasterRecoveryChunk::new(
-            transaction.recovery_id.clone(),
-            transaction.target_state_version,
-            transaction.backends.clone(),
+            recovery_scope.recovery_id.to_string(),
+            recovery_scope.target_state_version,
+            recovery_scope.backends.to_vec(),
             u32::try_from(chunk_index)?,
             u64::try_from(encoded_bytes)?,
             fragment.digest.clone(),
@@ -1467,6 +1770,7 @@ fn build_recovery_chunk_entry(
             stream_id,
             message_seq,
             BroadcasterPayload::RecoveryChunk(chunk),
+            recovery_scope.target_state_version,
         )?;
         let measured = redis_entry_encoded_size(config, &entry)?;
         if measured == encoded_bytes {
@@ -1485,11 +1789,13 @@ fn recovery_entry(
     stream_id: &str,
     message_seq: u64,
     payload: BroadcasterPayload,
+    state_version: u64,
 ) -> Result<BroadcasterRedisStreamEntry> {
     BroadcasterRedisStreamEntry::from_envelope_at(
         chain_id,
         &BroadcasterEnvelope::new(stream_id.to_string(), message_seq, payload),
         current_time_ms(),
+        state_version,
     )
     .map_err(Into::into)
 }
@@ -1603,6 +1909,10 @@ fn format_redis_snapshot_id(chain_id: u64, generation: u64) -> String {
     format!("chain-{chain_id}-snapshot-{generation}")
 }
 
+fn state_version_base(generation: u64) -> u64 {
+    generation.saturating_mul(1u64 << 48)
+}
+
 fn backends_from_base_heads(base_heads: &[BroadcasterBackendHead]) -> Vec<BroadcasterBackend> {
     let mut backends = base_heads
         .iter()
@@ -1623,7 +1933,7 @@ fn generation_marker_template_fields(
     let marker = BroadcasterProgress::new(chain_id, snapshot_id.clone(), backends, reason)?;
     let envelope = BroadcasterEnvelope::new(stream_id, 1, BroadcasterPayload::Progress(marker));
     let entry =
-        BroadcasterRedisStreamEntry::from_envelope_at(chain_id, &envelope, current_time_ms())?;
+        BroadcasterRedisStreamEntry::from_envelope_at(chain_id, &envelope, current_time_ms(), 0)?;
     redis_entry_fields(&entry)
 }
 

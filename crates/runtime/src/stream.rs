@@ -33,6 +33,7 @@ pub enum StreamRestartReason {
     MissingBlock,
     Error,
     Advanced,
+    SharedPublisherPaused,
     Stale,
     Ended,
 }
@@ -43,6 +44,7 @@ impl StreamRestartReason {
             StreamRestartReason::MissingBlock => "missing_block",
             StreamRestartReason::Error => "error",
             StreamRestartReason::Advanced => "advanced",
+            StreamRestartReason::SharedPublisherPaused => "shared_publisher_paused",
             StreamRestartReason::Stale => "stale",
             StreamRestartReason::Ended => "ended",
         }
@@ -109,6 +111,7 @@ pub async fn process_broadcaster_stream(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
+    pause_epoch: u64,
 ) -> StreamExit {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
@@ -119,7 +122,15 @@ pub async fn process_broadcaster_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_stream_message(StreamKind::Broadcaster, &mut stream, &health, &cfg).await {
+        let message = tokio::select! {
+            () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
+                return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
+            }
+            message = next_stream_message(StreamKind::Broadcaster, &mut stream, &health, &cfg) => {
+                message
+            }
+        };
+        match message {
             StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
             StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
             StreamMessage::Error(err_msg) => {
@@ -152,6 +163,7 @@ pub async fn process_broadcaster_raw_stream(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
+    pause_epoch: u64,
 ) -> StreamExit {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
@@ -162,7 +174,15 @@ pub async fn process_broadcaster_raw_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_broadcaster_raw_stream_message(&mut stream, &health, &cfg).await {
+        let message = tokio::select! {
+            () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
+                return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
+            }
+            message = next_broadcaster_raw_stream_message(&mut stream, &health, &cfg) => {
+                message
+            }
+        };
+        match message {
             BroadcasterRawStreamMessage::Stale => {
                 return stream_exit(StreamRestartReason::Stale, None)
             }
@@ -551,6 +571,8 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
+        controls.service.wait_for_shared_publisher_resume().await;
+        let pause_epoch = controls.service.shared_publisher_pause_epoch();
         let stream = match build_stream().await {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
@@ -571,9 +593,14 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
             }
         };
 
-        let exit =
-            process_broadcaster_stream(stream, Arc::clone(&health), cfg.clone(), &controls.service)
-                .await;
+        let exit = process_broadcaster_stream(
+            stream,
+            Arc::clone(&health),
+            cfg.clone(),
+            &controls.service,
+            pause_epoch,
+        )
+        .await;
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
@@ -635,6 +662,8 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
+        controls.service.wait_for_shared_publisher_resume().await;
+        let pause_epoch = controls.service.shared_publisher_pause_epoch();
         let stream = match build_stream().await {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
@@ -660,6 +689,7 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
             Arc::clone(&health),
             cfg.clone(),
             &controls.service,
+            pause_epoch,
         )
         .await;
 
