@@ -280,7 +280,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn deployment_ready_responds_while_publisher_mutex_is_held() -> Result<()> {
         let writer = RpcFakeRedisWriter::healthy();
         let (state, service) = build_state_with_redis_and_service(writer.clone()).await?;
@@ -303,7 +303,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retained_boundary_keeps_readiness_and_session_admission_in_agreement() -> Result<()> {
         let writer = RpcFakeRedisWriter::healthy();
         let state = build_state_with_redis(writer.clone()).await?;
@@ -324,7 +324,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn trimmed_boundary_closes_readiness_and_session_admission() -> Result<()> {
         let writer = RpcFakeRedisWriter::healthy();
         let state = build_state_with_redis(writer.clone()).await?;
@@ -342,7 +342,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn boundary_inspection_error_closes_readiness_and_session_admission() -> Result<()> {
         let writer = RpcFakeRedisWriter::healthy();
         let state = build_state_with_redis(writer.clone()).await?;
