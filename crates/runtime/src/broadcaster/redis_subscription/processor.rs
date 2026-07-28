@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
     evm::engine_db::SHARED_TYCHO_DB,
@@ -210,12 +211,45 @@ impl BroadcasterSubscriptionProcessor {
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
         if redis_entry_scope_contains(entry, self.controls.backend()) {
+            let native_progress_block = if self.controls.backend() == BroadcasterBackend::Native {
+                match &envelope.payload {
+                    BroadcasterPayload::Update(update) => update.complete_native_block(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let consumer_started_at = Instant::now();
+            let consumer_started_at_ms = unix_time_ms();
             self.observe_with_state_version(envelope.clone(), Some(entry.state_version))
                 .await?;
             self.controls
                 .broadcaster_subscription()
                 .record_publisher_to_consumer_delay(entry.published_at_ms)
                 .await;
+            if let Some(block_number) = native_progress_block {
+                let consumer_processing_ms = consumer_started_at.elapsed().as_millis() as u64;
+                let publisher_to_consumer_start_ms =
+                    consumer_started_at_ms.saturating_sub(entry.published_at_ms);
+                let publisher_to_consumer_complete_ms =
+                    publisher_to_consumer_start_ms.saturating_add(consumer_processing_ms);
+                let consumer_applied_at_ms =
+                    consumer_started_at_ms.saturating_add(consumer_processing_ms);
+                info!(
+                    event = "broadcaster_native_update_applied",
+                    block = block_number,
+                    stream_id = entry.stream_id.as_str(),
+                    message_seq = entry.message_seq,
+                    state_version = entry.state_version,
+                    published_at_ms = entry.published_at_ms,
+                    consumer_started_at_ms,
+                    consumer_applied_at_ms,
+                    publisher_to_consumer_start_ms,
+                    consumer_processing_ms,
+                    publisher_to_consumer_complete_ms,
+                    "Broadcaster native update applied"
+                );
+            }
             return Ok(());
         }
 
@@ -437,6 +471,12 @@ impl BroadcasterSubscriptionProcessor {
         }
         Ok(())
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 #[cfg(test)]
