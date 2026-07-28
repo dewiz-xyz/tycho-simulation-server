@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
@@ -10,6 +10,7 @@ use tycho_simulation::{
     tycho_client::feed::{BlockHeader, FeedMessage, HeaderLike, SynchronizerState},
 };
 
+use crate::broadcaster::redis_publisher::current_time_ms;
 use crate::broadcaster::service::BroadcasterServiceState;
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
@@ -416,9 +417,8 @@ async fn handle_broadcaster_raw_update(
     cfg: &StreamSupervisorConfig,
     ready_logged: &mut bool,
 ) -> Option<StreamExit> {
-    let received_at = Instant::now();
-    let received_at_ms = unix_time_ms();
     let now = Instant::now();
+    let received_at_ms = current_time_ms();
     let has_advanced = update
         .sync_states
         .values()
@@ -472,13 +472,9 @@ async fn handle_broadcaster_raw_update(
     let block_timestamp_ms = applied
         .native_progress
         .and_then(|block| broadcaster_raw_block_timestamp_ms(&update, block));
-    let broadcaster_processing_ms = received_at.elapsed().as_millis() as u64;
-    let broadcaster_completed_at_ms = received_at_ms.saturating_add(broadcaster_processing_ms);
-    let base_to_broadcaster_receive_ms = block_timestamp_ms
+    let broadcaster_processing_ms = now.elapsed().as_millis() as u64;
+    let chain_to_broadcaster_receive_ms = block_timestamp_ms
         .map(|timestamp| received_at_ms.saturating_sub(timestamp))
-        .unwrap_or_default();
-    let base_to_broadcaster_complete_ms = block_timestamp_ms
-        .map(|timestamp| broadcaster_completed_at_ms.saturating_sub(timestamp))
         .unwrap_or_default();
     maybe_log_memory_snapshot(
         "broadcaster",
@@ -497,10 +493,8 @@ async fn handle_broadcaster_raw_update(
         native_timing_available = block_timestamp_ms.is_some(),
         block_timestamp_ms = block_timestamp_ms.unwrap_or_default(),
         broadcaster_received_at_ms = received_at_ms,
-        broadcaster_completed_at_ms,
-        base_to_broadcaster_receive_ms,
+        chain_to_broadcaster_receive_ms,
         broadcaster_processing_ms,
-        base_to_broadcaster_complete_ms,
         "Raw broadcaster update processed"
     );
 
@@ -538,12 +532,6 @@ fn broadcaster_raw_block_timestamp_ms(
         .values()
         .find(|message| message.header.number == block_number)
         .map(|message| message.header.timestamp.saturating_mul(1_000))
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 async fn handle_stream_error(

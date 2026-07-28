@@ -1030,7 +1030,7 @@ mod tests {
             ],
             vm_protocols: Vec::new(),
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
-            native_progress_lease_secs: 5,
+            native_progress_lease_secs: 10,
             recovery_max_buffered_native_blocks: 64,
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
@@ -1267,14 +1267,14 @@ mod tests {
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
-        assert_eq!(app_state.native_progress_lease, Duration::from_secs(5));
+        assert_eq!(app_state.native_progress_lease, Duration::from_secs(10));
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(
             subscription_readiness_stale(
                 BroadcasterSubscriptionBackend::Native,
                 &config.chain_profile
             ),
-            Duration::from_secs(5)
+            Duration::from_secs(10)
         );
         assert_eq!(
             subscription_readiness_stale(BroadcasterSubscriptionBackend::Vm, &config.chain_profile),
