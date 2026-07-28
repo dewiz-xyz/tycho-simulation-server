@@ -62,7 +62,6 @@ pub struct AppState {
 #[derive(Clone, Default)]
 pub struct RfqClientConfig {
     pub tvl_threshold: f64,
-    pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,

@@ -525,7 +525,6 @@ fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Resul
 fn test_rfq_client_config() -> RfqClientConfig {
     RfqClientConfig {
         tvl_threshold: 100.0,
-        bebop_user: "test-bebop-user".to_string(),
         bebop_key: "test-bebop-key".to_string(),
         hashflow_user: "test-hashflow-user".to_string(),
         hashflow_key: "test-hashflow-key".to_string(),

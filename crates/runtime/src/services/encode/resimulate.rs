@@ -770,7 +770,6 @@ mod tests {
     fn rfq_client_config() -> RfqClientConfig {
         RfqClientConfig {
             tvl_threshold: 321.0,
-            bebop_user: "runtime-bebop-user".to_string(),
             bebop_key: "runtime-bebop-key".to_string(),
             hashflow_user: "runtime-hashflow-user".to_string(),
             hashflow_key: "runtime-hashflow-key".to_string(),

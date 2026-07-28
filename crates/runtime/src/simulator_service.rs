@@ -431,7 +431,6 @@ fn build_app_state(
         chain,
         rfq_client_config: Arc::new(RfqClientConfig {
             tvl_threshold: config.tvl_threshold,
-            bebop_user: config.bebop_user.clone(),
             bebop_key: config.bebop_key.clone(),
             hashflow_user: config.hashflow_user.clone(),
             hashflow_key: config.hashflow_key.clone(),
@@ -996,7 +995,6 @@ mod tests {
                 snapshots_min_new_pairs: 1_000,
                 snapshots_emit_emf: false,
             },
-            bebop_user: "bebop-user".to_string(),
             bebop_key: "bebop-key".to_string(),
             hashflow_user: "hashflow-user".to_string(),
             hashflow_key: "hashflow-key".to_string(),
@@ -1258,7 +1256,6 @@ mod tests {
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
         assert_eq!(app_state.rfq_client_config.tvl_threshold, 100.0);
-        assert_eq!(app_state.rfq_client_config.bebop_user, "bebop-user");
         assert_eq!(app_state.rfq_client_config.bebop_key, "bebop-key");
         assert_eq!(app_state.rfq_client_config.hashflow_user, "hashflow-user");
         assert_eq!(app_state.rfq_client_config.hashflow_key, "hashflow-key");

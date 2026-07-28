@@ -514,7 +514,6 @@ fn spawn_broadcaster_rfq_stream_task(
     let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
     let rfq_config = RFQConfig {
-        bebop_user: config.bebop_user.clone(),
         bebop_key: config.bebop_key.clone(),
         hashflow_user: config.hashflow_user.clone(),
         hashflow_key: config.hashflow_key.clone(),
@@ -703,7 +702,6 @@ mod tests {
                 token_min_quality: 0,
                 snapshot_session_ttl_secs: 300,
             },
-            bebop_user: "bebop-user".to_string(),
             bebop_key: "bebop-key".to_string(),
             hashflow_user: String::new(),
             hashflow_key: String::new(),
