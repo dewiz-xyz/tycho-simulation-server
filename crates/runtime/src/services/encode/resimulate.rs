@@ -382,7 +382,6 @@ fn hydrate_rfq_pool_state(
             chain,
             HashSet::new(),
             config.tvl_threshold,
-            config.bebop_user.clone(),
             config.bebop_key.clone(),
             HashSet::new(),
             quote_timeout,
@@ -785,7 +784,6 @@ mod tests {
             Chain::Ethereum,
             HashSet::new(),
             1.0,
-            "snapshot-user".to_string(),
             "snapshot-key".to_string(),
             HashSet::new(),
             Duration::from_secs(30),
@@ -826,11 +824,10 @@ mod tests {
 
         assert_eq!(hydrated.base_token, state.base_token);
         assert_eq!(hydrated.quote_token, state.quote_token);
-        assert!(client.contains("runtime-bebop-user"));
         assert!(client.contains("runtime-bebop-key"));
         assert!(client.contains("tvl: 321.0"));
         assert!(client.contains("quote_timeout: 3s"));
-        assert!(!client.contains("snapshot-user"));
+        assert!(!client.contains("snapshot-key"));
     }
 
     #[test]

@@ -25,8 +25,8 @@ use tycho_simulation::{
     },
     tycho_common::{
         dto::{
-            AccountBalance, AccountUpdate, Block, BlockChanges, Chain as DtoChain, ChangeType,
-            ComponentBalance, DCIUpdate, EntryPoint, EntryPointWithTracingParams,
+            AccountBalance, AccountUpdate, Block, BlockAggregatedChanges, Chain as DtoChain,
+            ChangeType, ComponentBalance, DCIUpdate, EntryPoint, EntryPointWithTracingParams,
             ProtocolComponent, ProtocolStateDelta, RPCTracerParams, ResponseAccount,
             ResponseProtocolState, TokenBalances, TracingParams, TracingResult,
         },
@@ -331,6 +331,7 @@ fn populated_state_sync_message(header: BlockHeader) -> StateSyncMessage<BlockHe
     let component_id = "native-pool-1";
     let account_address = bytes(0xa1, 20);
     let token_address = bytes(0xb1, 20);
+    let (entrypoint, tracing_result) = fixture_entrypoint();
     StateSyncMessage {
         header: header.clone(),
         snapshots: Snapshot {
@@ -341,26 +342,23 @@ fn populated_state_sync_message(header: BlockHeader) -> StateSyncMessage<BlockHe
                         component_id: component_id.to_string(),
                         attributes: HashMap::from([("reserve0".to_string(), bytes(0x01, 32))]),
                         balances: HashMap::from([(token_address.clone(), bytes(0x02, 32))]),
-                    },
-                    component: protocol_component(component_id, "uniswap_v2", "uniswap_v2_pool"),
+                    }
+                    .into(),
+                    component: protocol_component(component_id, "uniswap_v2", "uniswap_v2_pool")
+                        .into(),
                     component_tvl: Some(1_234_567.5),
-                    entrypoints: vec![fixture_entrypoint()],
+                    entrypoints: vec![(entrypoint.into(), tracing_result.into())],
                 },
             )]),
             vm_storage: HashMap::from([(
                 account_address.clone(),
-                response_account(account_address.clone(), token_address.clone()),
+                response_account(account_address.clone(), token_address.clone()).into(),
             )]),
         },
-        deltas: Some(block_changes(
-            header,
-            component_id,
-            account_address,
-            token_address,
-        )),
+        deltas: Some(block_changes(header, component_id, account_address, token_address).into()),
         removed_components: HashMap::from([(
             "native-pool-removed".to_string(),
-            protocol_component("native-pool-removed", "uniswap_v2", "uniswap_v2_pool"),
+            protocol_component("native-pool-removed", "uniswap_v2", "uniswap_v2_pool").into(),
         )]),
     }
 }
@@ -379,11 +377,11 @@ fn block_changes(
     component_id: &str,
     account_address: Bytes,
     token_address: Bytes,
-) -> BlockChanges {
+) -> BlockAggregatedChanges {
     let entrypoint = fixture_entrypoint().0;
     let entrypoint_id = entrypoint.entry_point.external_id.clone();
     let tracing_params = entrypoint.params;
-    BlockChanges {
+    BlockAggregatedChanges {
         extractor: "uniswap_v2".to_string(),
         chain: DtoChain::Ethereum,
         block: Block {
@@ -527,7 +525,6 @@ fn bebop_state() -> Result<BebopState> {
         Chain::Ethereum,
         HashSet::from([base_token.address.clone()]),
         100.0,
-        "fixture-user".to_string(),
         "fixture-key".to_string(),
         HashSet::from([quote_token.address.clone()]),
         Duration::from_secs(5),

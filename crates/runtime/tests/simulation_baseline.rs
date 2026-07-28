@@ -13,7 +13,10 @@ use tycho_simulation::{
         uniswap_v3::state::UniswapV3State, uniswap_v4::state::UniswapV4State,
     },
     protocol::models::{DecoderContext, TryFromWithBlock},
-    tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader},
+    tycho_client::feed::{
+        dto::ComponentWithState as DtoComponentWithState, synchronizer::ComponentWithState,
+        BlockHeader,
+    },
     tycho_common::{
         models::{token::Token, Chain},
         simulation::protocol_sim::ProtocolSim,
@@ -35,13 +38,13 @@ type Baseline = BTreeMap<String, BTreeMap<String, BaselineEntry>>;
 #[tokio::test]
 #[ignore = "run explicitly when comparing Tycho simulation versions"]
 async fn tycho_simulation_amount_and_gas_baseline() -> Result<()> {
-    let snapshots: BTreeMap<String, ComponentWithState> =
+    let snapshots: BTreeMap<String, DtoComponentWithState> =
         serde_json::from_str(SNAPSHOTS_JSON).context("parse simulation snapshots")?;
     let mut actual = Baseline::new();
 
     for (protocol, snapshot) in snapshots {
         let amounts = input_amounts(&protocol)?;
-        let (state, token_in, token_out) = decode_state(&protocol, snapshot).await?;
+        let (state, token_in, token_out) = decode_state(&protocol, snapshot.into()).await?;
         let entries = amounts
             .into_iter()
             .map(|amount| {

@@ -504,7 +504,6 @@ fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Resul
         chain,
         HashSet::new(),
         100.0,
-        "snapshot-user".to_string(),
         "snapshot-key".to_string(),
         HashSet::new(),
         Duration::from_secs(5),

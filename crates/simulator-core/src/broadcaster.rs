@@ -857,7 +857,33 @@ pub fn complete_broadcaster_partition_block(
 pub struct BroadcasterProtocolMessage {
     pub protocol: String,
     pub sync_state: SynchronizerState,
+    #[serde(with = "feed_dto_wire")]
     pub message: StateSyncMessage<BlockHeader>,
+}
+
+// Tycho's feed types no longer implement serde, so use its DTO conversion to preserve
+// the historical feed JSON. Converting back drops db_committed_block_height, which
+// the broadcaster does not consume.
+mod feed_dto_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tycho_simulation::tycho_client::feed::{dto, synchronizer::StateSyncMessage, BlockHeader};
+
+    pub fn serialize<S>(
+        message: &StateSyncMessage<BlockHeader>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        dto::StateSyncMessage::from(message.clone()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<StateSyncMessage<BlockHeader>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        dto::StateSyncMessage::deserialize(deserializer).map(Into::into)
+    }
 }
 
 impl BroadcasterProtocolMessage {

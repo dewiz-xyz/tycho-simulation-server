@@ -3,7 +3,7 @@ use std::collections::{
 };
 
 use anyhow::{anyhow, Result};
-use tycho_simulation::tycho_common::{dto::ResponseAccount, Bytes};
+use tycho_simulation::tycho_common::{models::contract::Account, Bytes};
 
 use simulator_core::broadcaster::BroadcasterProtocolMessage;
 
@@ -67,7 +67,7 @@ fn merge_snapshot_protocol_message(
     let mut merged_message = existing.message.clone().merge(incoming_message);
     merged_message.snapshots.vm_storage = merged_vm_storage;
     if let Some(deltas) = merged_message.deltas.as_mut() {
-        // BlockChanges::merge omits these bootstrap-only fields.
+        // BlockAggregatedChanges::merge omits these bootstrap-only fields.
         deltas.new_tokens.extend(incoming_new_tokens);
         for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
             deltas
@@ -193,8 +193,8 @@ fn ensure_no_snapshot_removal_overlap<State, Removed>(
 }
 
 fn merge_vm_storage(
-    existing: &mut HashMap<Bytes, ResponseAccount>,
-    incoming: HashMap<Bytes, ResponseAccount>,
+    existing: &mut HashMap<Bytes, Account>,
+    incoming: HashMap<Bytes, Account>,
 ) -> Result<()> {
     for (address, account) in incoming {
         match existing.entry(address.clone()) {
@@ -211,8 +211,8 @@ fn merge_vm_storage(
 
 fn merge_vm_storage_account(
     address: &Bytes,
-    existing: &mut ResponseAccount,
-    incoming: ResponseAccount,
+    existing: &mut Account,
+    incoming: Account,
 ) -> Result<()> {
     ensure_vm_account_metadata_matches(address, existing, &incoming)?;
     for (slot, value) in incoming.slots {
@@ -233,14 +233,10 @@ fn merge_vm_storage_account(
     Ok(())
 }
 
-#[expect(
-    deprecated,
-    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
-)]
 fn ensure_vm_account_metadata_matches(
     address: &Bytes,
-    existing: &ResponseAccount,
-    incoming: &ResponseAccount,
+    existing: &Account,
+    incoming: &Account,
 ) -> Result<()> {
     let mismatch = if existing.chain != incoming.chain {
         Some("chain")
