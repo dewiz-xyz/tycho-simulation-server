@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::OwnedRwLockWriteGuard;
@@ -20,6 +19,8 @@ use simulator_core::broadcaster::{
     BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterSubscriptionTracker,
     BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
+
+use crate::broadcaster::redis_publisher::current_time_ms;
 
 use super::snapshot::RawSnapshotReassembly;
 use super::{
@@ -220,21 +221,17 @@ impl BroadcasterSubscriptionProcessor {
                 None
             };
             let consumer_started_at = Instant::now();
-            let consumer_started_at_ms = unix_time_ms();
+            let consumer_started_at_ms = current_time_ms();
             self.observe_with_state_version(envelope.clone(), Some(entry.state_version))
                 .await?;
+            let consumer_processing_ms = consumer_started_at.elapsed().as_millis() as u64;
             self.controls
                 .broadcaster_subscription()
                 .record_publisher_to_consumer_delay(entry.published_at_ms)
                 .await;
             if let Some(block_number) = native_progress_block {
-                let consumer_processing_ms = consumer_started_at.elapsed().as_millis() as u64;
                 let publisher_to_consumer_start_ms =
                     consumer_started_at_ms.saturating_sub(entry.published_at_ms);
-                let publisher_to_consumer_complete_ms =
-                    publisher_to_consumer_start_ms.saturating_add(consumer_processing_ms);
-                let consumer_applied_at_ms =
-                    consumer_started_at_ms.saturating_add(consumer_processing_ms);
                 info!(
                     event = "broadcaster_native_update_applied",
                     block = block_number,
@@ -243,10 +240,8 @@ impl BroadcasterSubscriptionProcessor {
                     state_version = entry.state_version,
                     published_at_ms = entry.published_at_ms,
                     consumer_started_at_ms,
-                    consumer_applied_at_ms,
                     publisher_to_consumer_start_ms,
                     consumer_processing_ms,
-                    publisher_to_consumer_complete_ms,
                     "Broadcaster native update applied"
                 );
             }
@@ -471,12 +466,6 @@ impl BroadcasterSubscriptionProcessor {
         }
         Ok(())
     }
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 #[cfg(test)]
