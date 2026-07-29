@@ -487,14 +487,13 @@ impl NativeAttemptFence {
 
     async fn evaluate(&self, state: &AppState) -> Option<NativeFenceEvaluation> {
         let pinned = self.pin.as_ref()?;
-        let status = state
+        let check = state
             .native_route_fence_status(pinned, &self.native_pool_ids)
             .await;
-        let current_generation = state.native_state_store.pin().await.request_generation();
         Some(NativeFenceEvaluation {
-            status,
-            generation_moved: current_generation != pinned.request_generation(),
-            identity_changed: status == NativeFenceStatus::Changed,
+            status: check.status,
+            generation_moved: check.current_generation != pinned.request_generation(),
+            identity_changed: check.status == NativeFenceStatus::Changed,
             native_pool_count: self.native_pool_ids.len(),
         })
     }

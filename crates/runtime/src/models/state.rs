@@ -529,6 +529,12 @@ pub(crate) enum NativeFenceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRouteFenceCheck {
+    pub(crate) status: NativeFenceStatus,
+    pub(crate) current_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativePoolFenceStatus {
     Available(HashSet<String>),
     Unavailable,
@@ -805,13 +811,21 @@ impl AppState {
         &self,
         pinned: &PublishedStatePin,
         pool_ids: &HashSet<String>,
-    ) -> NativeFenceStatus {
-        match self.native_pool_fence_status(pinned, pool_ids).await {
+    ) -> NativeRouteFenceCheck {
+        let current = self.native_state_store.pin().await;
+        let status = match self
+            .native_pool_fence_status(pinned, &current, pool_ids)
+            .await
+        {
             NativePoolFenceStatus::Available(changed_pool_ids) if changed_pool_ids.is_empty() => {
                 NativeFenceStatus::Current
             }
             NativePoolFenceStatus::Available(_) => NativeFenceStatus::Changed,
             NativePoolFenceStatus::Unavailable => NativeFenceStatus::Unavailable,
+        };
+        NativeRouteFenceCheck {
+            status,
+            current_generation: current.request_generation(),
         }
     }
 
@@ -832,16 +846,25 @@ impl AppState {
     pub(crate) async fn native_pool_fence_status(
         &self,
         pinned: &PublishedStatePin,
+        current: &PublishedStatePin,
         pool_ids: &HashSet<String>,
     ) -> NativePoolFenceStatus {
-        let (available, _) = self.native_request_availability().await;
-        if !available {
+        if !self.native_broadcaster_bootstrap_ready().await {
             return NativePoolFenceStatus::Unavailable;
         }
-
-        // Route identity replaces only the generation test after the availability preamble.
-        let current = self.native_state_store.pin().await;
-        NativePoolFenceStatus::Available(pinned.changed_pool_ids(&current, pool_ids))
+        if is_update_stale(
+            self.native_update_age_ms().await,
+            self.native_progress_lease_ms(),
+        ) {
+            return NativePoolFenceStatus::Unavailable;
+        }
+        // The request flags must come from the same publication as the identity compare.
+        // fence_requests only flips requests_allowed and keeps every pool Arc, so a fence
+        // landing between a separate availability read and the pin would pass as Current.
+        if !current.state.ready || !current.state.requests_allowed {
+            return NativePoolFenceStatus::Unavailable;
+        }
+        NativePoolFenceStatus::Available(pinned.changed_pool_ids(current, pool_ids))
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
@@ -3462,17 +3485,24 @@ mod tests {
         let pool_a = HashSet::from(["pool-native".to_string()]);
         let pool_b = HashSet::from(["pool-b".to_string()]);
         assert_eq!(
-            state.native_route_fence_status(&pinned, &pool_a).await,
+            state
+                .native_route_fence_status(&pinned, &pool_a)
+                .await
+                .status,
             NativeFenceStatus::Changed
         );
         assert_eq!(
-            state.native_route_fence_status(&pinned, &pool_b).await,
+            state
+                .native_route_fence_status(&pinned, &pool_b)
+                .await
+                .status,
             NativeFenceStatus::Current
         );
         assert_eq!(
             state
                 .native_pool_fence_status(
                     &pinned,
+                    &current,
                     &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
                 )
                 .await,
@@ -3603,7 +3633,8 @@ mod tests {
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Changed
         );
     }
@@ -3642,23 +3673,29 @@ mod tests {
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &missing_pool)
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Current
         );
+        let current = state.native_state_store.pin().await;
         assert_eq!(
-            state.native_pool_fence_status(&pinned, &missing_pool).await,
+            state
+                .native_pool_fence_status(&pinned, &current, &missing_pool)
+                .await,
             NativePoolFenceStatus::Available(HashSet::new())
         );
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Changed
         );
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-added".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Changed
         );
     }
@@ -3699,7 +3736,8 @@ mod tests {
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Current
         );
     }
@@ -3732,7 +3770,8 @@ mod tests {
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Changed
         );
     }
@@ -3747,7 +3786,8 @@ mod tests {
         assert_eq!(
             state
                 .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await,
+                .await
+                .status,
             NativeFenceStatus::Unavailable
         );
     }
