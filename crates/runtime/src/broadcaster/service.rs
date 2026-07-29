@@ -4597,7 +4597,8 @@ mod tests {
                                 Bytes::from([3_u8; 32]),
                                 Bytes::from([4_u8; 32]),
                                 None,
-                            ),
+                            )
+                            .into(),
                         )]),
                     },
                     deltas: None,

@@ -126,7 +126,6 @@ pub async fn build_broadcaster_subscription_decoder(
 
 #[derive(Clone)]
 pub struct RFQConfig {
-    pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
@@ -167,12 +166,11 @@ pub async fn build_rfq_stream(
 
     if rfq_protocol_enabled(protocols, "rfq:bebop") {
         info!("Setting up Bebop RFQ client...\n");
-        let (user, key) = (rfq_config.bebop_user.clone(), rfq_config.bebop_key.clone());
         let mut rfq_tokens_bebop = HashSet::new();
         for bebop_token_addr in token_stores.bebop.snapshot().await.keys().clone() {
             rfq_tokens_bebop.insert(bebop_token_addr.clone());
         }
-        let bebop_client = BebopClientBuilder::new(chain, user, key)
+        let bebop_client = BebopClientBuilder::new(chain, rfq_config.bebop_key.clone())
             .tokens(rfq_tokens_bebop)
             .tvl_threshold(tvl_add_threshold)
             .quote_timeout(RFQ_QUOTE_TIMEOUT)
@@ -324,7 +322,7 @@ fn raw_base_builder(
     );
     let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
 
-    let builder = TychoStreamBuilder::new(tycho_url, chain.into())
+    let builder = TychoStreamBuilder::new(tycho_url, chain)
         .timeout(15)
         .websockets_retry_config(&RetryConfiguration::constant(
             u64::MAX,

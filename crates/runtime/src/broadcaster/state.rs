@@ -13,9 +13,11 @@ use tycho_simulation::{
         BlockHeader, FeedMessage, SynchronizerState,
     },
     tycho_common::{
-        dto::{
-            AccountBalance, AccountUpdate, BlockChanges, ChangeType, ProtocolStateDelta,
-            ResponseAccount,
+        models::{
+            blockchain::BlockAggregatedChanges,
+            contract::{Account, AccountBalance, AccountDelta},
+            protocol::ProtocolComponentStateDelta,
+            ChangeType,
         },
         Bytes,
     },
@@ -1122,9 +1124,9 @@ fn validate_raw_update_message(
 
 #[derive(Debug, Clone, PartialEq)]
 enum ProjectedVmAccount {
-    Materialized(Option<ResponseAccount>),
+    Materialized(Option<Account>),
     Residual {
-        update: Option<AccountUpdate>,
+        update: Option<AccountDelta>,
         balances: HashMap<Bytes, AccountBalance>,
     },
 }
@@ -1155,15 +1157,11 @@ fn merge_projected_vm_accounts(
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "creation_tx remains part of Tycho's account identity while it is on the wire"
-)]
 fn merge_shared_vm_accounts(
-    mut left: ResponseAccount,
-    right: ResponseAccount,
+    mut left: Account,
+    right: Account,
     block_number: u64,
-) -> Result<ResponseAccount> {
+) -> Result<Account> {
     let address = left.address.clone();
     ensure!(
         left.chain == right.chain
@@ -1182,7 +1180,7 @@ fn merge_shared_vm_accounts(
     Ok(left)
 }
 
-fn merge_vm_account_map(target: &mut HashMap<Bytes, Bytes>, incoming: HashMap<Bytes, Bytes>) {
+fn merge_vm_account_map<V>(target: &mut HashMap<Bytes, V>, incoming: HashMap<Bytes, V>) {
     // Tycho's protocol-local account views can disagree on an overlapping value.
     // Sorted protocol order gives the shared VM database one stable winner.
     for (key, value) in incoming {
@@ -1207,7 +1205,7 @@ fn touched_vm_addresses(message: &BroadcasterProtocolMessage) -> BTreeSet<Bytes>
         .cloned()
         .collect::<BTreeSet<_>>();
     if let Some(changes) = &message.message.deltas {
-        touched.extend(changes.account_updates.keys().cloned());
+        touched.extend(changes.account_deltas.keys().cloned());
         touched.extend(changes.account_balances.keys().cloned());
     }
     touched
@@ -1220,15 +1218,15 @@ fn project_vm_account(
     address: &Bytes,
 ) -> ProjectedVmAccount {
     let changes = incoming.message.deltas.as_ref();
-    let update = changes.and_then(|changes| changes.account_updates.get(address));
+    let update = changes.and_then(|changes| changes.account_deltas.get(address));
     let balances = changes
         .and_then(|changes| changes.account_balances.get(address))
         .cloned()
         .unwrap_or_default();
-    if update.is_some_and(|update| matches!(update.change, ChangeType::Deletion)) {
+    if update.is_some_and(|update| matches!(update.change_type(), ChangeType::Deletion)) {
         return ProjectedVmAccount::Materialized(None);
     }
-    if update.is_some_and(|update| matches!(update.change, ChangeType::Creation)) {
+    if update.is_some_and(|update| matches!(update.change_type(), ChangeType::Creation)) {
         return ProjectedVmAccount::Residual {
             update: update.cloned(),
             balances,
@@ -1260,11 +1258,7 @@ fn project_vm_account(
         if let Some(update) = update.cloned() {
             fold_account_update_into_snapshot(account, update);
         }
-        account.token_balances.extend(
-            balances
-                .into_iter()
-                .map(|(token, balance)| (token, balance.balance)),
-        );
+        account.token_balances.extend(balances);
         ProjectedVmAccount::Materialized(Some(account.clone()))
     } else {
         ProjectedVmAccount::Residual {
@@ -1372,14 +1366,14 @@ fn propagate_touched_vm_accounts(
         .collect::<BTreeSet<_>>();
     let mut deleted = BTreeSet::new();
     if let Some(changes) = &incoming.message.deltas {
-        touched.extend(changes.account_updates.keys().cloned());
+        touched.extend(changes.account_deltas.keys().cloned());
         touched.extend(changes.account_balances.keys().cloned());
         deleted.extend(
             changes
-                .account_updates
+                .account_deltas
                 .iter()
                 .filter_map(|(address, update)| {
-                    matches!(update.change, ChangeType::Deletion).then_some(address.clone())
+                    matches!(update.change_type(), ChangeType::Deletion).then_some(address.clone())
                 }),
         );
     }
@@ -1599,10 +1593,13 @@ fn merge_raw_message(
             .as_ref()
             .map(|deltas| {
                 deltas
-                    .account_updates
+                    .account_deltas
                     .iter()
                     .filter(|(_, update)| {
-                        matches!(update.change, ChangeType::Creation | ChangeType::Deletion)
+                        matches!(
+                            update.change_type(),
+                            ChangeType::Creation | ChangeType::Deletion
+                        )
                     })
                     .map(|(address, update)| (address.clone(), update.clone()))
                     .collect::<HashMap<_, _>>()
@@ -1610,7 +1607,7 @@ fn merge_raw_message(
             .unwrap_or_default();
         existing.message = existing.message.merge(incoming.message);
         if let Some(deltas) = existing.message.deltas.as_mut() {
-            // BlockChanges::merge omits new_tokens and dci_update, so preserve them explicitly.
+            // BlockAggregatedChanges::merge omits new_tokens and dci_update, so preserve them explicitly.
             deltas.new_tokens.extend(incoming_new_tokens);
             for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
                 deltas
@@ -1634,7 +1631,7 @@ fn merge_raw_message(
                 .extend(incoming_dci_update.trace_results);
             // Creation and deletion are lifecycle edges. The dependency's merge keeps an old
             // creation forever, so the newest edge has to win before materialization.
-            deltas.account_updates.extend(incoming_account_lifecycle);
+            deltas.account_deltas.extend(incoming_account_lifecycle);
         }
         let stats = compact_raw_state_sync_message(&mut existing.message);
         if stats.residual_entries > previous_residue_count {
@@ -1691,7 +1688,7 @@ fn compact_raw_state_sync_message(
     for component_id in removed_components.keys() {
         message.snapshots.states.remove(component_id);
         if let Some(deltas) = message.deltas.as_mut() {
-            deltas.state_updates.remove(component_id);
+            deltas.state_deltas.remove(component_id);
             deltas.component_balances.remove(component_id);
             deltas.component_tvl.remove(component_id);
             deltas.new_protocol_components.remove(component_id);
@@ -1717,11 +1714,11 @@ fn compact_raw_state_sync_message(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the accumulator applies one BlockChanges transaction in field order"
+    reason = "the accumulator applies one BlockAggregatedChanges transaction in field order"
 )]
 fn fold_block_changes_into_snapshot(
     snapshots: &mut Snapshot,
-    deltas: &mut BlockChanges,
+    deltas: &mut BlockAggregatedChanges,
 ) -> RawCompactionStats {
     let mut stats = RawCompactionStats::default();
 
@@ -1735,7 +1732,7 @@ fn fold_block_changes_into_snapshot(
         .collect::<Vec<_>>();
     for component_id in &deleted_component_ids {
         snapshots.states.remove(component_id);
-        deltas.state_updates.remove(component_id);
+        deltas.state_deltas.remove(component_id);
         deltas.component_balances.remove(component_id);
         deltas.component_tvl.remove(component_id);
         deltas.new_protocol_components.remove(component_id);
@@ -1746,7 +1743,7 @@ fn fold_block_changes_into_snapshot(
         .new_protocol_components
         .retain(|component_id, _| !snapshots.states.contains_key(component_id));
 
-    deltas.state_updates.retain(|component_id, delta| {
+    deltas.state_deltas.retain(|component_id, delta| {
         let Some(component) = snapshots.states.get_mut(component_id) else {
             return true;
         };
@@ -1760,7 +1757,7 @@ fn fold_block_changes_into_snapshot(
             return true;
         };
         component.state.balances.extend(
-            std::mem::take(&mut balances.0)
+            std::mem::take(balances)
                 .into_iter()
                 .map(|(token, balance)| (token, balance.balance)),
         );
@@ -1778,22 +1775,22 @@ fn fold_block_changes_into_snapshot(
     });
 
     let deleted_accounts = deltas
-        .account_updates
+        .account_deltas
         .iter()
         .filter_map(|(address, update)| {
-            matches!(update.change, ChangeType::Deletion).then_some(address.clone())
+            matches!(update.change_type(), ChangeType::Deletion).then_some(address.clone())
         })
         .collect::<Vec<_>>();
     for address in &deleted_accounts {
         snapshots.vm_storage.remove(address);
         deltas.account_balances.remove(address);
     }
-    deltas.account_updates.retain(|address, update| {
-        if matches!(update.change, ChangeType::Deletion) {
+    deltas.account_deltas.retain(|address, update| {
+        if matches!(update.change_type(), ChangeType::Deletion) {
             stats.folded_account_updates += 1;
             return false;
         }
-        if matches!(update.change, ChangeType::Creation) {
+        if matches!(update.change_type(), ChangeType::Creation) {
             // A creation has no title or code hashes, so keep the latest operation for bootstrap.
             snapshots.vm_storage.remove(address);
             return true;
@@ -1810,11 +1807,7 @@ fn fold_block_changes_into_snapshot(
         let Some(account) = snapshots.vm_storage.get_mut(address) else {
             return true;
         };
-        account.token_balances.extend(
-            std::mem::take(balances)
-                .into_iter()
-                .map(|(token, balance)| (token, balance.balance)),
-        );
+        account.token_balances.extend(std::mem::take(balances));
         stats.folded_account_balances += 1;
         false
     });
@@ -1843,7 +1836,7 @@ fn fold_block_changes_into_snapshot(
 
 fn apply_protocol_delta_to_snapshot(
     component: &mut tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
-    delta: ProtocolStateDelta,
+    delta: ProtocolComponentStateDelta,
 ) {
     for attribute in delta.deleted_attributes {
         component.state.attributes.remove(&attribute);
@@ -1851,20 +1844,26 @@ fn apply_protocol_delta_to_snapshot(
     component.state.attributes.extend(delta.updated_attributes);
 }
 
-fn fold_account_update_into_snapshot(account: &mut ResponseAccount, update: AccountUpdate) {
-    account.slots.extend(update.slots);
+fn fold_account_update_into_snapshot(account: &mut Account, update: AccountDelta) {
+    let code = update.code().clone();
+    account.slots.extend(
+        update
+            .slots
+            .into_iter()
+            .map(|(slot, value)| (slot, value.unwrap_or_default())),
+    );
     if let Some(balance) = update.balance {
         account.native_balance = balance;
     }
-    if let Some(code) = update.code {
+    if let Some(code) = code {
         account.code = code;
     }
 }
 
-fn block_changes_has_bootstrap_residue(deltas: &BlockChanges) -> bool {
+fn block_changes_has_bootstrap_residue(deltas: &BlockAggregatedChanges) -> bool {
     !deltas.new_tokens.is_empty()
-        || !deltas.account_updates.is_empty()
-        || !deltas.state_updates.is_empty()
+        || !deltas.account_deltas.is_empty()
+        || !deltas.state_deltas.is_empty()
         || !deltas.new_protocol_components.is_empty()
         || !deltas.deleted_protocol_components.is_empty()
         || !deltas.component_balances.is_empty()
@@ -1878,8 +1877,8 @@ fn block_changes_has_bootstrap_residue(deltas: &BlockChanges) -> bool {
 fn raw_residue_entry_count(message: &StateSyncMessage<BlockHeader>) -> usize {
     let delta_entries = message.deltas.as_ref().map_or(0, |deltas| {
         deltas.new_tokens.len()
-            + deltas.account_updates.len()
-            + deltas.state_updates.len()
+            + deltas.account_deltas.len()
+            + deltas.state_deltas.len()
             + deltas.new_protocol_components.len()
             + deltas.deleted_protocol_components.len()
             + deltas.component_balances.len()
@@ -2168,16 +2167,16 @@ fn split_protocol_tail_for_snapshot(
         })?;
         builder.append_delta_entries(
             "state_updates",
-            &source.state_updates,
+            &source.state_deltas,
             |deltas, key, value| {
-                deltas.state_updates.insert(key, value);
+                deltas.state_deltas.insert(key, value);
             },
         )?;
         builder.append_delta_entries(
             "account_updates",
-            &source.account_updates,
+            &source.account_deltas,
             |deltas, key, value| {
-                deltas.account_updates.insert(key, value);
+                deltas.account_deltas.insert(key, value);
             },
         )?;
         builder.append_delta_entries(
@@ -2288,7 +2287,7 @@ impl<'a> ProtocolTailFragmentBuilder<'a> {
         &mut self,
         kind: &str,
         entries: &HashMap<K, V>,
-        insert: impl Fn(&mut BlockChanges, K, V),
+        insert: impl Fn(&mut BlockAggregatedChanges, K, V),
     ) -> Result<()>
     where
         K: Clone + Eq + std::hash::Hash + Ord + std::fmt::Debug,
@@ -2388,16 +2387,17 @@ impl<'a> ProtocolTailFragmentBuilder<'a> {
     }
 }
 
-fn empty_block_changes_fragment(source: &BlockChanges) -> BlockChanges {
-    BlockChanges {
+fn empty_block_changes_fragment(source: &BlockAggregatedChanges) -> BlockAggregatedChanges {
+    BlockAggregatedChanges {
         extractor: source.extractor.clone(),
         chain: source.chain,
         block: source.block.clone(),
         finalized_block_height: source.finalized_block_height,
+        db_committed_block_height: source.db_committed_block_height,
         revert: source.revert,
         new_tokens: HashMap::new(),
-        account_updates: HashMap::new(),
-        state_updates: HashMap::new(),
+        account_deltas: HashMap::new(),
+        state_deltas: HashMap::new(),
         new_protocol_components: HashMap::new(),
         deleted_protocol_components: HashMap::new(),
         component_balances: HashMap::new(),
@@ -2465,7 +2465,7 @@ fn split_vm_storage_account_for_snapshot(
     message: &BroadcasterProtocolMessage,
     sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
     address: Bytes,
-    account: &ResponseAccount,
+    account: &Account,
     include_sync_statuses: bool,
 ) -> Result<Vec<BroadcasterProtocolMessage>> {
     let mut slots = account
@@ -2570,22 +2570,15 @@ fn hex_json_string_size(bytes: &Bytes) -> usize {
 fn vm_storage_account_fragment_for_slot_range(
     message: &BroadcasterProtocolMessage,
     address: Bytes,
-    account: &ResponseAccount,
+    account: &Account,
     slots: &[(Bytes, Bytes)],
 ) -> BroadcasterProtocolMessage {
     let account = response_account_with_slots(account, slots.iter().cloned().collect());
     vm_storage_account_fragment(message, address, account)
 }
 
-#[expect(
-    deprecated,
-    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
-)]
-fn response_account_with_slots(
-    account: &ResponseAccount,
-    slots: HashMap<Bytes, Bytes>,
-) -> ResponseAccount {
-    ResponseAccount::new(
+fn response_account_with_slots(account: &Account, slots: HashMap<Bytes, Bytes>) -> Account {
+    Account::new(
         account.chain,
         account.address.clone(),
         account.title.clone(),
@@ -2603,7 +2596,7 @@ fn response_account_with_slots(
 fn vm_storage_account_fragment(
     message: &BroadcasterProtocolMessage,
     address: Bytes,
-    account: ResponseAccount,
+    account: Account,
 ) -> BroadcasterProtocolMessage {
     let mut fragment = empty_protocol_fragment(message, false);
     fragment
@@ -2787,15 +2780,18 @@ mod tests {
         BroadcasterSubscriptionEvent, BroadcasterSubscriptionTracker,
     };
     use tycho_common::{
-        dto::{
-            AccountBalance, AccountUpdate, BlockChanges, ChangeType, ComponentBalance,
-            ProtocolComponent as DtoProtocolComponent, ResponseAccount, ResponseProtocolState,
-            ResponseToken, TokenBalances,
+        dto::{ProtocolStateDelta as SimulationProtocolStateDelta, ResponseToken},
+        models::{
+            blockchain::BlockAggregatedChanges,
+            contract::{Account, AccountBalance, AccountDelta},
+            protocol::{
+                ComponentBalance, ProtocolComponent as DtoProtocolComponent,
+                ProtocolComponentState, ProtocolComponentStateDelta,
+            },
+            Chain as DtoChain, ChangeType,
         },
-        models::Chain as DtoChain,
         Bytes as DtoBytes,
     };
-    use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
@@ -2846,7 +2842,7 @@ mod tests {
 
         fn delta_transition(
             &mut self,
-            _delta: ProtocolStateDelta,
+            _delta: SimulationProtocolStateDelta,
             _tokens: &HashMap<Bytes, Token>,
             _balances: &Balances,
         ) -> Result<(), TransitionError> {
@@ -2959,7 +2955,7 @@ mod tests {
     fn vm_account_fragments<'a>(
         export: &'a BroadcasterSnapshotExport,
         account_address: &DtoBytes,
-    ) -> Vec<&'a ResponseAccount> {
+    ) -> Vec<&'a Account> {
         snapshot_chunks(export)
             .into_iter()
             .flat_map(|chunk| &chunk.partitions)
@@ -2982,7 +2978,7 @@ mod tests {
             .collect()
     }
 
-    fn account_metadata_without_slots(account: &ResponseAccount) -> ResponseAccount {
+    fn account_metadata_without_slots(account: &Account) -> Account {
         let mut metadata = account.clone();
         metadata.slots.clear();
         metadata
@@ -2991,7 +2987,7 @@ mod tests {
     fn assert_vm_storage_account_fragments_match(
         export: &BroadcasterSnapshotExport,
         account_address: &DtoBytes,
-        expected_account: &ResponseAccount,
+        expected_account: &Account,
     ) {
         let fragments = vm_account_fragments(export, account_address);
         assert!(fragments.len() > 1);
@@ -3353,8 +3349,8 @@ mod tests {
         );
 
         for block_number in 2..=20 {
-            let mut changes = BlockChanges::default();
-            changes.state_updates.insert(
+            let mut changes = BlockAggregatedChanges::default();
+            changes.state_deltas.insert(
                 component_id.to_string(),
                 component_state_delta(
                     component_id,
@@ -3364,10 +3360,10 @@ mod tests {
             );
             changes.component_balances.insert(
                 component_id.to_string(),
-                TokenBalances(HashMap::from([(
+                HashMap::from([(
                     token.clone(),
                     component_balance(component_id, token.clone(), block_number as u8),
-                )])),
+                )]),
             );
             changes
                 .component_tvl
@@ -3406,17 +3402,14 @@ mod tests {
     fn raw_cache_keeps_unfoldable_component_residue() {
         let component_id = "missing";
         let token = DtoBytes::from([18u8; 20]);
-        let mut changes = BlockChanges::default();
-        changes.state_updates.insert(
+        let mut changes = BlockAggregatedChanges::default();
+        changes.state_deltas.insert(
             component_id.to_string(),
             component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
         );
         changes.component_balances.insert(
             component_id.to_string(),
-            TokenBalances(HashMap::from([(
-                token.clone(),
-                component_balance(component_id, token, 2),
-            )])),
+            HashMap::from([(token.clone(), component_balance(component_id, token, 2))]),
         );
         changes.component_tvl.insert(component_id.to_string(), 2.0);
         let expected = changes.clone();
@@ -3439,7 +3432,7 @@ mod tests {
         let mut messages = Vec::new();
         for block_number in 1..=2 {
             let token_address = DtoBytes::from([block_number as u8; 20]);
-            let mut changes = BlockChanges::default();
+            let mut changes = BlockAggregatedChanges::default();
             changes.new_tokens.insert(
                 token_address.clone(),
                 ResponseToken {
@@ -3450,7 +3443,8 @@ mod tests {
                     tax: 0,
                     gas: Vec::new(),
                     quality: 100,
-                },
+                }
+                .into(),
             );
             changes
                 .dci_update
@@ -3488,8 +3482,8 @@ mod tests {
             None,
             HashMap::new(),
         );
-        let mut changes = BlockChanges::default();
-        changes.account_updates.insert(
+        let mut changes = BlockAggregatedChanges::default();
+        changes.account_deltas.insert(
             address.clone(),
             account_update(
                 address.clone(),
@@ -3515,7 +3509,10 @@ mod tests {
             DtoBytes::from([8u8; 32])
         );
         assert_eq!(account.native_balance, DtoBytes::from([41u8; 32]));
-        assert_eq!(account.token_balances[&token], DtoBytes::from([42u8; 32]));
+        assert_eq!(
+            account.token_balances[&token].balance,
+            DtoBytes::from([42u8; 32])
+        );
         assert!(message.message.deltas.is_none());
     }
 
@@ -3529,20 +3526,24 @@ mod tests {
         for address in [&creation, &deletion, &unspecified] {
             vm_storage.insert(address.clone(), raw_response_account(address.clone(), 0, 0));
         }
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         for (address, change, seed) in [
             (creation.clone(), ChangeType::Creation, 1),
             (deletion.clone(), ChangeType::Deletion, 2),
-            (unspecified.clone(), ChangeType::Unspecified, 3),
+            (
+                unspecified.clone(),
+                tycho_common::dto::ChangeType::Unspecified.into(),
+                3,
+            ),
             (absent.clone(), ChangeType::Update, 4),
         ] {
             changes
-                .account_updates
+                .account_deltas
                 .insert(address.clone(), account_update(address, change, seed, None));
         }
         let expected = HashMap::from([
-            (creation.clone(), changes.account_updates[&creation].clone()),
-            (absent.clone(), changes.account_updates[&absent].clone()),
+            (creation.clone(), changes.account_deltas[&creation].clone()),
+            (absent.clone(), changes.account_deltas[&absent].clone()),
         ]);
         let mut message = raw_protocol_message_with_changes(
             "vm:balancer_v2",
@@ -3560,15 +3561,15 @@ mod tests {
         let Some(deltas) = message.message.deltas else {
             return Err(anyhow!("expected VM update residue"));
         };
-        assert_eq!(deltas.account_updates, expected);
+        assert_eq!(deltas.account_deltas, expected);
         Ok(())
     }
 
     #[test]
     fn raw_cache_account_creation_then_deletion_does_not_resurrect_on_bootstrap() {
         let address = DtoBytes::from([58u8; 20]);
-        let mut creation = BlockChanges::default();
-        creation.account_updates.insert(
+        let mut creation = BlockAggregatedChanges::default();
+        creation.account_deltas.insert(
             address.clone(),
             account_update(address.clone(), ChangeType::Creation, 1, None),
         );
@@ -3584,8 +3585,8 @@ mod tests {
             ),
         );
 
-        let mut deletion = BlockChanges::default();
-        deletion.account_updates.insert(
+        let mut deletion = BlockAggregatedChanges::default();
+        deletion.account_deltas.insert(
             address.clone(),
             account_update(address.clone(), ChangeType::Deletion, 2, None),
         );
@@ -3612,14 +3613,14 @@ mod tests {
     fn raw_cache_prunes_removed_components_for_fresh_bootstrap() {
         let component_id = "removed";
         let account_address = DtoBytes::from([61u8; 20]);
-        let mut changes = BlockChanges::default();
-        changes.state_updates.insert(
+        let mut changes = BlockAggregatedChanges::default();
+        changes.state_deltas.insert(
             component_id.to_string(),
             component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
         );
         changes
             .component_balances
-            .insert(component_id.to_string(), TokenBalances::default());
+            .insert(component_id.to_string(), HashMap::new());
         changes.component_tvl.insert(component_id.to_string(), 2.0);
         changes.new_protocol_components.insert(
             component_id.to_string(),
@@ -3674,8 +3675,8 @@ mod tests {
         );
 
         for block_number in 11..=1_010 {
-            let mut changes = BlockChanges::default();
-            changes.state_updates.insert(
+            let mut changes = BlockAggregatedChanges::default();
+            changes.state_deltas.insert(
                 component_id.to_string(),
                 component_state_delta(
                     component_id,
@@ -3734,8 +3735,8 @@ mod tests {
                 .ok_or_else(|| anyhow!("native partition missing"))?;
             for update_index in 0..UPDATE_COUNT {
                 let component_id = format!("raw-{:02}", update_index as usize % KEY_COUNT);
-                let mut changes = BlockChanges::default();
-                changes.state_updates.insert(
+                let mut changes = BlockAggregatedChanges::default();
+                changes.state_deltas.insert(
                     component_id.clone(),
                     component_state_delta(
                         &component_id,
@@ -3812,8 +3813,8 @@ mod tests {
             .await?;
 
         for block_number in 11..=510 {
-            let mut changes = BlockChanges::default();
-            changes.state_updates.insert(
+            let mut changes = BlockAggregatedChanges::default();
+            changes.state_deltas.insert(
                 component_id.to_string(),
                 component_state_delta(
                     component_id,
@@ -3918,7 +3919,8 @@ mod tests {
                     tax: 0,
                     gas: Vec::new(),
                     quality: 100,
-                },
+                }
+                .into(),
             );
             deltas
                 .dci_update
@@ -3983,7 +3985,7 @@ mod tests {
             "uniswap_v2",
             10,
             Snapshot::default(),
-            Some(BlockChanges::default()),
+            Some(BlockAggregatedChanges::default()),
             HashMap::new(),
         );
         let sizing_ctx = snapshot_chunk_build_context(usize::MAX);
@@ -4484,7 +4486,7 @@ mod tests {
 
     fn raw_vm_protocol_message(
         account_address: DtoBytes,
-        account: ResponseAccount,
+        account: Account,
     ) -> BroadcasterProtocolMessage {
         BroadcasterProtocolMessage::new(
             "vm:balancer_v2",
@@ -4505,7 +4507,7 @@ mod tests {
         protocol: &str,
         block_number: u64,
         snapshots: Snapshot,
-        deltas: Option<BlockChanges>,
+        deltas: Option<BlockAggregatedChanges>,
         removed_components: HashMap<String, DtoProtocolComponent>,
     ) -> BroadcasterProtocolMessage {
         let header = block_header(block_number, block_number as u8);
@@ -4525,22 +4527,22 @@ mod tests {
         component_id: &str,
         attributes: impl IntoIterator<Item = (&'static str, DtoBytes)>,
         deleted_attributes: impl IntoIterator<Item = &'static str>,
-    ) -> ProtocolStateDelta {
-        ProtocolStateDelta {
-            component_id: component_id.to_string(),
-            updated_attributes: attributes
+    ) -> ProtocolComponentStateDelta {
+        ProtocolComponentStateDelta::new(
+            component_id,
+            attributes
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value))
                 .collect(),
-            deleted_attributes: deleted_attributes.into_iter().map(str::to_string).collect(),
-        }
+            deleted_attributes.into_iter().map(str::to_string).collect(),
+        )
     }
 
     fn residual_tail_message(entry_count: usize, value_size: usize) -> BroadcasterProtocolMessage {
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         for index in (0..entry_count).rev() {
             let component_id = format!("missing-{index:04}");
-            changes.state_updates.insert(
+            changes.state_deltas.insert(
                 component_id.clone(),
                 component_state_delta(
                     &component_id,
@@ -4563,13 +4565,13 @@ mod tests {
         change: ChangeType,
         slot_seed: u8,
         balance: Option<DtoBytes>,
-    ) -> AccountUpdate {
-        AccountUpdate::new(
+    ) -> AccountDelta {
+        AccountDelta::new(
+            DtoChain::Ethereum,
             address,
-            DtoChain::Ethereum.into(),
             HashMap::from([(
                 DtoBytes::from([slot_seed; 32]),
-                DtoBytes::from([slot_seed.saturating_add(1); 32]),
+                Some(DtoBytes::from([slot_seed.saturating_add(1); 32])),
             )]),
             balance,
             None,
@@ -4646,7 +4648,7 @@ mod tests {
 
     fn raw_component_with_state(component_id: &str, seed: u8) -> ComponentWithState {
         ComponentWithState {
-            state: ResponseProtocolState {
+            state: ProtocolComponentState {
                 component_id: component_id.to_string(),
                 attributes: HashMap::from([(
                     "large".to_string(),
@@ -4665,9 +4667,9 @@ mod tests {
             id: component_id.to_string(),
             protocol_system: protocol.to_string(),
             protocol_type_name: protocol.to_string(),
-            chain: DtoChain::Ethereum.into(),
+            chain: DtoChain::Ethereum,
             tokens: vec![DtoBytes::from([seed; 20]), DtoBytes::from([seed + 1; 20])],
-            contract_ids: Vec::new(),
+            contract_addresses: Vec::new(),
             static_attributes: HashMap::new(),
             change: Default::default(),
             creation_tx: DtoBytes::from([seed; 32]),
@@ -4681,7 +4683,7 @@ mod tests {
         address: DtoBytes,
         slot_count: usize,
         slot_value_size: usize,
-    ) -> ResponseAccount {
+    ) -> Account {
         let mut slots = HashMap::new();
         for index in 0..slot_count {
             let seed = index as u8;
@@ -4693,8 +4695,8 @@ mod tests {
             );
         }
 
-        ResponseAccount::new(
-            DtoChain::Ethereum.into(),
+        Account::new(
+            DtoChain::Ethereum,
             address,
             "vm-account".to_string(),
             slots,
@@ -4775,8 +4777,8 @@ mod tests {
         component_seed: u8,
     ) -> StateSyncMessage<BlockHeader> {
         let mut message = raw_snapshot_message(protocol, header, component_seed);
-        let mut changes = BlockChanges::default();
-        changes.state_updates.insert(
+        let mut changes = BlockAggregatedChanges::default();
+        changes.state_deltas.insert(
             "still-unresolved".to_string(),
             component_state_delta(
                 "still-unresolved",
@@ -5270,8 +5272,8 @@ mod tests {
             .await?;
 
         let block_11 = linked_header(11, 11, 10);
-        let mut changes = BlockChanges::default();
-        changes.state_updates.insert(
+        let mut changes = BlockAggregatedChanges::default();
+        changes.state_deltas.insert(
             "pool-0001".to_string(),
             component_state_delta("pool-0001", [("value", DtoBytes::from([77u8; 32]))], []),
         );
@@ -5315,13 +5317,17 @@ mod tests {
         first
             .slots
             .insert(first_slot.clone(), DtoBytes::from([11u8; 32]));
-        first
-            .token_balances
-            .insert(first_token.clone(), DtoBytes::from([12u8; 32]));
+        first.token_balances.insert(
+            first_token.clone(),
+            account_balance(address.clone(), first_token.clone(), 12),
+        );
         let mut second = first.clone();
         second.title = "Balancer token".to_string();
         second.slots = HashMap::from([(second_slot.clone(), DtoBytes::from([21u8; 32]))]);
-        second.token_balances = HashMap::from([(second_token.clone(), DtoBytes::from([22u8; 32]))]);
+        second.token_balances = HashMap::from([(
+            second_token.clone(),
+            account_balance(address.clone(), second_token.clone(), 22),
+        )]);
         let message = |account| StateSyncMessage {
             header: block.clone(),
             snapshots: Snapshot {
@@ -5358,11 +5364,17 @@ mod tests {
             );
             assert_eq!(account.token_balances.len(), 2);
             assert_eq!(
-                account.token_balances.get(&first_token),
+                account
+                    .token_balances
+                    .get(&first_token)
+                    .map(|balance| &balance.balance),
                 Some(&DtoBytes::from([12u8; 32]))
             );
             assert_eq!(
-                account.token_balances.get(&second_token),
+                account
+                    .token_balances
+                    .get(&second_token)
+                    .map(|balance| &balance.balance),
                 Some(&DtoBytes::from([22u8; 32]))
             );
         }
@@ -5476,13 +5488,15 @@ mod tests {
 
         let delta_message = |slot_value| {
             let mut update = account_update(address.clone(), ChangeType::Update, 7, None);
-            update.slots =
-                HashMap::from([(DtoBytes::from([7u8; 32]), DtoBytes::from([slot_value; 32]))]);
+            update.slots = HashMap::from([(
+                DtoBytes::from([7u8; 32]),
+                Some(DtoBytes::from([slot_value; 32])),
+            )]);
             StateSyncMessage {
                 header: block_11.clone(),
                 snapshots: Snapshot::default(),
-                deltas: Some(BlockChanges {
-                    account_updates: HashMap::from([(address.clone(), update)]),
+                deltas: Some(BlockAggregatedChanges {
+                    account_deltas: HashMap::from([(address.clone(), update)]),
                     ..Default::default()
                 }),
                 removed_components: HashMap::new(),

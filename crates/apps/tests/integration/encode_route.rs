@@ -504,7 +504,6 @@ fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Resul
         chain,
         HashSet::new(),
         100.0,
-        "snapshot-user".to_string(),
         "snapshot-key".to_string(),
         HashSet::new(),
         Duration::from_secs(5),
@@ -526,7 +525,6 @@ fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Resul
 fn test_rfq_client_config() -> RfqClientConfig {
     RfqClientConfig {
         tvl_threshold: 100.0,
-        bebop_user: "test-bebop-user".to_string(),
         bebop_key: "test-bebop-key".to_string(),
         hashflow_user: "test-hashflow-user".to_string(),
         hashflow_key: "test-hashflow-key".to_string(),
@@ -1731,5 +1729,231 @@ async fn encode_route_times_out_during_slow_resimulation() -> Result<()> {
     let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert_eq!(response.error, "Encode request timed out after 20ms");
     assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedCalldataFixtures {
+    approval: ExpectedInteraction,
+    scenarios: Vec<ExpectedCalldataScenario>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedCalldataScenario {
+    name: String,
+    chain_id: u64,
+    protocol: String,
+    token_in: String,
+    token_out: String,
+    receiver: String,
+    function_selector: String,
+    router: ExpectedInteraction,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ExpectedInteraction {
+    kind: InteractionKind,
+    target: String,
+    value: String,
+    calldata: String,
+}
+
+fn base_calldata_fixture_configs() -> Vec<(&'static str, EncodeFixtureConfig<'static>)> {
+    let base_config = || EncodeFixtureConfig {
+        chain: Chain::Base,
+        pool_id: "0x0000000000000000000000000000000000000009",
+        component_address_hex: "0x0000000000000000000000000000000000000009",
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    vec![
+        (
+            "base_uniswap_v2",
+            EncodeFixtureConfig {
+                request_id: "fixture-base-uniswap-v2",
+                ..base_config()
+            },
+        ),
+        (
+            "base_uniswap_v3",
+            EncodeFixtureConfig {
+                request_pool_protocol: "uniswap_v3",
+                component_protocol_system: "uniswap_v3",
+                component_protocol_type_name: "uniswap_v3",
+                component_static_attributes: HashMap::from([(
+                    "fee".to_string(),
+                    Bytes::from(500_u32),
+                )]),
+                request_id: "fixture-base-uniswap-v3",
+                ..base_config()
+            },
+        ),
+        (
+            "base_pancakeswap_v3",
+            EncodeFixtureConfig {
+                request_pool_protocol: "pancakeswap_v3",
+                component_protocol_system: "pancakeswap_v3",
+                component_protocol_type_name: "pancakeswap_v3",
+                component_static_attributes: HashMap::from([(
+                    "fee".to_string(),
+                    Bytes::from(500_u32),
+                )]),
+                request_id: "fixture-base-pancakeswap-v3",
+                ..base_config()
+            },
+        ),
+        (
+            "base_uniswap_v4",
+            EncodeFixtureConfig {
+                pool_id: "0x0000000000000000000000000000000000000000000000000000000000000009",
+                component_address_hex:
+                    "0x0000000000000000000000000000000000000000000000000000000000000009",
+                request_pool_protocol: "uniswap_v4",
+                component_protocol_system: "uniswap_v4",
+                component_protocol_type_name: "uniswap_v4_pool",
+                component_static_attributes: HashMap::from([
+                    ("key_lp_fee".to_string(), Bytes::from(500_u32)),
+                    ("tick_spacing".to_string(), Bytes::from(10_u32)),
+                ]),
+                vm_pool: true,
+                enable_vm_pools: true,
+                request_id: "fixture-base-uniswap-v4",
+                ..base_config()
+            },
+        ),
+        (
+            "base_aerodrome_slipstreams",
+            EncodeFixtureConfig {
+                request_pool_protocol: "aerodrome_slipstreams",
+                component_protocol_system: "aerodrome_slipstreams",
+                component_protocol_type_name: "aerodrome_slipstreams",
+                component_static_attributes: HashMap::from([(
+                    "tick_spacing".to_string(),
+                    Bytes::from(100_u32),
+                )]),
+                request_id: "fixture-base-aerodrome-slipstreams",
+                ..base_config()
+            },
+        ),
+        (
+            "base_bebop",
+            EncodeFixtureConfig {
+                request_pool_protocol: "rfq:bebop",
+                component_protocol_system: "rfq:bebop",
+                component_protocol_type_name: "bebop_pool",
+                rfq_pool: true,
+                enable_rfq_pools: true,
+                request_id: "fixture-base-bebop",
+                ..base_config()
+            },
+        ),
+    ]
+}
+
+fn calldata_address_word(calldata: &str, word_index: usize) -> Result<String> {
+    const SELECTOR_BYTES: usize = 4;
+    const ABI_WORD_BYTES: usize = 32;
+    const ADDRESS_BYTES: usize = 20;
+
+    let calldata = hex_to_bytes(calldata)?;
+    let address_start =
+        SELECTOR_BYTES + (word_index * ABI_WORD_BYTES) + (ABI_WORD_BYTES - ADDRESS_BYTES);
+    let address_end = address_start + ADDRESS_BYTES;
+    let address = calldata
+        .get(address_start..address_end)
+        .ok_or_else(|| anyhow!("router calldata is missing ABI word {word_index}"))?;
+    Ok(format!("0x{}", alloy_primitives::hex::encode(address)))
+}
+
+#[tokio::test]
+async fn encode_route_calldata_matches_committed_fixtures() -> Result<()> {
+    let expected_fixture: ExpectedCalldataFixtures =
+        serde_json::from_str(include_str!("fixtures/encode_calldata.json"))?;
+    let configs = base_calldata_fixture_configs();
+    assert_eq!(expected_fixture.scenarios.len(), configs.len());
+
+    for (expected, (name, config)) in expected_fixture.scenarios.iter().zip(configs) {
+        assert_eq!(expected.name, name);
+        let (app, request) = setup_app_state_and_request(config).await?;
+        let (status, body) = post_encode(app, &request).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name} returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+
+        assert_eq!(expected.chain_id, request.chain_id, "{name} chain");
+        assert_eq!(
+            expected.protocol, request.segments[0].hops[0].swaps[0].pool.protocol,
+            "{name} protocol"
+        );
+        assert_eq!(expected.token_in, request.token_in, "{name} token in");
+        assert_eq!(expected.token_out, request.token_out, "{name} token out");
+        assert_eq!(
+            expected.receiver, request.settlement_address,
+            "{name} receiver"
+        );
+        assert_eq!(response.interactions.len(), 2, "{name} interaction count");
+        let approval = &response.interactions[0];
+        assert_eq!(
+            approval.kind, expected_fixture.approval.kind,
+            "{name} approval kind"
+        );
+        assert_eq!(
+            approval.target, expected_fixture.approval.target,
+            "{name} approval target"
+        );
+        assert_eq!(
+            approval.value, expected_fixture.approval.value,
+            "{name} approval value"
+        );
+        assert_eq!(
+            approval.calldata, expected_fixture.approval.calldata,
+            "{name} approval calldata"
+        );
+
+        let router_call = &response.interactions[1];
+        assert_eq!(router_call.kind, expected.router.kind, "{name} router kind");
+        assert_eq!(
+            router_call.target, expected.router.target,
+            "{name} router fixture target"
+        );
+        assert_eq!(
+            router_call.value, expected.router.value,
+            "{name} router value"
+        );
+        assert_eq!(
+            router_call.calldata, expected.router.calldata,
+            "{name} router calldata"
+        );
+        assert_eq!(
+            router_call.target, request.tycho_router_address,
+            "{name} router target"
+        );
+        assert_eq!(
+            &router_call.calldata[..10],
+            expected.function_selector,
+            "{name} function selector"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 1)?,
+            expected.token_in.to_lowercase(),
+            "{name} calldata token in"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 2)?,
+            expected.token_out.to_lowercase(),
+            "{name} calldata token out"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 6)?,
+            expected.receiver.to_lowercase(),
+            "{name} calldata receiver"
+        );
+    }
     Ok(())
 }

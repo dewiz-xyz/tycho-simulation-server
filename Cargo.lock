@@ -1247,6 +1247,9 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "async-compression"
@@ -4048,6 +4051,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lunarbase-pmm-math"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6c396dc8a9a539025cb4eba99e042a78fc9a9a430cf80edbf9487658f904cf0"
+dependencies = [
+ "ruint",
+]
+
+[[package]]
 name = "macro-string"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5952,6 +5964,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serdect"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6452,7 +6477,6 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -6885,9 +6909,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-client"
-version = "0.158.0"
+version = "0.341.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18a34452cea1b63662de4149ab15ebd63e0814dc943ef27275da2f80edc53f16"
+checksum = "ee82b2ef8c0ea26d3df38b2f3a180f08c4397c50a2b7cc45baef2109184545ab"
 dependencies = [
  "async-trait",
  "backoff",
@@ -6915,11 +6939,12 @@ dependencies = [
 
 [[package]]
 name = "tycho-common"
-version = "0.158.0"
+version = "0.341.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8490bfcd1c547cc797fa97ae28c067ad82a972a822f9dc8ec20c31e0a85dc4b2"
+checksum = "f2bd533aa30850f5de6bcdef666a345a06d430c4d267b3b4406fde9e7ad6321b"
 dependencies = [
  "anyhow",
+ "arrayvec",
  "async-trait",
  "bytes",
  "chrono",
@@ -6930,6 +6955,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "serde_yaml",
  "strum 0.25.0",
  "strum_macros 0.25.3",
  "thiserror 1.0.69",
@@ -6942,9 +6968,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-ethereum"
-version = "0.158.0"
+version = "0.341.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c84083e89bfdde1c73827fa8bef0b4797f80448a5f0d5c871c96f9f5dba8d5dc"
+checksum = "6c89805103135278dfe066c6b4a81f08eaca2d1f227de4d6c2832b823c7db16e"
 dependencies = [
  "alloy",
  "async-trait",
@@ -6984,12 +7010,13 @@ dependencies = [
 
 [[package]]
 name = "tycho-simulation"
-version = "0.258.0"
+version = "0.341.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb7576a7147305f8478b3a116828ba0444922a811c124a3cd574b89f5b3554f"
+checksum = "7d76df3a27d42a91cb5540498d711d1e5b8839def718a65cb67e2ccf1901a3b8"
 dependencies = [
  "alloy",
  "alloy-chains",
+ "alloy-primitives 1.5.7",
  "async-stream",
  "async-trait",
  "chrono",
@@ -7002,7 +7029,8 @@ dependencies = [
  "hex",
  "hex-literal",
  "http 1.4.0",
- "itertools 0.10.5",
+ "itertools 0.13.0",
+ "lunarbase-pmm-math",
  "num-bigint",
  "num-traits",
  "prost 0.13.5",
@@ -7012,7 +7040,6 @@ dependencies = [
  "ruint",
  "serde",
  "serde_json",
- "strum 0.25.0",
  "strum_macros 0.25.3",
  "thiserror 1.0.69",
  "tokio",
@@ -7122,6 +7149,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

@@ -7,7 +7,7 @@ use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use tokio::sync::RwLock;
-use tycho_simulation::tycho_common::dto::{BlockChanges, ProtocolStateDelta};
+use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
@@ -1798,7 +1798,7 @@ fn raw_snapshot_reassembly_happy_path_preserves_header_and_sync_state() -> Resul
 async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
     let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
     let header = raw_block_header(10, 1);
-    let mut changes = BlockChanges::default();
+    let mut changes = BlockAggregatedChanges::default();
     for index in (0..24).rev() {
         let component_id = format!("missing-{index:04}");
         changes.state_updates.insert(
@@ -1870,7 +1870,7 @@ async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
                         )]),
                         vm_storage: HashMap::new(),
                     },
-                    deltas: Some(changes),
+                    deltas: Some(changes.into()),
                     removed_components: HashMap::new(),
                 },
             )]),
@@ -1966,7 +1966,7 @@ struct StatefulCompactionFixture {
     component_id: &'static str,
     token: Bytes,
     snapshot_state: ComponentWithState,
-    changes: BlockChanges,
+    changes: BlockAggregatedChanges,
     initial_header: BlockHeader,
     final_header: BlockHeader,
 }
@@ -1982,12 +1982,13 @@ fn stateful_compaction_fixture() -> StatefulCompactionFixture {
                 ("deleted".to_string(), Bytes::from([9u8; 32])),
             ]),
             balances: HashMap::from([(token.clone(), Bytes::from([10u8; 32]))]),
-        },
-        component: raw_dto_protocol_component(component_id),
+        }
+        .into(),
+        component: raw_dto_protocol_component(component_id).into(),
         component_tvl: Some(1.0),
         entrypoints: Vec::new(),
     };
-    let mut changes = BlockChanges::default();
+    let mut changes = BlockAggregatedChanges::default();
     changes.state_updates.insert(
         component_id.to_string(),
         ProtocolStateDelta {
@@ -2035,7 +2036,7 @@ async fn bootstrap_uncompacted_stateful(
                 )]),
                 vm_storage: HashMap::new(),
             },
-            deltas: Some(fixture.changes.clone()),
+            deltas: Some(fixture.changes.clone().into()),
             removed_components: HashMap::new(),
         },
     );
@@ -2099,7 +2100,7 @@ async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Re
                 StateSyncMessage {
                     header: fixture.final_header.clone(),
                     snapshots: Snapshot::default(),
-                    deltas: Some(fixture.changes.clone()),
+                    deltas: Some(fixture.changes.clone().into()),
                     removed_components: HashMap::new(),
                 },
             )]),
@@ -2898,7 +2899,10 @@ fn raw_protocol_message_with_parts(
                         )
                     })
                     .collect(),
-                vm_storage,
+                vm_storage: vm_storage
+                    .into_iter()
+                    .map(|(address, account)| (address, account.into()))
+                    .collect(),
             },
             deltas: None,
             removed_components: removal_ids
@@ -2906,7 +2910,7 @@ fn raw_protocol_message_with_parts(
                 .map(|component_id| {
                     (
                         (*component_id).to_string(),
-                        raw_dto_protocol_component(component_id),
+                        raw_dto_protocol_component(component_id).into(),
                     )
                 })
                 .collect(),
@@ -2920,8 +2924,9 @@ fn raw_component_with_state(component_id: &str) -> ComponentWithState {
             component_id: component_id.to_string(),
             attributes: HashMap::new(),
             balances: HashMap::new(),
-        },
-        component: raw_dto_protocol_component(component_id),
+        }
+        .into(),
+        component: raw_dto_protocol_component(component_id).into(),
         component_tvl: None,
         entrypoints: Vec::new(),
     }

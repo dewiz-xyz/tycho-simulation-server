@@ -304,7 +304,7 @@ impl TokenStore {
         let maybe_token = tokens
             .into_iter()
             .find(|token| token.address == *address)
-            .and_then(|token| Token::try_from(token).ok());
+            .map(Token::from);
 
         if let Some(token) = maybe_token {
             self.tokens

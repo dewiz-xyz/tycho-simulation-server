@@ -713,7 +713,7 @@ impl RequiredProtocolEvidence {
             for component_id in deltas.new_protocol_components.keys() {
                 self.record_live_pool(message.protocol.as_str(), component_id.as_str());
             }
-            for component_id in deltas.state_updates.keys() {
+            for component_id in deltas.state_deltas.keys() {
                 self.record_live_pool(message.protocol.as_str(), component_id.as_str());
             }
         }
@@ -887,8 +887,8 @@ fn raw_message_has_live_material(message: &BroadcasterProtocolMessage) -> bool {
     let snapshots = &message.message.snapshots;
     let has_snapshot = !snapshots.states.is_empty() || !snapshots.vm_storage.is_empty();
     let has_delta = message.message.deltas.as_ref().is_some_and(|deltas| {
-        !deltas.account_updates.is_empty()
-            || !deltas.state_updates.is_empty()
+        !deltas.account_deltas.is_empty()
+            || !deltas.state_deltas.is_empty()
             || !deltas.new_protocol_components.is_empty()
             || !deltas.deleted_protocol_components.is_empty()
     });

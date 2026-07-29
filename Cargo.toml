@@ -35,16 +35,16 @@ reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-stream = "0.1.18"
 tokio-util = "0.7"
 toml = "0.8"
 tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tycho-common = "0.158.0"
+tycho-common = "=0.341.8"
 tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
-tycho-simulation = "0.258.0"
+tycho-simulation = "=0.341.8"
 typetag = "0.2"
 
 [workspace.lints.clippy]
