@@ -174,6 +174,26 @@ pub(super) fn log_retry_fired(
     );
 }
 
+pub(super) fn log_fence_evaluation(
+    request_id: Option<&str>,
+    attempt: u8,
+    generation_moved: bool,
+    identity_changed: bool,
+    native_pool_count: usize,
+    outcome: &str,
+) {
+    info!(
+        scope = "encode_fence",
+        request_id,
+        attempt,
+        generation_moved,
+        identity_changed,
+        native_pool_count,
+        outcome,
+        "Evaluated encode native-state fence"
+    );
+}
+
 pub(super) fn log_retry_skipped_budget(
     request_id: Option<&str>,
     remaining: Duration,

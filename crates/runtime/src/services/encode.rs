@@ -18,6 +18,7 @@ mod mocks;
 pub use error::{EncodeError, EncodeErrorKind};
 pub use response::{log_failure, log_handler_timeout, log_received, log_success};
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -151,14 +152,18 @@ async fn encode_route(
     for attempt_number in [AttemptNumber::First, AttemptNumber::Second] {
         let attempt = encode_attempt(&state, &prepared, attempt_number).await;
         let outcome_class = attempt.outcome.class();
-        let fence_status = if outcome_class == AttemptOutcomeClass::Deterministic {
-            NativeFenceStatus::Current
+        let fence_evaluation = if outcome_class == AttemptOutcomeClass::Deterministic {
+            None
         } else {
-            attempt.native_fence.status(&state).await
+            attempt.native_fence.evaluate(&state).await
         };
+        let fence_status = fence_evaluation
+            .as_ref()
+            .map_or(NativeFenceStatus::Current, |evaluation| evaluation.status);
 
         match resolve_attempt(outcome_class, fence_status, attempt_number) {
             AttemptResolution::ReturnOutcome => {
+                log_fence(&fence_evaluation, &prepared, attempt_number, "pass");
                 return attempt.outcome.into_result().map(|mut computation| {
                     computation.attempts = attempt_number.value();
                     computation.first_attempt_expected_amount_out =
@@ -181,6 +186,12 @@ async fn encode_route(
                     prepared.backend_usage.rfq,
                 );
                 if !budget.can_start {
+                    log_fence(
+                        &fence_evaluation,
+                        &prepared,
+                        attempt_number,
+                        "retry_skipped_budget",
+                    );
                     response::log_retry_skipped_budget(
                         prepared.request.request_id.as_deref(),
                         budget.remaining,
@@ -190,6 +201,7 @@ async fn encode_route(
                     return Err(native_state_changed_error());
                 }
 
+                log_fence(&fence_evaluation, &prepared, attempt_number, "retry");
                 let trigger = if outcome_class == AttemptOutcomeClass::Success {
                     RetryTrigger::Fence
                 } else {
@@ -207,6 +219,12 @@ async fn encode_route(
                 first_attempt_expected_amount_out = first_expected_amount_out;
             }
             AttemptResolution::ReturnNativeStateChanged => {
+                log_fence(
+                    &fence_evaluation,
+                    &prepared,
+                    attempt_number,
+                    "second_trip_abort",
+                );
                 response::log_second_trip_abort(
                     prepared.request.request_id.as_deref(),
                     outcome_class.label(),
@@ -217,6 +235,7 @@ async fn encode_route(
                 return Err(native_state_changed_error());
             }
             AttemptResolution::ReturnNativeUnavailable => {
+                log_fence(&fence_evaluation, &prepared, attempt_number, "unavailable");
                 return Err(native_state_changed_error());
             }
         }
@@ -304,13 +323,22 @@ async fn encode_attempt(
     } else {
         None
     };
-    let native_fence = NativeAttemptFence::from_pin(native_pin.as_ref());
-    let outcome = encode_attempt_with_pin(state, prepared, attempt_number, native_pin).await;
+    let execution =
+        encode_attempt_with_pin(state, prepared, attempt_number, native_pin.clone()).await;
+    let native_pool_ids = execution
+        .native_pool_ids
+        .unwrap_or_else(|| normalized_native_pool_ids(&prepared.normalized));
+    let native_fence = NativeAttemptFence::new(native_pin, native_pool_ids);
 
     EncodeAttempt {
-        outcome: AttemptOutcome::from_result(outcome),
+        outcome: AttemptOutcome::from_result(execution.outcome),
         native_fence,
     }
+}
+
+struct EncodeAttemptExecution {
+    outcome: Result<EncodeComputation, AttemptError>,
+    native_pool_ids: Option<HashSet<String>>,
 }
 
 async fn encode_attempt_with_pin(
@@ -318,7 +346,7 @@ async fn encode_attempt_with_pin(
     prepared: &PreparedEncodeRoute,
     attempt_number: AttemptNumber,
     native_pin: Option<PublishedStatePin>,
-) -> Result<EncodeComputation, AttemptError> {
+) -> EncodeAttemptExecution {
     let rebuild_guard = state
         .acquire_simulation_rebuild_guard(prepared.backend_usage.vm, prepared.backend_usage.rfq)
         .await;
@@ -330,11 +358,14 @@ async fn encode_attempt_with_pin(
         )
         .await;
     if let Some(message) = availability.availability_message() {
-        return Err(AttemptError::deterministic(EncodeError::unavailable(
-            message,
-        )));
+        return EncodeAttemptExecution {
+            outcome: Err(AttemptError::deterministic(EncodeError::unavailable(
+                message,
+            ))),
+            native_pool_ids: None,
+        };
     }
-    let resimulated = resimulate::resimulate_route_with_native_pin(
+    let resimulated = match resimulate::resimulate_route_with_native_pin(
         state,
         &prepared.normalized,
         prepared.chain,
@@ -344,7 +375,31 @@ async fn encode_attempt_with_pin(
         rebuild_guard,
         native_pin,
     )
-    .await?;
+    .await
+    {
+        Ok(resimulated) => resimulated,
+        Err(error) => {
+            return EncodeAttemptExecution {
+                outcome: Err(error),
+                native_pool_ids: None,
+            };
+        }
+    };
+    let native_pool_ids = resimulated_native_pool_ids(&resimulated);
+    let outcome = complete_encode_attempt(state, prepared, attempt_number, resimulated).await;
+
+    EncodeAttemptExecution {
+        outcome,
+        native_pool_ids: Some(native_pool_ids),
+    }
+}
+
+async fn complete_encode_attempt(
+    state: &AppState,
+    prepared: &PreparedEncodeRoute,
+    attempt_number: AttemptNumber,
+    resimulated: model::ResimulatedRouteInternal,
+) -> Result<EncodeComputation, AttemptError> {
     response::log_resimulation_amounts(
         prepared.request.request_id.as_deref(),
         attempt_number.value(),
@@ -393,23 +448,82 @@ async fn encode_attempt_with_pin(
     })
 }
 
+fn normalized_native_pool_ids(normalized: &NormalizedRouteInternal) -> HashSet<String> {
+    normalized
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .filter(|swap| backend::PoolBackend::from_protocol_hint(&swap.pool.protocol).is_native())
+        .map(|swap| swap.pool.component_id.clone())
+        .collect()
+}
+
+fn resimulated_native_pool_ids(resimulated: &model::ResimulatedRouteInternal) -> HashSet<String> {
+    // Reused pools can carry route-local state Arcs. Compare the published entries by ID.
+    // Store fallback can find a native pool absent from the pin. One retry converges.
+    resimulated
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .filter(|swap| swap.backend.is_native())
+        .map(|swap| swap.pool.component_id.clone())
+        .collect()
+}
+
 struct NativeAttemptFence {
-    request_generation: Option<u64>,
+    pin: Option<PublishedStatePin>,
+    native_pool_ids: HashSet<String>,
 }
 
 impl NativeAttemptFence {
-    fn from_pin(pin: Option<&PublishedStatePin>) -> Self {
+    fn new(pin: Option<PublishedStatePin>, native_pool_ids: HashSet<String>) -> Self {
         Self {
-            request_generation: pin.map(PublishedStatePin::request_generation),
+            pin,
+            native_pool_ids,
         }
     }
 
-    async fn status(&self, state: &AppState) -> NativeFenceStatus {
-        let Some(request_generation) = self.request_generation else {
-            return NativeFenceStatus::Current;
-        };
-        state.native_request_fence_status(request_generation).await
+    async fn evaluate(&self, state: &AppState) -> Option<NativeFenceEvaluation> {
+        let pinned = self.pin.as_ref()?;
+        let status = state
+            .native_route_fence_status(pinned, &self.native_pool_ids)
+            .await;
+        let current_generation = state.native_state_store.pin().await.request_generation();
+        Some(NativeFenceEvaluation {
+            status,
+            generation_moved: current_generation != pinned.request_generation(),
+            identity_changed: status == NativeFenceStatus::Changed,
+            native_pool_count: self.native_pool_ids.len(),
+        })
     }
+}
+
+struct NativeFenceEvaluation {
+    status: NativeFenceStatus,
+    generation_moved: bool,
+    identity_changed: bool,
+    native_pool_count: usize,
+}
+
+fn log_fence(
+    evaluation: &Option<NativeFenceEvaluation>,
+    prepared: &PreparedEncodeRoute,
+    attempt_number: AttemptNumber,
+    outcome: &str,
+) {
+    let Some(evaluation) = evaluation.as_ref() else {
+        return;
+    };
+    response::log_fence_evaluation(
+        prepared.request.request_id.as_deref(),
+        attempt_number.value(),
+        evaluation.generation_moved,
+        evaluation.identity_changed,
+        evaluation.native_pool_count,
+        outcome,
+    );
 }
 
 enum AttemptOutcome {

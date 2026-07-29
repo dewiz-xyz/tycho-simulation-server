@@ -92,20 +92,25 @@ impl TychoEncoder for MockTychoEncoder {
 struct PublishingEncoderState {
     state_store: Arc<StateStore>,
     router: Bytes,
+    update_pool_id: String,
     calls: AtomicUsize,
 }
 
 impl PublishingEncoderState {
-    fn new(state_store: Arc<StateStore>, router: Bytes) -> Self {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
         Self {
             state_store,
             router,
+            update_pool_id,
             calls: AtomicUsize::new(0),
         }
     }
 
     fn publish_update(&self) {
-        let states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
+        let states = HashMap::from([(
+            self.update_pool_id.clone(),
+            Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+        )]);
         let new_pairs: HashMap<String, ProtocolComponent> = HashMap::new();
         let update = Update::new(43, states, new_pairs);
         tokio::task::block_in_place(|| {
@@ -123,9 +128,9 @@ struct PublishUpdateOnFirstCallEncoder {
 }
 
 impl PublishUpdateOnFirstCallEncoder {
-    fn new(state_store: Arc<StateStore>, router: Bytes) -> Self {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
         Self {
-            state: PublishingEncoderState::new(state_store, router),
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
         }
     }
 
@@ -164,9 +169,9 @@ struct PublishUpdateOnEveryCallEncoder {
 }
 
 impl PublishUpdateOnEveryCallEncoder {
-    fn new(state_store: Arc<StateStore>, router: Bytes) -> Self {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
         Self {
-            state: PublishingEncoderState::new(state_store, router),
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
         }
     }
 
@@ -205,9 +210,14 @@ struct PublishUpdateWithWrongRouterEncoder {
 }
 
 impl PublishUpdateWithWrongRouterEncoder {
-    fn new(state_store: Arc<StateStore>, router: Bytes, wrong_router: Bytes) -> Self {
+    fn new(
+        state_store: Arc<StateStore>,
+        router: Bytes,
+        wrong_router: Bytes,
+        update_pool_id: String,
+    ) -> Self {
         Self {
-            state: PublishingEncoderState::new(state_store, router),
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
             wrong_router,
         }
     }
@@ -867,6 +877,41 @@ async fn setup_app_state_and_request(
     Ok((create_router(runtime), request))
 }
 
+async fn add_native_echo_pool(
+    state: &AppState,
+    request: &RouteEncodeRequest,
+    pool_id: &str,
+) -> Result<()> {
+    let token_in = parse_bytes(&request.token_in)?;
+    let token_out = parse_bytes(&request.token_out)?;
+    let component = ProtocolComponent::new(
+        parse_bytes("0x00000000000000000000000000000000000000bb")?,
+        "uniswap_v2".to_string(),
+        "uniswap_v2".to_string(),
+        state.chain,
+        vec![
+            make_token(&token_in, "TK1", state.chain),
+            make_token(&token_out, "TK2", state.chain),
+        ],
+        Vec::new(),
+        HashMap::new(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    state
+        .native_state_store
+        .apply_update(Update::new(
+            43,
+            HashMap::from([(
+                pool_id.to_string(),
+                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+            )]),
+            HashMap::from([(pool_id.to_string(), component)]),
+        ))
+        .await;
+    Ok(())
+}
+
 async fn post_encode(
     app: axum::Router,
     request: &RouteEncodeRequest,
@@ -1062,6 +1107,10 @@ async fn encode_route_retries_after_first_attempt_publication() -> Result<()> {
     let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
         Arc::clone(&state.native_state_store),
         parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
     ));
     let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
     let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
@@ -1080,6 +1129,35 @@ async fn encode_route_retries_after_first_attempt_publication() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn encode_route_does_not_retry_after_unrelated_pool_publication() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-unrelated-publication",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_native_echo_pool(&state, &request, "pool-unrelated").await?;
+    let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        "pool-unrelated".to_string(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(encoder.call_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn encode_route_returns_service_unavailable_after_second_publication() -> Result<()> {
     let config = EncodeFixtureConfig {
         request_id: "req-retry-second-trip",
@@ -1089,6 +1167,10 @@ async fn encode_route_returns_service_unavailable_after_second_publication() -> 
     let encoder = Arc::new(PublishUpdateOnEveryCallEncoder::new(
         Arc::clone(&state.native_state_store),
         parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
     ));
     let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
     let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
@@ -1116,6 +1198,10 @@ async fn encode_route_returns_deterministic_error_without_retry_after_publicatio
         Arc::clone(&state.native_state_store),
         parse_bytes(&request.tycho_router_address)?,
         parse_bytes("0x0000000000000000000000000000000000000005")?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
     ));
     let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
     let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
