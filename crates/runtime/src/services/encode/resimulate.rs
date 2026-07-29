@@ -30,6 +30,7 @@ use crate::services::stream_builder::{
 
 use super::allocation::allocate_swaps_by_bps;
 use super::backend::PoolBackend;
+use super::error::AttemptError;
 use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
@@ -78,7 +79,7 @@ async fn resimulate_route(
     request_token_out: &Bytes,
     native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
-) -> Result<ResimulatedRouteInternal, EncodeError> {
+) -> Result<ResimulatedRouteInternal, AttemptError> {
     let native_pin = Some(state.native_state_store.pin().await);
     resimulate_route_with_native_pin(
         state,
@@ -106,7 +107,7 @@ pub(super) async fn resimulate_route_with_native_pin(
     native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
     native_pin: Option<PublishedStatePin>,
-) -> Result<ResimulatedRouteInternal, EncodeError> {
+) -> Result<ResimulatedRouteInternal, AttemptError> {
     let mut resimulator =
         RouteResimulator::new(state, normalized, chain, rebuild_guard, native_pin);
 
@@ -158,7 +159,7 @@ impl<'a> RouteResimulator<'a> {
         &mut self,
         segment_index: usize,
         hop_index: usize,
-    ) -> Result<(), EncodeError> {
+    ) -> Result<(), AttemptError> {
         let Some(hop) = self
             .normalized
             .segments
@@ -168,22 +169,25 @@ impl<'a> RouteResimulator<'a> {
             return Ok(());
         };
         let hop_amount_in = {
-            let segment_state = self
-                .segment_states
-                .get_mut(segment_index)
-                .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+            let segment_state = self.segment_states.get_mut(segment_index).ok_or_else(|| {
+                AttemptError::deterministic(EncodeError::internal(
+                    "Segment state missing after resimulation",
+                ))
+            })?;
             require_hop_amount_in(segment_state, segment_index, hop_index)?
         };
         let allocated_swaps =
-            allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)?;
+            allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)
+                .map_err(|error| classify_allocation_error(error, hop_index))?;
         let (swap_results, hop_expected) = self
             .simulate_allocated_swaps(allocated_swaps, &hop_amount_in)
             .await?;
         // We come back for the segment state here because the pool work above awaits.
-        let segment_state = self
-            .segment_states
-            .get_mut(segment_index)
-            .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+        let segment_state = self.segment_states.get_mut(segment_index).ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment state missing after resimulation",
+            ))
+        })?;
         segment_state.hops[hop_index] = Some(ResimulatedHopInternal {
             token_in: hop.token_in.clone(),
             token_out: hop.token_out.clone(),
@@ -199,7 +203,7 @@ impl<'a> RouteResimulator<'a> {
         &mut self,
         allocated_swaps: Vec<super::allocation::AllocatedSwap>,
         hop_amount_in: &BigUint,
-    ) -> Result<(Vec<ResimulatedSwapInternal>, BigUint), EncodeError> {
+    ) -> Result<(Vec<ResimulatedSwapInternal>, BigUint), AttemptError> {
         let mut swap_results = Vec::with_capacity(allocated_swaps.len());
         let mut hop_expected = BigUint::zero();
 
@@ -210,9 +214,8 @@ impl<'a> RouteResimulator<'a> {
         }
 
         if hop_expected.is_zero() {
-            return Err(EncodeError::simulation(format!(
-                "hop amountIn {} produced zero amountOut",
-                hop_amount_in
+            return Err(AttemptError::state_dependent(EncodeError::simulation(
+                format!("hop amountIn {} produced zero amountOut", hop_amount_in),
             )));
         }
 
@@ -222,7 +225,7 @@ impl<'a> RouteResimulator<'a> {
     async fn simulate_allocated_swap(
         &mut self,
         allocated: super::allocation::AllocatedSwap,
-    ) -> Result<ResimulatedSwapInternal, EncodeError> {
+    ) -> Result<ResimulatedSwapInternal, AttemptError> {
         let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
         ensure_erc4626_swap_supported(
             self.state,
@@ -285,7 +288,7 @@ impl<'a> RouteResimulator<'a> {
         })
     }
 
-    async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, EncodeError> {
+    async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, AttemptError> {
         if let Some(entry) = self.pool_cache.get(pool_id) {
             return Ok(entry.clone());
         }
@@ -327,7 +330,12 @@ impl<'a> RouteResimulator<'a> {
             .pool_by_id(pool_id)
             .await
             .map_err(availability_error)?
-            .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
+            .ok_or_else(|| {
+                AttemptError::state_dependent(EncodeError::not_found(format!(
+                    "Pool {} not found",
+                    pool_id
+                )))
+            })?;
         let backend = PoolBackend::from_component(component.as_ref());
         let pool_state = if backend.is_rfq() {
             hydrate_rfq_pool_state(
@@ -352,7 +360,7 @@ impl<'a> RouteResimulator<'a> {
 
     fn build_resimulated_segments(
         &mut self,
-    ) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
+    ) -> Result<Vec<ResimulatedSegmentInternal>, AttemptError> {
         build_resimulated_segments(self.normalized, &mut self.segment_states)
     }
 }
@@ -373,7 +381,7 @@ fn hydrate_rfq_pool_state(
     chain: Chain,
     config: &RfqClientConfig,
     quote_timeout: Duration,
-) -> Result<Arc<dyn ProtocolSim>, EncodeError> {
+) -> Result<Arc<dyn ProtocolSim>, AttemptError> {
     // Broadcaster serialization strips credentials, so rebuild only the request-scoped client.
     // Firm quotes do not use the stream token filters carried by these clients.
     if let Some(state) = pool_state.as_any().downcast_ref::<BebopState>() {
@@ -423,27 +431,28 @@ fn hydrate_rfq_pool_state(
         return Ok(Arc::new(hydrated));
     }
 
-    Err(EncodeError::internal(format!(
+    Err(AttemptError::deterministic(EncodeError::internal(format!(
         "RFQ pool {pool_id} has unsupported state type"
-    )))
+    ))))
 }
 
 fn rfq_hydration_error(
     pool_id: &str,
     provider: &str,
     error: impl std::fmt::Display,
-) -> EncodeError {
-    EncodeError::internal(format!(
+) -> AttemptError {
+    AttemptError::deterministic(EncodeError::internal(format!(
         "Failed to hydrate {provider} client for RFQ pool {pool_id}: {error}"
-    ))
+    )))
 }
 
-fn availability_error(availability: crate::models::state::EncodeAvailability) -> EncodeError {
-    EncodeError::unavailable(
+fn availability_error(availability: crate::models::state::EncodeAvailability) -> AttemptError {
+    // Unavailable state must fail immediately instead of entering the future retry loop.
+    AttemptError::deterministic(EncodeError::unavailable(
         availability.availability_message().unwrap_or_else(|| {
             unreachable!("unready pool lookup must have an availability message")
         }),
-    )
+    ))
 }
 
 fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<SegmentSimState> {
@@ -457,17 +466,26 @@ fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<Segmen
         .collect()
 }
 
+fn classify_allocation_error(error: AttemptError, hop_index: usize) -> AttemptError {
+    // First-hop amounts come from the request. Later hop amounts come from simulated state.
+    if hop_index == 0 {
+        error
+    } else {
+        AttemptError::state_dependent(EncodeError::from(error))
+    }
+}
+
 fn require_hop_amount_in(
     segment_state: &SegmentSimState,
     segment_index: usize,
     hop_index: usize,
-) -> Result<BigUint, EncodeError> {
+) -> Result<BigUint, AttemptError> {
     let hop_amount_in = segment_state.next_amount_in.clone();
     if hop_amount_in.is_zero() {
-        return Err(EncodeError::invalid(format!(
+        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
             "segment[{}].hop[{}] amountIn is zero",
             segment_index, hop_index
-        )));
+        ))));
     }
 
     Ok(hop_amount_in)
@@ -480,7 +498,7 @@ async fn simulate_swap(
         Arc<dyn ProtocolSim>,
         tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
     ),
-    EncodeError,
+    AttemptError,
 > {
     let SwapSimulationRequest {
         pool_state,
@@ -502,30 +520,32 @@ async fn simulate_swap(
         .map_err(|err| execution_error(&failure_pool_id, err))?;
 
     let result = result.map_err(|err| {
-        EncodeError::simulation(format!("Pool {} simulation failed: {}", pool_id, err))
+        AttemptError::state_dependent(EncodeError::simulation(format!(
+            "Pool {} simulation failed: {}",
+            pool_id, err
+        )))
     })?;
     Ok((pre_state, result))
 }
 
-fn execution_error(pool_id: &str, err: SimulationExecutionError) -> EncodeError {
+fn execution_error(pool_id: &str, err: SimulationExecutionError) -> AttemptError {
     match err {
-        SimulationExecutionError::WorkerPanicked(_) => {
-            EncodeError::internal(format!("Pool {} simulation worker panicked", pool_id))
-        }
-        SimulationExecutionError::ResultDropped => {
-            EncodeError::internal(format!("Pool {} simulation result was dropped", pool_id))
-        }
+        SimulationExecutionError::WorkerPanicked(_) => AttemptError::deterministic(
+            EncodeError::internal(format!("Pool {} simulation worker panicked", pool_id)),
+        ),
+        SimulationExecutionError::ResultDropped => AttemptError::deterministic(
+            EncodeError::internal(format!("Pool {} simulation result was dropped", pool_id)),
+        ),
     }
 }
 
 fn require_non_zero_amount_out(
     pool_id: &str,
     expected_out: BigUint,
-) -> Result<BigUint, EncodeError> {
+) -> Result<BigUint, AttemptError> {
     if expected_out.is_zero() {
-        return Err(EncodeError::simulation(format!(
-            "Pool {} returned zero amountOut",
-            pool_id
+        return Err(AttemptError::state_dependent(EncodeError::simulation(
+            format!("Pool {} returned zero amountOut", pool_id),
         )));
     }
 
@@ -535,13 +555,15 @@ fn require_non_zero_amount_out(
 fn build_resimulated_segments(
     normalized: &NormalizedRouteInternal,
     segment_states: &mut [SegmentSimState],
-) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
+) -> Result<Vec<ResimulatedSegmentInternal>, AttemptError> {
     let mut resim_segments = Vec::with_capacity(normalized.segments.len());
     for (segment_index, segment) in normalized.segments.iter().enumerate() {
         let resim_hops = take_segment_hops(segment_states, segment_index, segment.hops.len())?;
-        let last_hop = resim_hops
-            .last()
-            .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
+        let last_hop = resim_hops.last().ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment hops missing after resimulation",
+            ))
+        })?;
         resim_segments.push(ResimulatedSegmentInternal {
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.clone(),
@@ -556,15 +578,19 @@ fn take_segment_hops(
     segment_states: &mut [SegmentSimState],
     segment_index: usize,
     hop_len: usize,
-) -> Result<Vec<ResimulatedHopInternal>, EncodeError> {
-    let segment_state = segment_states
-        .get_mut(segment_index)
-        .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+) -> Result<Vec<ResimulatedHopInternal>, AttemptError> {
+    let segment_state = segment_states.get_mut(segment_index).ok_or_else(|| {
+        AttemptError::deterministic(EncodeError::internal(
+            "Segment state missing after resimulation",
+        ))
+    })?;
     let mut resim_hops = Vec::with_capacity(hop_len);
     for hop_index in 0..hop_len {
-        let resim_hop = segment_state.hops[hop_index]
-            .take()
-            .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
+        let resim_hop = segment_state.hops[hop_index].take().ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment hops missing after resimulation",
+            ))
+        })?;
         resim_hops.push(resim_hop);
     }
     Ok(resim_hops)
@@ -573,11 +599,11 @@ fn take_segment_hops(
 fn validate_request_tokens(
     request_token_in: &Bytes,
     request_token_out: &Bytes,
-) -> Result<(), EncodeError> {
+) -> Result<(), AttemptError> {
     if request_token_in.is_empty() || request_token_out.is_empty() {
-        return Err(EncodeError::internal(
+        return Err(AttemptError::deterministic(EncodeError::internal(
             "Request tokens missing after resimulation",
-        ));
+        )));
     }
 
     Ok(())
@@ -590,7 +616,7 @@ fn ensure_native_swap_supported(
     component: &ProtocolComponent,
     component_id: &str,
     native_token_protocol_allowlist: &[String],
-) -> Result<bool, EncodeError> {
+) -> Result<bool, AttemptError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
     let protocol_supports_native =
@@ -598,10 +624,10 @@ fn ensure_native_swap_supported(
 
     if swap_uses_native && !protocol_supports_native {
         let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
-        return Err(EncodeError::invalid(format!(
+        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
             "native tokenIn/tokenOut is only supported for protocols [{}]; pool {} uses {}",
             supported, component_id, component.protocol_system
-        )));
+        ))));
     }
 
     Ok(protocol_supports_native)
@@ -611,7 +637,7 @@ fn validate_native_request_tokens(
     normalized: &NormalizedRouteInternal,
     chain: Chain,
     native_token_protocol_allowlist: &[String],
-) -> Result<(), EncodeError> {
+) -> Result<(), AttemptError> {
     let native_address = chain.native_token().address;
 
     for segment in &normalized.segments {
@@ -629,10 +655,10 @@ fn validate_native_request_tokens(
                 ) {
                     let supported =
                         format_native_protocol_allowlist(native_token_protocol_allowlist);
-                    return Err(EncodeError::invalid(format!(
+                    return Err(AttemptError::deterministic(EncodeError::invalid(format!(
                         "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
                         supported, swap.pool.protocol
-                    )));
+                    ))));
                 }
             }
         }
@@ -648,7 +674,7 @@ fn ensure_erc4626_swap_supported(
     token_in: &Bytes,
     token_out: &Bytes,
     erc4626_deposits_enabled: bool,
-) -> Result<(), EncodeError> {
+) -> Result<(), AttemptError> {
     if !component_is_erc4626(component) {
         return Ok(());
     }
@@ -670,11 +696,13 @@ fn ensure_erc4626_swap_supported(
         token_out = token_out.to_string(),
         "Rejecting unsupported ERC4626 encode hop during resimulation"
     );
-    Err(EncodeError::invalid(unsupported_direction_message(
-        token_in,
-        token_out,
-        erc4626_deposits_enabled,
-        &state.erc4626_pair_policies,
+    Err(AttemptError::deterministic(EncodeError::invalid(
+        unsupported_direction_message(
+            token_in,
+            token_out,
+            erc4626_deposits_enabled,
+            &state.erc4626_pair_policies,
+        ),
     )))
 }
 
@@ -703,14 +731,14 @@ impl<'a> TokenCache<'a> {
         &mut self,
         address: &Bytes,
         native_pin: Option<&PublishedStatePin>,
-    ) -> Result<Token, EncodeError> {
+    ) -> Result<Token, AttemptError> {
         if let Some(token) = self.cache.get(address) {
             return Ok(token.clone());
         }
         if let Some(native_pin) = native_pin {
-            let token = native_pin
-                .token(address)
-                .ok_or_else(|| EncodeError::invalid("Token not found"))?;
+            let token = native_pin.token(address).ok_or_else(|| {
+                AttemptError::state_dependent(EncodeError::invalid("Token not found"))
+            })?;
             self.cache.insert(address.clone(), token.clone());
             return Ok(token);
         }
@@ -719,8 +747,13 @@ impl<'a> TokenCache<'a> {
             .tokens
             .ensure(address)
             .await
-            .map_err(|err| EncodeError::simulation(format!("Token lookup failed: {}", err)))?
-            .ok_or_else(|| EncodeError::invalid("Token not found"))?;
+            .map_err(|err| {
+                AttemptError::deterministic(EncodeError::simulation(format!(
+                    "Token lookup failed: {}",
+                    err
+                )))
+            })?
+            .ok_or_else(|| AttemptError::deterministic(EncodeError::invalid("Token not found")))?;
         self.cache.insert(address.clone(), token.clone());
         Ok(token)
     }
@@ -753,8 +786,8 @@ mod tests {
     use super::*;
     use crate::models::state::RfqClientConfig;
     use crate::services::encode::fixtures::{
-        component_with_protocol, component_with_tokens, dummy_token, pool_ref, test_app_state,
-        test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, pool_ref,
+        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
     use crate::services::encode::mocks::{step_multiplier, StepProtocolSim};
     use crate::services::encode::model::{
@@ -765,6 +798,52 @@ mod tests {
         app_state
             .acquire_simulation_rebuild_guard(false, false)
             .await
+    }
+
+    #[test]
+    fn allocation_errors_follow_hop_amount_source() {
+        let swaps = vec![
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p1"),
+                token_in: fixture_bytes("0x0000000000000000000000000000000000000001"),
+                token_out: fixture_bytes("0x0000000000000000000000000000000000000002"),
+                split_bps: 1,
+            },
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p2"),
+                token_in: fixture_bytes("0x0000000000000000000000000000000000000001"),
+                token_out: fixture_bytes("0x0000000000000000000000000000000000000002"),
+                split_bps: 0,
+            },
+        ];
+
+        let first_hop = match allocate_swaps_by_bps(BigUint::from(1u32), &swaps, 0, 0)
+            .map_err(|error| classify_allocation_error(error, 0))
+        {
+            Ok(_) => panic!("first-hop split should round to zero"),
+            Err(error) => error,
+        };
+        assert!(!first_hop.is_state_dependent());
+
+        let later_hop = match allocate_swaps_by_bps(BigUint::from(1u32), &swaps, 0, 1)
+            .map_err(|error| classify_allocation_error(error, 1))
+        {
+            Ok(_) => panic!("later-hop split should round to zero"),
+            Err(error) => error,
+        };
+        assert!(later_hop.is_state_dependent());
+    }
+
+    #[test]
+    fn simulation_state_and_worker_failures_use_separate_buckets() {
+        let zero_output = match require_non_zero_amount_out("pool", BigUint::zero()) {
+            Ok(_) => panic!("zero output should fail"),
+            Err(error) => error,
+        };
+        assert!(zero_output.is_state_dependent());
+
+        let dropped_result = execution_error("pool", SimulationExecutionError::ResultDropped);
+        assert!(!dropped_result.is_state_dependent());
     }
 
     fn rfq_client_config() -> RfqClientConfig {
@@ -944,6 +1023,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::Internal
         );
+        assert!(!err.is_state_dependent());
         assert_eq!(
             err.message(),
             "RFQ pool pool-unknown has unsupported state type"
@@ -1334,6 +1414,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
         );
+        assert!(!err.is_state_dependent());
 
         let enabled_state = test_app_state(
             tokens_store,
@@ -1507,6 +1588,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::Simulation
         );
+        assert!(!err.is_state_dependent());
         assert!(err.message().contains("Token lookup failed"));
     }
 
@@ -1569,6 +1651,19 @@ mod tests {
 
         assert_eq!(from_pin.symbol, "PINNED");
         assert_eq!(from_pin.decimals, 18);
+
+        let missing_address = dummy_token("0x0000000000000000000000000000000000000003").address;
+        let missing_error = match cache.get(&missing_address, Some(&native_pin)).await {
+            Ok(_) => panic!("missing pinned metadata should fail"),
+            Err(error) => error,
+        };
+        assert!(missing_error.is_state_dependent());
+        assert_eq!(
+            missing_error.kind(),
+            crate::services::encode::EncodeErrorKind::InvalidRequest
+        );
+        assert_eq!(missing_error.message(), "Token not found");
+
         assert!(
             !app_state
                 .tokens

@@ -521,6 +521,25 @@ pub enum EncodeAvailability {
     RfqStale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeFenceStatus {
+    Current,
+    Changed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRouteFenceCheck {
+    pub(crate) status: NativeFenceStatus,
+    pub(crate) current_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativePoolFenceStatus {
+    Available(HashSet<String>),
+    Unavailable,
+}
+
 impl EncodeAvailability {
     pub const fn availability_message(self) -> Option<&'static str> {
         match self {
@@ -788,19 +807,64 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn native_request_is_current(&self, pinned_generation: u64) -> bool {
+    pub(crate) async fn native_route_fence_status(
+        &self,
+        pinned: &PublishedStatePin,
+        pool_ids: &HashSet<String>,
+    ) -> NativeRouteFenceCheck {
+        let current = self.native_state_store.pin().await;
+        let status = match self
+            .native_pool_fence_status(pinned, &current, pool_ids)
+            .await
+        {
+            NativePoolFenceStatus::Available(changed_pool_ids) if changed_pool_ids.is_empty() => {
+                NativeFenceStatus::Current
+            }
+            NativePoolFenceStatus::Available(_) => NativeFenceStatus::Changed,
+            NativePoolFenceStatus::Unavailable => NativeFenceStatus::Unavailable,
+        };
+        NativeRouteFenceCheck {
+            status,
+            current_generation: current.request_generation(),
+        }
+    }
+
+    pub(crate) async fn native_request_availability(&self) -> (bool, u64) {
+        let bootstrap_ready = self.native_broadcaster_bootstrap_ready().await;
+        let update_is_stale = is_update_stale(
+            self.native_update_age_ms().await,
+            self.native_progress_lease_ms(),
+        );
+        let (state_ready, requests_allowed, current_generation) =
+            self.native_state_store.request_snapshot().await;
+        (
+            bootstrap_ready && !update_is_stale && state_ready && requests_allowed,
+            current_generation,
+        )
+    }
+
+    pub(crate) async fn native_pool_fence_status(
+        &self,
+        pinned: &PublishedStatePin,
+        current: &PublishedStatePin,
+        pool_ids: &HashSet<String>,
+    ) -> NativePoolFenceStatus {
         if !self.native_broadcaster_bootstrap_ready().await {
-            return false;
+            return NativePoolFenceStatus::Unavailable;
         }
         if is_update_stale(
             self.native_update_age_ms().await,
             self.native_progress_lease_ms(),
         ) {
-            return false;
+            return NativePoolFenceStatus::Unavailable;
         }
-        let (state_ready, requests_allowed, current_generation) =
-            self.native_state_store.request_snapshot().await;
-        state_ready && requests_allowed && current_generation == pinned_generation
+        // The request flags must come from the same publication as the identity compare.
+        // fence_requests only flips requests_allowed and keeps every pool Arc, so a fence
+        // landing between a separate availability read and the pin would pass as Current.
+        if !current.state.ready || !current.state.requests_allowed {
+            return NativePoolFenceStatus::Unavailable;
+        }
+        NativePoolFenceStatus::Available(pinned.changed_pool_ids(current, pool_ids))
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
@@ -1182,6 +1246,40 @@ impl PublishedStatePin {
 
     pub(crate) fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         pool_by_id_from_published(&self.state, id)
+    }
+
+    /// Pointer identity is a valid fence because updates replace state and component Arcs instead
+    /// of mutating them. `get_amount_out` borrows state and returns a separate state after the
+    /// swap, while delta application requires `&mut self` upstream. Native protocol states do not
+    /// use interior mutability, which the invariant test below enforces with a real implementation.
+    pub(crate) fn changed_pool_ids(
+        &self,
+        current: &Self,
+        pool_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        pool_ids
+            .iter()
+            .filter(|pool_id| {
+                let pinned_entry = self.pool_by_id(pool_id);
+                let current_entry = current.pool_by_id(pool_id);
+                match (pinned_entry, current_entry) {
+                    (None, None) => {
+                        // Neither pin has an identity that could have moved during encode.
+                        false
+                    }
+                    (None, Some(_)) | (Some(_), None) => true,
+                    (
+                        Some((pinned_state, pinned_component)),
+                        Some((current_state, current_component)),
+                    ) => {
+                        // Component identity catches pools removed and re-added between pins.
+                        !Arc::ptr_eq(&pinned_state, &current_state)
+                            || !Arc::ptr_eq(&pinned_component, &current_component)
+                    }
+                }
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -1750,7 +1848,12 @@ mod tests {
 
     use num_bigint::BigUint;
     use tycho_simulation::{
-        protocol::models::ProtocolComponent,
+        evm::protocol::uniswap_v2::state::UniswapV2State,
+        protocol::models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        tycho_client::feed::{
+            dto::ComponentWithState as DtoComponentWithState, synchronizer::ComponentWithState,
+            BlockHeader,
+        },
         tycho_common::{
             dto::ProtocolStateDelta,
             models::{token::Token, Chain},
@@ -2268,41 +2371,6 @@ mod tests {
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
-    }
-
-    #[tokio::test]
-    async fn native_request_generation_survives_wire_version_realignment() {
-        let state = build_readiness_test_state(false, false).await;
-        state.native_stream_health.record_update(1).await;
-        let pinned = state.native_state_store.pin().await;
-        let wire_version = pinned.version();
-
-        assert!(
-            state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-
-        state.native_state_store.fence_requests().await;
-        assert!(!state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-
-        state
-            .native_state_store
-            .align_bootstrap_state_version(wire_version)
-            .await;
-        assert_eq!(state.native_state_store.state_version().await, wire_version);
-        assert!(state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await,
-            "realigning to the same wire version must not recreate an old request fence"
-        );
     }
 
     #[tokio::test]
@@ -3359,6 +3427,369 @@ mod tests {
         let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
 
         assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
+    }
+
+    async fn build_native_identity_fence_state() -> AppState {
+        let state = build_readiness_test_state(false, false).await;
+        state
+            .native_state_store
+            .apply_update(mk_update(vec![(
+                "pool-b".to_string(),
+                mk_component(
+                    31,
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    vec![mk_token(32, "TKNC"), mk_token(33, "TKND")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_tracks_touched_pool_identity_only() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let (pinned_a_state, pinned_a_component) = pinned
+            .pool_by_id("pool-native")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let (pinned_b_state, pinned_b_component) = pinned
+            .pool_by_id("pool-b")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+
+        state
+            .native_state_store
+            .apply_update(Update::new(
+                2,
+                HashMap::from([(
+                    "pool-native".to_string(),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::new(),
+            ))
+            .await;
+
+        let current = state.native_state_store.pin().await;
+        let (current_a_state, current_a_component) = current
+            .pool_by_id("pool-native")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let (current_b_state, current_b_component) = current
+            .pool_by_id("pool-b")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        assert!(!Arc::ptr_eq(&pinned_a_state, &current_a_state));
+        assert!(Arc::ptr_eq(&pinned_a_component, &current_a_component));
+        assert!(Arc::ptr_eq(&pinned_b_state, &current_b_state));
+        assert!(Arc::ptr_eq(&pinned_b_component, &current_b_component));
+
+        let pool_a = HashSet::from(["pool-native".to_string()]);
+        let pool_b = HashSet::from(["pool-b".to_string()]);
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &pool_a)
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &pool_b)
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+        assert_eq!(
+            state
+                .native_pool_fence_status(
+                    &pinned,
+                    &current,
+                    &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+                )
+                .await,
+            NativePoolFenceStatus::Available(HashSet::from(["pool-native".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_amount_out_preserves_published_pool_identity_and_result() {
+        const SNAPSHOTS_JSON: &str =
+            include_str!("../../tests/fixtures/simulation_baseline_snapshots.json");
+        const POOL_ID: &str = "uniswap-v2-baseline";
+
+        let mut snapshots: HashMap<String, DtoComponentWithState> =
+            serde_json::from_str(SNAPSHOTS_JSON)
+                .unwrap_or_else(|error| unreachable!("valid simulation snapshots: {error}"));
+        let snapshot: ComponentWithState = snapshots
+            .remove("uniswap_v2")
+            .unwrap_or_else(|| unreachable!("Uniswap V2 snapshot exists"))
+            .into();
+        let tokens = snapshot
+            .component
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                Token::new(
+                    address,
+                    &format!("TOKEN{index}"),
+                    18,
+                    0,
+                    &[Some(10_000)],
+                    Chain::Base,
+                    100,
+                )
+            })
+            .collect::<Vec<_>>();
+        let token_in = tokens[0].clone();
+        let token_out = tokens[1].clone();
+        let all_tokens = tokens
+            .iter()
+            .cloned()
+            .map(|token| (token.address.clone(), token))
+            .collect::<HashMap<_, _>>();
+        let component = ProtocolComponent::new(
+            address(42),
+            snapshot.component.protocol_system.clone(),
+            snapshot.component.protocol_type_name.clone(),
+            snapshot.component.chain,
+            tokens.clone(),
+            snapshot.component.contract_addresses.clone(),
+            snapshot.component.static_attributes.clone(),
+            snapshot.component.creation_tx.clone(),
+            snapshot.component.created_at,
+        );
+        let pool_state = UniswapV2State::try_from_with_header(
+            snapshot,
+            BlockHeader {
+                number: 20_000_000,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            &HashMap::new(),
+            &all_tokens,
+            &DecoderContext::new(),
+        )
+        .await
+        .unwrap_or_else(|error| unreachable!("valid Uniswap V2 snapshot: {error}"));
+
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Base,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+        store
+            .apply_update(Update::new(
+                20_000_000,
+                HashMap::from([(
+                    POOL_ID.to_string(),
+                    Box::new(pool_state) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(POOL_ID.to_string(), component)]),
+            ))
+            .await;
+
+        let pinned = store.pin().await;
+        let (pinned_state, _) = pinned
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let amount_in = BigUint::from(1_000_000_000_000u64);
+        let first = pinned_state
+            .get_amount_out(amount_in.clone(), &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("fixture swap succeeds: {error}"));
+
+        let published = store.pin().await;
+        let (published_state, _) = published
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        assert!(Arc::ptr_eq(&pinned_state, &published_state));
+
+        let repeated = pinned_state
+            .get_amount_out(amount_in, &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("repeated fixture swap succeeds: {error}"));
+        assert_eq!(first.amount, repeated.amount);
+        assert_eq!(first.gas, repeated.gas);
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_marks_removed_pool_changed() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let component = pinned
+            .pool_by_id("pool-native")
+            .map(|(_, component)| component.as_ref().clone())
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+
+        state
+            .native_state_store
+            .apply_update(
+                Update::new(2, HashMap::new(), HashMap::new())
+                    .set_removed_pairs(HashMap::from([("pool-native".to_string(), component)])),
+            )
+            .await;
+
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_distinguishes_missing_removed_and_added_pools() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let removed_component = pinned
+            .pool_by_id("pool-native")
+            .map(|(_, component)| component.as_ref().clone())
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let added_component = mk_component(
+            34,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![mk_token(35, "TKNE"), mk_token(36, "TKNF")],
+        );
+
+        state
+            .native_state_store
+            .apply_update(
+                mk_update(vec![(
+                    "pool-added".to_string(),
+                    added_component,
+                    Box::new(DummySim),
+                )])
+                .set_removed_pairs(HashMap::from([(
+                    "pool-native".to_string(),
+                    removed_component,
+                )])),
+            )
+            .await;
+
+        let missing_pool = HashSet::from(["pool-missing".to_string()]);
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &missing_pool)
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+        let current = state.native_state_store.pin().await;
+        assert_eq!(
+            state
+                .native_pool_fence_status(&pinned, &current, &missing_pool)
+                .await,
+            NativePoolFenceStatus::Available(HashSet::new())
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-added".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn native_pool_identity_marks_full_reset_changed() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state.native_state_store.reset().await;
+        let current = state.native_state_store.pin().await;
+
+        assert_eq!(
+            pinned.changed_pool_ids(
+                &current,
+                &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+            ),
+            HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_ignores_bootstrap_version_alignment() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state
+            .native_state_store
+            .align_bootstrap_state_version(pinned.version())
+            .await;
+
+        let current = state.native_state_store.pin().await;
+        assert_ne!(
+            pinned.request_generation(),
+            current.request_generation(),
+            "alignment should still advance the request generation"
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_marks_recovery_candidate_changed() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let candidate_store = StateStore::new_private(Arc::clone(&state.tokens));
+        candidate_store
+            .apply_update(mk_update(vec![(
+                "pool-native".to_string(),
+                mk_component(
+                    28,
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        let candidate = candidate_store.pin().await;
+
+        state
+            .native_state_store
+            .publish_candidate(candidate, pinned.version().saturating_add(1))
+            .await
+            .unwrap_or_else(|error| unreachable!("newer candidate publishes: {error}"));
+
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_reports_fenced_requests_unavailable() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state.native_state_store.fence_requests().await;
+
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Unavailable
+        );
     }
 
     #[tokio::test]
