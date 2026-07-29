@@ -180,10 +180,10 @@ Important failure kinds include:
 - `internal`
 - `invalid_request`
 
-Native pool rows computed against a superseded native version are dropped and reported through
-`stale_native_state`. A natively-routed request that consistently runs longer than one native
-update interval will always be fenced, so operators must keep the request timeout below that
-interval. VM/RFQ-only requests are never fenced.
+Native pool rows computed against pool state or component data that changed while the request was
+running are dropped and reported through `stale_native_state`. Unrelated native updates do not
+invalidate them. If native state becomes unavailable before the fence, all native rows are dropped.
+VM/RFQ-only requests are never fenced.
 
 `meta.pool_results` is the per-pool anomaly layer.
 

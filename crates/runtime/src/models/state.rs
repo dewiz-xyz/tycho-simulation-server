@@ -1220,6 +1220,10 @@ impl PublishedStatePin {
         pool_by_id_from_published(&self.state, id)
     }
 
+    /// Pointer identity is a valid fence because updates replace state and component Arcs instead
+    /// of mutating them. `get_amount_out` borrows state and returns a separate state after the
+    /// swap, while delta application requires `&mut self` upstream. Native protocol states do not
+    /// use interior mutability, which the invariant test below enforces with a real implementation.
     pub(crate) fn changed_pool_ids(
         &self,
         current: &Self,
@@ -1816,7 +1820,12 @@ mod tests {
 
     use num_bigint::BigUint;
     use tycho_simulation::{
-        protocol::models::ProtocolComponent,
+        evm::protocol::uniswap_v2::state::UniswapV2State,
+        protocol::models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        tycho_client::feed::{
+            dto::ComponentWithState as DtoComponentWithState, synchronizer::ComponentWithState,
+            BlockHeader,
+        },
         tycho_common::{
             dto::ProtocolStateDelta,
             models::{token::Token, Chain},
@@ -3464,6 +3473,109 @@ mod tests {
                 .await,
             NativePoolFenceStatus::Available(HashSet::from(["pool-native".to_string()]))
         );
+    }
+
+    #[tokio::test]
+    async fn get_amount_out_preserves_published_pool_identity_and_result() {
+        const SNAPSHOTS_JSON: &str =
+            include_str!("../../tests/fixtures/simulation_baseline_snapshots.json");
+        const POOL_ID: &str = "uniswap-v2-baseline";
+
+        let mut snapshots: HashMap<String, DtoComponentWithState> =
+            serde_json::from_str(SNAPSHOTS_JSON)
+                .unwrap_or_else(|error| unreachable!("valid simulation snapshots: {error}"));
+        let snapshot: ComponentWithState = snapshots
+            .remove("uniswap_v2")
+            .unwrap_or_else(|| unreachable!("Uniswap V2 snapshot exists"))
+            .into();
+        let tokens = snapshot
+            .component
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                Token::new(
+                    address,
+                    &format!("TOKEN{index}"),
+                    18,
+                    0,
+                    &[Some(10_000)],
+                    Chain::Base,
+                    100,
+                )
+            })
+            .collect::<Vec<_>>();
+        let token_in = tokens[0].clone();
+        let token_out = tokens[1].clone();
+        let all_tokens = tokens
+            .iter()
+            .cloned()
+            .map(|token| (token.address.clone(), token))
+            .collect::<HashMap<_, _>>();
+        let component = ProtocolComponent::new(
+            address(42),
+            snapshot.component.protocol_system.clone(),
+            snapshot.component.protocol_type_name.clone(),
+            snapshot.component.chain,
+            tokens.clone(),
+            snapshot.component.contract_addresses.clone(),
+            snapshot.component.static_attributes.clone(),
+            snapshot.component.creation_tx.clone(),
+            snapshot.component.created_at,
+        );
+        let pool_state = UniswapV2State::try_from_with_header(
+            snapshot,
+            BlockHeader {
+                number: 20_000_000,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            &HashMap::new(),
+            &all_tokens,
+            &DecoderContext::new(),
+        )
+        .await
+        .unwrap_or_else(|error| unreachable!("valid Uniswap V2 snapshot: {error}"));
+
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Base,
+            Duration::from_secs(1),
+        ));
+        let store = StateStore::new(token_store);
+        store
+            .apply_update(Update::new(
+                20_000_000,
+                HashMap::from([(
+                    POOL_ID.to_string(),
+                    Box::new(pool_state) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(POOL_ID.to_string(), component)]),
+            ))
+            .await;
+
+        let pinned = store.pin().await;
+        let (pinned_state, _) = pinned
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let amount_in = BigUint::from(1_000_000_000_000u64);
+        let first = pinned_state
+            .get_amount_out(amount_in.clone(), &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("fixture swap succeeds: {error}"));
+
+        let published = store.pin().await;
+        let (published_state, _) = published
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        assert!(Arc::ptr_eq(&pinned_state, &published_state));
+
+        let repeated = pinned_state
+            .get_amount_out(amount_in, &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("repeated fixture swap succeeds: {error}"));
+        assert_eq!(first.amount, repeated.amount);
+        assert_eq!(first.gas, repeated.gas);
     }
 
     #[tokio::test]
