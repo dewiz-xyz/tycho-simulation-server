@@ -815,22 +815,27 @@ impl AppState {
         }
     }
 
+    pub(crate) async fn native_request_availability(&self) -> (bool, u64) {
+        let bootstrap_ready = self.native_broadcaster_bootstrap_ready().await;
+        let update_is_stale = is_update_stale(
+            self.native_update_age_ms().await,
+            self.native_progress_lease_ms(),
+        );
+        let (state_ready, requests_allowed, current_generation) =
+            self.native_state_store.request_snapshot().await;
+        (
+            bootstrap_ready && !update_is_stale && state_ready && requests_allowed,
+            current_generation,
+        )
+    }
+
     pub(crate) async fn native_pool_fence_status(
         &self,
         pinned: &PublishedStatePin,
         pool_ids: &HashSet<String>,
     ) -> NativePoolFenceStatus {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return NativePoolFenceStatus::Unavailable;
-        }
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            return NativePoolFenceStatus::Unavailable;
-        }
-        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
-        if !state_ready || !requests_allowed {
+        let (available, _) = self.native_request_availability().await;
+        if !available {
             return NativePoolFenceStatus::Unavailable;
         }
 
