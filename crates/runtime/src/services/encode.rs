@@ -40,6 +40,8 @@ const RETRY_RFQ_BUDGET_MARGIN: Duration = Duration::from_millis(500);
 const RETRY_NATIVE_BUDGET_FLOOR: Duration = Duration::from_millis(300);
 const NATIVE_STATE_CHANGED_MESSAGE: &str =
     "Native state changed while the route was being encoded; retry against the current version";
+const NATIVE_STATE_UNAVAILABLE_MESSAGE: &str =
+    "Native state is unavailable for encoding; retry once the simulator is ready";
 
 /// Transport-free runtime wrapper for `/encode` route encoding.
 #[derive(Clone)]
@@ -183,7 +185,7 @@ async fn encode_route(
                 let budget = retry_budget(
                     request_timeout,
                     started_at.elapsed(),
-                    prepared.backend_usage.rfq,
+                    attempt.route_uses_rfq,
                 );
                 if !budget.can_start {
                     log_fence(
@@ -196,7 +198,7 @@ async fn encode_route(
                         prepared.request.request_id.as_deref(),
                         budget.remaining,
                         started_at.elapsed(),
-                        prepared.backend_usage.rfq,
+                        attempt.route_uses_rfq,
                     );
                     return Err(native_state_changed_error());
                 }
@@ -214,7 +216,7 @@ async fn encode_route(
                     first_error_message.as_deref(),
                     first_expected_amount_out.as_deref(),
                     started_at.elapsed(),
-                    prepared.backend_usage.rfq,
+                    attempt.route_uses_rfq,
                 );
                 first_attempt_expected_amount_out = first_expected_amount_out;
             }
@@ -236,7 +238,7 @@ async fn encode_route(
             }
             AttemptResolution::ReturnNativeUnavailable => {
                 log_fence(&fence_evaluation, &prepared, attempt_number, "unavailable");
-                return Err(native_state_changed_error());
+                return Err(EncodeError::unavailable(NATIVE_STATE_UNAVAILABLE_MESSAGE));
             }
         }
     }
@@ -311,6 +313,7 @@ async fn prepare_encode_route(
 struct EncodeAttempt {
     outcome: AttemptOutcome,
     native_fence: NativeAttemptFence,
+    route_uses_rfq: bool,
 }
 
 async fn encode_attempt(
@@ -329,16 +332,25 @@ async fn encode_attempt(
         .native_pool_ids
         .unwrap_or_else(|| normalized_native_pool_ids(&prepared.normalized));
     let native_fence = NativeAttemptFence::new(native_pin, native_pool_ids);
+    // Protocol hints can misclassify a pool's backend; the resimulated route carries the
+    // component-resolved truth. The retry budget must know about a real RFQ hop, or a
+    // retry approved under the native floor would run a firm quote inside block_in_place
+    // that the request timeout cannot interrupt.
+    let route_uses_rfq = execution
+        .route_uses_rfq
+        .unwrap_or(prepared.backend_usage.rfq);
 
     EncodeAttempt {
         outcome: AttemptOutcome::from_result(execution.outcome),
         native_fence,
+        route_uses_rfq,
     }
 }
 
 struct EncodeAttemptExecution {
     outcome: Result<EncodeComputation, AttemptError>,
     native_pool_ids: Option<HashSet<String>>,
+    route_uses_rfq: Option<bool>,
 }
 
 async fn encode_attempt_with_pin(
@@ -363,6 +375,7 @@ async fn encode_attempt_with_pin(
                 message,
             ))),
             native_pool_ids: None,
+            route_uses_rfq: None,
         };
     }
     let resimulated = match resimulate::resimulate_route_with_native_pin(
@@ -382,15 +395,18 @@ async fn encode_attempt_with_pin(
             return EncodeAttemptExecution {
                 outcome: Err(error),
                 native_pool_ids: None,
+                route_uses_rfq: None,
             };
         }
     };
     let native_pool_ids = resimulated_native_pool_ids(&resimulated);
+    let route_uses_rfq = resimulated_route_uses_rfq(&resimulated);
     let outcome = complete_encode_attempt(state, prepared, attempt_number, resimulated).await;
 
     EncodeAttemptExecution {
         outcome,
         native_pool_ids: Some(native_pool_ids),
+        route_uses_rfq: Some(route_uses_rfq),
     }
 }
 
@@ -457,6 +473,15 @@ fn normalized_native_pool_ids(normalized: &NormalizedRouteInternal) -> HashSet<S
         .filter(|swap| backend::PoolBackend::from_protocol_hint(&swap.pool.protocol).is_native())
         .map(|swap| swap.pool.component_id.clone())
         .collect()
+}
+
+fn resimulated_route_uses_rfq(resimulated: &model::ResimulatedRouteInternal) -> bool {
+    resimulated
+        .segments
+        .iter()
+        .flat_map(|segment| segment.hops.iter())
+        .flat_map(|hop| hop.swaps.iter())
+        .any(|swap| swap.backend.is_rfq())
 }
 
 fn resimulated_native_pool_ids(resimulated: &model::ResimulatedRouteInternal) -> HashSet<String> {

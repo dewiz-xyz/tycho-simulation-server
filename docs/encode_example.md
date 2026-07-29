@@ -215,3 +215,22 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 ### Local analysis note
 
 The repo-local analyzer uses a SimpleSwap, MultiSwap, and MegaSwap route matrix built from `/simulate` results and records how `/encode` behaves for those routes. It is meant to surface behavior, latency, and oddities in a standardized report, not to act like a strict pass/fail encode contract test.
+
+## Staleness and retry
+
+Each encode attempt pins native state at the start and resimulates the route from that pin. Before
+returning, the service compares the route's own pools between the pinned and current published
+state by allocation identity. Updates that do not touch the route's pools never invalidate an
+encode.
+
+If the route's pools did change, the service re-pins and retries once internally, whether the first
+attempt produced a result or a state-dependent error. Both attempts share the request timeout, and
+the retry only starts when enough budget remains (an RFQ hop needs the firm quote window,
+native-only routes need a small floor). A second stale attempt returns 503 with "Native state
+changed while the route was being encoded". When native state is unavailable (bootstrap incomplete,
+stale update lease, or recovery fenced requests) the service returns 503 with "Native state is
+unavailable for encoding" without retrying.
+
+Operators can follow this behavior in logs through the `encode_fence` and `encode_retry` scopes,
+keyed by request id (`/simulate` logs the `quote_fence` scope). Both attempts' resimulated amounts
+and the attempt count are logged per request.
