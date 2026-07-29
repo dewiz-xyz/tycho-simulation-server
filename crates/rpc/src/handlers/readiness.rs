@@ -5,21 +5,33 @@ use serde::Serialize;
 use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
 use crate::models::state::{
-    AppState, SimulatorBackendStatusSnapshot, SimulatorBackendSubscriptionSnapshot,
-    SimulatorReadinessReason, SimulatorServiceStatus, SimulatorStatusSnapshot,
+    AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
+    SimulatorBackendSubscriptionSnapshot, SimulatorReadinessReason, SimulatorServiceStatus,
+    SimulatorStatusSnapshot,
 };
 
 #[derive(Serialize)]
 pub struct StatusPayload {
     status: &'static str,
+    block: u64,
+    pools: usize,
     chain_id: u64,
     backends: BTreeMap<&'static str, BackendStatusPayload>,
 }
 
 impl From<SimulatorStatusSnapshot> for StatusPayload {
     fn from(snapshot: SimulatorStatusSnapshot) -> Self {
+        let native_backend = snapshot
+            .backends
+            .iter()
+            .find(|backend| backend.kind == SimulatorBackendKind::Native);
+
         Self {
             status: snapshot.status.label(),
+            block: native_backend
+                .and_then(|backend| backend.block_number)
+                .unwrap_or(0),
+            pools: native_backend.map_or(0, |backend| backend.pool_count),
             chain_id: snapshot.chain_id,
             backends: snapshot
                 .backends
