@@ -4,6 +4,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::models::messages::PoolRef;
 
+use super::error::AttemptError;
 use super::model::NormalizedSwapDraftInternal;
 use super::EncodeError;
 
@@ -100,12 +101,16 @@ pub(super) fn allocate_swaps_by_bps(
     swaps: &[NormalizedSwapDraftInternal],
     segment_index: usize,
     hop_index: usize,
-) -> Result<Vec<AllocatedSwap>, EncodeError> {
+) -> Result<Vec<AllocatedSwap>, AttemptError> {
     if swaps.is_empty() {
-        return Err(EncodeError::invalid("hop.swaps must not be empty"));
+        return Err(AttemptError::deterministic(EncodeError::invalid(
+            "hop.swaps must not be empty",
+        )));
     }
     if hop_amount_in.is_zero() {
-        return Err(EncodeError::invalid("hop amountIn must be > 0"));
+        return Err(AttemptError::deterministic(EncodeError::invalid(
+            "hop amountIn must be > 0",
+        )));
     }
 
     let mut allocations = Vec::with_capacity(swaps.len());
@@ -115,14 +120,14 @@ pub(super) fn allocate_swaps_by_bps(
         &split_bps,
         &format!("segment[{}].hop[{}].swap", segment_index, hop_index),
         "splitBps",
-    )?;
+    )
+    .map_err(AttemptError::deterministic)?;
 
     for (index, swap) in swaps.iter().enumerate() {
         let split = swap.split_bps;
-        let amount_in = amounts
-            .get(index)
-            .cloned()
-            .ok_or_else(|| EncodeError::internal("Missing swap amount allocation"))?;
+        let amount_in = amounts.get(index).cloned().ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal("Missing swap amount allocation"))
+        })?;
         allocations.push(AllocatedSwap {
             pool: swap.pool.clone(),
             token_in: swap.token_in.clone(),

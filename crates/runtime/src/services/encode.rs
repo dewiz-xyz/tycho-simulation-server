@@ -23,11 +23,12 @@ use std::time::Instant;
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::{AppState, PublishedStatePin};
+use error::AttemptError;
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 type EncoderFactory =
-    Arc<dyn Fn(Chain, Bytes) -> Result<Arc<dyn TychoEncoder>, EncodeError> + Send + Sync>;
+    Arc<dyn Fn(Chain, Bytes) -> Result<Arc<dyn TychoEncoder>, AttemptError> + Send + Sync>;
 
 /// Transport-free runtime wrapper for `/encode` route encoding.
 #[derive(Clone)]
@@ -169,7 +170,8 @@ async fn encode_route(
         rebuild_guard,
         native_pin,
     )
-    .await?;
+    .await
+    .map_err(EncodeError::from)?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
     let expected_total = response::compute_expected_total(&resimulated);
     if expected_total < min_amount_out {
@@ -178,7 +180,7 @@ async fn encode_route(
         ));
     }
     let amount_out_delta = (&expected_total - &min_amount_out).to_string();
-    let encoder = encoder_factory(chain, router_address.clone())?;
+    let encoder = encoder_factory(chain, router_address.clone()).map_err(EncodeError::from)?;
     let route_context = calldata::RouteContext {
         request: &request,
         token_in: &token_in,
@@ -192,7 +194,8 @@ async fn encode_route(
         &resimulated,
         encoder.as_ref(),
         &min_amount_out,
-    )?;
+    )
+    .map_err(EncodeError::from)?;
     let reset_approval =
         request::should_reset_allowance(&state.reset_allowance_tokens, request.chain_id, &token_in);
     let interactions = calldata::build_settlement_interactions(
@@ -201,7 +204,8 @@ async fn encode_route(
         router_call,
         reset_approval,
         is_native_input,
-    )?;
+    )
+    .map_err(EncodeError::from)?;
 
     let debug = response::build_debug(&state, &request).await;
     if let Some(native_request_generation) = native_request_generation {
