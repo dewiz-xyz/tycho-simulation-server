@@ -19,16 +19,26 @@ pub use error::{EncodeError, EncodeErrorKind};
 pub use response::{log_failure, log_handler_timeout, log_received, log_success};
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
-use crate::models::state::{AppState, PublishedStatePin};
+use crate::models::state::{AppState, NativeFenceStatus, PublishedStatePin};
 use error::AttemptError;
+use model::NormalizedRouteInternal;
+use num_bigint::BigUint;
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
+use super::stream_builder::ENCODE_RFQ_QUOTE_TIMEOUT;
+
 type EncoderFactory =
     Arc<dyn Fn(Chain, Bytes) -> Result<Arc<dyn TychoEncoder>, AttemptError> + Send + Sync>;
+
+const MAX_ENCODE_ATTEMPTS: u8 = 2;
+const RETRY_RFQ_BUDGET_MARGIN: Duration = Duration::from_millis(500);
+const RETRY_NATIVE_BUDGET_FLOOR: Duration = Duration::from_millis(300);
+const NATIVE_STATE_CHANGED_MESSAGE: &str =
+    "Native state changed while the route was being encoded; retry against the current version";
 
 /// Transport-free runtime wrapper for `/encode` route encoding.
 #[derive(Clone)]
@@ -75,6 +85,8 @@ impl EncodeService {
             self.state.clone(),
             request,
             Arc::clone(&self.encoder_factory),
+            started_at,
+            request_timeout,
         );
 
         let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await
@@ -100,17 +112,124 @@ pub struct EncodeComputation {
     pub expected_amount_out: String,
     pub amount_out_delta: String,
     pub reset_approval: bool,
+    pub attempts: u8,
+    pub first_attempt_expected_amount_out: Option<String>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "request validation, pinning, resimulation, and final fencing stay visible in one request flow"
-)]
+struct PreparedEncodeRoute {
+    request: RouteEncodeRequest,
+    chain: Chain,
+    token_in: Bytes,
+    token_out: Bytes,
+    amount_in: BigUint,
+    min_amount_out: BigUint,
+    router_address: Bytes,
+    is_native_input: bool,
+    normalized: NormalizedRouteInternal,
+    backend_usage: RouteBackendUsage,
+    reset_approval: bool,
+    encoder: Arc<dyn TychoEncoder>,
+}
+
+#[derive(Clone, Copy)]
+struct RouteBackendUsage {
+    native: bool,
+    vm: bool,
+    rfq: bool,
+}
+
 async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
     encoder_factory: EncoderFactory,
+    started_at: Instant,
+    request_timeout: Duration,
 ) -> Result<EncodeComputation, EncodeError> {
+    let prepared = prepare_encode_route(&state, request, encoder_factory).await?;
+    let mut first_attempt_expected_amount_out = None;
+
+    for attempt_number in [AttemptNumber::First, AttemptNumber::Second] {
+        let attempt = encode_attempt(&state, &prepared, attempt_number).await;
+        let outcome_class = attempt.outcome.class();
+        let fence_status = if outcome_class == AttemptOutcomeClass::Deterministic {
+            NativeFenceStatus::Current
+        } else {
+            attempt.native_fence.status(&state).await
+        };
+
+        match resolve_attempt(outcome_class, fence_status, attempt_number) {
+            AttemptResolution::ReturnOutcome => {
+                return attempt.outcome.into_result().map(|mut computation| {
+                    computation.attempts = attempt_number.value();
+                    computation.first_attempt_expected_amount_out =
+                        first_attempt_expected_amount_out.clone();
+                    computation
+                });
+            }
+            AttemptResolution::Retry => {
+                let first_error_kind = attempt.outcome.error().map(EncodeError::kind);
+                let first_error_message = attempt
+                    .outcome
+                    .error()
+                    .map(EncodeError::message)
+                    .map(str::to_string);
+                let first_expected_amount_out =
+                    attempt.outcome.expected_amount_out().map(str::to_string);
+                let budget = retry_budget(
+                    request_timeout,
+                    started_at.elapsed(),
+                    prepared.backend_usage.rfq,
+                );
+                if !budget.can_start {
+                    response::log_retry_skipped_budget(
+                        prepared.request.request_id.as_deref(),
+                        budget.remaining,
+                        started_at.elapsed(),
+                        prepared.backend_usage.rfq,
+                    );
+                    return Err(native_state_changed_error());
+                }
+
+                let trigger = if outcome_class == AttemptOutcomeClass::Success {
+                    RetryTrigger::Fence
+                } else {
+                    RetryTrigger::StateDependentError
+                };
+                response::log_retry_fired(
+                    prepared.request.request_id.as_deref(),
+                    trigger.label(),
+                    first_error_kind,
+                    first_error_message.as_deref(),
+                    first_expected_amount_out.as_deref(),
+                    started_at.elapsed(),
+                    prepared.backend_usage.rfq,
+                );
+                first_attempt_expected_amount_out = first_expected_amount_out;
+            }
+            AttemptResolution::ReturnNativeStateChanged => {
+                response::log_second_trip_abort(
+                    prepared.request.request_id.as_deref(),
+                    outcome_class.label(),
+                    attempt.outcome.error().map(EncodeError::message),
+                    attempt.outcome.expected_amount_out(),
+                    started_at.elapsed(),
+                );
+                return Err(native_state_changed_error());
+            }
+            AttemptResolution::ReturnNativeUnavailable => {
+                return Err(native_state_changed_error());
+            }
+        }
+    }
+
+    unreachable!("encode attempt loop always returns after attempt two")
+}
+
+async fn prepare_encode_route(
+    state: &AppState,
+    request: RouteEncodeRequest,
+    encoder_factory: EncoderFactory,
+) -> Result<PreparedEncodeRoute, EncodeError> {
     let chain = request::validate_chain(request.chain_id, state.chain)?;
     request::validate_swap_kinds(&request)?;
 
@@ -137,84 +256,129 @@ async fn encode_route(
         allowlist,
     )?;
     let (uses_native, uses_vm, uses_rfq) = normalize::route_backend_usage(&normalized);
+    let backend_usage = RouteBackendUsage {
+        native: uses_native,
+        vm: uses_vm,
+        rfq: uses_rfq,
+    };
     let availability = state
         .encode_availability(uses_native, uses_vm, uses_rfq)
         .await;
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
-    let native_pin = if uses_native {
+
+    // Build the encoder once so retries repeat only state-dependent work.
+    let encoder = encoder_factory(chain, router_address.clone()).map_err(EncodeError::from)?;
+    let reset_approval =
+        request::should_reset_allowance(&state.reset_allowance_tokens, request.chain_id, &token_in);
+
+    Ok(PreparedEncodeRoute {
+        request,
+        chain,
+        token_in,
+        token_out,
+        amount_in,
+        min_amount_out,
+        router_address,
+        is_native_input,
+        normalized,
+        backend_usage,
+        reset_approval,
+        encoder,
+    })
+}
+
+struct EncodeAttempt {
+    outcome: AttemptOutcome,
+    native_fence: NativeAttemptFence,
+}
+
+async fn encode_attempt(
+    state: &AppState,
+    prepared: &PreparedEncodeRoute,
+    attempt_number: AttemptNumber,
+) -> EncodeAttempt {
+    let native_pin = if prepared.backend_usage.native {
         Some(state.native_state_store.pin().await)
     } else {
         None
     };
-    let native_request_generation = native_pin
-        .as_ref()
-        .map(PublishedStatePin::request_generation);
+    let native_fence = NativeAttemptFence::from_pin(native_pin.as_ref());
+    let outcome = encode_attempt_with_pin(state, prepared, attempt_number, native_pin).await;
+
+    EncodeAttempt {
+        outcome: AttemptOutcome::from_result(outcome),
+        native_fence,
+    }
+}
+
+async fn encode_attempt_with_pin(
+    state: &AppState,
+    prepared: &PreparedEncodeRoute,
+    attempt_number: AttemptNumber,
+    native_pin: Option<PublishedStatePin>,
+) -> Result<EncodeComputation, AttemptError> {
     let rebuild_guard = state
-        .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
+        .acquire_simulation_rebuild_guard(prepared.backend_usage.vm, prepared.backend_usage.rfq)
         .await;
     let availability = state
-        .encode_availability(uses_native, uses_vm, uses_rfq)
+        .encode_availability(
+            prepared.backend_usage.native,
+            prepared.backend_usage.vm,
+            prepared.backend_usage.rfq,
+        )
         .await;
     if let Some(message) = availability.availability_message() {
-        return Err(EncodeError::unavailable(message));
+        return Err(AttemptError::deterministic(EncodeError::unavailable(
+            message,
+        )));
     }
     let resimulated = resimulate::resimulate_route_with_native_pin(
-        &state,
-        &normalized,
-        chain,
-        &token_in,
-        &token_out,
-        allowlist,
+        state,
+        &prepared.normalized,
+        prepared.chain,
+        &prepared.token_in,
+        &prepared.token_out,
+        &state.native_token_protocol_allowlist,
         rebuild_guard,
         native_pin,
     )
-    .await
-    .map_err(EncodeError::from)?;
-    response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
+    .await?;
+    response::log_resimulation_amounts(
+        prepared.request.request_id.as_deref(),
+        attempt_number.value(),
+        &resimulated,
+    );
     let expected_total = response::compute_expected_total(&resimulated);
-    if expected_total < min_amount_out {
-        return Err(EncodeError::simulation(
+    if expected_total < prepared.min_amount_out {
+        return Err(AttemptError::state_dependent(EncodeError::simulation(
             "Route expectedAmountOut below minAmountOut",
-        ));
+        )));
     }
-    let amount_out_delta = (&expected_total - &min_amount_out).to_string();
-    let encoder = encoder_factory(chain, router_address.clone()).map_err(EncodeError::from)?;
+    let amount_out_delta = (&expected_total - &prepared.min_amount_out).to_string();
     let route_context = calldata::RouteContext {
-        request: &request,
-        token_in: &token_in,
-        token_out: &token_out,
-        amount_in: &amount_in,
-        router_address: &router_address,
-        is_native_input,
+        request: &prepared.request,
+        token_in: &prepared.token_in,
+        token_out: &prepared.token_out,
+        amount_in: &prepared.amount_in,
+        router_address: &prepared.router_address,
+        is_native_input: prepared.is_native_input,
     };
     let router_call = calldata::build_route_calldata_tx(
         &route_context,
         &resimulated,
-        encoder.as_ref(),
-        &min_amount_out,
-    )
-    .map_err(EncodeError::from)?;
-    let reset_approval =
-        request::should_reset_allowance(&state.reset_allowance_tokens, request.chain_id, &token_in);
+        prepared.encoder.as_ref(),
+        &prepared.min_amount_out,
+    )?;
     let interactions = calldata::build_settlement_interactions(
-        &token_in,
-        &amount_in,
+        &prepared.token_in,
+        &prepared.amount_in,
         router_call,
-        reset_approval,
-        is_native_input,
-    )
-    .map_err(EncodeError::from)?;
-
-    let debug = response::build_debug(&state, &request).await;
-    if let Some(native_request_generation) = native_request_generation {
-        ensure_native_encode_current(
-            state
-                .native_request_is_current(native_request_generation)
-                .await,
-        )?;
-    }
+        prepared.reset_approval,
+        prepared.is_native_input,
+    )?;
+    let debug = response::build_debug(state, &prepared.request).await;
 
     Ok(EncodeComputation {
         response: RouteEncodeResponse {
@@ -223,26 +387,249 @@ async fn encode_route(
         },
         expected_amount_out: expected_total.to_string(),
         amount_out_delta,
-        reset_approval,
+        reset_approval: prepared.reset_approval,
+        attempts: attempt_number.value(),
+        first_attempt_expected_amount_out: None,
     })
 }
 
-fn ensure_native_encode_current(native_is_current: bool) -> Result<(), EncodeError> {
-    if native_is_current {
-        return Ok(());
+struct NativeAttemptFence {
+    request_generation: Option<u64>,
+}
+
+impl NativeAttemptFence {
+    fn from_pin(pin: Option<&PublishedStatePin>) -> Self {
+        Self {
+            request_generation: pin.map(PublishedStatePin::request_generation),
+        }
     }
-    Err(EncodeError::unavailable(
-        "Native state changed while the route was being encoded; retry against the current version",
-    ))
+
+    async fn status(&self, state: &AppState) -> NativeFenceStatus {
+        let Some(request_generation) = self.request_generation else {
+            return NativeFenceStatus::Current;
+        };
+        state.native_request_fence_status(request_generation).await
+    }
+}
+
+enum AttemptOutcome {
+    Success(EncodeComputation),
+    StateDependent(EncodeError),
+    Deterministic(EncodeError),
+}
+
+impl AttemptOutcome {
+    fn from_result(result: Result<EncodeComputation, AttemptError>) -> Self {
+        match result {
+            Ok(computation) => Self::Success(computation),
+            Err(AttemptError::StateDependent(error)) => Self::StateDependent(error),
+            Err(AttemptError::Deterministic(error)) => Self::Deterministic(error),
+        }
+    }
+
+    const fn class(&self) -> AttemptOutcomeClass {
+        match self {
+            Self::Success(_) => AttemptOutcomeClass::Success,
+            Self::StateDependent(_) => AttemptOutcomeClass::StateDependent,
+            Self::Deterministic(_) => AttemptOutcomeClass::Deterministic,
+        }
+    }
+
+    fn error(&self) -> Option<&EncodeError> {
+        match self {
+            Self::Success(_) => None,
+            Self::StateDependent(error) | Self::Deterministic(error) => Some(error),
+        }
+    }
+
+    fn expected_amount_out(&self) -> Option<&str> {
+        match self {
+            Self::Success(computation) => Some(computation.expected_amount_out.as_str()),
+            Self::StateDependent(_) | Self::Deterministic(_) => None,
+        }
+    }
+
+    fn into_result(self) -> Result<EncodeComputation, EncodeError> {
+        match self {
+            Self::Success(computation) => Ok(computation),
+            Self::StateDependent(error) | Self::Deterministic(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcomeClass {
+    Success,
+    StateDependent,
+    Deterministic,
+}
+
+impl AttemptOutcomeClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::StateDependent => "state_dependent_error",
+            Self::Deterministic => "deterministic_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptNumber {
+    First,
+    Second,
+}
+
+impl AttemptNumber {
+    const fn value(self) -> u8 {
+        match self {
+            Self::First => 1,
+            Self::Second => MAX_ENCODE_ATTEMPTS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptResolution {
+    ReturnOutcome,
+    Retry,
+    ReturnNativeStateChanged,
+    ReturnNativeUnavailable,
+}
+
+const fn resolve_attempt(
+    outcome_class: AttemptOutcomeClass,
+    fence_status: NativeFenceStatus,
+    attempt_number: AttemptNumber,
+) -> AttemptResolution {
+    match (outcome_class, fence_status, attempt_number) {
+        (AttemptOutcomeClass::Deterministic, _, _)
+        | (
+            AttemptOutcomeClass::Success | AttemptOutcomeClass::StateDependent,
+            NativeFenceStatus::Current,
+            _,
+        ) => AttemptResolution::ReturnOutcome,
+        (_, NativeFenceStatus::Unavailable, _) => AttemptResolution::ReturnNativeUnavailable,
+        (
+            AttemptOutcomeClass::Success | AttemptOutcomeClass::StateDependent,
+            NativeFenceStatus::Changed,
+            AttemptNumber::First,
+        ) => AttemptResolution::Retry,
+        (
+            AttemptOutcomeClass::Success | AttemptOutcomeClass::StateDependent,
+            NativeFenceStatus::Changed,
+            AttemptNumber::Second,
+        ) => {
+            // A second generation change invalidates success and state-dependent errors alike.
+            AttemptResolution::ReturnNativeStateChanged
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryBudget {
+    remaining: Duration,
+    can_start: bool,
+}
+
+fn retry_budget(request_timeout: Duration, elapsed: Duration, route_uses_rfq: bool) -> RetryBudget {
+    let remaining = request_timeout.saturating_sub(elapsed);
+    // RFQ quotes block the task, so attempt two needs enough time to cover the quote and finish.
+    let required = if route_uses_rfq {
+        ENCODE_RFQ_QUOTE_TIMEOUT.saturating_add(RETRY_RFQ_BUDGET_MARGIN)
+    } else {
+        RETRY_NATIVE_BUDGET_FLOOR
+    };
+    RetryBudget {
+        remaining,
+        can_start: remaining >= required,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryTrigger {
+    Fence,
+    StateDependentError,
+}
+
+impl RetryTrigger {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Fence => "fence",
+            Self::StateDependentError => "state_dependent_error",
+        }
+    }
+}
+
+fn native_state_changed_error() -> EncodeError {
+    EncodeError::unavailable(NATIVE_STATE_CHANGED_MESSAGE)
 }
 
 #[cfg(test)]
-mod version_fence_tests {
-    use super::ensure_native_encode_current;
+mod retry_tests {
+    use super::{
+        resolve_attempt, retry_budget, AttemptNumber, AttemptOutcomeClass, AttemptResolution,
+        NativeFenceStatus,
+    };
+    use std::time::Duration;
 
     #[test]
-    fn native_encode_fence_rejects_stale_requests() {
-        assert!(ensure_native_encode_current(true).is_ok());
-        assert!(ensure_native_encode_current(false).is_err());
+    fn resolve_attempt_covers_every_outcome_fence_and_attempt_combination() {
+        use AttemptNumber::{First, Second};
+        use AttemptOutcomeClass::{Deterministic, StateDependent, Success};
+        use AttemptResolution::{
+            Retry, ReturnNativeStateChanged, ReturnNativeUnavailable, ReturnOutcome,
+        };
+        use NativeFenceStatus::{Changed, Current, Unavailable};
+
+        let cases = [
+            (Success, Current, First, ReturnOutcome),
+            (Success, Current, Second, ReturnOutcome),
+            (Success, Changed, First, Retry),
+            (Success, Changed, Second, ReturnNativeStateChanged),
+            (Success, Unavailable, First, ReturnNativeUnavailable),
+            (Success, Unavailable, Second, ReturnNativeUnavailable),
+            (StateDependent, Current, First, ReturnOutcome),
+            (StateDependent, Current, Second, ReturnOutcome),
+            (StateDependent, Changed, First, Retry),
+            (StateDependent, Changed, Second, ReturnNativeStateChanged),
+            (StateDependent, Unavailable, First, ReturnNativeUnavailable),
+            (StateDependent, Unavailable, Second, ReturnNativeUnavailable),
+            (Deterministic, Current, First, ReturnOutcome),
+            (Deterministic, Current, Second, ReturnOutcome),
+            (Deterministic, Changed, First, ReturnOutcome),
+            (Deterministic, Changed, Second, ReturnOutcome),
+            (Deterministic, Unavailable, First, ReturnOutcome),
+            (Deterministic, Unavailable, Second, ReturnOutcome),
+        ];
+
+        assert_eq!(cases.len(), 18);
+        for (outcome, fence, attempt, expected) in cases {
+            assert_eq!(
+                resolve_attempt(outcome, fence, attempt),
+                expected,
+                "{outcome:?} with {fence:?} on {attempt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_budget_requires_quote_timeout_and_margin_for_rfq_routes() {
+        let timeout = Duration::from_millis(4_500);
+
+        assert!(retry_budget(timeout, Duration::from_millis(1_000), true).can_start);
+        let insufficient = retry_budget(timeout, Duration::from_millis(1_001), true);
+        assert!(!insufficient.can_start);
+        assert_eq!(insufficient.remaining, Duration::from_millis(3_499));
+    }
+
+    #[test]
+    fn retry_budget_uses_native_floor_without_rfq_hops() {
+        let timeout = Duration::from_millis(4_500);
+
+        assert!(retry_budget(timeout, Duration::from_millis(4_200), false).can_start);
+        let insufficient = retry_budget(timeout, Duration::from_millis(4_201), false);
+        assert!(!insufficient.can_start);
+        assert_eq!(insufficient.remaining, Duration::from_millis(299));
     }
 }
