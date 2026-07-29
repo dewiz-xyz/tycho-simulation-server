@@ -801,30 +801,6 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn native_request_fence_status(
-        &self,
-        pinned_generation: u64,
-    ) -> NativeFenceStatus {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return NativeFenceStatus::Unavailable;
-        }
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            return NativeFenceStatus::Unavailable;
-        }
-        let (state_ready, requests_allowed, current_generation) =
-            self.native_state_store.request_snapshot().await;
-        if !state_ready || !requests_allowed {
-            return NativeFenceStatus::Unavailable;
-        }
-        if current_generation != pinned_generation {
-            return NativeFenceStatus::Changed;
-        }
-        NativeFenceStatus::Current
-    }
-
     pub(crate) async fn native_route_fence_status(
         &self,
         pinned: &PublishedStatePin,
@@ -861,13 +837,6 @@ impl AppState {
         // Route identity replaces only the generation test after the availability preamble.
         let current = self.native_state_store.pin().await;
         NativePoolFenceStatus::Available(pinned.changed_pool_ids(&current, pool_ids))
-    }
-
-    pub(crate) async fn native_request_is_current(&self, pinned_generation: u64) -> bool {
-        matches!(
-            self.native_request_fence_status(pinned_generation).await,
-            NativeFenceStatus::Current
-        )
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
@@ -2365,59 +2334,6 @@ mod tests {
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
-    }
-
-    #[tokio::test]
-    async fn native_request_generation_survives_wire_version_realignment() {
-        let state = build_readiness_test_state(false, false).await;
-        state.native_stream_health.record_update(1).await;
-        let pinned = state.native_state_store.pin().await;
-        let wire_version = pinned.version();
-
-        assert!(
-            state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-        assert_eq!(
-            state
-                .native_request_fence_status(pinned.request_generation())
-                .await,
-            NativeFenceStatus::Current
-        );
-
-        state.native_state_store.fence_requests().await;
-        assert!(!state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-        assert_eq!(
-            state
-                .native_request_fence_status(pinned.request_generation())
-                .await,
-            NativeFenceStatus::Unavailable
-        );
-
-        state
-            .native_state_store
-            .align_bootstrap_state_version(wire_version)
-            .await;
-        assert_eq!(state.native_state_store.state_version().await, wire_version);
-        assert!(state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await,
-            "realigning to the same wire version must not recreate an old request fence"
-        );
-        assert_eq!(
-            state
-                .native_request_fence_status(pinned.request_generation())
-                .await,
-            NativeFenceStatus::Changed
-        );
     }
 
     #[tokio::test]

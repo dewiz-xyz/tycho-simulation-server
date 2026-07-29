@@ -23,7 +23,9 @@ use crate::models::messages::{
     QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
 use crate::models::protocol::ProtocolKind;
-use crate::models::state::{AppState, PublishedStatePin, SimulationRebuildGuard};
+use crate::models::state::{
+    AppState, NativePoolFenceStatus, PublishedStatePin, SimulationRebuildGuard,
+};
 use crate::models::tokens::TokenStoreError;
 
 use super::simulation_executor::{SimulationExecutionError, SimulationExecutor};
@@ -334,7 +336,7 @@ struct PreparedQuoteExecution {
 }
 
 struct NativeFence {
-    request_generation: u64,
+    pin: PublishedStatePin,
     native_pool_ids: HashSet<String>,
 }
 
@@ -383,6 +385,7 @@ pub async fn get_amounts_out(
     request: AmountOutRequest,
     cancel: Option<CancellationToken>,
 ) -> QuoteComputation {
+    let request_id = request.request_id.clone();
     let runner = QuoteRequestRunner::new(state.clone(), request, cancel).await;
     let (mut computation, native_fence) = runner.run().await;
     if let Some(native_fence) = native_fence.filter(|fence| {
@@ -391,15 +394,44 @@ pub async fn get_amounts_out(
             .iter()
             .any(|response| fence.native_pool_ids.contains(&response.pool))
     }) {
-        // The fence covers simulated native outputs only: pinned token metadata is
-        // version-independent, native routes reject mid-request updates, and VM/RFQ-only
-        // requests never consult native request freshness.
-        if !state
-            .native_request_is_current(native_fence.request_generation)
-            .await
-        {
-            discard_stale_native_responses(&mut computation, &native_fence.native_pool_ids);
-        }
+        // Native response states are cloned for simulation, so compare pool identities
+        // between pins. Pinned token metadata is version-independent, and VM/RFQ-only
+        // requests never build this fence.
+        let fence_status = state
+            .native_pool_fence_status(&native_fence.pin, &native_fence.native_pool_ids)
+            .await;
+        let generation_moved = state.native_state_store.pin().await.request_generation()
+            != native_fence.pin.request_generation();
+        let response_count = computation.responses.len();
+        let unavailable = matches!(&fence_status, NativePoolFenceStatus::Unavailable);
+        let changed_pool_count = match fence_status {
+            NativePoolFenceStatus::Available(changed_pool_ids) => {
+                let changed_pool_count = changed_pool_ids.len();
+                discard_stale_native_responses(&mut computation, &changed_pool_ids);
+                changed_pool_count
+            }
+            NativePoolFenceStatus::Unavailable => {
+                discard_stale_native_responses(&mut computation, &native_fence.native_pool_ids);
+                0
+            }
+        };
+        let dropped = response_count - computation.responses.len();
+        let outcome = if unavailable {
+            "unavailable"
+        } else if dropped == 0 {
+            "pass"
+        } else {
+            "identity_drop"
+        };
+        info!(
+            scope = "quote_fence",
+            request_id = request_id.as_str(),
+            generation_moved,
+            changed_pool_count,
+            dropped,
+            outcome,
+            "Evaluated quote native-state fence"
+        );
     }
     computation
 }
@@ -527,7 +559,7 @@ impl QuoteRequestRunner {
             None
         } else {
             self.native_pin.as_ref().map(|pin| NativeFence {
-                request_generation: pin.request_generation(),
+                pin: pin.clone(),
                 native_pool_ids: std::mem::take(&mut self.native_pool_ids),
             })
         };
@@ -2741,20 +2773,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_native_fence_preserves_vm_and_rfq_responses() {
+    fn stale_native_fence_preserves_untouched_responses() {
         let mut computation = fence_test_computation(
-            &["native-pool", "vm-pool"],
+            &["native-pool-changed", "native-pool-unchanged", "vm-pool"],
             QuoteResultQuality::Complete,
             None,
         );
 
         discard_stale_native_responses(
             &mut computation,
-            &HashSet::from(["native-pool".to_string()]),
+            &HashSet::from(["native-pool-changed".to_string()]),
         );
 
-        assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].pool, "vm-pool");
+        assert_eq!(computation.responses.len(), 2);
+        assert_eq!(computation.responses[0].pool, "native-pool-unchanged");
+        assert_eq!(computation.responses[1].pool, "vm-pool");
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
         assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
@@ -4727,7 +4760,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_quote_is_still_fenced_when_generation_advances() {
+    async fn native_quote_drops_only_changed_pool_responses() {
+        let fixture = BasicQuoteFixture::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "native-pool-changed",
+            "0x0000000000000000000000000000000000000016",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(DelayedAmountOrderSim {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "native-pool-unchanged",
+            "0x0000000000000000000000000000000000000017",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(DelayedAmountOrderSim {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-native-subset-update", &["10"]);
+        let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native quote should begin before the timeout");
+        let mut replacement_states = HashMap::new();
+        replacement_states.insert(
+            "native-pool-changed".to_string(),
+            Box::new(LinearAmountSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .await;
+
+        let computation = quote_task.await.expect("quote task should not panic");
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "native-pool-unchanged");
+        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
+        assert_eq!(
+            computation.meta.partial_kind,
+            Some(QuotePartialKind::PoolCoverage)
+        );
+        let stale_failure = computation
+            .meta
+            .failures
+            .iter()
+            .find(|failure| matches!(failure.kind, QuoteFailureKind::StaleNativeState))
+            .expect("changed native pool should add a stale-state failure");
+        assert!(stale_failure.message.contains("dropped 1"));
+    }
+
+    #[tokio::test]
+    async fn native_quote_keeps_responses_when_generation_moves_without_pool_changes() {
         let fixture = BasicQuoteFixture::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut states = HashMap::new();
@@ -4755,7 +4866,7 @@ mod tests {
             Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
-        let request = fixture.request("req-native-generation-advance", &["10"]);
+        let request = fixture.request("req-native-generation-only-update", &["10"]);
         let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
 
         tokio::time::timeout(Duration::from_millis(500), async {
@@ -4771,15 +4882,76 @@ mod tests {
             .await;
 
         let computation = quote_task.await.expect("quote task should not panic");
-        assert!(computation
-            .responses
-            .iter()
-            .all(|response| response.pool != "native-pool"));
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "native-pool");
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::Complete
+        );
+        assert!(computation.meta.partial_kind.is_none());
         assert!(computation
             .meta
             .failures
             .iter()
-            .any(|failure| matches!(failure.kind, QuoteFailureKind::StaleNativeState)));
+            .all(|failure| !matches!(failure.kind, QuoteFailureKind::StaleNativeState)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_native_fence_drops_all_responses() {
+        let fixture = BasicQuoteFixture::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "native-pool",
+            "0x0000000000000000000000000000000000000016",
+            "uniswap_v2",
+            "uniswap_v2",
+            fixture.pair_tokens(),
+            Box::new(DelayedAmountOrderSim {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        fixture
+            .native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("req-native-fence-unavailable", &["10"]);
+        let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native quote should begin before the timeout");
+        fixture.native_state_store.fence_requests().await;
+
+        let computation = quote_task.await.expect("quote task should not panic");
+        assert!(computation.responses.is_empty());
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::RequestLevelFailure
+        );
+        assert!(computation.meta.partial_kind.is_none());
+        let stale_failure = computation
+            .meta
+            .failures
+            .iter()
+            .find(|failure| matches!(failure.kind, QuoteFailureKind::StaleNativeState))
+            .expect("unavailable native fence should add a stale-state failure");
+        assert!(stale_failure.message.contains("dropped 1"));
     }
 
     #[tokio::test]
