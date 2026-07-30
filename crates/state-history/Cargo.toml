@@ -18,6 +18,7 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+simulator_core = { package = "simulator-core", path = "../simulator-core" }
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
