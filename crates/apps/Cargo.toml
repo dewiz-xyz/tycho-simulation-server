@@ -20,6 +20,11 @@ tokio.workspace = true
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
 rpc = { path = "../rpc" }
 runtime = { path = "../runtime" }
+state-history = { path = "../state-history" }
+
+[[bin]]
+name = "state-history-analysis"
+path = "src/bin/state-history-analysis.rs"
 
 [dev-dependencies]
 chrono.workspace = true

@@ -9,6 +9,7 @@ use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterRecoveryStatus, BroadcasterSnapshotSessionsSnapshot,
     BroadcasterSnapshotStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
+use runtime::broadcaster::state_history::{StreamPosition, WriterStatus};
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +24,8 @@ pub struct BroadcasterStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
     pub deployment_admission: BroadcasterDeploymentAdmissionPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_history: Option<BroadcasterStateHistoryStatus>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -46,6 +49,64 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                 .collect(),
             redis_publisher: snapshot.redis_publisher,
             deployment_admission: snapshot.deployment_admission.into(),
+            state_history: snapshot.state_history.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterStateHistoryStatus {
+    pub healthy: bool,
+    pub queue_len: u64,
+    pub queue_capacity: u64,
+    pub enqueued_deltas: u64,
+    pub persisted_deltas: u64,
+    pub dropped_deltas: u64,
+    pub failed_deltas: u64,
+    pub recorded_gaps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted: Option<BroadcasterStateHistoryPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub checkpoints_completed: u64,
+    pub checkpoints_failed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_status: Option<String>,
+}
+
+impl From<WriterStatus> for BroadcasterStateHistoryStatus {
+    fn from(status: WriterStatus) -> Self {
+        Self {
+            healthy: status.healthy,
+            queue_len: status.queue_len,
+            queue_capacity: status.queue_capacity,
+            enqueued_deltas: status.enqueued_deltas,
+            persisted_deltas: status.persisted_deltas,
+            dropped_deltas: status.dropped_deltas,
+            failed_deltas: status.failed_deltas,
+            recorded_gaps: status.recorded_gaps,
+            last_persisted: status.last_persisted.map(Into::into),
+            last_error: status.last_error,
+            checkpoints_completed: status.checkpoints_completed,
+            checkpoints_failed: status.checkpoints_failed,
+            last_checkpoint_status: status.last_checkpoint_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterStateHistoryPosition {
+    pub generation: u64,
+    pub message_seq: u64,
+}
+
+impl From<StreamPosition> for BroadcasterStateHistoryPosition {
+    fn from(position: StreamPosition) -> Self {
+        Self {
+            generation: position.generation,
+            message_seq: position.message_seq,
         }
     }
 }

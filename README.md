@@ -113,6 +113,8 @@ The simulator bootstraps local state from the active broadcaster's HTTP snapshot
 
 The shared `broadcaster-replay-client` crate owns that bootstrap and Redis replay contract, so simulator and external consumers use the same checkpoint, gap detection, and recovery rules.
 
+Optional broadcaster state history persists full-state checkpoints and ordered deltas for historical replay and analysis. See [docs/state_history.md](docs/state_history.md) for the segment model, PostgreSQL schema, example queries, Rust reader API, environment variables, status fields, and retention contract.
+
 Broadcaster deployments use four modes:
 
 - `Passive` warms upstream/cache state, but does not append Redis deltas or serve snapshot sessions.

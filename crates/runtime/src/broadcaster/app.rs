@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
 use crate::broadcaster::redis_publisher::{
@@ -17,9 +17,10 @@ use crate::broadcaster::state::{
     BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterStatusSnapshot,
     BroadcasterUpstreamState,
 };
+use crate::broadcaster::state_history::{build_state_history_runtime, StateHistoryRuntime};
 use crate::config::{
-    init_logging, load_broadcaster_config, load_broadcaster_redis_config, BroadcasterConfig,
-    MemoryConfig,
+    init_logging, load_broadcaster_config, load_broadcaster_redis_config,
+    load_state_history_config, BroadcasterConfig, MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_broadcaster_health_snapshot;
@@ -37,6 +38,8 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterSnapshotSessionResponse,
     BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
 };
+use state_history::{CheckpointKind, StreamPosition};
+use tokio_util::sync::CancellationToken;
 use tycho_simulation::tycho_common::Bytes;
 
 #[derive(Clone)]
@@ -48,6 +51,7 @@ pub struct BroadcasterAppState {
     chain_id: u64,
     snapshot_session_ttl: Duration,
     last_reported_readiness: Arc<tokio::sync::Mutex<Option<BroadcasterReadiness>>>,
+    state_history: Option<Arc<StateHistoryRuntime>>,
 }
 
 impl BroadcasterAppState {
@@ -67,7 +71,13 @@ impl BroadcasterAppState {
             chain_id,
             snapshot_session_ttl,
             last_reported_readiness: Arc::new(tokio::sync::Mutex::new(None)),
+            state_history: None,
         }
+    }
+
+    pub fn with_state_history(mut self, state_history: Option<Arc<StateHistoryRuntime>>) -> Self {
+        self.state_history = state_history;
+        self
     }
 
     pub async fn create_snapshot_session(
@@ -149,6 +159,10 @@ impl BroadcasterAppState {
         }
         snapshot.redis_publisher = Some(redis_status);
         snapshot.deployment_admission = self.redis_publisher.deployment_admission_snapshot();
+        snapshot.state_history = self
+            .state_history
+            .as_ref()
+            .map(|state_history| state_history.handle.status());
         snapshot
     }
 
@@ -194,6 +208,17 @@ impl BroadcasterAppState {
         self.redis_publisher.begin_shutdown();
     }
 
+    pub async fn shutdown_state_history(&self) {
+        if let Some(state_history) = &self.state_history {
+            state_history.stop_checkpoint_task().await;
+            state_history
+                .handle
+                .clone()
+                .shutdown(Duration::from_secs(10))
+                .await;
+        }
+    }
+
     pub async fn lookup_tokens(
         &self,
         addresses: Vec<Bytes>,
@@ -233,6 +258,10 @@ pub struct BroadcasterServiceParts {
     pub supervisors: Vec<tokio::task::JoinHandle<()>>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared publisher, cache, and task ownership are assembled in one startup path"
+)]
 pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     init_logging();
 
@@ -244,7 +273,9 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let redis_publisher = build_redis_publisher(&config, heartbeat_interval).await?;
+    let (state_history_config, state_history) = initialize_state_history(&config).await?;
+    let redis_publisher =
+        build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -311,8 +342,17 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     };
     // New broadcasters warm their caches while passive. Readiness stays closed
     // until this local promotion loop wins the writer fence.
-    spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
+    spawn_promotion_task(
+        generation_services.clone(),
+        Duration::from_secs(1),
+        state_history.is_some(),
+    );
     spawn_snapshot_artifact_refresh_task(generation_services.clone(), Duration::from_secs(5 * 60));
+    start_state_history_checkpoint_task(
+        &generation_services,
+        state_history_config.as_ref(),
+        state_history.as_ref(),
+    )?;
     supervisors.push(spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
@@ -328,7 +368,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         chain.id(),
         snapshot_session_ttl,
         redis_publisher,
-    );
+    )
+    .with_state_history(state_history);
     spawn_broadcaster_health_snapshot_task(app_state.clone(), heartbeat_interval);
 
     Ok(BroadcasterServiceParts {
@@ -336,6 +377,24 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         app_state,
         supervisors,
     })
+}
+
+async fn initialize_state_history(
+    config: &BroadcasterConfig,
+) -> Result<(
+    Option<crate::config::StateHistoryConfig>,
+    Option<Arc<StateHistoryRuntime>>,
+)> {
+    let state_history_config = load_state_history_config();
+    let state_history = match state_history_config.as_ref() {
+        Some(state_history_config) => {
+            build_state_history_runtime(state_history_config, config.rpc_url.clone())
+                .await?
+                .map(Arc::new)
+        }
+        None => None,
+    };
+    Ok((state_history_config, state_history))
 }
 
 fn combine_status_snapshots(
@@ -375,10 +434,11 @@ fn redis_readiness(mode: &str) -> BroadcasterReadiness {
 async fn build_redis_publisher(
     config: &BroadcasterConfig,
     heartbeat_interval: Duration,
+    state_history: Option<&Arc<StateHistoryRuntime>>,
 ) -> Result<Arc<BroadcasterRedisPublisher>> {
     let redis_config = load_broadcaster_redis_config();
     let writer = Arc::new(TokioRedisStreamWriter::connect(&redis_config.redis_url).await?);
-    let publisher = Arc::new(BroadcasterRedisPublisher::new(
+    let publisher = BroadcasterRedisPublisher::new(
         BroadcasterRedisPublisherConfig::from_redis_config(
             &redis_config,
             config.chain_profile.chain.id(),
@@ -386,8 +446,12 @@ async fn build_redis_publisher(
             config.chain_profile.recovery_max_buffered_native_blocks,
         ),
         writer,
-    ));
-    Ok(publisher)
+    );
+    let publisher = match state_history {
+        Some(state_history) => publisher.with_state_history(Arc::clone(state_history)),
+        None => publisher,
+    };
+    Ok(Arc::new(publisher))
 }
 
 fn log_memory_config(memory: MemoryConfig) {
@@ -571,7 +635,11 @@ fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interv
     });
 }
 
-fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
+fn spawn_promotion_task(
+    services: Vec<BroadcasterServiceState>,
+    interval: Duration,
+    state_history_enabled: bool,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
@@ -618,6 +686,34 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
                         generation = boundary.generation,
                         "Broadcaster active writer promoted"
                     );
+                    if state_history_enabled {
+                        match BroadcasterServiceState::capture_state_history_checkpoint(
+                            &services,
+                            CheckpointKind::Boundary,
+                            None,
+                            Some(StreamPosition {
+                                generation: boundary.generation,
+                                message_seq: boundary.exclusive_message_seq,
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Some(_)) => {}
+                            Ok(None) => warn!(
+                                event = "state_history_boundary_checkpoint_failed",
+                                generation = boundary.generation,
+                                message_seq = boundary.exclusive_message_seq,
+                                "Broadcaster promotion state history checkpoint was discarded"
+                            ),
+                            Err(error) => warn!(
+                                event = "state_history_boundary_checkpoint_failed",
+                                generation = boundary.generation,
+                                message_seq = boundary.exclusive_message_seq,
+                                error = %error,
+                                "Broadcaster promotion state history checkpoint failed"
+                            ),
+                        }
+                    }
                     refreshing_recovered_snapshot =
                         mode == BroadcasterRedisPublisherMode::Unhealthy;
                 }
@@ -643,6 +739,101 @@ fn spawn_snapshot_artifact_refresh_task(
             let _ = BroadcasterServiceState::run_snapshot_export_preflight(&services).await;
         }
     });
+}
+
+fn start_state_history_checkpoint_task(
+    services: &[BroadcasterServiceState],
+    config: Option<&crate::config::StateHistoryConfig>,
+    state_history: Option<&Arc<StateHistoryRuntime>>,
+) -> Result<()> {
+    if let (Some(config), Some(state_history)) = (config, state_history) {
+        spawn_state_history_checkpoint_task(
+            services.to_vec(),
+            Arc::clone(state_history),
+            config.checkpoint_poll_interval,
+            config.checkpoint_block_interval,
+        )?;
+    }
+    Ok(())
+}
+
+fn spawn_state_history_checkpoint_task(
+    services: Vec<BroadcasterServiceState>,
+    state_history: Arc<StateHistoryRuntime>,
+    poll_interval: Duration,
+    block_interval: u64,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let mut boundary_requests = state_history.take_boundary_request_receiver()?;
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_completed = None;
+        let mut retry_delay = Duration::from_secs(30);
+        let mut retry_after = None;
+        loop {
+            tokio::select! {
+                () = task_cancellation.cancelled() => break,
+                request = boundary_requests.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    let result = BroadcasterServiceState::capture_state_history_checkpoint(
+                        &services,
+                        CheckpointKind::Boundary,
+                        Some(request.state_version),
+                        Some(request.position),
+                    )
+                    .await;
+                    StateHistoryRuntime::respond_to_boundary_request(request, result);
+                }
+                _ = ticker.tick() => {
+                    if retry_after.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+                        continue;
+                    }
+                    let Some(current) =
+                        BroadcasterServiceState::state_history_aligned_head(&services).await
+                    else {
+                        continue;
+                    };
+                    if last_completed
+                        .is_some_and(|last| current.saturating_sub(last) < block_interval)
+                    {
+                        continue;
+                    }
+                    match BroadcasterServiceState::capture_state_history_checkpoint(
+                        &services,
+                        CheckpointKind::Interval,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(Some(completed)) => {
+                            last_completed = Some(completed);
+                            retry_delay = Duration::from_secs(30);
+                            retry_after = None;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(
+                                event = "state_history_interval_checkpoint_failed",
+                                %error,
+                                retry_delay_secs = retry_delay.as_secs(),
+                                "State history interval checkpoint failed"
+                            );
+                            retry_after = Some(tokio::time::Instant::now() + retry_delay);
+                            retry_delay =
+                                retry_delay.saturating_mul(2).min(Duration::from_secs(600));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    state_history.set_checkpoint_task(cancellation, join);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -674,6 +865,7 @@ mod tests {
             hashflow_filename: "./hashflow.csv".to_string(),
             liquorice_url: None,
             api_key: "test-api-key".to_string(),
+            rpc_url: None,
             tvl_threshold: 100.0,
             tvl_keep_threshold: 20.0,
             port: 3001,

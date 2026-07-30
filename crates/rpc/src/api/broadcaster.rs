@@ -256,6 +256,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "active");
+        assert!(body["state_history"].is_null());
         let Some(stream_id) = body["redis_publisher"]["stream_id"].as_str() else {
             bail!("expected redis publisher stream_id");
         };

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context, Result};
+use state_history::WriterStatus;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -75,6 +76,7 @@ pub struct BroadcasterStatusSnapshot {
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
     pub deployment_admission: BroadcasterDeploymentAdmissionSnapshot,
+    pub state_history: Option<WriterStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -855,6 +857,7 @@ impl BroadcasterSnapshotCache {
                 phase: BroadcasterDeploymentPhase::Warming,
                 last_error: None,
             },
+            state_history: None,
         }
     }
 

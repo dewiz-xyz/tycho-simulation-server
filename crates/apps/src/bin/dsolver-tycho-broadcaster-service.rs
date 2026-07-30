@@ -10,11 +10,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let server = axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(app_state));
+        .with_graceful_shutdown(shutdown_signal(app_state.clone()));
     let supervisor = wait_for_supervisor(service.supervisors);
     tokio::select! {
-        result = server => result
-            .map_err(|error| anyhow::anyhow!("Failed to start server: {error}")),
+        result = server => {
+            app_state.shutdown_state_history().await;
+            result.map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
+        },
         result = supervisor => {
             result?;
             Err(anyhow::anyhow!("Broadcaster feed supervisor terminated unexpectedly"))
