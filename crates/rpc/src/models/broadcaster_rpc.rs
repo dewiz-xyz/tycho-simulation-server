@@ -73,6 +73,9 @@ pub struct BroadcasterStateHistoryStatus {
     pub checkpoints_failed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_checkpoint_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_token_snapshot_sha: Option<String>,
+    pub token_persistence_failures: u64,
 }
 
 impl From<WriterStatus> for BroadcasterStateHistoryStatus {
@@ -91,6 +94,8 @@ impl From<WriterStatus> for BroadcasterStateHistoryStatus {
             checkpoints_completed: status.checkpoints_completed,
             checkpoints_failed: status.checkpoints_failed,
             last_checkpoint_status: status.last_checkpoint_status,
+            last_token_snapshot_sha: status.last_token_snapshot_sha,
+            token_persistence_failures: status.token_persistence_failures,
         }
     }
 }
@@ -289,5 +294,85 @@ impl BroadcasterBackendPayload {
             pool_count: status.pool_count,
             sync_statuses: status.sync_statuses,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use runtime::broadcaster::{
+        redis_publisher::BroadcasterDeploymentPhase,
+        state::{BroadcasterReadiness, BroadcasterSnapshotSessionsSnapshot},
+    };
+
+    use super::*;
+
+    #[test]
+    fn state_history_token_failure_is_visible_without_changing_readiness() -> anyhow::Result<()> {
+        let payload = BroadcasterStatusPayload::from(BroadcasterStatusSnapshot {
+            readiness: BroadcasterReadiness::Ready,
+            chain_id: 8453,
+            upstream: BroadcasterUpstreamSnapshot {
+                connected: true,
+                restart_count: 0,
+                last_error: None,
+                last_disconnect_reason: None,
+                last_update_age_ms: Some(1),
+            },
+            recovery: BroadcasterRecoveryStatus::default(),
+            snapshot: BroadcasterSnapshotStatus {
+                ready: true,
+                stream_id: "stream".to_owned(),
+                snapshot_id: "snapshot".to_owned(),
+                configured_backends: Vec::new(),
+                total_states: 1,
+                max_payload_bytes: 1,
+                exportable: true,
+                last_export_check_age_ms: Some(1),
+                last_export_success_age_ms: Some(1),
+                last_export_duration_ms: Some(1),
+                last_export_payload_count: Some(1),
+                largest_payload_bytes: Some(1),
+                payload_limit_utilization_bps: Some(1),
+                last_export_error: None,
+                recovery_pending: false,
+                recovery_id: None,
+                recovery_error: None,
+            },
+            snapshot_sessions: BroadcasterSnapshotSessionsSnapshot::default(),
+            backends: BTreeMap::new(),
+            redis_publisher: None,
+            deployment_admission: BroadcasterDeploymentAdmissionSnapshot {
+                admitted: true,
+                phase: BroadcasterDeploymentPhase::Admitted,
+                last_error: None,
+            },
+            state_history: Some(WriterStatus {
+                healthy: true,
+                queue_len: 0,
+                queue_capacity: 8,
+                enqueued_deltas: 1,
+                persisted_deltas: 1,
+                dropped_deltas: 0,
+                failed_deltas: 0,
+                recorded_gaps: 0,
+                last_persisted: Some(StreamPosition {
+                    generation: 2,
+                    message_seq: 3,
+                }),
+                last_error: None,
+                checkpoints_completed: 2,
+                checkpoints_failed: 0,
+                last_checkpoint_status: Some("complete".to_owned()),
+                last_token_snapshot_sha: Some("token-sha".to_owned()),
+                token_persistence_failures: 1,
+            }),
+        });
+
+        let json = serde_json::to_value(payload)?;
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["state_history"]["lastTokenSnapshotSha"], "token-sha");
+        assert_eq!(json["state_history"]["tokenPersistenceFailures"], 1);
+        assert_eq!(json["state_history"]["healthy"], true);
+        Ok(())
     }
 }

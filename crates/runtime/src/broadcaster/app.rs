@@ -273,7 +273,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let (state_history_config, state_history) = initialize_state_history(&config).await?;
+    let (state_history_config, state_history) =
+        initialize_state_history(&config, Arc::clone(&tokens)).await?;
     let redis_publisher =
         build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let token_min_quality = u32::try_from(config.tuning.token_min_quality)
@@ -388,17 +389,20 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
 
 async fn initialize_state_history(
     config: &BroadcasterConfig,
+    tokens: Arc<TokenStore>,
 ) -> Result<(
     Option<crate::config::StateHistoryConfig>,
     Option<Arc<StateHistoryRuntime>>,
 )> {
     let state_history_config = load_state_history_config();
     let state_history = match state_history_config.as_ref() {
-        Some(state_history_config) => {
-            build_state_history_runtime(state_history_config, config.rpc_url.clone())
-                .await?
-                .map(Arc::new)
-        }
+        Some(state_history_config) => build_state_history_runtime(
+            state_history_config,
+            config.rpc_url.clone(),
+            Arc::clone(&tokens),
+        )
+        .await?
+        .map(Arc::new),
         None => None,
     };
     Ok((state_history_config, state_history))
