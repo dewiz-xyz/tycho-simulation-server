@@ -75,6 +75,8 @@ One row is the PostgreSQL manifest for a full-state checkpoint archive in S3.
 
 `(chain_id, generation, message_seq, kind)` is unique.
 
+After `STATE_HISTORY_S3_PREFIX`, S3 keys use `chain={chain_id}/gen={generation}/seq={message_seq}/kind={boundary|interval}/checkpoint.zst`.
+
 ### `state_history.gaps`
 
 Rows record losses known to the writer.
@@ -86,7 +88,7 @@ Rows record losses known to the writer.
 | `generation` | Writer generation containing the gap. |
 | `from_message_seq` | First missing or unusable message sequence, inclusive. |
 | `to_message_seq` | Last missing or unusable message sequence, inclusive. |
-| `reason` | Known cause. Allowed values are `queue_overflow`, `write_failed`, `writer_stopped`, and `checkpoint_failed`. |
+| `reason` | Known cause. Allowed values are `queue_overflow`, `write_failed`, `writer_stopped`, `checkpoint_failed`, and `boundary_slip`. |
 | `from_block_number` | First affected block when a block bound is known. |
 | `to_block_number` | Last affected block when a block bound is known. |
 | `from_observed_at_ms` | First affected observation time in Unix milliseconds, when known. |
@@ -94,6 +96,10 @@ Rows record losses known to the writer.
 | `created_at` | Time PostgreSQL inserted the row. |
 
 `from_message_seq` cannot exceed `to_message_seq`. The full gap identity is unique, including nullable block and time bounds.
+
+Block bounds come only from block backend cursors. Observation time bounds come only from RFQ provider cursors, never from Redis publication time. A bound stays `NULL` when the lost payload has no corresponding cursor. Boundary checkpoint failures use the capture block number and RFQ high water for both sides of their bounds. Rows with all four bounds `NULL` are still selected by stream position.
+
+`boundary_slip` records a same generation recovery boundary checkpoint that pins after its requested commit position. Its stream span starts at the requested message sequence plus one and ends at the pinned capture position, so replay across any slipped position fails closed.
 
 ### `state_history.block_times`
 
@@ -113,6 +119,8 @@ This table joins block number, block time, hashes, and base fee for direct analy
 | `updated_at` | Time a newer observation changed the block metadata. |
 
 A row is superseded only by a newer `(source_generation, source_message_seq)` observation.
+
+When a newer observation keeps the same block hash and supplies no base fee, the stored fee is preserved. When it changes the hash and supplies no base fee, the stored fee is cleared rather than inherited from the orphaned block.
 
 ## Example queries
 
@@ -205,7 +213,9 @@ ORDER BY db.backend;
 
 `StateHistoryReader::resolve_backtest_range(&BacktestRequest)` returns a `BacktestPlan`. Native and VM requests get informational start and end timestamps when rows exist. Requests that include RFQ require continuous `block_times` rows through `end_block + 1`, which the reader uses to derive inclusive RFQ timestamp bounds.
 
-Each `RangeLeg` contains a `CheckpointManifest` and the ordered deltas to apply after that checkpoint. `StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, downloads its S3 object, verifies the archive digest, and returns the decoded `CheckpointArchive`.
+Each `RangeLeg` contains a `CheckpointManifest` and zero or more ordered deltas to apply after that checkpoint. Boundary discovery uses the request end rather than the last stored delta. For every requested backend represented by a boundary, its checkpoint cursor must be at or below that backend's requested end. A trailing boundary can therefore close a range without a later delta, producing a leg with zero deltas.
+
+`StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, downloads its S3 object, verifies the archive digest, and returns the decoded `CheckpointArchive`.
 
 ```rust
 use state_history::{Backend, BacktestRequest, StateHistoryReader};
