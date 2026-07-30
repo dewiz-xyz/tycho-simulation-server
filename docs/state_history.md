@@ -1,10 +1,58 @@
 # State History
 
-State history records the broadcaster as ordered segments. A stream position is the pair `(generation, message_seq)`. PostgreSQL stores accepted update payloads as deltas and stores checkpoint metadata, while S3 stores the compressed full-state checkpoint archives.
+State history records the broadcaster as ordered segments. A stream position is the pair `(generation, message_seq)`. PostgreSQL stores accepted update payloads as deltas and stores checkpoint metadata with optional token references. S3 stores compressed full-state checkpoint archives and token snapshot sidecar objects.
 
 A reader starts from the newest complete checkpoint at or before the requested start block, then selects deltas using each backend's own block or timestamp cursor. A replay plan can contain multiple legs. Each leg starts from one checkpoint and applies its deltas in `(generation, message_seq)` order.
 
 Boundary checkpoints start new segments after writer promotion and recovery commits. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
+
+## Terminology
+
+- **Token catalog.** The broadcaster's live in-memory `TokenStore` map. It is mutable and append-only. Known entries are not replaced.
+- **Token snapshot.** An immutable canonical serialization of the token catalog captured with a checkpoint. It is stored as an S3 sidecar object.
+- **Token reference.** The nullable checkpoint manifest fields that identify a token snapshot. Many checkpoint manifests can reference the same token snapshot.
+- **Content-addressed.** The object key contains the SHA-256 digest of the object's uncompressed canonical bytes, so the content defines the object's identity.
+
+The terms "version" and "token history" are avoided for token snapshots. Token snapshots have no ordering, lineage, or diff model. Token metadata also has no block-indexed change timeline.
+
+## S3 objects
+
+### Checkpoint archives
+
+With a non-empty `STATE_HISTORY_S3_PREFIX`, checkpoint archive keys use `{prefix}/chain={chain_id}/gen={generation}/seq={message_seq}/kind={boundary|interval}/checkpoint.zst`. With an empty prefix, the key starts at the `chain=` segment.
+
+Checkpoint archives are position-addressed because each archive anchors replay at one checkpoint kind and stream position. Its manifest records the SHA-256 digest of the uncompressed archive JSON for read verification.
+
+### Token snapshots
+
+Every boundary and interval checkpoint capture attempts to persist a token snapshot. With a non-empty `STATE_HISTORY_S3_PREFIX`, token snapshot keys use `{prefix}/chain={chain_id}/tokens/{sha256}.zst`. With an empty prefix, the key is `chain={chain_id}/tokens/{sha256}.zst`.
+
+The uncompressed JSON envelope has this shape:
+
+```json
+{
+  "schema_version": 1,
+  "chain_id": 8453,
+  "token_count": 1,
+  "tokens": [
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "symbol": "TOKEN",
+      "decimals": 18,
+      "tax": 0,
+      "gas": [21000],
+      "chainId": 8453,
+      "quality": 100
+    }
+  ]
+}
+```
+
+`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION`. Both constants are currently `1`.
+
+Canonical encoding sorts tokens by address and rejects duplicate addresses. Serde emits deterministic JSON from the fixed envelope and token DTO fields. The writer computes SHA-256 over those uncompressed canonical bytes, then compresses them with Zstandard level 3. The manifest `token_bytes` column records the uncompressed canonical JSON length. `TokenSnapshotCodecError` provides the typed `Sha256Mismatch`, `UnsupportedSchemaVersion`, and `DuplicateTokenAddress` variants.
+
+Token snapshots are content-addressed because an unchanged token catalog can be shared by checkpoint manifests at different positions. The writer memoizes the most recent successfully persisted SHA-256 digest. A matching capture reuses its token reference without another S3 PUT. A changed catalog produces a new object key. This also lets readers cache one fetch by SHA-256 across replay legs.
 
 ## PostgreSQL schema
 
@@ -68,6 +116,10 @@ One row is the PostgreSQL manifest for a full-state checkpoint archive in S3.
 | `archive_sha256` | SHA-256 digest of the uncompressed checkpoint archive JSON. |
 | `archive_bytes` | Uncompressed checkpoint archive size in bytes. |
 | `compressed_bytes` | Stored Zstandard archive size in bytes. |
+| `token_s3_key` | Nullable `TEXT` object key for the token snapshot. |
+| `token_sha256` | Nullable `TEXT` SHA-256 digest of the uncompressed canonical token snapshot JSON. |
+| `token_count` | Nullable `BIGINT` token count from the token snapshot envelope. |
+| `token_bytes` | Nullable `BIGINT` uncompressed canonical token snapshot JSON size in bytes. |
 | `status` | Lifecycle state. Allowed values are `writing`, `complete`, and `failed`. |
 | `error` | Checkpoint failure detail, when the checkpoint failed. |
 | `created_at` | Time PostgreSQL created the manifest. |
@@ -75,7 +127,9 @@ One row is the PostgreSQL manifest for a full-state checkpoint archive in S3.
 
 `(chain_id, generation, message_seq, kind)` is unique.
 
-After `STATE_HISTORY_S3_PREFIX`, S3 keys use `chain={chain_id}/gen={generation}/seq={message_seq}/kind={boundary|interval}/checkpoint.zst`.
+The four token reference columns are nullable. The `checkpoints_token_reference_all_or_none` CHECK constraint requires all four to be set together or all four to be `NULL`.
+
+`StateHistoryStore::complete_checkpoint` writes the archive fields, optional token reference, `status='complete'`, and block-time updates in one database transaction. The token object is durable, or known durable through the writer memo, before that transaction publishes its reference. `StateHistoryStore::fail_checkpoint` clears all four token reference columns while setting `status='failed'`. This clearing is required because complete-then-failed is a real writer transition. Writing and failed manifests therefore expose no token reference.
 
 ### `state_history.gaps`
 
@@ -121,6 +175,16 @@ This table joins block number, block time, hashes, and base fee for direct analy
 A row is superseded only by a newer `(source_generation, source_message_seq)` observation.
 
 When a newer observation keeps the same block hash and supplies no base fee, the stored fee is preserved. When it changes the hash and supplies no base fee, the stored fee is cleared rather than inherited from the orphaned block.
+
+## Token catalog capture
+
+At startup, the broadcaster admits tokens using `BROADCASTER_TOKEN_MIN_QUALITY`, which defaults to `0`. It also extracts `new_tokens` while staging each accepted Tycho stream update. At commit time, after the cache write guard is released, it filters those tokens with the same quality floor and inserts them into the token catalog. `TokenStore::insert_batch` uses `or_insert`, so a stream update never replaces metadata for a known address. This fold also runs for accepted updates buffered during same-generation recovery. RFQ updates are outside the token catalog because RFQ payloads embed their own full token values.
+
+Checkpoint capture pins every component state source under the shared lifecycle gate. It then clones the token catalog under the same gate and only after every state pin. Accepted update paths hold that gate through staging, state commit, and the token fold. A captured token snapshot therefore contains every token address referenced by the captured component payloads when Tycho supplied that token. Catalog appends between a state pin and the catalog clone can only add harmless extra entries. If the pinned world changes during export, the state export and token catalog clone are discarded together.
+
+Token snapshot persistence is optional enrichment. An encoding or token object upload failure increments the token persistence failure counter and clears the writer's persistence memo. The writer proceeds with checkpoint completion and all four token reference columns set to `NULL`. The failure does not record a gap and does not change broadcaster readiness. The shared shutdown drain deadline still bounds the complete checkpoint flow. A later checkpoint attempts token persistence again.
+
+Token metadata is not block-versioned in Tycho. The catalog does not refresh metadata for a known address, and a later broadcaster process can load different quality, tax, or gas metadata. A token snapshot records what the decoder would have had at checkpoint capture. It is reference data rather than chain state, so reorg handling does not apply.
 
 ## Example queries
 
@@ -217,6 +281,21 @@ Each `RangeLeg` contains a `CheckpointManifest` and zero or more ordered deltas 
 
 `StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, downloads its S3 object, verifies the archive digest, and returns the decoded `CheckpointArchive`.
 
+Each checkpoint manifest exposes `token_reference: Option<TokenSnapshotRef>`. A checkpoint captured without a token reference returns `None`. It remains a valid replay anchor and never creates a gap. Range selection, `ensure_gap_free`, and backtest admission do not check token references.
+
+`StateHistoryReader::fetch_token_snapshot` has this signature:
+
+```rust
+pub async fn fetch_token_snapshot(
+    &self,
+    reference: &TokenSnapshotRef,
+) -> anyhow::Result<RawTokenSnapshot>
+```
+
+The method fetches `reference.s3_key` and passes the bytes to `decode_token_snapshot_raw`. The codec verifies the object against `reference.sha256`, validates `TOKEN_SNAPSHOT_SCHEMA_VERSION`, and returns `RawTokenSnapshot { schema_version, chain_id, token_count, tokens }`. `tokens` is the original JSON array as `Box<RawValue>`. It is not decoded into Tycho types or re-serialized. Missing objects, invalid Zstandard data, SHA-256 mismatches, invalid JSON, and unsupported schema values return errors. Consumers can cache the result by `reference.sha256` and reuse it for every leg with the same token reference.
+
+Gap machinery covers stream data, which consists of checkpoint state and ordered deltas. A token snapshot is optional reference metadata in the same enrichment class as `base_fee_wei`. An absent reference is a caller decision, not evidence of missing stream data.
+
 ```rust
 use state_history::{Backend, BacktestRequest, StateHistoryReader};
 
@@ -242,6 +321,8 @@ async fn load_range(reader: &StateHistoryReader) -> anyhow::Result<()> {
 
 Construct the reader with `StateHistoryReader::new(StateHistoryStore, CheckpointObjectStore)`. See `crates/state-history/src/reader.rs` for the complete API and replay plan types.
 
+When replaying deltas with a Tycho decoder, set its `min_token_quality` to the broadcaster's `BROADCASTER_TOKEN_MIN_QUALITY` value. The broadcaster default is `0`, while Tycho 0.341.8 defaults the decoder floor to `100`. Without matching floors, the decoder refuses mid-stream `new_tokens` below quality `100` even though the checkpoint token snapshot includes tokens admitted by the broadcaster.
+
 ## Operations
 
 State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, the writer is not created and the `state_history` property is absent from `/status` JSON. Enabling it requires PostgreSQL, S3, and the checkpoint block interval. Deployment configuration remains in solver-iac.
@@ -252,8 +333,8 @@ State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, 
 | --- | --- |
 | `STATE_HISTORY_ENABLED` | Enables the writer. Defaults to `false`. |
 | `STATE_HISTORY_DATABASE_URL` | PostgreSQL connection URL. Required when enabled. |
-| `STATE_HISTORY_S3_BUCKET` | S3 bucket for checkpoint archives. Required when enabled. |
-| `STATE_HISTORY_S3_PREFIX` | Object key prefix. Defaults to `state-history`. One trailing slash is removed. |
+| `STATE_HISTORY_S3_BUCKET` | S3 bucket for checkpoint archives and token snapshots. Required when enabled. |
+| `STATE_HISTORY_S3_PREFIX` | Checkpoint archive and token snapshot object key prefix. Defaults to `state-history`. One trailing slash is removed. |
 | `STATE_HISTORY_S3_REGION` | S3 region. Defaults to `eu-central-1`. |
 | `STATE_HISTORY_S3_ENDPOINT_URL` | Optional custom S3 endpoint for compatible local services. |
 | `STATE_HISTORY_S3_FORCE_PATH_STYLE` | Forces path-style S3 requests. Defaults to `false`. |
@@ -264,9 +345,11 @@ State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, 
 
 `.env.example` contains the complete local example block. The recommended production value is `STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL=300`.
 
+Token snapshots add no environment variables. They use the existing state history S3 settings. Stream token admission uses the existing `BROADCASTER_TOKEN_MIN_QUALITY` setting.
+
 ### `/status.state_history`
 
-The object mirrors the writer's 13 status fields. Its fields use camelCase. Optional fields are omitted when they have no value.
+The object mirrors the writer's 15 status fields. Its fields use camelCase. Optional fields are omitted when they have no value.
 
 | Field | Meaning |
 | --- | --- |
@@ -283,7 +366,9 @@ The object mirrors the writer's 13 status fields. Its fields use camelCase. Opti
 | `checkpointsCompleted` | Checkpoints whose archive and manifest completed successfully. |
 | `checkpointsFailed` | Checkpoints whose archive or manifest lifecycle failed. |
 | `lastCheckpointStatus` | Latest checkpoint result, currently `complete` or `failed`. Omitted before the first result. |
+| `lastTokenSnapshotSha` | SHA-256 digest from the latest token snapshot successfully uploaded by this writer. Omitted before the first successful token snapshot upload. |
+| `tokenPersistenceFailures` | Token snapshot encoding or upload failures. The writer omits the token reference and proceeds with checkpoint completion. These failures do not change readiness. |
 
 Gaps are honest reporting. They record losses the writer knows about, but their absence is not proof that a range is complete. Consumers should call `RangePlan::ensure_gap_free()` before using a replay plan.
 
-Retention is keep everything. There is no state history TTL or cleanup policy for PostgreSQL rows or S3 checkpoint archives.
+Retention is keep everything. There is no state history TTL or cleanup policy for PostgreSQL rows, S3 checkpoint archives, or token snapshots.
