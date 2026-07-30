@@ -18,11 +18,14 @@ use tycho_simulation::{
             blockchain::BlockAggregatedChanges,
             contract::{Account, AccountBalance, AccountDelta},
             protocol::ProtocolComponentStateDelta,
+            token::Token,
             ChangeType,
         },
         Bytes,
     },
 };
+
+use crate::models::tokens::TokenStore;
 
 use simulator_core::broadcaster::{
     complete_broadcaster_partition_block, BroadcasterBackend, BroadcasterBackendHead,
@@ -176,6 +179,7 @@ pub(crate) struct BroadcasterSnapshotSource {
 pub(crate) struct BroadcasterStagedUpdate {
     message: Option<BroadcasterUpdateMessage>,
     apply_mode: BroadcasterStagedUpdateApplyMode,
+    new_tokens: Vec<Token>,
     replacement_ready: bool,
     recovery_id: Option<u64>,
 }
@@ -340,6 +344,13 @@ pub struct BroadcasterSnapshotCache {
     chain_id: u64,
     configured_backends: Vec<BroadcasterBackend>,
     inner: Arc<RwLock<BroadcasterSnapshotCacheData>>,
+    token_catalog: Option<BroadcasterTokenCatalog>,
+}
+
+#[derive(Debug, Clone)]
+struct BroadcasterTokenCatalog {
+    tokens: Arc<TokenStore>,
+    min_quality: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -371,13 +382,45 @@ struct BroadcasterPartitionState {
 
 impl BroadcasterSnapshotCache {
     pub fn new(chain_id: u64, configured_backends: Vec<BroadcasterBackend>) -> Self {
-        Self::new_with_initial_generation(chain_id, configured_backends, 1)
+        Self::new_with_initial_generation_and_token_catalog(chain_id, configured_backends, 1, None)
     }
 
+    pub fn with_token_catalog(
+        chain_id: u64,
+        configured_backends: Vec<BroadcasterBackend>,
+        tokens: Arc<TokenStore>,
+        min_quality: u32,
+    ) -> Self {
+        Self::new_with_initial_generation_and_token_catalog(
+            chain_id,
+            configured_backends,
+            1,
+            Some(BroadcasterTokenCatalog {
+                tokens,
+                min_quality,
+            }),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_initial_generation(
+        chain_id: u64,
+        configured_backends: Vec<BroadcasterBackend>,
+        generation: u64,
+    ) -> Self {
+        Self::new_with_initial_generation_and_token_catalog(
+            chain_id,
+            configured_backends,
+            generation,
+            None,
+        )
+    }
+
+    fn new_with_initial_generation_and_token_catalog(
         chain_id: u64,
         mut configured_backends: Vec<BroadcasterBackend>,
         generation: u64,
+        token_catalog: Option<BroadcasterTokenCatalog>,
     ) -> Self {
         configured_backends.sort();
         configured_backends.dedup();
@@ -396,6 +439,7 @@ impl BroadcasterSnapshotCache {
                 replacement: None,
                 next_recovery_id: 1,
             })),
+            token_catalog,
         }
     }
 
@@ -498,6 +542,7 @@ impl BroadcasterSnapshotCache {
         Ok(BroadcasterStagedUpdate {
             message: Some(message),
             apply_mode: BroadcasterStagedUpdateApplyMode::Decoded,
+            new_tokens: Vec::new(),
             replacement_ready: false,
             recovery_id: None,
         })
@@ -509,6 +554,11 @@ impl BroadcasterSnapshotCache {
     ) -> Result<BroadcasterStagedUpdate> {
         let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
         ensure_configured_update_backends(&message, &self.configured_backends)?;
+        // Replacement compaction clears delta tokens, so retain them from the accepted input.
+        let new_tokens = self
+            .token_catalog
+            .as_ref()
+            .map_or_else(Vec::new, |_| raw_update_new_tokens(&message));
         let guard = self.inner.read().await;
         let mut expected_protocols = guard.expected_protocols.clone();
         expected_protocols.extend(feed.sync_states.keys().cloned());
@@ -540,6 +590,7 @@ impl BroadcasterSnapshotCache {
                         pending: None,
                         next_recovery_id,
                     },
+                    new_tokens,
                     replacement_ready: true,
                     recovery_id: Some(pending.id),
                 });
@@ -558,6 +609,7 @@ impl BroadcasterSnapshotCache {
                         pending: Some(pending),
                         next_recovery_id,
                     },
+                    new_tokens,
                     replacement_ready: false,
                     recovery_id: None,
                 });
@@ -571,16 +623,23 @@ impl BroadcasterSnapshotCache {
                 expected_protocols,
                 next_recovery_id,
             },
+            new_tokens,
             replacement_ready: false,
             recovery_id: None,
         })
     }
 
     pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
+        let BroadcasterStagedUpdate {
+            message,
+            apply_mode,
+            new_tokens: accepted_new_tokens,
+            ..
+        } = staged;
         let mut guard = self.inner.write().await;
-        match staged.apply_mode {
+        match apply_mode {
             BroadcasterStagedUpdateApplyMode::Decoded => {
-                if let Some(message) = staged.message.as_ref() {
+                if let Some(message) = message.as_ref() {
                     apply_update_message(&mut guard, message);
                 }
             }
@@ -588,7 +647,7 @@ impl BroadcasterSnapshotCache {
                 expected_protocols,
                 next_recovery_id,
             } => {
-                if let Some(message) = staged.message.as_ref() {
+                if let Some(message) = message.as_ref() {
                     apply_raw_update_message(&mut guard.partitions, message)?;
                 }
                 guard.expected_protocols = expected_protocols;
@@ -606,6 +665,20 @@ impl BroadcasterSnapshotCache {
                 guard.next_recovery_id = next_recovery_id;
             }
         }
+        drop(guard);
+
+        if accepted_new_tokens.is_empty() {
+            return Ok(());
+        }
+        let Some(token_catalog) = &self.token_catalog else {
+            return Ok(());
+        };
+        // Match startup admission before exposing stream tokens through catalog snapshots.
+        let admitted_tokens = accepted_new_tokens
+            .into_iter()
+            .filter(|token| token.quality >= token_catalog.min_quality);
+        // Live publication releases the publisher lock before cache commit reaches this write.
+        token_catalog.tokens.insert_batch(admitted_tokens).await;
         Ok(())
     }
 
@@ -1565,6 +1638,25 @@ fn validate_update_message_applicable(
     }
 
     Ok(())
+}
+
+fn raw_update_new_tokens(message: &BroadcasterUpdateMessage) -> Vec<Token> {
+    let mut new_tokens = Vec::new();
+    for partition in &message.partitions {
+        let mut messages = partition.messages.iter().collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+        for message in messages {
+            new_tokens.extend(
+                message
+                    .message
+                    .deltas
+                    .iter()
+                    .flat_map(|deltas| deltas.new_tokens.values())
+                    .cloned(),
+            );
+        }
+    }
+    new_tokens
 }
 
 fn merge_raw_message(

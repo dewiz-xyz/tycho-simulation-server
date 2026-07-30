@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
@@ -276,7 +276,14 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let (state_history_config, state_history) = initialize_state_history(&config).await?;
     let redis_publisher =
         build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
-    let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
+    let token_min_quality = u32::try_from(config.tuning.token_min_quality)
+        .context("BROADCASTER_TOKEN_MIN_QUALITY must fit u32")?;
+    let raw_cache = BroadcasterSnapshotCache::with_token_catalog(
+        chain.id(),
+        raw_backends.clone(),
+        Arc::clone(&tokens),
+        token_min_quality,
+    );
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
     let rfq_cache = rfq_backends
