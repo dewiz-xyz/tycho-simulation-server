@@ -448,7 +448,7 @@ async fn resolve_range_in_transaction(
     };
 
     let deltas = fetch_deltas(&mut *transaction, request, &anchor, rfq_bounds).await?;
-    let boundaries = fetch_boundaries(&mut *transaction, request, &anchor).await?;
+    let boundaries = fetch_boundaries(&mut *transaction, &anchor).await?;
     let gaps = fetch_gap_rows(&mut *transaction, request, &anchor, rfq_bounds).await?;
     let (legs, gaps) = build_legs(anchor, deltas, boundaries, gaps, request);
     Ok(RangePlan { legs, gaps })
@@ -753,7 +753,6 @@ async fn fetch_delta_backends(
 
 async fn fetch_boundaries(
     connection: &mut sqlx::PgConnection,
-    request: &RangeRequest,
     anchor: &CheckpointManifest,
 ) -> anyhow::Result<Vec<ManifestRow>> {
     let rows = sqlx::query(
@@ -778,18 +777,13 @@ async fn fetch_boundaries(
     .fetch_all(connection)
     .await
     .context("failed to select state history boundary checkpoints")?;
-    let boundaries = rows
-        .iter()
+    rows.iter()
         .map(|row| {
             Ok(ManifestRow {
                 manifest: manifest_from_row(row)?,
             })
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(boundaries
-        .into_iter()
-        .filter(|row| boundary_fits_request_end(&row.manifest, request))
-        .collect())
+        .collect()
 }
 
 fn boundary_fits_request_end(manifest: &CheckpointManifest, request: &RangeRequest) -> bool {
@@ -845,6 +839,9 @@ async fn fetch_gap_rows(
                 AND to_block_number IS NULL
                 AND from_observed_at_ms IS NULL
                 AND to_observed_at_ms IS NULL
+                AND (generation > $2 OR (generation = $2 AND from_message_seq > $3)))
+               OR
+               (reason = 'checkpoint_failed'
                 AND (generation > $2 OR (generation = $2 AND from_message_seq > $3)))
            )
          ORDER BY generation, from_message_seq, to_message_seq, id",
@@ -1021,7 +1018,7 @@ fn build_legs(
     deltas.sort_by_key(|delta| delta.position);
     let anchor_block_number = anchor.block_number;
     let anchor_rfq_observed_at_ms = anchor.rfq_observed_at_ms;
-    let breaks = break_positions(&anchor, &deltas, &boundaries);
+    let breaks = break_positions(&anchor, &deltas, &boundaries, &gaps, request);
     let mut legs = Vec::with_capacity(breaks.len() + 1);
     let mut range_gaps = Vec::new();
 
@@ -1068,8 +1065,10 @@ fn break_positions(
     anchor: &CheckpointManifest,
     deltas: &[DeltaRow],
     boundaries: &[ManifestRow],
+    gaps: &[GapRow],
+    request: &RangeRequest,
 ) -> Vec<StreamPosition> {
-    let boundary_positions = boundaries
+    let all_boundary_positions = boundaries
         .iter()
         .map(|row| &row.manifest)
         .filter(|manifest| {
@@ -1077,13 +1076,51 @@ fn break_positions(
         })
         .map(|manifest| manifest.position)
         .collect::<BTreeSet<_>>();
-    let mut positions = boundary_positions.clone();
+    let last_delta_position = deltas.last().map(|delta| delta.position);
+    // A boundary past every selected delta must not fail a range that ends before it.
+    let mut positions = boundaries
+        .iter()
+        .map(|row| &row.manifest)
+        .filter(|manifest| {
+            manifest.kind == crate::CheckpointKind::Boundary
+                && manifest.position > anchor.position
+                && (last_delta_position.is_some_and(|last_delta| manifest.position <= last_delta)
+                    || boundary_fits_request_end(manifest, request))
+        })
+        .map(|manifest| manifest.position)
+        .collect::<BTreeSet<_>>();
+
+    if let Some(last_delta_position) = last_delta_position {
+        positions.extend(
+            gaps.iter()
+                // Overlapping failures already fail as Recorded gaps.
+                // This cut keeps hidden bounded failures from being bridged by later deltas.
+                // The writer merges adjacent failures into one span, so the row's width
+                // does not matter: any checkpoint_failed row marks a boundary that never
+                // landed, and the cut goes at the span start.
+                .filter(|gap| {
+                    gap.reason == "checkpoint_failed"
+                        && gap_has_cursor_bounds(gap)
+                        && !gap_overlaps_request(
+                            gap,
+                            request,
+                            anchor.block_number,
+                            anchor.rfq_observed_at_ms,
+                        )
+                })
+                .map(|gap| StreamPosition {
+                    generation: gap.generation,
+                    message_seq: gap.from_message_seq,
+                })
+                .filter(|position| *position > anchor.position && *position <= last_delta_position),
+        );
+    }
 
     let mut previous_generation = anchor.position.generation;
     for delta in deltas {
         // Promotion markers have no delta row, so the manifest is authoritative.
         // A generation jump only proxies for a missing manifest.
-        let generation_has_leading_boundary = boundary_positions.iter().any(|position| {
+        let generation_has_leading_boundary = all_boundary_positions.iter().any(|position| {
             position.generation == delta.position.generation && *position <= delta.position
         });
         if delta.position.generation > anchor.position.generation
@@ -1110,6 +1147,7 @@ fn complete_boundary_at(
             manifest.position == position
                 && manifest.kind == crate::CheckpointKind::Boundary
                 && manifest.status == crate::CheckpointStatus::Complete
+                && boundary_fits_request_end(manifest, request)
                 && request
                     .backends
                     .iter()
@@ -1706,6 +1744,272 @@ mod tests {
             .iter()
             .flat_map(|leg| &leg.deltas)
             .all(|delta| delta.position < position(2, 500)));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn boundary_past_native_end_breaks_before_selected_rfq_delta() {
+        let request = RangeRequest::new(8453, 100, 110, vec![Backend::Native, Backend::Rfq])
+            .expect("test request should be valid")
+            .with_rfq_bounds(1_000, 2_000)
+            .expect("test RFQ bounds should be valid");
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![delta(1, 1, 110), rfq_delta(1, 3, 2_000)],
+            vec![ManifestRow {
+                manifest: rfq_manifest(
+                    1,
+                    2,
+                    111,
+                    1_500,
+                    CheckpointKind::Boundary,
+                    CheckpointStatus::Complete,
+                ),
+            }],
+            vec![],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(
+            plan.legs[0]
+                .deltas
+                .iter()
+                .map(|delta| delta.position)
+                .collect::<Vec<_>>(),
+            vec![position(1, 1)]
+        );
+        assert_eq!(
+            plan.gaps,
+            vec![RangeGap {
+                kind: RangeGapKind::MissingCheckpoint,
+                generation: Some(1),
+                from_message_seq: Some(2),
+                to_message_seq: Some(3),
+                reason: "no complete boundary checkpoint at generation 1 message sequence 2"
+                    .to_owned(),
+            }]
+        );
+        plan.ensure_gap_free()
+            .expect_err("a boundary past the native end must fail closed");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn boundary_past_rfq_end_breaks_before_selected_native_delta() {
+        let request = RangeRequest::new(8453, 100, 110, vec![Backend::Native, Backend::Rfq])
+            .expect("test request should be valid")
+            .with_rfq_bounds(1_000, 2_000)
+            .expect("test RFQ bounds should be valid");
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 1, 2_000), delta(1, 3, 110)],
+            vec![ManifestRow {
+                manifest: rfq_manifest(
+                    1,
+                    2,
+                    110,
+                    2_500,
+                    CheckpointKind::Boundary,
+                    CheckpointStatus::Complete,
+                ),
+            }],
+            vec![],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(
+            plan.legs[0]
+                .deltas
+                .iter()
+                .map(|delta| delta.position)
+                .collect::<Vec<_>>(),
+            vec![position(1, 1)]
+        );
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(2));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(3));
+        plan.ensure_gap_free()
+            .expect_err("a boundary past the RFQ end must fail closed");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn checkpoint_failure_position_breaks_rfq_replay_without_manifest() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
+            .expect("test request should be valid")
+            .with_rfq_bounds(1_000, 2_000)
+            .expect("test RFQ bounds should be valid");
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 2, 2_000)],
+            vec![],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 1,
+                to_message_seq: 1,
+                reason: "checkpoint_failed".to_owned(),
+                from_block_number: Some(105),
+                to_block_number: Some(105),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(1));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(2));
+        plan.ensure_gap_free()
+            .expect_err("a positional checkpoint failure must fail RFQ replay");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn merged_checkpoint_failure_span_breaks_rfq_replay_without_manifest() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
+            .expect("test request should be valid")
+            .with_rfq_bounds(1_000, 2_000)
+            .expect("test RFQ bounds should be valid");
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 3, 2_000)],
+            vec![],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 1,
+                to_message_seq: 2,
+                reason: "checkpoint_failed".to_owned(),
+                from_block_number: Some(105),
+                to_block_number: Some(106),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(1));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(3));
+        plan.ensure_gap_free()
+            .expect_err("a merged checkpoint failure span must fail RFQ replay");
+    }
+
+    #[test]
+    fn checkpoint_failure_past_last_delta_does_not_create_a_break() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
+            .unwrap_or_else(|_| unreachable!("test request should be valid"))
+            .with_rfq_bounds(1_000, 2_000)
+            .unwrap_or_else(|_| unreachable!("test RFQ bounds should be valid"));
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 1, 2_000)],
+            vec![],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 2,
+                to_message_seq: 2,
+                reason: "checkpoint_failed".to_owned(),
+                from_block_number: Some(105),
+                to_block_number: Some(105),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(plan.legs[0].deltas.len(), 1);
+        assert!(plan.gaps.is_empty());
+        assert!(plan.ensure_gap_free().is_ok());
+    }
+
+    #[test]
+    fn fitting_boundary_anchors_post_recovery_rfq_delta() {
+        let request = RangeRequest::new(8453, 100, 111, vec![Backend::Native, Backend::Rfq])
+            .unwrap_or_else(|_| unreachable!("test request should be valid"))
+            .with_rfq_bounds(1_000, 2_000)
+            .unwrap_or_else(|_| unreachable!("test RFQ bounds should be valid"));
+        let boundary = rfq_manifest(
+            1,
+            2,
+            111,
+            1_500,
+            CheckpointKind::Boundary,
+            CheckpointStatus::Complete,
+        );
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                0,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![delta(1, 1, 110), rfq_delta(1, 3, 2_000)],
+            vec![ManifestRow {
+                manifest: boundary.clone(),
+            }],
+            vec![],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 2);
+        assert_eq!(plan.legs[0].deltas[0].position, position(1, 1));
+        assert_eq!(plan.legs[1].checkpoint, boundary);
+        assert_eq!(plan.legs[1].deltas[0].position, position(1, 3));
+        assert!(plan.gaps.is_empty());
+        assert!(plan.ensure_gap_free().is_ok());
     }
 
     #[test]
@@ -2573,6 +2877,68 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
     #[expect(clippy::expect_used)]
+    async fn resolve_rfq_range_breaks_at_block_bounded_checkpoint_failure(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-rfq-checkpoint-failure-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let writer_objects = test_object_store(BUCKET).await;
+        persist_checkpoint(
+            &pool,
+            &writer_objects,
+            rfq_capture(
+                1,
+                0,
+                100,
+                timestamp_ms(100),
+                CheckpointKind::Boundary,
+                r#"{"state":"pre-recovery"}"#,
+            )?,
+        )
+        .await?;
+        let mut connection = pool.acquire().await?;
+        StateHistoryStore::record_gap(
+            &mut connection,
+            &GapRecord {
+                chain_id: 8453,
+                generation: 1,
+                from_message_seq: 1,
+                to_message_seq: 1,
+                reason: GapReason::CheckpointFailed,
+                from_block_number: Some(105),
+                to_block_number: Some(105),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            },
+        )
+        .await?;
+        drop(connection);
+        persist_delta(&pool, database_delta_with_rfq(1, 2, 110)?).await?;
+
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool),
+            test_object_store(BUCKET).await,
+        );
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])?
+            .with_rfq_bounds(timestamp_ms(100), timestamp_ms(111) - 1)?;
+        let plan = reader.resolve_range(&request).await?;
+
+        assert_eq!(plan.legs.len(), 1);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(1));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(2));
+        plan.ensure_gap_free()
+            .expect_err("the SQL path must retain the positional checkpoint failure");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    #[expect(clippy::expect_used)]
     async fn resolve_range_replays_across_a_promotion(pool: PgPool) -> anyhow::Result<()> {
         const BUCKET: &str = "state-history-reader-test";
 
@@ -2673,6 +3039,23 @@ mod tests {
         }
     }
 
+    #[expect(clippy::expect_used)]
+    fn rfq_delta(generation: u64, message_seq: u64, observed_at_ms: u64) -> DeltaRow {
+        DeltaRow {
+            position: position(generation, message_seq),
+            observed_at_ms,
+            payload: RawValue::from_string(format!(
+                r#"{{"generation":{generation},"message_seq":{message_seq}}}"#
+            ))
+            .expect("test delta payload should be valid JSON"),
+            backends: vec![DeltaBackendCursor {
+                backend: Backend::Rfq,
+                block_number: None,
+                observed_at_ms: Some(observed_at_ms),
+            }],
+        }
+    }
+
     fn manifest(
         generation: u64,
         message_seq: u64,
@@ -2696,6 +3079,21 @@ mod tests {
             status,
             error: None,
         }
+    }
+
+    fn rfq_manifest(
+        generation: u64,
+        message_seq: u64,
+        block_number: u64,
+        rfq_observed_at_ms: u64,
+        kind: CheckpointKind,
+        status: CheckpointStatus,
+    ) -> CheckpointManifest {
+        let mut manifest = manifest(generation, message_seq, block_number, kind, status);
+        manifest.rfq_observed_at_ms = Some(rfq_observed_at_ms);
+        manifest.backends.push(Backend::Rfq);
+        manifest.backends.sort_unstable();
+        manifest
     }
 
     const fn position(generation: u64, message_seq: u64) -> StreamPosition {
