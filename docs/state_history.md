@@ -97,7 +97,7 @@ Rows record losses known to the writer.
 
 `from_message_seq` cannot exceed `to_message_seq`. The full gap identity is unique, including nullable block and time bounds.
 
-Block bounds come only from block backend cursors. Observation time bounds come only from RFQ provider cursors, never from Redis publication time. A bound stays `NULL` when the lost payload has no corresponding cursor. Boundary checkpoint failures use the capture block number and RFQ high water for both sides of their bounds. Rows with all four bounds `NULL` are still selected by stream position.
+Block bounds come only from block backend cursors. Observation time bounds come only from RFQ provider cursors, never from Redis publication time. A bound stays `NULL` when the lost payload has no corresponding cursor. Boundary checkpoint failures use the capture block number and RFQ high water for both sides of their bounds. Boundary slip bounds start at the request-time cursors and end at the capture cursors. Rows with all four bounds `NULL` are still selected by stream position.
 
 `boundary_slip` records a same generation recovery boundary checkpoint that pins after its requested commit position. Its stream span starts at the requested message sequence plus one and ends at the pinned capture position, so replay across any slipped position fails closed.
 

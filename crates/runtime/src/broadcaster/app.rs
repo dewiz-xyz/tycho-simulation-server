@@ -345,7 +345,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     spawn_promotion_task(
         generation_services.clone(),
         Duration::from_secs(1),
-        state_history.is_some(),
+        state_history.clone(),
     );
     spawn_snapshot_artifact_refresh_task(generation_services.clone(), Duration::from_secs(5 * 60));
     start_state_history_checkpoint_task(
@@ -638,7 +638,7 @@ fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interv
 fn spawn_promotion_task(
     services: Vec<BroadcasterServiceState>,
     interval: Duration,
-    state_history_enabled: bool,
+    state_history: Option<Arc<StateHistoryRuntime>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -686,7 +686,10 @@ fn spawn_promotion_task(
                         generation = boundary.generation,
                         "Broadcaster active writer promoted"
                     );
-                    if state_history_enabled {
+                    if let Some(state_history) = &state_history {
+                        let requested_block_number =
+                            BroadcasterServiceState::state_history_aligned_head(&services).await;
+                        let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
                         match BroadcasterServiceState::capture_state_history_checkpoint(
                             &services,
                             CheckpointKind::Boundary,
@@ -695,6 +698,8 @@ fn spawn_promotion_task(
                                 generation: boundary.generation,
                                 message_seq: boundary.exclusive_message_seq,
                             }),
+                            requested_block_number,
+                            requested_rfq_observed_at_ms,
                         )
                         .await
                         {
@@ -784,6 +789,8 @@ fn spawn_state_history_checkpoint_task(
                         CheckpointKind::Boundary,
                         Some(request.state_version),
                         Some(request.position),
+                        request.complete_native_block,
+                        request.rfq_high_water_ms,
                     )
                     .await;
                     StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -805,6 +812,8 @@ fn spawn_state_history_checkpoint_task(
                     match BroadcasterServiceState::capture_state_history_checkpoint(
                         &services,
                         CheckpointKind::Interval,
+                        None,
+                        None,
                         None,
                         None,
                     )

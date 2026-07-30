@@ -79,6 +79,8 @@ impl StateHistoryUpdateProjection {
 pub(crate) struct BoundaryCheckpointRequest {
     pub(crate) position: StreamPosition,
     pub(crate) state_version: u64,
+    pub(crate) complete_native_block: Option<u64>,
+    pub(crate) rfq_high_water_ms: Option<u64>,
     response: oneshot::Sender<Result<Option<u64>>>,
 }
 
@@ -140,12 +142,16 @@ impl StateHistoryRuntime {
         &self,
         position: StreamPosition,
         state_version: u64,
+        complete_native_block: Option<u64>,
+        rfq_high_water_ms: Option<u64>,
     ) -> Result<Option<u64>> {
         let (response, receiver) = oneshot::channel();
         self.boundary_requests
             .send(BoundaryCheckpointRequest {
                 position,
                 state_version,
+                complete_native_block,
+                rfq_high_water_ms,
                 response,
             })
             .context("state history checkpoint task is not running")?;

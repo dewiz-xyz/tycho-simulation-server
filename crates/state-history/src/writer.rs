@@ -195,20 +195,22 @@ impl WriterHandle {
         chain_id: u64,
         from: StreamPosition,
         to: StreamPosition,
-        block_number: Option<u64>,
-        rfq_observed_at_ms: Option<u64>,
+        block_bounds: (Option<u64>, Option<u64>),
+        observed_at_ms_bounds: (Option<u64>, Option<u64>),
     ) {
         debug_assert_eq!(from.generation, to.generation);
+        let (from_block_number, to_block_number) = block_bounds;
+        let (from_observed_at_ms, to_observed_at_ms) = observed_at_ms_bounds;
         lock(&self.inner.gaps).merge(GapRecord {
             chain_id,
             generation: from.generation,
             from_message_seq: from.message_seq,
             to_message_seq: to.message_seq,
             reason: GapReason::BoundarySlip,
-            from_block_number: block_number,
-            to_block_number: block_number,
-            from_observed_at_ms: rfq_observed_at_ms,
-            to_observed_at_ms: rfq_observed_at_ms,
+            from_block_number,
+            to_block_number,
+            from_observed_at_ms,
+            to_observed_at_ms,
         });
     }
 

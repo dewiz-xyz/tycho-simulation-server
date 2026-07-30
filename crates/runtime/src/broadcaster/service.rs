@@ -686,6 +686,8 @@ impl BroadcasterServiceState {
         kind: CheckpointKind,
         state_version: Option<u64>,
         position: Option<StreamPosition>,
+        requested_block_number: Option<u64>,
+        requested_rfq_observed_at_ms: Option<u64>,
     ) -> Result<Option<u64>> {
         anyhow::ensure!(
             !services.is_empty(),
@@ -788,10 +790,16 @@ impl BroadcasterServiceState {
         record_boundary_slip_gap_if_any(
             &state_history.handle,
             chain_id,
-            position,
-            capture_position,
-            block_number,
-            rfq_observed_at_ms,
+            position.map(|position| BoundaryCheckpointCursor {
+                position,
+                block_number: requested_block_number,
+                rfq_observed_at_ms: requested_rfq_observed_at_ms,
+            }),
+            BoundaryCheckpointCursor {
+                position: capture_position,
+                block_number: Some(block_number),
+                rfq_observed_at_ms,
+            },
         );
         Ok(Some(block_number))
     }
@@ -1297,7 +1305,12 @@ impl BroadcasterServiceState {
                     let block_number = finish.complete_native_block;
                     let rfq_observed_at_ms = state_history.rfq_high_water_ms();
                     let checkpoint = state_history
-                        .request_boundary_checkpoint(commit_position, target_state_version)
+                        .request_boundary_checkpoint(
+                            commit_position,
+                            target_state_version,
+                            block_number,
+                            rfq_observed_at_ms,
+                        )
                         .await;
                     if !matches!(checkpoint, Ok(Some(_))) {
                         state_history.handle.record_boundary_failure_gap(
@@ -1956,32 +1969,46 @@ fn checkpoint_world_matches(
         && current.snapshot_id == pinned.snapshot_id
 }
 
+struct BoundaryCheckpointCursor {
+    position: StreamPosition,
+    block_number: Option<u64>,
+    rfq_observed_at_ms: Option<u64>,
+}
+
 fn record_boundary_slip_gap_if_any(
     handle: &state_history::WriterHandle,
     chain_id: u64,
-    requested: Option<StreamPosition>,
-    capture: StreamPosition,
-    block_number: u64,
-    rfq_observed_at_ms: Option<u64>,
+    requested: Option<BoundaryCheckpointCursor>,
+    capture: BoundaryCheckpointCursor,
 ) {
     let Some(requested) = requested else {
         return;
     };
-    if requested.generation != capture.generation || capture.message_seq <= requested.message_seq {
+    if requested.position.generation != capture.position.generation
+        || capture.position.message_seq <= requested.position.message_seq
+    {
         return;
     }
-    let Some(message_seq) = requested.message_seq.checked_add(1) else {
+    let Some(message_seq) = requested.position.message_seq.checked_add(1) else {
         return;
     };
+    // A half-bounded gap never matches the reader's overlap checks, so an unknown
+    // request-time cursor falls back to the capture cursor instead of NULL.
     handle.record_boundary_slip_gap(
         chain_id,
         StreamPosition {
-            generation: requested.generation,
+            generation: requested.position.generation,
             message_seq,
         },
-        capture,
-        Some(block_number),
-        rfq_observed_at_ms,
+        capture.position,
+        (
+            requested.block_number.or(capture.block_number),
+            capture.block_number,
+        ),
+        (
+            requested.rfq_observed_at_ms.or(capture.rfq_observed_at_ms),
+            capture.rfq_observed_at_ms,
+        ),
     );
 }
 
@@ -2989,6 +3016,8 @@ mod tests {
                 state_history::CheckpointKind::Boundary,
                 Some(request.state_version),
                 Some(request.position),
+                request.complete_native_block,
+                request.rfq_high_water_ms,
             )
             .await;
             StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -3054,12 +3083,12 @@ mod tests {
         );
         let mut boundary_requests = state_history.take_boundary_request_receiver()?;
         let checkpoint_service = service.clone();
-        let (position_sender, position_receiver) = oneshot::channel();
+        let (request_sender, request_receiver) = oneshot::channel();
         let checkpoint_task = tokio::spawn(async move {
             let Some(request) = boundary_requests.recv().await else {
                 return;
             };
-            let _ = position_sender.send(request.position);
+            let _ = request_sender.send((request.position, request.complete_native_block));
             let result = async {
                 checkpoint_service
                     .apply_update(&native_only_update(13, "native-slip"))
@@ -3069,6 +3098,8 @@ mod tests {
                     state_history::CheckpointKind::Boundary,
                     Some(request.state_version),
                     Some(request.position),
+                    request.complete_native_block,
+                    request.rfq_high_water_ms,
                 )
                 .await
             }
@@ -3089,7 +3120,7 @@ mod tests {
         service.mark_upstream_connected().await;
         assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
 
-        let requested = timeout(Duration::from_secs(2), position_receiver)
+        let (requested, requested_block_number) = timeout(Duration::from_secs(2), request_receiver)
             .await
             .map_err(|_| anyhow!("recovery boundary checkpoint was not requested"))??;
         timeout(Duration::from_secs(2), async {
@@ -3118,7 +3149,8 @@ mod tests {
         assert_eq!(gaps[0].from_message_seq, expected_from_message_seq);
         assert_eq!(gaps[0].to_message_seq, capture_position.message_seq);
         assert_eq!(gaps[0].reason, state_history::GapReason::BoundarySlip);
-        assert_eq!(gaps[0].from_block_number, Some(13));
+        assert_eq!(gaps[0].from_block_number, requested_block_number);
+        assert_eq!(requested_block_number, Some(12));
         assert_eq!(gaps[0].to_block_number, Some(13));
         assert_eq!(gaps[0].from_observed_at_ms, None);
         assert_eq!(gaps[0].to_observed_at_ms, None);
@@ -3172,6 +3204,8 @@ mod tests {
                 generation: promotion_boundary.generation,
                 message_seq: promotion_boundary.exclusive_message_seq,
             }),
+            Some(10),
+            None,
         )
         .await?;
 
