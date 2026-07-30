@@ -321,43 +321,32 @@ async fn encode_attempt(
     prepared: &PreparedEncodeRoute,
     attempt_number: AttemptNumber,
 ) -> EncodeAttempt {
-    let native_pin = if prepared.backend_usage.native {
-        Some(state.native_state_store.pin().await)
-    } else {
-        None
-    };
+    // Protocol hints can label a native pool VM or RFQ, and the component-resolved lookup
+    // still serves it, so neither the pin nor the fence can follow backend_usage. Pin
+    // every attempt and key the fence on the pools the attempt resolved as native.
+    let native_pin = state.native_state_store.pin().await;
     let execution =
         encode_attempt_with_pin(state, prepared, attempt_number, native_pin.clone()).await;
-    let native_pool_ids = execution
-        .native_pool_ids
-        .unwrap_or_else(|| normalized_native_pool_ids(&prepared.normalized));
-    let native_fence = NativeAttemptFence::new(native_pin, native_pool_ids);
-    // Protocol hints can misclassify a pool's backend; the resimulated route carries the
-    // component-resolved truth. The retry budget must know about a real RFQ hop, or a
-    // retry approved under the native floor would run a firm quote inside block_in_place
-    // that the request timeout cannot interrupt.
-    let route_uses_rfq = execution
-        .route_uses_rfq
-        .unwrap_or(prepared.backend_usage.rfq);
+    let native_fence = NativeAttemptFence::new(native_pin, execution.native_pool_ids);
 
     EncodeAttempt {
         outcome: AttemptOutcome::from_result(execution.outcome),
         native_fence,
-        route_uses_rfq,
+        route_uses_rfq: execution.route_uses_rfq,
     }
 }
 
 struct EncodeAttemptExecution {
     outcome: Result<EncodeComputation, AttemptError>,
-    native_pool_ids: Option<HashSet<String>>,
-    route_uses_rfq: Option<bool>,
+    native_pool_ids: HashSet<String>,
+    route_uses_rfq: bool,
 }
 
 async fn encode_attempt_with_pin(
     state: &AppState,
     prepared: &PreparedEncodeRoute,
     attempt_number: AttemptNumber,
-    native_pin: Option<PublishedStatePin>,
+    native_pin: PublishedStatePin,
 ) -> EncodeAttemptExecution {
     let rebuild_guard = state
         .acquire_simulation_rebuild_guard(prepared.backend_usage.vm, prepared.backend_usage.rfq)
@@ -374,11 +363,11 @@ async fn encode_attempt_with_pin(
             outcome: Err(AttemptError::deterministic(EncodeError::unavailable(
                 message,
             ))),
-            native_pool_ids: None,
-            route_uses_rfq: None,
+            native_pool_ids: normalized_native_pool_ids(&prepared.normalized),
+            route_uses_rfq: prepared.backend_usage.rfq,
         };
     }
-    let resimulated = match resimulate::resimulate_route_with_native_pin(
+    let resimulation = resimulate::resimulate_route_with_native_pin(
         state,
         &prepared.normalized,
         prepared.chain,
@@ -388,25 +377,31 @@ async fn encode_attempt_with_pin(
         rebuild_guard,
         native_pin,
     )
-    .await
-    {
-        Ok(resimulated) => resimulated,
-        Err(error) => {
-            return EncodeAttemptExecution {
-                outcome: Err(error),
-                native_pool_ids: None,
-                route_uses_rfq: None,
-            };
+    .await;
+    match resimulation.result {
+        Ok(resimulated) => {
+            let outcome =
+                complete_encode_attempt(state, prepared, attempt_number, resimulated).await;
+            EncodeAttemptExecution {
+                outcome,
+                native_pool_ids: resimulation.native_pool_ids,
+                route_uses_rfq: resimulation.uses_rfq,
+            }
         }
-    };
-    let native_pool_ids = resimulated_native_pool_ids(&resimulated);
-    let route_uses_rfq = resimulated_route_uses_rfq(&resimulated);
-    let outcome = complete_encode_attempt(state, prepared, attempt_number, resimulated).await;
-
-    EncodeAttemptExecution {
-        outcome,
-        native_pool_ids: Some(native_pool_ids),
-        route_uses_rfq: Some(route_uses_rfq),
+        Err(error) => {
+            // Failure can strike before every pool resolves, so widen the resolved view
+            // with the hinted pools. An id wrongly treated as native never registers as
+            // changed, while a missed RFQ hop would let a retry approved under the native
+            // floor run a firm quote inside block_in_place that the request timeout cannot
+            // interrupt.
+            let mut native_pool_ids = resimulation.native_pool_ids;
+            native_pool_ids.extend(normalized_native_pool_ids(&prepared.normalized));
+            EncodeAttemptExecution {
+                outcome: Err(error),
+                native_pool_ids,
+                route_uses_rfq: resimulation.uses_rfq || prepared.backend_usage.rfq,
+            }
+        }
     }
 }
 
@@ -475,35 +470,13 @@ fn normalized_native_pool_ids(normalized: &NormalizedRouteInternal) -> HashSet<S
         .collect()
 }
 
-fn resimulated_route_uses_rfq(resimulated: &model::ResimulatedRouteInternal) -> bool {
-    resimulated
-        .segments
-        .iter()
-        .flat_map(|segment| segment.hops.iter())
-        .flat_map(|hop| hop.swaps.iter())
-        .any(|swap| swap.backend.is_rfq())
-}
-
-fn resimulated_native_pool_ids(resimulated: &model::ResimulatedRouteInternal) -> HashSet<String> {
-    // Reused pools can carry route-local state Arcs. Compare the published entries by ID.
-    // Store fallback can find a native pool absent from the pin. One retry converges.
-    resimulated
-        .segments
-        .iter()
-        .flat_map(|segment| segment.hops.iter())
-        .flat_map(|hop| hop.swaps.iter())
-        .filter(|swap| swap.backend.is_native())
-        .map(|swap| swap.pool.component_id.clone())
-        .collect()
-}
-
 struct NativeAttemptFence {
-    pin: Option<PublishedStatePin>,
+    pin: PublishedStatePin,
     native_pool_ids: HashSet<String>,
 }
 
 impl NativeAttemptFence {
-    fn new(pin: Option<PublishedStatePin>, native_pool_ids: HashSet<String>) -> Self {
+    fn new(pin: PublishedStatePin, native_pool_ids: HashSet<String>) -> Self {
         Self {
             pin,
             native_pool_ids,
@@ -511,13 +484,17 @@ impl NativeAttemptFence {
     }
 
     async fn evaluate(&self, state: &AppState) -> Option<NativeFenceEvaluation> {
-        let pinned = self.pin.as_ref()?;
+        // Every attempt holds a pin, but a route with no native pools must stay
+        // independent of native readiness, so only native involvement arms the fence.
+        if self.native_pool_ids.is_empty() {
+            return None;
+        }
         let check = state
-            .native_route_fence_status(pinned, &self.native_pool_ids)
+            .native_route_fence_status(&self.pin, &self.native_pool_ids)
             .await;
         Some(NativeFenceEvaluation {
             status: check.status,
-            generation_moved: check.current_generation != pinned.request_generation(),
+            generation_moved: check.current_generation != self.pin.request_generation(),
             identity_changed: check.status == NativeFenceStatus::Changed,
             native_pool_count: self.native_pool_ids.len(),
         })
