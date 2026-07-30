@@ -838,11 +838,9 @@ async fn fetch_gap_rows(
                (from_block_number IS NULL
                 AND to_block_number IS NULL
                 AND from_observed_at_ms IS NULL
-                AND to_observed_at_ms IS NULL
-                AND (generation > $2 OR (generation = $2 AND from_message_seq > $3)))
+                AND to_observed_at_ms IS NULL)
                OR
-               (reason = 'checkpoint_failed'
-                AND (generation > $2 OR (generation = $2 AND from_message_seq > $3)))
+               (reason = 'checkpoint_failed')
            )
          ORDER BY generation, from_message_seq, to_message_seq, id",
     )
@@ -1101,6 +1099,8 @@ fn break_positions(
                 .filter(|gap| {
                     gap.reason == "checkpoint_failed"
                         && gap_has_cursor_bounds(gap)
+                        && (gap.generation > anchor.position.generation
+                            || gap.to_message_seq > anchor.position.message_seq)
                         && !gap_overlaps_request(
                             gap,
                             request,
@@ -1108,9 +1108,18 @@ fn break_positions(
                             anchor.rfq_observed_at_ms,
                         )
                 })
-                .map(|gap| StreamPosition {
-                    generation: gap.generation,
-                    message_seq: gap.from_message_seq,
+                .map(|gap| {
+                    // A merged span can straddle the anchor, so the cut clamps to the
+                    // first post-anchor position instead of the raw span start.
+                    let message_seq = if gap.generation == anchor.position.generation {
+                        gap.from_message_seq.max(anchor.position.message_seq + 1)
+                    } else {
+                        gap.from_message_seq
+                    };
+                    StreamPosition {
+                        generation: gap.generation,
+                        message_seq,
+                    }
                 })
                 .filter(|position| *position > anchor.position && *position <= last_delta_position),
         );
@@ -1933,6 +1942,85 @@ mod tests {
         assert_eq!(plan.gaps[0].to_message_seq, Some(3));
         plan.ensure_gap_free()
             .expect_err("a merged checkpoint failure span must fail RFQ replay");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn anchor_straddling_checkpoint_failure_span_breaks_at_first_post_anchor_position() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
+            .expect("test request should be valid")
+            .with_rfq_bounds(1_000, 2_000)
+            .expect("test RFQ bounds should be valid");
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                10,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 12, 2_000)],
+            vec![],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 9,
+                to_message_seq: 11,
+                reason: "checkpoint_failed".to_owned(),
+                from_block_number: Some(99),
+                to_block_number: Some(101),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(11));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(12));
+        plan.ensure_gap_free()
+            .expect_err("a failure span straddling the anchor must fail closed");
+    }
+
+    #[test]
+    fn pre_anchor_checkpoint_failure_span_does_not_create_a_break() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
+            .unwrap_or_else(|_| unreachable!("test request should be valid"))
+            .with_rfq_bounds(1_000, 2_000)
+            .unwrap_or_else(|_| unreachable!("test RFQ bounds should be valid"));
+        let (legs, gaps) = build_legs(
+            rfq_manifest(
+                1,
+                10,
+                100,
+                1_000,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![rfq_delta(1, 12, 2_000)],
+            vec![],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 5,
+                to_message_seq: 9,
+                reason: "checkpoint_failed".to_owned(),
+                from_block_number: Some(90),
+                to_block_number: Some(95),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request,
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(plan.legs[0].deltas.len(), 1);
+        assert!(plan.gaps.is_empty());
+        assert!(plan.ensure_gap_free().is_ok());
     }
 
     #[test]
@@ -2933,6 +3021,68 @@ mod tests {
         assert_eq!(plan.gaps[0].to_message_seq, Some(2));
         plan.ensure_gap_free()
             .expect_err("the SQL path must retain the positional checkpoint failure");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    #[expect(clippy::expect_used)]
+    async fn resolve_rfq_range_breaks_at_anchor_straddling_checkpoint_failure(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-rfq-straddling-failure-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let writer_objects = test_object_store(BUCKET).await;
+        persist_checkpoint(
+            &pool,
+            &writer_objects,
+            rfq_capture(
+                1,
+                10,
+                100,
+                timestamp_ms(100),
+                CheckpointKind::Boundary,
+                r#"{"state":"pre-recovery"}"#,
+            )?,
+        )
+        .await?;
+        let mut connection = pool.acquire().await?;
+        StateHistoryStore::record_gap(
+            &mut connection,
+            &GapRecord {
+                chain_id: 8453,
+                generation: 1,
+                from_message_seq: 9,
+                to_message_seq: 11,
+                reason: GapReason::CheckpointFailed,
+                from_block_number: Some(99),
+                to_block_number: Some(101),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            },
+        )
+        .await?;
+        drop(connection);
+        persist_delta(&pool, database_delta_with_rfq(1, 12, 110)?).await?;
+
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool),
+            test_object_store(BUCKET).await,
+        );
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])?
+            .with_rfq_bounds(timestamp_ms(100), timestamp_ms(111) - 1)?;
+        let plan = reader.resolve_range(&request).await?;
+
+        assert_eq!(plan.legs.len(), 1);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::MissingCheckpoint);
+        assert_eq!(plan.gaps[0].from_message_seq, Some(11));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(12));
+        plan.ensure_gap_free()
+            .expect_err("a failure span straddling the anchor must fail closed");
         Ok(())
     }
 
