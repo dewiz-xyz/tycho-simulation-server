@@ -15,7 +15,11 @@ const BLOCK_TIME_UPSERT: &str = r#"
     ON CONFLICT (chain_id, block_number) DO UPDATE SET
         timestamp_ms = EXCLUDED.timestamp_ms, block_hash = EXCLUDED.block_hash,
         parent_hash = EXCLUDED.parent_hash,
-        base_fee_wei = COALESCE(EXCLUDED.base_fee_wei, bt.base_fee_wei),
+        base_fee_wei = CASE
+            WHEN EXCLUDED.block_hash IS NOT DISTINCT FROM bt.block_hash
+                THEN COALESCE(EXCLUDED.base_fee_wei, bt.base_fee_wei)
+            ELSE EXCLUDED.base_fee_wei
+        END,
         source_generation = EXCLUDED.source_generation, source_message_seq = EXCLUDED.source_message_seq,
         updated_at = CASE WHEN (bt.timestamp_ms, bt.block_hash, bt.parent_hash)
             IS DISTINCT FROM (EXCLUDED.timestamp_ms, EXCLUDED.block_hash, EXCLUDED.parent_hash)
@@ -386,7 +390,7 @@ fn db_i64(value: u64, field: &str) -> anyhow::Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} exceeds PostgreSQL BIGINT"))
 }
 
-const fn checkpoint_kind(kind: CheckpointKind) -> &'static str {
+pub(crate) const fn checkpoint_kind(kind: CheckpointKind) -> &'static str {
     match kind {
         CheckpointKind::Boundary => "boundary",
         CheckpointKind::Interval => "interval",
@@ -446,6 +450,39 @@ mod tests {
         let generation_three = test_delta_with_block_hash(8453, 3, 1, "C");
         StateHistoryStore::insert_delta(&mut conn, &generation_three, &BTreeMap::new()).await?;
         assert_eq!(block_time_source(&pool).await?, ("C".to_owned(), 3));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn changed_block_hash_clears_missing_replacement_fee(pool: PgPool) -> anyhow::Result<()> {
+        let mut connection = pool.acquire().await?;
+        let original = test_delta_with_block_hash(8453, 1, 1, "old-hash");
+        let base_fees = BTreeMap::from([(100, "100".to_owned())]);
+        StateHistoryStore::insert_delta(&mut connection, &original, &base_fees).await?;
+
+        let replacement = test_delta_with_block_hash(8453, 1, 2, "new-hash");
+        StateHistoryStore::insert_delta(&mut connection, &replacement, &BTreeMap::new()).await?;
+
+        assert_eq!(block_time_fee(&pool).await?, ("new-hash".to_owned(), None));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn unchanged_block_hash_preserves_existing_fee(pool: PgPool) -> anyhow::Result<()> {
+        let mut connection = pool.acquire().await?;
+        let original = test_delta_with_block_hash(8453, 1, 1, "same-hash");
+        let base_fees = BTreeMap::from([(100, "100".to_owned())]);
+        StateHistoryStore::insert_delta(&mut connection, &original, &base_fees).await?;
+
+        let replacement = test_delta_with_block_hash(8453, 1, 2, "same-hash");
+        StateHistoryStore::insert_delta(&mut connection, &replacement, &BTreeMap::new()).await?;
+
+        assert_eq!(
+            block_time_fee(&pool).await?,
+            ("same-hash".to_owned(), Some("100".to_owned()))
+        );
         Ok(())
     }
 
@@ -677,6 +714,16 @@ mod tests {
     async fn block_time_source(pool: &PgPool) -> anyhow::Result<(String, i64)> {
         Ok(sqlx::query_as(
             "SELECT block_hash, source_generation
+             FROM state_history.block_times
+             WHERE chain_id = 8453 AND block_number = 100",
+        )
+        .fetch_one(pool)
+        .await?)
+    }
+
+    async fn block_time_fee(pool: &PgPool) -> anyhow::Result<(String, Option<String>)> {
+        Ok(sqlx::query_as(
+            "SELECT block_hash, base_fee_wei::text
              FROM state_history.block_times
              WHERE chain_id = 8453 AND block_number = 100",
         )

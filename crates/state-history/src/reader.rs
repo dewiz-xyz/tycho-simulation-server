@@ -448,15 +448,8 @@ async fn resolve_range_in_transaction(
     };
 
     let deltas = fetch_deltas(&mut *transaction, request, &anchor, rfq_bounds).await?;
-    let boundaries = fetch_boundaries(&mut *transaction, &anchor, deltas.last()).await?;
-    let gaps = fetch_gap_rows(
-        &mut *transaction,
-        request,
-        &anchor,
-        deltas.last(),
-        rfq_bounds,
-    )
-    .await?;
+    let boundaries = fetch_boundaries(&mut *transaction, request, &anchor).await?;
+    let gaps = fetch_gap_rows(&mut *transaction, request, &anchor, rfq_bounds).await?;
     let (legs, gaps) = build_legs(anchor, deltas, boundaries, gaps, request);
     Ok(RangePlan { legs, gaps })
 }
@@ -760,12 +753,9 @@ async fn fetch_delta_backends(
 
 async fn fetch_boundaries(
     connection: &mut sqlx::PgConnection,
+    request: &RangeRequest,
     anchor: &CheckpointManifest,
-    last_delta: Option<&DeltaRow>,
 ) -> anyhow::Result<Vec<ManifestRow>> {
-    let Some(last_delta) = last_delta else {
-        return Ok(Vec::new());
-    };
     let rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
                 rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
@@ -774,7 +764,6 @@ async fn fetch_boundaries(
          WHERE chain_id = $1
            AND kind = 'boundary'
            AND (generation, message_seq) > ($2, $3)
-           AND (generation, message_seq) <= ($4, $5)
          ORDER BY generation, message_seq",
     )
     .bind(database_i64(anchor.chain_id, "anchor chain_id")?)
@@ -786,38 +775,49 @@ async fn fetch_boundaries(
         anchor.position.message_seq,
         "anchor message_seq",
     )?)
-    .bind(database_i64(
-        last_delta.position.generation,
-        "last delta generation",
-    )?)
-    .bind(database_i64(
-        last_delta.position.message_seq,
-        "last delta message_seq",
-    )?)
     .fetch_all(connection)
     .await
     .context("failed to select state history boundary checkpoints")?;
-    rows.iter()
+    let boundaries = rows
+        .iter()
         .map(|row| {
             Ok(ManifestRow {
                 manifest: manifest_from_row(row)?,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(boundaries
+        .into_iter()
+        .filter(|row| boundary_fits_request_end(&row.manifest, request))
+        .collect())
+}
+
+fn boundary_fits_request_end(manifest: &CheckpointManifest, request: &RangeRequest) -> bool {
+    request.backends.iter().all(|backend| {
+        if manifest.backends.binary_search(backend).is_err() {
+            return true;
+        }
+        match backend {
+            Backend::Native | Backend::Vm => manifest.block_number <= request.end_block,
+            Backend::Rfq => request.rfq_end_ms.is_some_and(|end| {
+                manifest
+                    .rfq_observed_at_ms
+                    .is_some_and(|cursor| cursor <= end)
+            }),
+        }
+    })
 }
 
 async fn fetch_gap_rows(
     connection: &mut sqlx::PgConnection,
     request: &RangeRequest,
     anchor: &CheckpointManifest,
-    last_delta: Option<&DeltaRow>,
     rfq_bounds: Option<(u64, u64)>,
 ) -> anyhow::Result<Vec<GapRow>> {
     let includes_block_backend = request
         .backends
         .iter()
         .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
-    let last_position = last_delta.map(|delta| delta.position);
     let rows = sqlx::query(
         "SELECT generation, from_message_seq, to_message_seq, reason,
                 from_block_number, to_block_number, from_observed_at_ms, to_observed_at_ms
@@ -838,8 +838,7 @@ async fn fetch_gap_rows(
                 AND to_block_number IS NULL
                 AND from_observed_at_ms IS NULL
                 AND to_observed_at_ms IS NULL
-                AND $10::boolean
-                AND (generation < $11 OR (generation = $11 AND from_message_seq <= $12)))
+                AND (generation > $2 OR (generation = $2 AND from_message_seq > $3)))
            )
          ORDER BY generation, from_message_seq, to_message_seq, id",
     )
@@ -864,17 +863,6 @@ async fn fetch_gap_rows(
     .bind(
         rfq_bounds
             .map(|bounds| database_i64(bounds.1, "range RFQ end_ms"))
-            .transpose()?,
-    )
-    .bind(last_position.is_some())
-    .bind(
-        last_position
-            .map(|position| database_i64(position.generation, "last delta generation"))
-            .transpose()?,
-    )
-    .bind(
-        last_position
-            .map(|position| database_i64(position.message_seq, "last delta message_seq"))
             .transpose()?,
     )
     .fetch_all(connection)
@@ -1026,8 +1014,6 @@ fn build_legs(
     deltas.sort_by_key(|delta| delta.position);
     let breaks = break_positions(&anchor, &deltas, &boundaries);
     let mut legs = Vec::with_capacity(breaks.len() + 1);
-    let mut replay_spans = Vec::with_capacity(breaks.len() + 1);
-    let mut missing_spans = Vec::new();
     let mut range_gaps = Vec::new();
 
     let first_break = breaks.first().copied();
@@ -1035,13 +1021,7 @@ fn build_legs(
         .iter()
         .filter(|delta| first_break.is_none_or(|position| delta.position < position))
         .collect::<Vec<_>>();
-    push_leg(
-        &mut legs,
-        &mut replay_spans,
-        anchor,
-        &anchor_deltas,
-        request,
-    );
+    push_leg(&mut legs, anchor, &anchor_deltas, request);
 
     for (index, position) in breaks.iter().copied().enumerate() {
         let next_break = breaks.get(index + 1).copied();
@@ -1057,26 +1037,14 @@ fn build_legs(
                 .into_iter()
                 .filter(|delta| delta.position > checkpoint.position)
                 .collect::<Vec<_>>();
-            push_leg(
-                &mut legs,
-                &mut replay_spans,
-                checkpoint,
-                &replayable,
-                request,
-            );
+            push_leg(&mut legs, checkpoint, &replayable, request);
         } else {
             let span = missing_span(position, &segment);
-            missing_spans.push(span);
             range_gaps.push(missing_checkpoint_gap(span));
         }
     }
 
-    range_gaps.extend(recorded_range_gaps(
-        &gaps,
-        request,
-        &replay_spans,
-        &missing_spans,
-    ));
+    range_gaps.extend(recorded_range_gaps(&gaps, request));
     range_gaps.extend(incomplete_tail_gaps(request, &legs, &deltas));
 
     (legs, range_gaps)
@@ -1087,16 +1055,11 @@ fn break_positions(
     deltas: &[DeltaRow],
     boundaries: &[ManifestRow],
 ) -> Vec<StreamPosition> {
-    let Some(last_delta) = deltas.last().map(|delta| delta.position) else {
-        return Vec::new();
-    };
     let boundary_positions = boundaries
         .iter()
         .map(|row| &row.manifest)
         .filter(|manifest| {
-            manifest.kind == crate::CheckpointKind::Boundary
-                && manifest.position > anchor.position
-                && manifest.position <= last_delta
+            manifest.kind == crate::CheckpointKind::Boundary && manifest.position > anchor.position
         })
         .map(|manifest| manifest.position)
         .collect::<BTreeSet<_>>();
@@ -1138,22 +1101,10 @@ fn complete_boundary_at(
 
 fn push_leg(
     legs: &mut Vec<RangeLeg>,
-    replay_spans: &mut Vec<PositionSpan>,
     checkpoint: CheckpointManifest,
     deltas: &[&DeltaRow],
     request: &RangeRequest,
 ) {
-    if let (Some(from_message_seq), Some(last)) = (
-        checkpoint.position.message_seq.checked_add(1),
-        deltas.last(),
-    ) {
-        replay_spans.push(PositionSpan {
-            generation: checkpoint.position.generation,
-            from_message_seq,
-            to_message_seq: last.position.message_seq,
-        });
-    }
-
     legs.push(RangeLeg {
         checkpoint,
         deltas: deltas
@@ -1171,7 +1122,18 @@ fn stored_delta(row: &DeltaRow, request: &RangeRequest) -> StoredDelta {
         backends: row
             .backends
             .iter()
-            .filter(|cursor| request.backends.binary_search(&cursor.backend).is_ok())
+            .filter(|cursor| {
+                request.backends.binary_search(&cursor.backend).is_ok()
+                    && match cursor.backend {
+                        Backend::Native | Backend::Vm => cursor
+                            .block_number
+                            .is_none_or(|block_number| block_number <= request.end_block),
+                        Backend::Rfq => cursor
+                            .observed_at_ms
+                            .zip(request.rfq_end_ms)
+                            .is_none_or(|(observed_at_ms, end_ms)| observed_at_ms <= end_ms),
+                    }
+            })
             .cloned()
             .collect(),
     }
@@ -1203,21 +1165,9 @@ fn missing_checkpoint_gap(span: PositionSpan) -> RangeGap {
     }
 }
 
-fn recorded_range_gaps(
-    gaps: &[GapRow],
-    request: &RangeRequest,
-    replay_spans: &[PositionSpan],
-    missing_spans: &[PositionSpan],
-) -> Vec<RangeGap> {
+fn recorded_range_gaps(gaps: &[GapRow], request: &RangeRequest) -> Vec<RangeGap> {
     gaps.iter()
-        .filter(|gap| {
-            gap_overlaps_request(gap, request)
-                || (!gap_has_cursor_bounds(gap)
-                    && replay_spans
-                        .iter()
-                        .chain(missing_spans)
-                        .any(|span| gap_overlaps_span(gap, *span)))
-        })
+        .filter(|gap| !gap_has_cursor_bounds(gap) || gap_overlaps_request(gap, request))
         .map(|gap| RangeGap {
             kind: RangeGapKind::Recorded,
             generation: Some(gap.generation),
@@ -1272,12 +1222,6 @@ fn ranges_overlap(
         .is_some_and(|(stored_start, stored_end)| {
             stored_end >= request_start && stored_start <= request_end
         })
-}
-
-const fn gap_overlaps_span(gap: &GapRow, span: PositionSpan) -> bool {
-    gap.generation == span.generation
-        && gap.to_message_seq >= span.from_message_seq
-        && gap.from_message_seq <= span.to_message_seq
 }
 
 fn incomplete_tail_gaps(
@@ -1427,6 +1371,32 @@ mod tests {
         assert_eq!(legs[0].deltas.len(), 2);
         assert_eq!(legs[0].deltas[0].backends[0].block_number, Some(90));
         assert!(gaps.is_empty());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn stored_delta_strips_cursor_past_its_backend_end() {
+        let request = RangeRequest::new(8453, 100, 100, vec![Backend::Native, Backend::Vm])
+            .expect("test request should be valid");
+        let mut row = delta(1, 1, 101);
+        row.backends.push(DeltaBackendCursor {
+            backend: Backend::Vm,
+            block_number: Some(100),
+            observed_at_ms: None,
+        });
+
+        let stored = stored_delta(&row, &request);
+
+        assert_eq!(stored.position, position(1, 1));
+        assert_eq!(stored.payload.get(), row.payload.get());
+        assert_eq!(
+            stored.backends,
+            vec![DeltaBackendCursor {
+                backend: Backend::Vm,
+                block_number: Some(100),
+                observed_at_ms: None,
+            }]
+        );
     }
 
     #[test]
@@ -1765,6 +1735,59 @@ mod tests {
 
     #[test]
     #[expect(clippy::expect_used)]
+    fn boundary_slip_inside_previous_leg_fails_the_range() {
+        let boundary = manifest(
+            1,
+            4,
+            110,
+            CheckpointKind::Boundary,
+            CheckpointStatus::Complete,
+        );
+        let (legs, gaps) = build_legs(
+            manifest(
+                1,
+                0,
+                100,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![delta(1, 1, 105), delta(1, 2, 110), delta(1, 3, 110)],
+            vec![ManifestRow { manifest: boundary }],
+            vec![GapRow {
+                generation: 1,
+                from_message_seq: 2,
+                to_message_seq: 3,
+                reason: "boundary_slip".to_owned(),
+                from_block_number: Some(110),
+                to_block_number: Some(110),
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
+            }],
+            &request(100, 110),
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 2);
+        assert_eq!(
+            plan.legs[0]
+                .deltas
+                .iter()
+                .map(|delta| delta.position)
+                .collect::<Vec<_>>(),
+            vec![position(1, 1), position(1, 2), position(1, 3)]
+        );
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::Recorded);
+        assert_eq!(plan.gaps[0].generation, Some(1));
+        assert_eq!(plan.gaps[0].from_message_seq, Some(2));
+        assert_eq!(plan.gaps[0].to_message_seq, Some(3));
+        assert_eq!(plan.gaps[0].reason, "boundary_slip");
+        plan.ensure_gap_free()
+            .expect_err("a boundary slip must fail the range");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
     fn recorded_gap_without_surviving_deltas_fails_checkpoint_covered_range() {
         let (legs, gaps) = build_legs(
             manifest(
@@ -1868,6 +1891,81 @@ mod tests {
     }
 
     #[test]
+    fn trailing_complete_boundary_covers_request_without_later_deltas() {
+        let boundary = manifest(
+            1,
+            2,
+            120,
+            CheckpointKind::Boundary,
+            CheckpointStatus::Complete,
+        );
+        let (legs, gaps) = build_legs(
+            manifest(
+                1,
+                0,
+                100,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![delta(1, 1, 110)],
+            vec![ManifestRow {
+                manifest: boundary.clone(),
+            }],
+            vec![],
+            &request(100, 120),
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 2);
+        assert_eq!(plan.legs[1].checkpoint, boundary);
+        assert!(plan.legs[1].deltas.is_empty());
+        assert!(plan.gaps.is_empty());
+        assert!(plan.ensure_gap_free().is_ok());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn trailing_failed_boundary_reports_single_position_checkpoint_gap() {
+        let (legs, gaps) = build_legs(
+            manifest(
+                1,
+                0,
+                100,
+                CheckpointKind::Boundary,
+                CheckpointStatus::Complete,
+            ),
+            vec![delta(1, 1, 110)],
+            vec![ManifestRow {
+                manifest: manifest(
+                    1,
+                    2,
+                    120,
+                    CheckpointKind::Boundary,
+                    CheckpointStatus::Failed,
+                ),
+            }],
+            vec![],
+            &request(100, 120),
+        );
+        let plan = RangePlan { legs, gaps };
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(
+            plan.gaps[0],
+            RangeGap {
+                kind: RangeGapKind::MissingCheckpoint,
+                generation: Some(1),
+                from_message_seq: Some(2),
+                to_message_seq: Some(2),
+                reason: "no complete boundary checkpoint at generation 1 message sequence 2"
+                    .to_owned(),
+            }
+        );
+        plan.ensure_gap_free()
+            .expect_err("failed boundary must leave an explicit gap");
+    }
+
+    #[test]
     #[expect(clippy::expect_used)]
     fn ensure_gap_free_preserves_kinds() {
         let plan = RangePlan {
@@ -1907,6 +2005,159 @@ mod tests {
             error.to_string(),
             "state history range has gaps: missing_checkpoint: missing boundary, recorded: write_failed"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn checkpoint_kind_separates_objects_in_both_insertion_orders(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-checkpoint-kind-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let writer_objects = test_object_store(BUCKET).await;
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool.clone()),
+            test_object_store(BUCKET).await,
+        );
+
+        for (order_index, kinds) in [
+            [CheckpointKind::Boundary, CheckpointKind::Interval],
+            [CheckpointKind::Interval, CheckpointKind::Boundary],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message_seq = 20 + u64::try_from(order_index)?;
+            let mut persisted = Vec::new();
+
+            for (capture_index, kind) in kinds.into_iter().enumerate() {
+                let payload = format!(r#"{{"order":{order_index},"capture":{capture_index}}}"#);
+                let manifest = persist_checkpoint(
+                    &pool,
+                    &writer_objects,
+                    capture(4, message_seq, 100, kind, &payload)?,
+                )
+                .await?;
+                persisted.push((manifest, payload));
+            }
+
+            let first_key = persisted[0]
+                .0
+                .s3_key
+                .as_deref()
+                .context("first checkpoint is missing its object key")?;
+            let second_key = persisted[1]
+                .0
+                .s3_key
+                .as_deref()
+                .context("second checkpoint is missing its object key")?;
+            assert_ne!(first_key, second_key);
+
+            for (manifest, expected_payload) in persisted {
+                let archive = reader.fetch_checkpoint(&manifest).await?;
+                assert_eq!(archive.metadata.kind, manifest.kind);
+                assert_eq!(archive.payloads_json, vec![expected_payload]);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn resolve_range_uses_complete_boundary_when_range_has_no_deltas(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-zero-delta-boundary-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let writer_objects = test_object_store(BUCKET).await;
+        persist_checkpoint(
+            &pool,
+            &writer_objects,
+            capture(1, 0, 100, CheckpointKind::Boundary, r#"{"state":"anchor"}"#)?,
+        )
+        .await?;
+        let boundary = persist_checkpoint(
+            &pool,
+            &writer_objects,
+            capture(1, 1, 120, CheckpointKind::Boundary, r#"{"state":"tail"}"#)?,
+        )
+        .await?;
+
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool),
+            test_object_store(BUCKET).await,
+        );
+        let plan = reader
+            .resolve_range(&RangeRequest::new(8453, 100, 120, vec![Backend::Native])?)
+            .await?;
+
+        assert_eq!(plan.legs.len(), 2);
+        assert!(plan.legs[0].deltas.is_empty());
+        assert_eq!(plan.legs[1].checkpoint, boundary);
+        assert!(plan.legs[1].deltas.is_empty());
+        assert!(plan.gaps.is_empty());
+        plan.ensure_gap_free()?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn resolve_range_excludes_boundary_past_requested_rfq_end(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-rfq-boundary-end-reader-test";
+        const RFQ_END_MS: u64 = 120_000;
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let writer_objects = test_object_store(BUCKET).await;
+        persist_checkpoint(
+            &pool,
+            &writer_objects,
+            rfq_capture(
+                1,
+                0,
+                100,
+                timestamp_ms(100),
+                CheckpointKind::Boundary,
+                r#"{"state":"anchor"}"#,
+            )?,
+        )
+        .await?;
+        persist_delta(&pool, database_delta(1, 1, 120, false)?).await?;
+        persist_checkpoint(
+            &pool,
+            &writer_objects,
+            rfq_capture(
+                1,
+                2,
+                120,
+                RFQ_END_MS + 1,
+                CheckpointKind::Boundary,
+                r#"{"state":"past-rfq-end"}"#,
+            )?,
+        )
+        .await?;
+
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool),
+            test_object_store(BUCKET).await,
+        );
+        let request = RangeRequest::new(8453, 100, 120, vec![Backend::Native, Backend::Rfq])?
+            .with_rfq_bounds(timestamp_ms(100), RFQ_END_MS)?;
+        let plan = reader.resolve_range(&request).await?;
+
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(plan.legs[0].deltas.len(), 1);
+        assert_eq!(plan.gaps.len(), 1);
+        assert_eq!(plan.gaps[0].kind, RangeGapKind::IncompleteTail);
+        assert!(plan.gaps[0].reason.contains("rfq"));
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2053,7 +2304,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
     #[expect(clippy::expect_used)]
-    async fn resolve_range_surfaces_recorded_gap_without_surviving_deltas(
+    async fn resolve_range_surfaces_unbounded_boundary_gap_without_surviving_deltas(
         pool: PgPool,
     ) -> anyhow::Result<()> {
         const BUCKET: &str = "state-history-gap-reader-test";
@@ -2081,11 +2332,11 @@ mod tests {
                 generation: 1,
                 from_message_seq: 1,
                 to_message_seq: 3,
-                reason: GapReason::QueueOverflow,
-                from_block_number: Some(100),
-                to_block_number: Some(100),
-                from_observed_at_ms: Some(timestamp_ms(100)),
-                to_observed_at_ms: Some(timestamp_ms(100)),
+                reason: GapReason::CheckpointFailed,
+                from_block_number: None,
+                to_block_number: None,
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
             },
         )
         .await?;
@@ -2104,9 +2355,9 @@ mod tests {
         assert!(plan.legs[0].deltas.is_empty());
         assert_eq!(plan.gaps.len(), 1);
         assert_eq!(plan.gaps[0].kind, RangeGapKind::Recorded);
-        assert_eq!(plan.gaps[0].reason, "queue_overflow");
+        assert_eq!(plan.gaps[0].reason, "checkpoint_failed");
         plan.ensure_gap_free()
-            .expect_err("recorded same-block loss must fail the range");
+            .expect_err("recorded boundary loss must fail the range");
         Ok(())
     }
 
@@ -2338,7 +2589,7 @@ mod tests {
             payloads_json: capture.payloads_json().to_vec(),
         };
         let encoded = encode_archive(archive)?;
-        let key = objects.key_for(capture.chain_id(), capture.position());
+        let key = objects.key_for(capture.chain_id(), capture.position(), capture.kind());
         objects.put(&key, encoded.bytes).await?;
         StateHistoryStore::complete_checkpoint(
             &mut connection,

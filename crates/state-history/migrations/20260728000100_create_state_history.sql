@@ -71,7 +71,7 @@ CREATE TABLE state_history.gaps (
     generation BIGINT NOT NULL,
     from_message_seq BIGINT NOT NULL,
     to_message_seq BIGINT NOT NULL,
-    reason TEXT NOT NULL CHECK (reason IN ('queue_overflow', 'write_failed', 'writer_stopped', 'checkpoint_failed')),
+    reason TEXT NOT NULL CHECK (reason IN ('queue_overflow', 'write_failed', 'writer_stopped', 'checkpoint_failed', 'boundary_slip')),
     from_block_number BIGINT,
     to_block_number BIGINT,
     from_observed_at_ms BIGINT,

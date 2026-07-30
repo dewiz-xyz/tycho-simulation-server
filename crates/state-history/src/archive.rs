@@ -118,10 +118,17 @@ pub fn decode_archive(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<Che
     })
 }
 
-pub fn checkpoint_s3_key(prefix: &str, chain_id: u64, position: StreamPosition) -> String {
+pub fn checkpoint_s3_key(
+    prefix: &str,
+    chain_id: u64,
+    position: StreamPosition,
+    kind: CheckpointKind,
+) -> String {
     let suffix = format!(
-        "chain={chain_id}/gen={}/seq={}/checkpoint.zst",
-        position.generation, position.message_seq
+        "chain={chain_id}/gen={}/seq={}/kind={}/checkpoint.zst",
+        position.generation,
+        position.message_seq,
+        crate::store::checkpoint_kind(kind)
     );
     if prefix.is_empty() {
         suffix
@@ -161,8 +168,8 @@ impl CheckpointObjectStore {
         }
     }
 
-    pub fn key_for(&self, chain_id: u64, position: StreamPosition) -> String {
-        checkpoint_s3_key(&self.prefix, chain_id, position)
+    pub fn key_for(&self, chain_id: u64, position: StreamPosition, kind: CheckpointKind) -> String {
+        checkpoint_s3_key(&self.prefix, chain_id, position, kind)
     }
 
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -233,12 +240,12 @@ mod tests {
             message_seq: 4242,
         };
         assert_eq!(
-            checkpoint_s3_key("state-history", 8453, pos),
-            "state-history/chain=8453/gen=7/seq=4242/checkpoint.zst"
+            checkpoint_s3_key("state-history", 8453, pos, CheckpointKind::Boundary),
+            "state-history/chain=8453/gen=7/seq=4242/kind=boundary/checkpoint.zst"
         );
         assert_eq!(
-            checkpoint_s3_key("", 8453, pos),
-            "chain=8453/gen=7/seq=4242/checkpoint.zst"
+            checkpoint_s3_key("", 8453, pos, CheckpointKind::Interval),
+            "chain=8453/gen=7/seq=4242/kind=interval/checkpoint.zst"
         );
     }
 

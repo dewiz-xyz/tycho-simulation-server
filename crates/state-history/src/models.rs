@@ -148,6 +148,7 @@ pub enum GapReason {
     WriteFailed,
     WriterStopped,
     CheckpointFailed,
+    BoundarySlip,
 }
 
 impl GapReason {
@@ -157,6 +158,22 @@ impl GapReason {
             Self::WriteFailed => "write_failed",
             Self::WriterStopped => "writer_stopped",
             Self::CheckpointFailed => "checkpoint_failed",
+            Self::BoundarySlip => "boundary_slip",
+        }
+    }
+}
+
+impl FromStr for GapReason {
+    type Err = ModelError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queue_overflow" => Ok(Self::QueueOverflow),
+            "write_failed" => Ok(Self::WriteFailed),
+            "writer_stopped" => Ok(Self::WriterStopped),
+            "checkpoint_failed" => Ok(Self::CheckpointFailed),
+            "boundary_slip" => Ok(Self::BoundarySlip),
+            _ => Err(ModelError::InvalidGapReason(value.to_owned())),
         }
     }
 }
@@ -333,6 +350,8 @@ pub struct CheckpointManifest {
 pub enum ModelError {
     #[error("unsupported backend `{0}`")]
     InvalidBackend(String),
+    #[error("unsupported gap reason `{0}`")]
+    InvalidGapReason(String),
     #[error("backends must not be empty")]
     EmptyBackends,
     #[error("range start block {start} must not exceed end block {end}")]
@@ -378,6 +397,22 @@ mod tests {
             assert_eq!(s.parse::<Backend>().unwrap(), backend);
         }
         assert!("stream_header".parse::<Backend>().is_err());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn gap_reason_round_trips_db_values() {
+        for (reason, value) in [
+            (GapReason::QueueOverflow, "queue_overflow"),
+            (GapReason::WriteFailed, "write_failed"),
+            (GapReason::WriterStopped, "writer_stopped"),
+            (GapReason::CheckpointFailed, "checkpoint_failed"),
+            (GapReason::BoundarySlip, "boundary_slip"),
+        ] {
+            assert_eq!(reason.as_str(), value);
+            assert_eq!(value.parse::<GapReason>().unwrap(), reason);
+        }
+        assert!("unknown".parse::<GapReason>().is_err());
     }
 
     #[test]

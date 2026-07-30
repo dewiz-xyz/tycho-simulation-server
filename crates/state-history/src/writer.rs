@@ -16,8 +16,9 @@ use tokio::{
 };
 
 use crate::{
-    encode_archive, ArchiveMetadata, CapturedState, CheckpointArchive, CheckpointObjectStore,
-    DeltaEntry, GapReason, GapRecord, StateHistoryStore, StreamPosition, ARCHIVE_SCHEMA_VERSION,
+    encode_archive, ArchiveMetadata, CapturedState, CheckpointArchive, CheckpointKind,
+    CheckpointObjectStore, DeltaEntry, GapReason, GapRecord, StateHistoryStore, StreamPosition,
+    ARCHIVE_SCHEMA_VERSION,
 };
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -169,17 +170,45 @@ impl WriterHandle {
         }
     }
 
-    pub fn record_boundary_failure_gap(&self, chain_id: u64, position: StreamPosition) {
+    pub fn record_boundary_failure_gap(
+        &self,
+        chain_id: u64,
+        position: StreamPosition,
+        block_number: Option<u64>,
+        rfq_observed_at_ms: Option<u64>,
+    ) {
         lock(&self.inner.gaps).merge(GapRecord {
             chain_id,
             generation: position.generation,
             from_message_seq: position.message_seq,
             to_message_seq: position.message_seq,
             reason: GapReason::CheckpointFailed,
-            from_block_number: None,
-            to_block_number: None,
-            from_observed_at_ms: None,
-            to_observed_at_ms: None,
+            from_block_number: block_number,
+            to_block_number: block_number,
+            from_observed_at_ms: rfq_observed_at_ms,
+            to_observed_at_ms: rfq_observed_at_ms,
+        });
+    }
+
+    pub fn record_boundary_slip_gap(
+        &self,
+        chain_id: u64,
+        from: StreamPosition,
+        to: StreamPosition,
+        block_number: Option<u64>,
+        rfq_observed_at_ms: Option<u64>,
+    ) {
+        debug_assert_eq!(from.generation, to.generation);
+        lock(&self.inner.gaps).merge(GapRecord {
+            chain_id,
+            generation: from.generation,
+            from_message_seq: from.message_seq,
+            to_message_seq: to.message_seq,
+            reason: GapReason::BoundarySlip,
+            from_block_number: block_number,
+            to_block_number: block_number,
+            from_observed_at_ms: rfq_observed_at_ms,
+            to_observed_at_ms: rfq_observed_at_ms,
         });
     }
 
@@ -496,6 +525,9 @@ impl WriterTask {
             }
             Err(error) => {
                 tracing::error!(%error, "state history checkpoint failed");
+                if capture.kind() == CheckpointKind::Boundary {
+                    lock(&self.gaps).merge(checkpoint_gap(&capture, GapReason::CheckpointFailed));
+                }
                 self.status.send_modify(|status| {
                     status.healthy = false;
                     status.checkpoints_failed += 1;
@@ -565,7 +597,9 @@ impl WriterTask {
                 .context("checkpoint encoding task failed")?
         })
         .await?;
-        let key = self.objects.key_for(capture.chain_id(), capture.position());
+        let key = self
+            .objects
+            .key_for(capture.chain_id(), capture.position(), capture.kind());
         let archive_info = encoded.info;
         run_with_optional_deadline(
             deadline,
@@ -705,17 +739,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn command_gap(command: &WriterCommand, reason: GapReason) -> GapRecord {
     match command {
         WriterCommand::Delta(delta) => delta_gap(delta, reason),
-        WriterCommand::Checkpoint(capture) => GapRecord {
-            chain_id: capture.chain_id(),
-            generation: capture.position().generation,
-            from_message_seq: capture.position().message_seq,
-            to_message_seq: capture.position().message_seq,
-            reason,
-            from_block_number: Some(capture.block_number()),
-            to_block_number: Some(capture.block_number()),
-            from_observed_at_ms: capture.rfq_observed_at_ms(),
-            to_observed_at_ms: capture.rfq_observed_at_ms(),
-        },
+        WriterCommand::Checkpoint(capture) => checkpoint_gap(capture, reason),
+    }
+}
+
+fn checkpoint_gap(capture: &CapturedState, reason: GapReason) -> GapRecord {
+    GapRecord {
+        chain_id: capture.chain_id(),
+        generation: capture.position().generation,
+        from_message_seq: capture.position().message_seq,
+        to_message_seq: capture.position().message_seq,
+        reason,
+        from_block_number: Some(capture.block_number()),
+        to_block_number: Some(capture.block_number()),
+        from_observed_at_ms: capture.rfq_observed_at_ms(),
+        to_observed_at_ms: capture.rfq_observed_at_ms(),
     }
 }
 
@@ -731,6 +769,18 @@ fn delta_gap(delta: &DeltaEntry, reason: GapReason) -> GapRecord {
         .iter()
         .filter_map(|cursor| cursor.block_number)
         .max();
+    let from_observed_at_ms = delta
+        .backends()
+        .iter()
+        .filter(|cursor| cursor.backend == crate::Backend::Rfq)
+        .filter_map(|cursor| cursor.observed_at_ms)
+        .min();
+    let to_observed_at_ms = delta
+        .backends()
+        .iter()
+        .filter(|cursor| cursor.backend == crate::Backend::Rfq)
+        .filter_map(|cursor| cursor.observed_at_ms)
+        .max();
     GapRecord {
         chain_id: delta.chain_id(),
         generation: position.generation,
@@ -739,8 +789,8 @@ fn delta_gap(delta: &DeltaEntry, reason: GapReason) -> GapRecord {
         reason,
         from_block_number,
         to_block_number,
-        from_observed_at_ms: Some(delta.observed_at_ms()),
-        to_observed_at_ms: Some(delta.observed_at_ms()),
+        from_observed_at_ms,
+        to_observed_at_ms,
     }
 }
 
@@ -930,6 +980,44 @@ mod tests {
         assert!(!is_permanent_persistence_error(&sqlx_io_error()));
     }
 
+    #[test]
+    fn native_only_delta_gap_has_block_bounds_without_observed_bounds() {
+        let gap = delta_gap(&test_delta(1), GapReason::QueueOverflow);
+
+        assert_eq!(gap.from_block_number, Some(100));
+        assert_eq!(gap.to_block_number, Some(100));
+        assert_eq!(gap.from_observed_at_ms, None);
+        assert_eq!(gap.to_observed_at_ms, None);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn rfq_delta_gap_uses_provider_observation_time() {
+        let publication_time = 2_000;
+        let provider_observation_time = 1_000;
+        let delta = DeltaEntry::new(
+            8453,
+            StreamPosition {
+                generation: 7,
+                message_seq: 1,
+            },
+            publication_time,
+            r#"{"rfq":true}"#.to_owned(),
+            vec![DeltaBackendCursor {
+                backend: Backend::Rfq,
+                block_number: None,
+                observed_at_ms: Some(provider_observation_time),
+            }],
+            Vec::new(),
+        )
+        .expect("test delta should be valid");
+
+        assert_ne!(delta.observed_at_ms(), provider_observation_time);
+        let gap = delta_gap(&delta, GapReason::WriteFailed);
+        assert_eq!(gap.from_observed_at_ms, Some(provider_observation_time));
+        assert_eq!(gap.to_observed_at_ms, Some(provider_observation_time));
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
     async fn writer_persists_deltas_in_order_and_reports_status(
@@ -1090,6 +1178,44 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn boundary_checkpoint_creation_failure_records_bounded_gap(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let writer = StateHistoryWriter::spawn(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_object_store("state-history-writer-unused").await,
+            Arc::new(NoBaseFee),
+        );
+        sqlx::query("DROP TABLE state_history.checkpoints")
+            .execute(&pool)
+            .await?;
+
+        let capture = test_boundary_capture();
+        assert!(writer.request_checkpoint(capture));
+        wait_for_status(&writer, |status| {
+            status.checkpoints_failed == 1 && status.recorded_gaps == 1
+        })
+        .await?;
+
+        let gap: (String, i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT reason, from_message_seq, to_message_seq,
+                    from_block_number, to_block_number
+             FROM state_history.gaps
+             WHERE chain_id = 8453 AND generation = 7",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            gap,
+            ("checkpoint_failed".to_owned(), 10, 10, Some(100), Some(100))
+        );
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn shutdown_drains_queued_deltas(pool: sqlx::PgPool) -> anyhow::Result<()> {
         let writer = StateHistoryWriter::spawn(
             WriterConfig {
@@ -1196,8 +1322,16 @@ mod tests {
         .expect("test delta should be valid")
     }
 
-    #[expect(clippy::expect_used)]
     fn test_capture() -> CapturedState {
+        test_capture_with_kind(CheckpointKind::Interval)
+    }
+
+    fn test_boundary_capture() -> CapturedState {
+        test_capture_with_kind(CheckpointKind::Boundary)
+    }
+
+    #[expect(clippy::expect_used)]
+    fn test_capture_with_kind(kind: CheckpointKind) -> CapturedState {
         CapturedState::new(
             8453,
             StreamPosition {
@@ -1205,7 +1339,7 @@ mod tests {
                 message_seq: 10,
             },
             Some(42),
-            CheckpointKind::Interval,
+            kind,
             100,
             None,
             vec![Backend::Native],

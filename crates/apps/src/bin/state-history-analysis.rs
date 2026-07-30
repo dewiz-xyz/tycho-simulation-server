@@ -172,7 +172,7 @@ async fn persist_checkpoint(
         payloads_json: capture.payloads_json().to_vec(),
     };
     let encoded = encode_archive(archive.clone())?;
-    let key = objects.key_for(capture.chain_id(), capture.position());
+    let key = objects.key_for(capture.chain_id(), capture.position(), capture.kind());
     objects.put(&key, encoded.bytes).await?;
     StateHistoryStore::complete_checkpoint(
         &mut connection,
