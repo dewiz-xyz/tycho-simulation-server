@@ -8,20 +8,24 @@ async fn main() -> anyhow::Result<()> {
     let app_state = service.app_state;
     let app = rpc::create_broadcaster_router(app_state.clone());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let server = axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(app_state.clone()));
-    let supervisor = wait_for_supervisor(service.supervisors);
-    let result = tokio::select! {
-        result = server => {
-            result.map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
-        },
-        result = supervisor => {
-            // No `?` here: an early return would skip the state history drain below.
-            result.and_then(|()| {
-                Err(anyhow::anyhow!("Broadcaster feed supervisor terminated unexpectedly"))
-            })
+    let result = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let server = axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(shutdown_signal(app_state.clone()));
+            let supervisor = wait_for_supervisor(service.supervisors);
+            tokio::select! {
+                result = server => {
+                    result.map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
+                },
+                result = supervisor => {
+                    // An early return here would skip the state history drain below.
+                    result.and_then(|()| {
+                        Err(anyhow::anyhow!("Broadcaster feed supervisor terminated unexpectedly"))
+                    })
+                }
+            }
         }
+        Err(error) => Err(error.into()),
     };
     app_state.shutdown_state_history().await;
     result
