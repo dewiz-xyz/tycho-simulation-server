@@ -1,5 +1,7 @@
 use anyhow::Context;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::BroadcasterTokenDto;
 
@@ -10,6 +12,14 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 pub struct TokenSnapshot {
     pub chain_id: u64,
     pub tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTokenSnapshot {
+    pub schema_version: u32,
+    pub chain_id: u64,
+    pub token_count: u64,
+    pub tokens: Box<RawValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +59,22 @@ struct DecodedTokenSnapshotEnvelope {
     schema_version: u32,
     chain_id: u64,
     tokens: Vec<BroadcasterTokenDto>,
+}
+
+trait DecodedTokenSnapshot {
+    fn schema_version(&self) -> u32;
+}
+
+impl DecodedTokenSnapshot for DecodedTokenSnapshotEnvelope {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl DecodedTokenSnapshot for RawTokenSnapshot {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
 }
 
 pub fn encode_token_snapshot(snapshot: TokenSnapshot) -> anyhow::Result<EncodedTokenSnapshot> {
@@ -99,6 +125,32 @@ pub fn encode_token_snapshot(snapshot: TokenSnapshot) -> anyhow::Result<EncodedT
 }
 
 pub fn decode_token_snapshot(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<TokenSnapshot> {
+    let envelope: DecodedTokenSnapshotEnvelope =
+        decode_verified_token_snapshot(bytes, expected_sha256)?;
+
+    Ok(TokenSnapshot {
+        chain_id: envelope.chain_id,
+        tokens: envelope.tokens,
+    })
+}
+
+/// Decodes a token snapshot while preserving the token array as raw JSON.
+///
+/// # Errors
+///
+/// Returns an error when decompression, sha256 verification, envelope parsing,
+/// or schema validation fails.
+pub fn decode_token_snapshot_raw(
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> anyhow::Result<RawTokenSnapshot> {
+    decode_verified_token_snapshot(bytes, expected_sha256)
+}
+
+fn decode_verified_token_snapshot<T>(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<T>
+where
+    T: DeserializeOwned + DecodedTokenSnapshot,
+{
     let snapshot_json =
         zstd::stream::decode_all(bytes).context("failed to decompress token snapshot")?;
     let actual_sha256 = hex::encode(Sha256::digest(&snapshot_json));
@@ -110,20 +162,17 @@ pub fn decode_token_snapshot(bytes: &[u8], expected_sha256: &str) -> anyhow::Res
         .into());
     }
 
-    let envelope: DecodedTokenSnapshotEnvelope =
+    let envelope: T =
         serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
-    if envelope.schema_version != TOKEN_SNAPSHOT_SCHEMA_VERSION {
+    if envelope.schema_version() != TOKEN_SNAPSHOT_SCHEMA_VERSION {
         return Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
-            found: envelope.schema_version,
+            found: envelope.schema_version(),
             expected: TOKEN_SNAPSHOT_SCHEMA_VERSION,
         }
         .into());
     }
 
-    Ok(TokenSnapshot {
-        chain_id: envelope.chain_id,
-        tokens: envelope.tokens,
-    })
+    Ok(envelope)
 }
 
 pub fn token_snapshot_s3_key(prefix: &str, chain_id: u64, sha256: &str) -> String {
@@ -150,6 +199,47 @@ mod tests {
 
         assert_eq!(decoded, snapshot);
         assert_eq!(encoded.info.token_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_token_snapshot_round_trips() -> Result<()> {
+        let snapshot = test_snapshot()?;
+        let encoded = encode_token_snapshot(snapshot)?;
+        let decoded = decode_token_snapshot_raw(&encoded.bytes, &encoded.info.sha256)?;
+        let tokens: serde_json::Value = serde_json::from_str(decoded.tokens.get())?;
+
+        // The raw token array must be a verbatim slice of the canonical bytes, not a
+        // re-serialization: consumers cache by the sha computed over those bytes.
+        let canonical = String::from_utf8(zstd::stream::decode_all(encoded.bytes.as_slice())?)?;
+        assert!(canonical.contains(decoded.tokens.get()));
+
+        assert_eq!(decoded.schema_version, TOKEN_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(decoded.chain_id, 8453);
+        assert_eq!(decoded.token_count, 2);
+        assert_eq!(
+            tokens,
+            json!([
+                {
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "symbol": "ONE",
+                    "decimals": 6,
+                    "tax": 7,
+                    "gas": [21_000, null],
+                    "chainId": 8453,
+                    "quality": 80,
+                },
+                {
+                    "address": "0x2222222222222222222222222222222222222222",
+                    "symbol": "TWO",
+                    "decimals": 18,
+                    "tax": 7,
+                    "gas": [21_000, null],
+                    "chainId": 8453,
+                    "quality": 90,
+                }
+            ])
+        );
         Ok(())
     }
 
@@ -241,6 +331,30 @@ mod tests {
     }
 
     #[test]
+    fn raw_schema_version_mismatch_is_typed() -> Result<()> {
+        let encoded = encode_token_snapshot(test_snapshot()?)?;
+        let canonical = zstd::stream::decode_all(encoded.bytes.as_slice())?;
+        let mut envelope: serde_json::Value = serde_json::from_slice(&canonical)?;
+        envelope["schema_version"] = json!(TOKEN_SNAPSHOT_SCHEMA_VERSION + 1);
+        let changed_canonical = serde_json::to_vec(&envelope)?;
+        let changed_sha256 = hex::encode(Sha256::digest(&changed_canonical));
+        let changed_bytes =
+            zstd::stream::encode_all(changed_canonical.as_slice(), ZSTD_COMPRESSION_LEVEL)?;
+
+        let error = decode_token_snapshot_raw(&changed_bytes, &changed_sha256)
+            .err()
+            .ok_or_else(|| anyhow!("schema mismatch should fail"))?;
+        assert_eq!(
+            error.downcast_ref::<TokenSnapshotCodecError>(),
+            Some(&TokenSnapshotCodecError::UnsupportedSchemaVersion {
+                found: TOKEN_SNAPSHOT_SCHEMA_VERSION + 1,
+                expected: TOKEN_SNAPSHOT_SCHEMA_VERSION,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_token_address_is_typed() -> Result<()> {
         let mut snapshot = test_snapshot()?;
         let mut duplicate = snapshot.tokens[0].clone();
@@ -270,6 +384,34 @@ mod tests {
             Some(TokenSnapshotCodecError::Sha256Mismatch { expected, .. })
                 if expected == "deadbeef"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_sha256_mismatch_is_typed() -> Result<()> {
+        let encoded = encode_token_snapshot(test_snapshot()?)?;
+
+        let error = decode_token_snapshot_raw(&encoded.bytes, "deadbeef")
+            .err()
+            .ok_or_else(|| anyhow!("sha256 mismatch should fail"))?;
+        assert!(matches!(
+            error.downcast_ref::<TokenSnapshotCodecError>(),
+            Some(TokenSnapshotCodecError::Sha256Mismatch { expected, .. })
+                if expected == "deadbeef"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_corrupt_bytes_return_decompression_error() -> Result<()> {
+        let error = decode_token_snapshot_raw(b"not a zstd object", "unused")
+            .err()
+            .ok_or_else(|| anyhow!("corrupt token snapshot should fail"))?;
+
+        assert!(error
+            .to_string()
+            .contains("failed to decompress token snapshot"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
         Ok(())
     }
 
