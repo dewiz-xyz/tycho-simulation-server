@@ -522,20 +522,30 @@ pub fn load_state_history_config() -> Option<StateHistoryConfig> {
         "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
         &require_trimmed_env("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL"),
     );
-    let checkpoint_poll_interval = Duration::from_secs(parse_env_or_default(
-        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS",
-        "30",
-    ));
+    let checkpoint_poll_interval_secs =
+        parse_env_or_default("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "30");
     let queue_capacity = parse_env_or_default("STATE_HISTORY_QUEUE_CAPACITY", "8192");
-    let retry_window = Duration::from_millis(parse_env_or_default(
-        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS",
-        "30000",
-    ));
+    let retry_window_ms = parse_env_or_default("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "30000");
 
     assert!(
         checkpoint_block_interval > 0,
         "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"
     );
+    assert!(
+        checkpoint_poll_interval_secs > 0,
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"
+    );
+    assert!(
+        queue_capacity > 0,
+        "STATE_HISTORY_QUEUE_CAPACITY must be > 0"
+    );
+    assert!(
+        retry_window_ms > 0,
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"
+    );
+
+    let checkpoint_poll_interval = Duration::from_secs(checkpoint_poll_interval_secs);
+    let retry_window = Duration::from_millis(retry_window_ms);
 
     Some(StateHistoryConfig {
         database_url,
@@ -2101,6 +2111,48 @@ route_policy = " default "
         });
 
         assert!(message.contains("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_checkpoint_poll_interval() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("checkpoint poll interval must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_queue_capacity() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_QUEUE_CAPACITY", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history queue capacity must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_QUEUE_CAPACITY must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_write_retry_window() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history write retry window must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"));
     }
 
     #[test]
