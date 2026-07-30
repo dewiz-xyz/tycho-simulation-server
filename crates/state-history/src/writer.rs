@@ -621,6 +621,7 @@ impl WriterTask {
                 checkpoint_id,
                 &key,
                 &archive_info,
+                None,
                 capture.block_times(),
                 capture.position(),
                 capture.chain_id(),

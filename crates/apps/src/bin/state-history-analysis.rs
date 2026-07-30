@@ -179,6 +179,7 @@ async fn persist_checkpoint(
         id,
         &key,
         &encoded.info,
+        None,
         capture.block_times(),
         capture.position(),
         capture.chain_id(),

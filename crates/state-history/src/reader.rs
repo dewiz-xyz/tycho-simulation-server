@@ -11,7 +11,7 @@ use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
 use crate::{
     decode_archive, Backend, CheckpointArchive, CheckpointKind, CheckpointManifest,
     CheckpointObjectStore, CheckpointStatus, DeltaBackendCursor, ModelError, StateHistoryStore,
-    StreamPosition,
+    StreamPosition, TokenSnapshotRef,
 };
 
 pub struct StateHistoryReader {
@@ -630,7 +630,8 @@ async fn fetch_anchor(
     let row = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
                 rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
-                compressed_bytes, status, error
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
          FROM state_history.checkpoints
          WHERE chain_id = $1
            AND status = 'complete'
@@ -758,7 +759,8 @@ async fn fetch_boundaries(
     let rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
                 rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
-                compressed_bytes, status, error
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
          FROM state_history.checkpoints
          WHERE chain_id = $1
            AND kind = 'boundary'
@@ -943,9 +945,30 @@ fn manifest_from_row(row: &PgRow) -> anyhow::Result<CheckpointManifest> {
             row.try_get("compressed_bytes")?,
             "checkpoint compressed_bytes",
         )?,
+        token_reference: token_reference_from_row(row)?,
         status: checkpoint_status_from_database(&row.try_get::<String, _>("status")?)?,
         error: row.try_get("error")?,
     })
+}
+
+fn token_reference_from_row(row: &PgRow) -> anyhow::Result<Option<TokenSnapshotRef>> {
+    let s3_key: Option<String> = row.try_get("token_s3_key")?;
+    let sha256: Option<String> = row.try_get("token_sha256")?;
+    let token_count: Option<i64> = row.try_get("token_count")?;
+    let token_bytes: Option<i64> = row.try_get("token_bytes")?;
+
+    match (s3_key, sha256, token_count, token_bytes) {
+        (Some(s3_key), Some(sha256), Some(token_count), Some(token_bytes)) => {
+            Ok(Some(TokenSnapshotRef {
+                s3_key,
+                sha256,
+                token_count: database_u64(token_count, "checkpoint token_count")?,
+                token_bytes: database_u64(token_bytes, "checkpoint token_bytes")?,
+            }))
+        }
+        (None, None, None, None) => Ok(None),
+        _ => anyhow::bail!("checkpoint token reference columns must be all set or all null"),
+    }
 }
 
 fn gap_from_row(row: &PgRow) -> anyhow::Result<GapRow> {
@@ -1388,7 +1411,8 @@ mod tests {
     use super::*;
     use crate::{
         encode_archive, ArchiveMetadata, CapturedState, CheckpointArchive, CheckpointKind,
-        CheckpointStatus, DeltaEntry, GapReason, GapRecord, StateHistoryStore,
+        CheckpointStatus, DeltaEntry, EncodedArchiveInfo, GapReason, GapRecord, StateHistoryStore,
+        TokenSnapshotRef,
     };
 
     mod backtest {
@@ -2542,6 +2566,155 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn completed_checkpoint_token_reference_round_trips_through_manifest_reads(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let capture = capture(
+            1,
+            1,
+            100,
+            CheckpointKind::Interval,
+            r#"{"state":"token-reference"}"#,
+        )?;
+        let mut connection = pool.acquire().await?;
+        let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
+        let archive = test_archive_info();
+        let token_reference = TokenSnapshotRef {
+            s3_key: "state-history/chain=8453/tokens/token-sha256.zst".to_owned(),
+            sha256: "token-sha256".to_owned(),
+            token_count: 42,
+            token_bytes: 4_096,
+        };
+        StateHistoryStore::complete_checkpoint(
+            &mut connection,
+            id,
+            "checkpoints/token-reference.zst",
+            &archive,
+            Some(&token_reference),
+            capture.block_times(),
+            capture.position(),
+            capture.chain_id(),
+        )
+        .await?;
+        drop(connection);
+
+        let stored = sqlx::query_as::<_, (String, String, i64, i64)>(
+            "SELECT token_s3_key, token_sha256, token_count, token_bytes
+             FROM state_history.checkpoints
+             WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            stored,
+            (
+                token_reference.s3_key.clone(),
+                token_reference.sha256.clone(),
+                42,
+                4_096,
+            )
+        );
+
+        let manifest = read_checkpoint_manifest(&pool, id).await?;
+        assert_eq!(manifest.token_reference, Some(token_reference));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn completing_checkpoint_without_token_reference_preserves_null_columns(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let capture = capture(
+            1,
+            2,
+            101,
+            CheckpointKind::Interval,
+            r#"{"state":"no-token-reference"}"#,
+        )?;
+        let mut connection = pool.acquire().await?;
+        let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
+        StateHistoryStore::complete_checkpoint(
+            &mut connection,
+            id,
+            "checkpoints/no-token-reference.zst",
+            &test_archive_info(),
+            None,
+            capture.block_times(),
+            capture.position(),
+            capture.chain_id(),
+        )
+        .await?;
+        drop(connection);
+
+        let stored =
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<i64>, Option<i64>)>(
+                "SELECT token_s3_key, token_sha256, token_count, token_bytes
+             FROM state_history.checkpoints
+             WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(stored, (None, None, None, None));
+        assert_eq!(
+            read_checkpoint_manifest(&pool, id).await?.token_reference,
+            None
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn writing_and_failed_manifests_have_no_token_reference(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let writing_capture = capture(
+            1,
+            3,
+            102,
+            CheckpointKind::Interval,
+            r#"{"state":"writing"}"#,
+        )?;
+        let failed_capture = capture(1, 4, 103, CheckpointKind::Interval, r#"{"state":"failed"}"#)?;
+        let mut connection = pool.acquire().await?;
+        let writing_id =
+            StateHistoryStore::create_checkpoint(&mut connection, &writing_capture).await?;
+        let failed_id =
+            StateHistoryStore::create_checkpoint(&mut connection, &failed_capture).await?;
+        let token_reference = TokenSnapshotRef {
+            s3_key: "state-history/chain=8453/tokens/failed-sha256.zst".to_owned(),
+            sha256: "failed-sha256".to_owned(),
+            token_count: 1,
+            token_bytes: 128,
+        };
+        StateHistoryStore::complete_checkpoint(
+            &mut connection,
+            failed_id,
+            "checkpoints/failed.zst",
+            &test_archive_info(),
+            Some(&token_reference),
+            failed_capture.block_times(),
+            failed_capture.position(),
+            failed_capture.chain_id(),
+        )
+        .await?;
+        drop(connection);
+        StateHistoryStore::fail_checkpoint(&pool, failed_id, "archive upload failed").await?;
+
+        let writing = read_checkpoint_manifest(&pool, writing_id).await?;
+        assert_eq!(writing.status, CheckpointStatus::Writing);
+        assert_eq!(writing.token_reference, None);
+
+        let failed = read_checkpoint_manifest(&pool, failed_id).await?;
+        assert_eq!(failed.status, CheckpointStatus::Failed);
+        assert_eq!(failed.token_reference, None);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn checkpoint_kind_separates_objects_in_both_insertion_orders(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -3226,6 +3399,7 @@ mod tests {
             archive_sha256: (status == CheckpointStatus::Complete).then(|| "sha256".to_owned()),
             archive_bytes: None,
             compressed_bytes: None,
+            token_reference: None,
             status,
             error: None,
         }
@@ -3325,6 +3499,32 @@ mod tests {
         Ok(())
     }
 
+    fn test_archive_info() -> EncodedArchiveInfo {
+        EncodedArchiveInfo {
+            sha256: "archive-sha256".to_owned(),
+            archive_bytes: 1_024,
+            compressed_bytes: 512,
+        }
+    }
+
+    async fn read_checkpoint_manifest(
+        pool: &PgPool,
+        checkpoint_id: i64,
+    ) -> anyhow::Result<CheckpointManifest> {
+        let row = sqlx::query(
+            "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+                    rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                    compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                    status, error
+             FROM state_history.checkpoints
+             WHERE id = $1",
+        )
+        .bind(checkpoint_id)
+        .fetch_one(pool)
+        .await?;
+        manifest_from_row(&row)
+    }
+
     async fn persist_checkpoint(
         pool: &PgPool,
         objects: &CheckpointObjectStore,
@@ -3353,6 +3553,7 @@ mod tests {
             id,
             &key,
             &encoded.info,
+            None,
             capture.block_times(),
             capture.position(),
             capture.chain_id(),
@@ -3372,6 +3573,7 @@ mod tests {
             archive_sha256: Some(encoded.info.sha256),
             archive_bytes: Some(encoded.info.archive_bytes),
             compressed_bytes: Some(encoded.info.compressed_bytes),
+            token_reference: None,
             status: CheckpointStatus::Complete,
             error: None,
         })

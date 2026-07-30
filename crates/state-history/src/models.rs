@@ -329,6 +329,14 @@ impl TryFrom<UncheckedCapturedState> for CapturedState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSnapshotRef {
+    pub s3_key: String,
+    pub sha256: String,
+    pub token_count: u64,
+    pub token_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointManifest {
     pub id: i64,
     pub chain_id: u64,
@@ -342,6 +350,7 @@ pub struct CheckpointManifest {
     pub archive_sha256: Option<String>,
     pub archive_bytes: Option<u64>,
     pub compressed_bytes: Option<u64>,
+    pub token_reference: Option<TokenSnapshotRef>,
     pub status: CheckpointStatus,
     pub error: Option<String>,
 }
