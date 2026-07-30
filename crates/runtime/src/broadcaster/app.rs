@@ -690,19 +690,30 @@ fn spawn_promotion_task(
                         let requested_block_number =
                             BroadcasterServiceState::state_history_aligned_head(&services).await;
                         let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
-                        match BroadcasterServiceState::capture_state_history_checkpoint(
+                        let position = StreamPosition {
+                            generation: boundary.generation,
+                            message_seq: boundary.exclusive_message_seq,
+                        };
+                        let checkpoint = BroadcasterServiceState::capture_state_history_checkpoint(
                             &services,
                             CheckpointKind::Boundary,
                             None,
-                            Some(StreamPosition {
-                                generation: boundary.generation,
-                                message_seq: boundary.exclusive_message_seq,
-                            }),
+                            Some(position),
                             requested_block_number,
                             requested_rfq_observed_at_ms,
                         )
-                        .await
-                        {
+                        .await;
+                        // Mirrors the recovery commit path: a promotion boundary that never
+                        // lands must leave a durable gap, not just a log line.
+                        if !matches!(checkpoint, Ok(Some(_))) {
+                            state_history.handle.record_boundary_failure_gap(
+                                services[0].chain_id(),
+                                position,
+                                requested_block_number,
+                                requested_rfq_observed_at_ms,
+                            );
+                        }
+                        match checkpoint {
                             Ok(Some(_)) => {}
                             Ok(None) => warn!(
                                 event = "state_history_boundary_checkpoint_failed",

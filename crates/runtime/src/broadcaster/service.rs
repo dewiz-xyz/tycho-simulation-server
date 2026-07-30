@@ -455,6 +455,10 @@ impl BroadcasterServiceState {
         }
     }
 
+    pub(crate) fn chain_id(&self) -> u64 {
+        self.cache.chain_id()
+    }
+
     pub async fn mark_upstream_connected(&self) {
         let was_connected = self.upstream.snapshot().await.connected;
         self.upstream.mark_connected().await;
