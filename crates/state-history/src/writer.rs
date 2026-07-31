@@ -260,6 +260,20 @@ impl WriterHandle {
         });
     }
 
+    pub fn record_delta_preparation_failure_gap(&self, chain_id: u64, position: StreamPosition) {
+        lock(&self.inner.gaps).merge(GapRecord {
+            chain_id,
+            generation: position.generation,
+            from_message_seq: position.message_seq,
+            to_message_seq: position.message_seq,
+            reason: GapReason::WriteFailed,
+            from_block_number: None,
+            to_block_number: None,
+            from_observed_at_ms: None,
+            to_observed_at_ms: None,
+        });
+    }
+
     pub fn record_boundary_slip_gap(
         &self,
         chain_id: u64,
@@ -1079,10 +1093,12 @@ impl GapAccumulator {
         if let Some(last) = self.pending.last_mut() {
             let adjacent_or_overlapping =
                 gap.from_message_seq <= last.to_message_seq.saturating_add(1);
+            let cursor_scope_matches = has_cursor_bounds(last) == has_cursor_bounds(&gap);
             if last.chain_id == gap.chain_id
                 && last.generation == gap.generation
                 && last.reason == gap.reason
                 && adjacent_or_overlapping
+                && cursor_scope_matches
             {
                 last.from_message_seq = last.from_message_seq.min(gap.from_message_seq);
                 last.to_message_seq = last.to_message_seq.max(gap.to_message_seq);
@@ -1100,6 +1116,13 @@ impl GapAccumulator {
     fn drain(&mut self) -> Vec<GapRecord> {
         std::mem::take(&mut self.pending)
     }
+}
+
+fn has_cursor_bounds(gap: &GapRecord) -> bool {
+    gap.from_block_number.is_some()
+        || gap.to_block_number.is_some()
+        || gap.from_observed_at_ms.is_some()
+        || gap.to_observed_at_ms.is_some()
 }
 
 fn retry_delays(window: Duration) -> impl Iterator<Item = Duration> {
@@ -1204,6 +1227,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, 10, 13), (4, 1, 1), (4, 3, 3)]
         );
+    }
+
+    #[test]
+    fn gap_accumulator_does_not_scope_cursorless_gap_by_merging() {
+        let cursorless = test_gap(8453, 3, 10, 10, GapReason::WriteFailed);
+        let mut bounded = test_gap(8453, 3, 11, 11, GapReason::WriteFailed);
+        bounded.from_block_number = Some(100);
+        bounded.to_block_number = Some(100);
+        for (first, second) in [(cursorless.clone(), bounded.clone()), (bounded, cursorless)] {
+            let mut acc = GapAccumulator::default();
+            acc.merge(first);
+            acc.merge(second);
+
+            assert_eq!(acc.drain().len(), 2);
+        }
     }
 
     #[test]

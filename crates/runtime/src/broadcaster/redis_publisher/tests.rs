@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use redis::streams::{StreamId, StreamRangeReply};
 use redis::Value;
+use state_history::GapReason;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, timeout, Duration};
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
@@ -139,6 +140,43 @@ async fn accepted_update_reaches_state_history_queue() -> Result<()> {
         .await?;
 
     assert_eq!(state_history.handle.status().enqueued_deltas, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_failure_records_cursorless_write_failed_gap() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Rfq, 10, "rfq-1").await?;
+    let writer = FakeRedisWriter::default();
+    let (state_history, probe) = test_state_history_runtime(8);
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+        .with_state_history(Arc::clone(&state_history));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Rfq]), "test_active")
+        .await?;
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Rfq, u64::MAX, "rfq-overflow"))
+        .await?;
+
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    assert_eq!(writer.appends().await.len(), 2);
+    assert_eq!(state_history.handle.status().enqueued_deltas, 0);
+    assert_eq!(
+        probe.gaps(),
+        vec![state_history::GapRecord {
+            chain_id: Chain::Ethereum.id(),
+            generation: 1,
+            from_message_seq: 2,
+            to_message_seq: 2,
+            reason: GapReason::WriteFailed,
+            from_block_number: None,
+            to_block_number: None,
+            from_observed_at_ms: None,
+            to_observed_at_ms: None,
+        }]
+    );
     Ok(())
 }
 

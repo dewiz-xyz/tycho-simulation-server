@@ -2202,8 +2202,15 @@ fn enqueue_state_history_update(
             }
         }
         Err(error) => {
+            state_history.handle.record_delta_preparation_failure_gap(
+                entry.chain_id,
+                StreamPosition {
+                    generation: publisher.generation,
+                    message_seq: entry.message_seq,
+                },
+            );
             warn!(
-                event = "state_history_delta_enqueue_failed",
+                event = "state_history_delta_prepare_failed",
                 chain_id = entry.chain_id,
                 generation = publisher.generation,
                 message_seq = entry.message_seq,
