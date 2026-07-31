@@ -744,6 +744,9 @@ impl BroadcasterServiceState {
                 service.snapshot_max_payload_bytes,
             ));
         }
+        // The catalog clone follows every state pin under the lifecycle gate so it cannot miss
+        // tokens already referenced by the pinned state.
+        let token_catalog = state_history.clone_token_catalog().await;
         let rfq_observed_at_ms = state_history.rfq_high_water_ms();
         drop(gate);
 
@@ -765,21 +768,24 @@ impl BroadcasterServiceState {
             .status_snapshot()
             .await
             .replay_boundary;
-        let still_current =
-            current.is_some_and(|current| checkpoint_world_matches(&boundary, &current));
-        if !still_current
-            || futures::future::join_all(services.iter().map(|service| service.cache.is_ready()))
+        let services_ready =
+            futures::future::join_all(services.iter().map(|service| service.cache.is_ready()))
                 .await
                 .into_iter()
-                .any(|ready| !ready)
-        {
+                .all(|ready| ready);
+        let Some((export, token_catalog)) = retain_current_checkpoint_capture(
+            &boundary,
+            current.as_ref(),
+            services_ready,
+            (export, token_catalog),
+        ) else {
             return Ok(None);
-        }
+        };
         drop(gate);
 
         state_history.observe_rfq_export(&export)?;
         // Only the pinned boundary version is guaranteed to describe this exported world.
-        let capture = crate::broadcaster::state_history::captured_state_from_export(
+        let state = crate::broadcaster::state_history::captured_state_from_export(
             kind,
             &export,
             capture_position,
@@ -787,6 +793,7 @@ impl BroadcasterServiceState {
             block_number,
             rfq_observed_at_ms,
         )?;
+        let capture = state_history.checkpoint_capture(state, token_catalog);
         anyhow::ensure!(
             state_history.handle.request_checkpoint(capture),
             "state history checkpoint queue rejected the capture"
@@ -1971,6 +1978,16 @@ fn checkpoint_world_matches(
         && current.snapshot_id == pinned.snapshot_id
 }
 
+fn retain_current_checkpoint_capture<T>(
+    pinned: &BroadcasterRedisReplayBoundary,
+    current: Option<&BroadcasterRedisReplayBoundary>,
+    services_ready: bool,
+    capture: T,
+) -> Option<T> {
+    (services_ready && current.is_some_and(|current| checkpoint_world_matches(pinned, current)))
+        .then_some(capture)
+}
+
 struct BoundaryCheckpointCursor {
     position: StreamPosition,
     block_number: Option<u64>,
@@ -2462,8 +2479,8 @@ mod tests {
     };
 
     use super::{
-        checkpoint_world_matches, BroadcasterServiceState, BroadcasterSnapshotSessionRegistry,
-        SnapshotSessionError,
+        checkpoint_world_matches, retain_current_checkpoint_capture, BroadcasterServiceState,
+        BroadcasterSnapshotSessionRegistry, SnapshotSessionError,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
@@ -2472,7 +2489,9 @@ mod tests {
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
         BroadcasterUpstreamState,
     };
-    use crate::broadcaster::state_history::{test_state_history_runtime, StateHistoryRuntime};
+    use crate::broadcaster::state_history::{
+        test_state_history_runtime, test_state_history_runtime_with_tokens, StateHistoryRuntime,
+    };
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
         BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolSyncStatus,
@@ -2482,6 +2501,14 @@ mod tests {
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim(u8);
+
+    struct CaptureDropProbe(Arc<AtomicBool>);
+
+    impl Drop for CaptureDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 
     #[typetag::serde(name = "BroadcasterServiceDummySim")]
     impl ProtocolSim for DummySim {
@@ -3071,6 +3098,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_capture_enqueues_the_catalog_without_publishing() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let token = dummy_token(7, "SEVEN");
+        let (state_history, probe) = test_state_history_runtime_with_tokens(8, vec![token.clone()]);
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+                .with_state_history(state_history),
+        );
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+        let published_before_capture = writer.appends().await.len();
+
+        let completed = BroadcasterServiceState::capture_state_history_checkpoint(
+            std::slice::from_ref(&service),
+            state_history::CheckpointKind::Interval,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(completed, Some(10));
+        timeout(Duration::from_secs(2), async {
+            while probe.token_snapshots().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("checkpoint token catalog was not enqueued"))?;
+        let token_snapshots = probe.token_snapshots();
+        assert_eq!(token_snapshots.len(), 1);
+        assert_eq!(token_snapshots[0].chain_id, 1);
+        assert_eq!(token_snapshots[0].tokens.len(), 1);
+        assert_eq!(token_snapshots[0].tokens[0].address, token.address);
+        assert_eq!(writer.appends().await.len(), published_before_capture);
+        assert_eq!(
+            service.status_snapshot().await.readiness,
+            BroadcasterReadiness::Ready
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_capture_clones_the_live_token_catalog() -> Result<()> {
+        // Pins that captures read the shared catalog store at capture time, not a
+        // copy taken when the runtime was built. A token folded from the stream
+        // after startup must reach the next capture's token snapshot.
+        let writer = ServiceFakeRedisWriter::default();
+        let store = Arc::new(crate::models::tokens::TokenStore::local_only(
+            Default::default(),
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let (state_history, probe) =
+            super::super::state_history::test_state_history_runtime_with_store(
+                8,
+                Arc::clone(&store),
+            );
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+                .with_state_history(state_history),
+        );
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+
+        let token = dummy_token(9, "NINE");
+        store.insert_batch([token.clone()]).await;
+
+        let completed = BroadcasterServiceState::capture_state_history_checkpoint(
+            std::slice::from_ref(&service),
+            state_history::CheckpointKind::Interval,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(completed, Some(10));
+        timeout(Duration::from_secs(2), async {
+            while probe.token_snapshots().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("checkpoint token catalog was not enqueued"))?;
+        let token_snapshots = probe.token_snapshots();
+        assert_eq!(token_snapshots.len(), 1);
+        assert_eq!(token_snapshots[0].tokens.len(), 1);
+        assert_eq!(token_snapshots[0].tokens[0].address, token.address);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn state_history_recovery_commit_records_same_generation_boundary_slip_gap() -> Result<()>
     {
         let writer = ServiceFakeRedisWriter::default();
@@ -3214,6 +3362,24 @@ mod tests {
 
         after_append.snapshot_id = "moved-snapshot".to_owned();
         assert!(!checkpoint_world_matches(&pinned, &after_append));
+    }
+
+    #[test]
+    fn moved_world_discards_state_and_token_work_together() {
+        let pinned = replay_boundary();
+        let mut moved = pinned.clone();
+        moved.snapshot_id = "moved-snapshot".to_owned();
+        let token_work_dropped = Arc::new(AtomicBool::new(false));
+
+        let retained = retain_current_checkpoint_capture(
+            &pinned,
+            Some(&moved),
+            true,
+            ((), CaptureDropProbe(Arc::clone(&token_work_dropped))),
+        );
+
+        assert!(retained.is_none());
+        assert!(token_work_dropped.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

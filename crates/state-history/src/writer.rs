@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Context;
+use simulator_core::broadcaster::BroadcasterTokenDto;
 use sqlx::error::ErrorKind;
 use tokio::{
     sync::{mpsc, watch},
@@ -16,8 +17,9 @@ use tokio::{
 };
 
 use crate::{
-    encode_archive, ArchiveMetadata, CapturedState, CheckpointArchive, CheckpointKind,
-    CheckpointObjectStore, DeltaEntry, GapReason, GapRecord, StateHistoryStore, StreamPosition,
+    encode_archive, encode_token_snapshot, token_snapshot_s3_key, ArchiveMetadata, CapturedState,
+    CheckpointArchive, CheckpointKind, CheckpointObjectStore, DeltaEntry, EncodedTokenSnapshot,
+    GapReason, GapRecord, StateHistoryStore, StreamPosition, TokenSnapshot, TokenSnapshotRef,
     ARCHIVE_SCHEMA_VERSION,
 };
 
@@ -38,6 +40,41 @@ impl Default for WriterConfig {
             queue_capacity: 8_192,
             retry_window: Duration::from_secs(30),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCapture {
+    state: CapturedState,
+    token_snapshot: TokenSnapshot,
+    token_s3_prefix: String,
+}
+
+impl CheckpointCapture {
+    // The snapshot's chain_id comes from the captured state, so a state/token chain mismatch is
+    // unrepresentable rather than checked.
+    pub fn new(
+        state: CapturedState,
+        tokens: Vec<BroadcasterTokenDto>,
+        token_s3_prefix: String,
+    ) -> Self {
+        let token_snapshot = TokenSnapshot {
+            chain_id: state.chain_id(),
+            tokens,
+        };
+        Self {
+            state,
+            token_snapshot,
+            token_s3_prefix,
+        }
+    }
+
+    pub const fn state(&self) -> &CapturedState {
+        &self.state
+    }
+
+    pub const fn token_snapshot(&self) -> &TokenSnapshot {
+        &self.token_snapshot
     }
 }
 
@@ -70,6 +107,34 @@ impl StateHistoryWriter {
         objects: CheckpointObjectStore,
         base_fee: Arc<dyn BaseFeeSource>,
     ) -> WriterHandle {
+        #[cfg(test)]
+        {
+            Self::spawn_inner(config, store, objects, base_fee, None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::spawn_inner(config, store, objects, base_fee)
+        }
+    }
+
+    #[cfg(test)]
+    fn spawn_with_token_put_probe(
+        config: WriterConfig,
+        store: StateHistoryStore,
+        objects: CheckpointObjectStore,
+        base_fee: Arc<dyn BaseFeeSource>,
+        token_put_probe: Arc<TokenPutProbe>,
+    ) -> WriterHandle {
+        Self::spawn_inner(config, store, objects, base_fee, Some(token_put_probe))
+    }
+
+    fn spawn_inner(
+        config: WriterConfig,
+        store: StateHistoryStore,
+        objects: CheckpointObjectStore,
+        base_fee: Arc<dyn BaseFeeSource>,
+        #[cfg(test)] token_put_probe: Option<Arc<TokenPutProbe>>,
+    ) -> WriterHandle {
         let queue_capacity = config.queue_capacity;
         let (command_sender, command_receiver) = mpsc::channel(queue_capacity);
         let gaps = Arc::new(Mutex::new(GapAccumulator::default()));
@@ -88,6 +153,8 @@ impl StateHistoryWriter {
             checkpoints_completed: 0,
             checkpoints_failed: 0,
             last_checkpoint_status: None,
+            last_token_snapshot_sha: None,
+            token_persistence_failures: 0,
         });
         let task = WriterTask {
             config,
@@ -99,6 +166,9 @@ impl StateHistoryWriter {
             status: status_sender.clone(),
             shutdown_deadline: shutdown_deadline_receiver,
             base_fee_cache: BTreeMap::new(),
+            last_persisted_token: None,
+            #[cfg(test)]
+            token_put_probe,
         };
         let join = tokio::spawn(task.run());
 
@@ -147,7 +217,7 @@ impl WriterHandle {
         }
     }
 
-    pub fn request_checkpoint(&self, capture: CapturedState) -> bool {
+    pub fn request_checkpoint(&self, capture: CheckpointCapture) -> bool {
         let commands = lock(&self.inner.commands);
         let Some(sender) = commands.as_ref() else {
             return false;
@@ -258,6 +328,7 @@ impl WriterHandle {
 #[derive(Clone)]
 pub struct TestWriterProbe {
     checkpoints: Arc<Mutex<Vec<CapturedState>>>,
+    token_snapshots: Arc<Mutex<Vec<TokenSnapshot>>>,
     gaps: Arc<Mutex<GapAccumulator>>,
 }
 
@@ -265,6 +336,10 @@ pub struct TestWriterProbe {
 impl TestWriterProbe {
     pub fn checkpoints(&self) -> Vec<CapturedState> {
         lock(&self.checkpoints).clone()
+    }
+
+    pub fn token_snapshots(&self) -> Vec<TokenSnapshot> {
+        lock(&self.token_snapshots).clone()
     }
 
     pub fn gaps(&self) -> Vec<GapRecord> {
@@ -291,9 +366,13 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
         checkpoints_completed: 0,
         checkpoints_failed: 0,
         last_checkpoint_status: None,
+        last_token_snapshot_sha: None,
+        token_persistence_failures: 0,
     });
     let checkpoints = Arc::new(Mutex::new(Vec::new()));
+    let token_snapshots = Arc::new(Mutex::new(Vec::new()));
     let task_checkpoints = Arc::clone(&checkpoints);
+    let task_token_snapshots = Arc::clone(&token_snapshots);
     let probe_gaps = Arc::clone(&gaps);
     let task_status = status.clone();
     let join = tokio::spawn(async move {
@@ -308,7 +387,8 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
                     });
                 }
                 WriterCommand::Checkpoint(capture) => {
-                    lock(&task_checkpoints).push(capture);
+                    lock(&task_checkpoints).push(capture.state);
+                    lock(&task_token_snapshots).push(capture.token_snapshot);
                     task_status.send_modify(|status| {
                         status.queue_len =
                             u64::try_from(command_receiver.len()).unwrap_or(u64::MAX);
@@ -332,6 +412,7 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
         handle,
         TestWriterProbe {
             checkpoints,
+            token_snapshots,
             gaps: probe_gaps,
         },
     )
@@ -352,6 +433,8 @@ pub struct WriterStatus {
     pub checkpoints_completed: u64,
     pub checkpoints_failed: u64,
     pub last_checkpoint_status: Option<String>,
+    pub last_token_snapshot_sha: Option<String>,
+    pub token_persistence_failures: u64,
 }
 
 struct WriterHandleInner {
@@ -364,7 +447,14 @@ struct WriterHandleInner {
 
 enum WriterCommand {
     Delta(DeltaEntry),
-    Checkpoint(CapturedState),
+    Checkpoint(CheckpointCapture),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TokenPutProbe {
+    attempts: std::sync::atomic::AtomicU64,
+    fail: std::sync::atomic::AtomicBool,
 }
 
 struct WriterTask {
@@ -377,6 +467,9 @@ struct WriterTask {
     status: watch::Sender<WriterStatus>,
     shutdown_deadline: watch::Receiver<Option<Instant>>,
     base_fee_cache: BTreeMap<(u64, u64), String>,
+    last_persisted_token: Option<TokenSnapshotRef>,
+    #[cfg(test)]
+    token_put_probe: Option<Arc<TokenPutProbe>>,
 }
 
 impl WriterTask {
@@ -515,8 +608,10 @@ impl WriterTask {
         resolved
     }
 
-    async fn process_checkpoint(&mut self, capture: CapturedState) {
-        match self.execute_checkpoint(&capture).await {
+    async fn process_checkpoint(&mut self, capture: CheckpointCapture) {
+        let boundary_gap = (capture.state().kind() == CheckpointKind::Boundary)
+            .then(|| checkpoint_gap(capture.state(), GapReason::CheckpointFailed));
+        match self.execute_checkpoint(capture).await {
             Ok(()) => {
                 self.status.send_modify(|status| {
                     status.healthy = true;
@@ -527,8 +622,8 @@ impl WriterTask {
             }
             Err(error) => {
                 tracing::error!(%error, "state history checkpoint failed");
-                if capture.kind() == CheckpointKind::Boundary {
-                    lock(&self.gaps).merge(checkpoint_gap(&capture, GapReason::CheckpointFailed));
+                if let Some(gap) = boundary_gap {
+                    lock(&self.gaps).merge(gap);
                 }
                 self.status.send_modify(|status| {
                     status.healthy = false;
@@ -540,7 +635,12 @@ impl WriterTask {
         }
     }
 
-    async fn execute_checkpoint(&self, capture: &CapturedState) -> anyhow::Result<()> {
+    async fn execute_checkpoint(&mut self, capture: CheckpointCapture) -> anyhow::Result<()> {
+        let CheckpointCapture {
+            state,
+            token_snapshot,
+            token_s3_prefix,
+        } = capture;
         let deadline = self.shutdown_deadline();
         let checkpoint_id = run_with_optional_deadline(deadline, "checkpoint creation", async {
             let mut connection = self
@@ -549,12 +649,18 @@ impl WriterTask {
                 .acquire()
                 .await
                 .context("failed to acquire checkpoint connection")?;
-            StateHistoryStore::create_checkpoint(&mut connection, capture).await
+            StateHistoryStore::create_checkpoint(&mut connection, &state).await
         })
         .await?;
 
         let result = self
-            .finish_checkpoint(checkpoint_id, capture, deadline)
+            .finish_checkpoint(
+                checkpoint_id,
+                &state,
+                token_snapshot,
+                &token_s3_prefix,
+                deadline,
+            )
             .await;
         if let Err(error) = &result {
             if let Err(mark_error) = StateHistoryStore::fail_checkpoint(
@@ -575,9 +681,11 @@ impl WriterTask {
     }
 
     async fn finish_checkpoint(
-        &self,
+        &mut self,
         checkpoint_id: i64,
         capture: &CapturedState,
+        token_snapshot: TokenSnapshot,
+        token_s3_prefix: &str,
         deadline: Option<Instant>,
     ) -> anyhow::Result<()> {
         let archive = CheckpointArchive {
@@ -593,12 +701,17 @@ impl WriterTask {
             },
             payloads_json: capture.payloads_json().to_vec(),
         };
-        let encoded = run_with_optional_deadline(deadline, "checkpoint encoding", async {
-            tokio::task::spawn_blocking(move || encode_archive(archive))
+        let (encoded, encoded_token_snapshot) =
+            run_with_optional_deadline(deadline, "checkpoint encoding", async {
+                tokio::task::spawn_blocking(move || {
+                    let encoded_archive = encode_archive(archive)?;
+                    let encoded_token_snapshot = encode_token_snapshot(token_snapshot);
+                    Ok::<_, anyhow::Error>((encoded_archive, encoded_token_snapshot))
+                })
                 .await
                 .context("checkpoint encoding task failed")?
-        })
-        .await?;
+            })
+            .await?;
         let key = self
             .objects
             .key_for(capture.chain_id(), capture.position(), capture.kind());
@@ -609,6 +722,9 @@ impl WriterTask {
             self.objects.put(&key, encoded.bytes),
         )
         .await?;
+        let token_reference = self
+            .resolve_token_reference(capture, token_s3_prefix, encoded_token_snapshot, deadline)
+            .await;
         run_with_optional_deadline(deadline, "checkpoint completion", async {
             let mut connection = self
                 .store
@@ -621,6 +737,7 @@ impl WriterTask {
                 checkpoint_id,
                 &key,
                 &archive_info,
+                token_reference.as_ref(),
                 capture.block_times(),
                 capture.position(),
                 capture.chain_id(),
@@ -628,6 +745,98 @@ impl WriterTask {
             .await
         })
         .await
+    }
+
+    async fn resolve_token_reference(
+        &mut self,
+        capture: &CapturedState,
+        token_s3_prefix: &str,
+        encoded: anyhow::Result<EncodedTokenSnapshot>,
+        deadline: Option<Instant>,
+    ) -> Option<TokenSnapshotRef> {
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.record_token_persistence_failure(capture, &error);
+                return None;
+            }
+        };
+        let reference = TokenSnapshotRef {
+            s3_key: token_snapshot_s3_key(
+                token_s3_prefix,
+                capture.chain_id(),
+                &encoded.info.sha256,
+            ),
+            sha256: encoded.info.sha256.clone(),
+            token_count: encoded.info.token_count,
+            token_bytes: encoded.info.token_bytes,
+        };
+        // Only the most recent successful PUT is memoized. The full key is compared,
+        // not just the hash: a capture with a different S3 prefix must not reuse an
+        // object persisted under the old one. A mismatch always writes.
+        if self
+            .last_persisted_token
+            .as_ref()
+            .is_some_and(|persisted| persisted.s3_key == reference.s3_key)
+        {
+            return Some(reference);
+        }
+
+        // A draining writer skips the PUT: the remaining deadline belongs to checkpoint
+        // completion, and token snapshots are enrichment the next capture recreates.
+        // Memo hits above still resolve because they cost nothing. Not a failure, so
+        // the memo and failure counter stay untouched.
+        if deadline.is_some() {
+            tracing::debug!(
+                chain_id = capture.chain_id(),
+                generation = capture.position().generation,
+                message_seq = capture.position().message_seq,
+                "skipped token snapshot persistence during writer drain"
+            );
+            return None;
+        }
+
+        if let Err(error) = self
+            .put_token_snapshot(&reference.s3_key, encoded.bytes)
+            .await
+        {
+            self.record_token_persistence_failure(capture, &error);
+            return None;
+        }
+
+        self.last_persisted_token = Some(reference.clone());
+        self.status.send_modify(|status| {
+            status.last_token_snapshot_sha = Some(reference.sha256.clone());
+        });
+        Some(reference)
+    }
+
+    async fn put_token_snapshot(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = &self.token_put_probe {
+            probe
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if probe.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("injected token snapshot PUT failure");
+            }
+        }
+        self.objects.put(key, bytes).await
+    }
+
+    fn record_token_persistence_failure(&mut self, capture: &CapturedState, error: &anyhow::Error) {
+        // A failed attempt invalidates the memo so identical content must prove durability again.
+        self.last_persisted_token = None;
+        tracing::warn!(
+            chain_id = capture.chain_id(),
+            generation = capture.position().generation,
+            message_seq = capture.position().message_seq,
+            %error,
+            "state history token snapshot persistence failed"
+        );
+        self.status.send_modify(|status| {
+            status.token_persistence_failures += 1;
+        });
     }
 
     async fn flush_gaps(&self) {
@@ -748,8 +957,12 @@ fn command_gap(command: &WriterCommand, reason: GapReason) -> Option<GapRecord> 
         // Interval checkpoints are replay accelerators, not lineage. Abandoning one
         // loses no data, so a gap here would fail ranges that replay fine, matching
         // the boundary-only rule in process_checkpoint.
-        WriterCommand::Checkpoint(capture) if capture.kind() == CheckpointKind::Interval => None,
-        WriterCommand::Checkpoint(capture) => Some(checkpoint_gap(capture, reason)),
+        WriterCommand::Checkpoint(capture)
+            if capture.state().kind() == CheckpointKind::Interval =>
+        {
+            None
+        }
+        WriterCommand::Checkpoint(capture) => Some(checkpoint_gap(capture.state(), reason)),
     }
 }
 
@@ -1207,6 +1420,216 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn unchanged_catalog_reuses_one_token_object_for_both_checkpoint_kinds(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-writer-token-dedup";
+        let probe = Arc::new(TokenPutProbe::default());
+        let writer = StateHistoryWriter::spawn_with_token_put_probe(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_minio_store_for_bucket(BUCKET).await?,
+            Arc::new(NoBaseFee),
+            Arc::clone(&probe),
+        );
+        let token_snapshot = test_token_snapshot(11);
+
+        assert!(writer.request_checkpoint(test_capture_at(
+            20,
+            CheckpointKind::Interval,
+            token_snapshot.clone(),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 1).await?;
+        assert!(writer.request_checkpoint(test_capture_at(
+            21,
+            CheckpointKind::Boundary,
+            token_snapshot,
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 2).await?;
+
+        let interval = checkpoint_token_reference(&pool, 20)
+            .await?
+            .context("interval checkpoint is missing its token reference")?;
+        let boundary = checkpoint_token_reference(&pool, 21)
+            .await?
+            .context("boundary checkpoint is missing its token reference")?;
+        assert_eq!(interval, boundary);
+        assert_eq!(interval.token_count, 1);
+        assert!(interval.token_bytes > 0);
+        assert!(interval
+            .s3_key
+            .ends_with(&format!("{}.zst", interval.sha256)));
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(token_object_count(BUCKET).await?, 1);
+        assert_eq!(
+            writer.status().last_token_snapshot_sha.as_deref(),
+            Some(interval.sha256.as_str())
+        );
+        assert_eq!(writer.status().token_persistence_failures, 0);
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn changed_catalog_is_referenced_only_by_later_checkpoints(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-writer-token-change";
+        let probe = Arc::new(TokenPutProbe::default());
+        let writer = StateHistoryWriter::spawn_with_token_put_probe(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_minio_store_for_bucket(BUCKET).await?,
+            Arc::new(NoBaseFee),
+            Arc::clone(&probe),
+        );
+
+        assert!(writer.request_checkpoint(test_capture_at(
+            30,
+            CheckpointKind::Interval,
+            test_token_snapshot(12),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 1).await?;
+        assert!(writer.request_checkpoint(test_capture_at(
+            31,
+            CheckpointKind::Interval,
+            test_token_snapshot(13),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 2).await?;
+
+        let first = checkpoint_token_reference(&pool, 30)
+            .await?
+            .context("first checkpoint is missing its token reference")?;
+        let second = checkpoint_token_reference(&pool, 31)
+            .await?
+            .context("second checkpoint is missing its token reference")?;
+        assert_ne!(first.sha256, second.sha256);
+        assert_ne!(first.s3_key, second.s3_key);
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(token_object_count(BUCKET).await?, 2);
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn token_put_failure_is_enrichment_only_and_clears_the_memo(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-writer-token-failure";
+        let probe = Arc::new(TokenPutProbe::default());
+        let writer = StateHistoryWriter::spawn_with_token_put_probe(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_minio_store_for_bucket(BUCKET).await?,
+            Arc::new(NoBaseFee),
+            Arc::clone(&probe),
+        );
+
+        assert!(writer.request_checkpoint(test_capture_at(
+            40,
+            CheckpointKind::Interval,
+            test_token_snapshot(14),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 1).await?;
+        let first = checkpoint_token_reference(&pool, 40)
+            .await?
+            .context("first checkpoint is missing its token reference")?;
+
+        probe.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(writer.request_checkpoint(test_capture_at(
+            41,
+            CheckpointKind::Interval,
+            test_token_snapshot(15),
+        )));
+        wait_for_status(&writer, |status| {
+            status.checkpoints_completed == 2 && status.token_persistence_failures == 1
+        })
+        .await?;
+        assert_eq!(checkpoint_token_reference(&pool, 41).await?, None);
+        assert_eq!(writer.status().checkpoints_failed, 0);
+        assert!(writer.status().healthy);
+        let gap_count: i64 = sqlx::query_scalar("SELECT count(*) FROM state_history.gaps")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(gap_count, 0);
+
+        probe
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(writer.request_checkpoint(test_capture_at(
+            42,
+            CheckpointKind::Interval,
+            test_token_snapshot(14),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 3).await?;
+        let recovered = checkpoint_token_reference(&pool, 42)
+            .await?
+            .context("recovered checkpoint is missing its token reference")?;
+        assert_eq!(recovered, first);
+        assert_eq!(
+            probe.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the failed catalog must clear the earlier memo"
+        );
+        assert_eq!(writer.status().token_persistence_failures, 1);
+        assert_eq!(
+            writer.status().last_token_snapshot_sha.as_deref(),
+            Some(first.sha256.as_str())
+        );
+        assert_eq!(token_object_count(BUCKET).await?, 1);
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn draining_writer_skips_token_persistence_without_recording_failure(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-writer-token-drain";
+        let probe = Arc::new(TokenPutProbe::default());
+        let writer = StateHistoryWriter::spawn_with_token_put_probe(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_minio_store_for_bucket(BUCKET).await?,
+            Arc::new(NoBaseFee),
+            Arc::clone(&probe),
+        );
+
+        writer
+            .inner
+            .shutdown_deadline
+            .send_replace(Some(Instant::now() + Duration::from_secs(60)));
+        assert!(writer.request_checkpoint(test_capture_at(
+            50,
+            CheckpointKind::Interval,
+            test_token_snapshot(16),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 1).await?;
+        assert_eq!(checkpoint_token_reference(&pool, 50).await?, None);
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(writer.status().token_persistence_failures, 0);
+        assert_eq!(writer.status().checkpoints_failed, 0);
+
+        writer.inner.shutdown_deadline.send_replace(None);
+        assert!(writer.request_checkpoint(test_capture_at(
+            51,
+            CheckpointKind::Interval,
+            test_token_snapshot(16),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 2).await?;
+        checkpoint_token_reference(&pool, 51)
+            .await?
+            .context("post-drain checkpoint is missing its token reference")?;
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn boundary_checkpoint_creation_failure_records_bounded_gap(
         pool: sqlx::PgPool,
     ) -> anyhow::Result<()> {
@@ -1351,21 +1774,29 @@ mod tests {
         .expect("test delta should be valid")
     }
 
-    fn test_capture() -> CapturedState {
+    fn test_capture() -> CheckpointCapture {
         test_capture_with_kind(CheckpointKind::Interval)
     }
 
-    fn test_boundary_capture() -> CapturedState {
+    fn test_boundary_capture() -> CheckpointCapture {
         test_capture_with_kind(CheckpointKind::Boundary)
     }
 
+    fn test_capture_with_kind(kind: CheckpointKind) -> CheckpointCapture {
+        test_capture_at(10, kind, test_token_snapshot(1))
+    }
+
     #[expect(clippy::expect_used)]
-    fn test_capture_with_kind(kind: CheckpointKind) -> CapturedState {
-        CapturedState::new(
+    fn test_capture_at(
+        message_seq: u64,
+        kind: CheckpointKind,
+        token_snapshot: TokenSnapshot,
+    ) -> CheckpointCapture {
+        let state = CapturedState::new(
             8453,
             StreamPosition {
                 generation: 7,
-                message_seq: 10,
+                message_seq,
             },
             Some(42),
             kind,
@@ -1375,7 +1806,26 @@ mod tests {
             vec![r#"{"state":true}"#.to_owned()],
             vec![test_block_time()],
         )
-        .expect("test capture should be valid")
+        .expect("test capture should be valid");
+        CheckpointCapture::new(state, token_snapshot.tokens, "writer".to_owned())
+    }
+
+    #[expect(clippy::expect_used)]
+    fn test_token_snapshot(seed: u8) -> TokenSnapshot {
+        let token = serde_json::from_value(serde_json::json!({
+            "address": format!("0x{seed:040x}"),
+            "symbol": format!("TOKEN-{seed}"),
+            "decimals": 18,
+            "tax": 0,
+            "gas": [],
+            "chainId": 8453,
+            "quality": 100,
+        }))
+        .expect("test token should be valid");
+        TokenSnapshot {
+            chain_id: 8453,
+            tokens: vec![token],
+        }
     }
 
     fn test_block_time() -> BlockTimeObservation {
@@ -1390,6 +1840,32 @@ mod tests {
     async fn writer_store(pool: &sqlx::PgPool) -> anyhow::Result<StateHistoryStore> {
         let database_url = pool.connect_options().to_url_lossy();
         StateHistoryStore::connect(database_url.as_str()).await
+    }
+
+    async fn checkpoint_token_reference(
+        pool: &sqlx::PgPool,
+        message_seq: i64,
+    ) -> anyhow::Result<Option<TokenSnapshotRef>> {
+        let columns: (Option<String>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT token_s3_key, token_sha256, token_count, token_bytes
+             FROM state_history.checkpoints
+             WHERE chain_id = 8453 AND generation = 7 AND message_seq = $1",
+        )
+        .bind(message_seq)
+        .fetch_one(pool)
+        .await?;
+        match columns {
+            (Some(s3_key), Some(sha256), Some(token_count), Some(token_bytes)) => {
+                Ok(Some(TokenSnapshotRef {
+                    s3_key,
+                    sha256,
+                    token_count: u64::try_from(token_count)?,
+                    token_bytes: u64::try_from(token_bytes)?,
+                }))
+            }
+            (None, None, None, None) => Ok(None),
+            _ => anyhow::bail!("checkpoint token reference columns are partially populated"),
+        }
     }
 
     async fn wait_for_status(
@@ -1421,6 +1897,18 @@ mod tests {
     }
 
     async fn test_minio_store() -> anyhow::Result<CheckpointObjectStore> {
+        test_minio_store_for_bucket(TEST_MINIO_BUCKET).await
+    }
+
+    async fn test_minio_store_for_bucket(bucket: &str) -> anyhow::Result<CheckpointObjectStore> {
+        let client = test_minio_client().await;
+        if client.create_bucket().bucket(bucket).send().await.is_err() {
+            client.head_bucket().bucket(bucket).send().await?;
+        }
+        Ok(test_object_store(bucket).await)
+    }
+
+    async fn test_minio_client() -> aws_sdk_s3::Client {
         let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new("eu-central-1"))
             .load()
@@ -1429,21 +1917,18 @@ mod tests {
             .force_path_style(true)
             .endpoint_url("http://127.0.0.1:59000")
             .build();
-        let client = aws_sdk_s3::Client::from_conf(s3_config);
-        if client
-            .create_bucket()
-            .bucket(TEST_MINIO_BUCKET)
-            .send()
+        aws_sdk_s3::Client::from_conf(s3_config)
+    }
+
+    async fn token_object_count(bucket: &str) -> anyhow::Result<usize> {
+        let output = test_minio_client()
             .await
-            .is_err()
-        {
-            client
-                .head_bucket()
-                .bucket(TEST_MINIO_BUCKET)
-                .send()
-                .await?;
-        }
-        Ok(test_object_store(TEST_MINIO_BUCKET).await)
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("writer/chain=8453/tokens/")
+            .send()
+            .await?;
+        Ok(output.contents().len())
     }
 
     fn test_gap(

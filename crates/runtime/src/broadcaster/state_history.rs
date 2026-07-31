@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterPayload, BroadcasterUpdateMessage,
+    BroadcasterBackend, BroadcasterPayload, BroadcasterTokenDto, BroadcasterUpdateMessage,
 };
 use state_history::{
-    Backend, BaseFeeSource, BlockTimeObservation, CapturedState, CheckpointKind,
+    Backend, BaseFeeSource, BlockTimeObservation, CapturedState, CheckpointCapture, CheckpointKind,
     CheckpointObjectStore, DeltaBackendCursor, DeltaEntry, NoBaseFee, StateHistoryStore,
     StateHistoryWriter, WriterConfig, WriterHandle,
 };
@@ -18,11 +18,14 @@ use tokio_util::sync::CancellationToken;
 use crate::broadcaster::gas_price::RpcBaseFeeSource;
 use crate::broadcaster::state::BroadcasterSnapshotExport;
 use crate::config::StateHistoryConfig;
+use crate::models::tokens::TokenStore;
 
 pub use state_history::{StreamPosition, WriterStatus};
 
 pub struct StateHistoryRuntime {
     pub handle: WriterHandle,
+    tokens: Arc<TokenStore>,
+    token_s3_prefix: String,
     rfq_high_water_ms: AtomicU64,
     checkpoint_task: Mutex<Option<StateHistoryCheckpointTask>>,
     boundary_requests: mpsc::UnboundedSender<BoundaryCheckpointRequest>,
@@ -84,15 +87,34 @@ pub(crate) struct BoundaryCheckpointRequest {
 }
 
 impl StateHistoryRuntime {
-    fn new(handle: WriterHandle) -> Self {
+    fn new(handle: WriterHandle, tokens: Arc<TokenStore>, token_s3_prefix: String) -> Self {
         let (boundary_requests, boundary_request_receiver) = mpsc::unbounded_channel();
         Self {
             handle,
+            tokens,
+            token_s3_prefix,
             rfq_high_water_ms: AtomicU64::new(0),
             checkpoint_task: Mutex::new(None),
             boundary_requests,
             boundary_request_receiver: Mutex::new(Some(boundary_request_receiver)),
         }
+    }
+
+    pub(crate) async fn clone_token_catalog(&self) -> Vec<BroadcasterTokenDto> {
+        self.tokens
+            .snapshot()
+            .await
+            .into_values()
+            .map(BroadcasterTokenDto::from)
+            .collect()
+    }
+
+    pub(crate) fn checkpoint_capture(
+        &self,
+        state: CapturedState,
+        tokens: Vec<BroadcasterTokenDto>,
+    ) -> CheckpointCapture {
+        CheckpointCapture::new(state, tokens, self.token_s3_prefix.clone())
     }
 
     pub fn rfq_high_water_ms(&self) -> Option<u64> {
@@ -178,6 +200,7 @@ impl StateHistoryRuntime {
 pub async fn build_state_history_runtime(
     config: &StateHistoryConfig,
     rpc_url: Option<String>,
+    tokens: Arc<TokenStore>,
 ) -> Result<Option<StateHistoryRuntime>> {
     let store = StateHistoryStore::connect(&config.database_url).await?;
     store.validate_schema().await?;
@@ -202,15 +225,50 @@ pub async fn build_state_history_runtime(
         objects,
         base_fee,
     );
-    Ok(Some(StateHistoryRuntime::new(handle)))
+    Ok(Some(StateHistoryRuntime::new(
+        handle,
+        tokens,
+        config.s3_prefix.clone(),
+    )))
 }
 
 #[cfg(test)]
 pub(crate) fn test_state_history_runtime(
     queue_capacity: usize,
 ) -> (Arc<StateHistoryRuntime>, state_history::TestWriterProbe) {
+    test_state_history_runtime_with_tokens(queue_capacity, Vec::new())
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_history_runtime_with_tokens(
+    queue_capacity: usize,
+    tokens: Vec<tycho_simulation::tycho_common::models::token::Token>,
+) -> (Arc<StateHistoryRuntime>, state_history::TestWriterProbe) {
+    let tokens = Arc::new(TokenStore::local_only(
+        tokens
+            .into_iter()
+            .map(|token| (token.address.clone(), token))
+            .collect(),
+        tycho_simulation::tycho_common::models::Chain::Ethereum,
+        std::time::Duration::from_secs(1),
+    ));
+    test_state_history_runtime_with_store(queue_capacity, tokens)
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_history_runtime_with_store(
+    queue_capacity: usize,
+    tokens: Arc<TokenStore>,
+) -> (Arc<StateHistoryRuntime>, state_history::TestWriterProbe) {
     let (handle, probe) = state_history::test_writer_handle(queue_capacity);
-    (Arc::new(StateHistoryRuntime::new(handle)), probe)
+    (
+        Arc::new(StateHistoryRuntime::new(
+            handle,
+            tokens,
+            "writer".to_owned(),
+        )),
+        probe,
+    )
 }
 
 pub fn delta_entry_from_update(

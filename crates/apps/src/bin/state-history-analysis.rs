@@ -1,11 +1,39 @@
-use std::{collections::BTreeMap, env, process::ExitCode};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    env,
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{ensure, Context};
+use aws_sdk_s3::config::Region;
+use runtime::{
+    broadcaster::{state::BroadcasterSnapshotCache, state_history::captured_state_from_export},
+    models::tokens::TokenStore,
+};
+use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterTokenDto};
 use state_history::{
     encode_archive, ArchiveMetadata, Backend, BacktestRequest, BlockTimeObservation, CapturedState,
-    CheckpointArchive, CheckpointKind, CheckpointManifest, CheckpointObjectStore,
-    DeltaBackendCursor, DeltaEntry, GapReason, GapRecord, RangeGap, RangeGapKind, RangePlan,
-    RangeRequest, StateHistoryReader, StateHistoryStore, StreamPosition,
+    CheckpointArchive, CheckpointCapture, CheckpointKind, CheckpointManifest,
+    CheckpointObjectStore, DeltaBackendCursor, DeltaEntry, GapReason, GapRecord, NoBaseFee,
+    RangeGap, RangeGapKind, RangePlan, RangeRequest, StateHistoryReader, StateHistoryStore,
+    StateHistoryWriter, StreamPosition, TokenSnapshotRef, WriterConfig, WriterHandle,
+};
+use tycho_simulation::{
+    tycho_client::feed::{
+        synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+        BlockHeader, FeedMessage, SynchronizerState,
+    },
+    tycho_common::{
+        models::{
+            blockchain::BlockAggregatedChanges,
+            protocol::{ProtocolComponent, ProtocolComponentState},
+            token::Token,
+            Chain,
+        },
+        Bytes,
+    },
 };
 
 const CHAIN_ID: u64 = 8_453;
@@ -14,6 +42,14 @@ const DEFAULT_S3_BUCKET: &str = "state-history-analysis";
 const DEFAULT_S3_PREFIX: &str = "smoke";
 const DEFAULT_S3_REGION: &str = "eu-central-1";
 const DEFAULT_S3_ENDPOINT_URL: &str = "http://127.0.0.1:59000";
+
+#[derive(Clone, Copy)]
+struct TokenObjectStorage<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    region: &'a str,
+    endpoint: &'a str,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -70,6 +106,11 @@ async fn run() -> anyhow::Result<()> {
     assert_plan(&short_plan, &[(position(1, 10), positions(1, 11, 28))], &[])?;
     short_plan.ensure_gap_free()?;
     println!("PASS resolve_range 100..=105 returned one gap-free leg");
+    ensure!(
+        short_plan.legs[0].checkpoint.token_reference.is_none() && short_plan.gaps.is_empty(),
+        "token-less anchor must resolve with None and no gap"
+    );
+    println!("PASS token-less anchor resolved with None and no gap");
 
     let explicit_request = range_request(100, 115)?;
     let explicit_plan = reader.resolve_range(&explicit_request).await?;
@@ -127,7 +168,525 @@ async fn run() -> anyhow::Result<()> {
     assert_failed_boundary(&failed_plan, recorded_gap)?;
     println!("PASS failed gen-2 boundary replaced replay leg 2 with MissingCheckpoint");
 
+    run_token_snapshot_flow(&database_url, &bucket, &prefix, &region, &endpoint, &reader).await?;
+
     Ok(())
+}
+
+async fn run_token_snapshot_flow(
+    database_url: &str,
+    bucket: &str,
+    prefix: &str,
+    region: &str,
+    endpoint: &str,
+    reader: &StateHistoryReader,
+) -> anyhow::Result<()> {
+    let token_objects = TokenObjectStorage {
+        bucket,
+        prefix,
+        region,
+        endpoint,
+    };
+    let initial_tokens = vec![test_token(0x11, "INITIAL-A"), test_token(0x22, "INITIAL-B")];
+    let stream_token = test_token(0x33, "STREAM");
+    let token_store = Arc::new(TokenStore::local_only(
+        initial_tokens
+            .iter()
+            .cloned()
+            .map(|token| (token.address.clone(), token))
+            .collect(),
+        Chain::Base,
+        Duration::from_secs(1),
+    ));
+    let cache = BroadcasterSnapshotCache::with_token_catalog(
+        CHAIN_ID,
+        vec![BroadcasterBackend::Native],
+        Arc::clone(&token_store),
+        0,
+    );
+    ensure!(
+        cache
+            .apply_feed_message(&initial_component_feed())
+            .await?
+            .is_some(),
+        "initial broadcaster feed was not applied"
+    );
+
+    let writer = StateHistoryWriter::spawn(
+        WriterConfig::default(),
+        StateHistoryStore::connect(database_url).await?,
+        object_store(bucket, prefix, region, endpoint).await,
+        Arc::new(NoBaseFee),
+    );
+    let expected_initial_catalog = canonical_token_json(&initial_tokens)?;
+
+    let first_manifest = write_checkpoint_and_resolve(
+        &writer,
+        checkpoint_capture(&cache, &token_store, position(3, 1), 119, prefix).await?,
+        reader,
+        1,
+        119,
+    )
+    .await?;
+    ensure!(
+        cache
+            .apply_feed_message(&unchanged_catalog_feed())
+            .await?
+            .is_some(),
+        "unchanged-catalog broadcaster feed was not applied"
+    );
+    let second_manifest = write_checkpoint_and_resolve(
+        &writer,
+        checkpoint_capture(&cache, &token_store, position(3, 2), 120, prefix).await?,
+        reader,
+        2,
+        120,
+    )
+    .await?;
+    assert_unchanged_catalog(
+        reader,
+        &first_manifest,
+        &second_manifest,
+        &expected_initial_catalog,
+        token_objects,
+    )
+    .await?;
+    let first_reference = required_token_reference(&first_manifest)?;
+
+    ensure!(
+        cache
+            .apply_feed_message(&catalog_change_feed(stream_token.clone()))
+            .await?
+            .is_some(),
+        "mid-stream broadcaster feed was not applied"
+    );
+    let third_manifest = write_checkpoint_and_resolve(
+        &writer,
+        checkpoint_capture(&cache, &token_store, position(3, 3), 121, prefix).await?,
+        reader,
+        3,
+        121,
+    )
+    .await?;
+    let third_reference = required_token_reference(&third_manifest)?;
+    assert_catalog_change(reader, first_reference, third_reference, token_objects).await?;
+
+    assert_token_snapshot_superset(reader, &third_manifest, third_reference, &stream_token).await?;
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+async fn assert_unchanged_catalog(
+    reader: &StateHistoryReader,
+    first_manifest: &CheckpointManifest,
+    second_manifest: &CheckpointManifest,
+    expected_catalog: &serde_json::Value,
+    token_objects: TokenObjectStorage<'_>,
+) -> anyhow::Result<()> {
+    let first_reference = required_token_reference(first_manifest)?;
+    let second_reference = required_token_reference(second_manifest)?;
+    ensure!(
+        first_reference == second_reference,
+        "unchanged token catalog produced different token references"
+    );
+    let dedup_keys = list_token_object_keys(token_objects).await?;
+    ensure!(
+        dedup_keys == vec![first_reference.s3_key.clone()],
+        "unchanged token catalog should leave exactly one MinIO token object, got {dedup_keys:?}"
+    );
+    println!("PASS unchanged token catalog reused one token reference and one MinIO object");
+
+    let fetched_catalog = fetch_token_catalog(reader, first_reference).await?;
+    ensure!(
+        fetched_catalog == *expected_catalog,
+        "reader token catalog differs from the exact seeded catalog"
+    );
+    println!("PASS token snapshot reader returned the exact seeded catalog");
+    Ok(())
+}
+
+async fn assert_catalog_change(
+    reader: &StateHistoryReader,
+    first_reference: &TokenSnapshotRef,
+    third_reference: &TokenSnapshotRef,
+    token_objects: TokenObjectStorage<'_>,
+) -> anyhow::Result<()> {
+    let refreshed_first = resolve_single_native_anchor(reader, 119).await?;
+    ensure!(
+        required_token_reference(&refreshed_first)? == first_reference
+            && first_reference.sha256 != third_reference.sha256,
+        "catalog change did not preserve the earlier reference and create a new hash"
+    );
+    let changed_keys = list_token_object_keys(token_objects).await?;
+    let expected_keys = BTreeSet::from([
+        first_reference.s3_key.clone(),
+        third_reference.s3_key.clone(),
+    ]);
+    ensure!(
+        changed_keys.into_iter().collect::<BTreeSet<_>>() == expected_keys,
+        "catalog change should leave both MinIO token objects"
+    );
+    println!("PASS catalog change preserved the earlier token reference and both MinIO objects");
+    Ok(())
+}
+
+async fn assert_token_snapshot_superset(
+    reader: &StateHistoryReader,
+    manifest: &CheckpointManifest,
+    reference: &TokenSnapshotRef,
+    stream_token: &Token,
+) -> anyhow::Result<()> {
+    let checkpoint = reader.fetch_checkpoint(manifest).await?;
+    let component_addresses = component_token_addresses(&checkpoint)?;
+    let fetched_catalog = fetch_token_catalog(reader, reference).await?;
+    let catalog_addresses = token_catalog_addresses(&fetched_catalog)?;
+    ensure!(
+        component_addresses.contains(&stream_token.address.to_string()),
+        "later checkpoint does not reference the mid-stream token"
+    );
+    ensure!(
+        component_addresses.is_subset(&catalog_addresses),
+        "checkpoint component token references {component_addresses:?} are not a subset of the token snapshot {catalog_addresses:?}"
+    );
+    println!(
+        "PASS real broadcaster apply -> writer -> PostgreSQL/MinIO -> reader preserved the token snapshot superset"
+    );
+    Ok(())
+}
+
+async fn checkpoint_capture(
+    cache: &BroadcasterSnapshotCache,
+    token_store: &TokenStore,
+    capture_position: StreamPosition,
+    block_number: u64,
+    prefix: &str,
+) -> anyhow::Result<CheckpointCapture> {
+    let export = cache.export_snapshot(8_388_608).await?;
+    let state = captured_state_from_export(
+        CheckpointKind::Interval,
+        &export,
+        capture_position,
+        3,
+        block_number,
+        None,
+    )?;
+    let tokens = token_store
+        .snapshot()
+        .await
+        .into_values()
+        .map(BroadcasterTokenDto::from)
+        .collect();
+    Ok(CheckpointCapture::new(state, tokens, prefix.to_owned()))
+}
+
+async fn write_checkpoint_and_resolve(
+    writer: &WriterHandle,
+    capture: CheckpointCapture,
+    reader: &StateHistoryReader,
+    expected_completed: u64,
+    block_number: u64,
+) -> anyhow::Result<CheckpointManifest> {
+    ensure!(
+        writer.request_checkpoint(capture),
+        "writer rejected checkpoint {expected_completed}"
+    );
+    wait_for_checkpoints(writer, expected_completed).await?;
+    resolve_single_native_anchor(reader, block_number).await
+}
+
+async fn wait_for_checkpoints(
+    writer: &WriterHandle,
+    expected_completed: u64,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = writer.status();
+        if status.checkpoints_completed == expected_completed {
+            return Ok(());
+        }
+        ensure!(
+            status.checkpoints_failed == 0,
+            "writer failed while waiting for checkpoint {expected_completed}: {status:?}"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("writer did not complete checkpoint {expected_completed}: {status:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn resolve_single_native_anchor(
+    reader: &StateHistoryReader,
+    block_number: u64,
+) -> anyhow::Result<CheckpointManifest> {
+    let plan = reader
+        .resolve_range(&RangeRequest::new(
+            CHAIN_ID,
+            block_number,
+            block_number,
+            vec![Backend::Native],
+        )?)
+        .await?;
+    ensure!(
+        plan.legs.len() == 1 && plan.gaps.is_empty(),
+        "expected one gap-free native checkpoint at block {block_number}, got {plan:?}"
+    );
+    Ok(plan.legs[0].checkpoint.clone())
+}
+
+fn required_token_reference(manifest: &CheckpointManifest) -> anyhow::Result<&TokenSnapshotRef> {
+    manifest
+        .token_reference
+        .as_ref()
+        .context("completed checkpoint is missing its token reference")
+}
+
+async fn fetch_token_catalog(
+    reader: &StateHistoryReader,
+    reference: &TokenSnapshotRef,
+) -> anyhow::Result<serde_json::Value> {
+    let snapshot = reader.fetch_token_snapshot(reference).await?;
+    ensure!(
+        snapshot.chain_id == CHAIN_ID
+            && snapshot.token_count == reference.token_count
+            && snapshot.token_count
+                == u64::try_from(
+                    serde_json::from_str::<Vec<serde_json::Value>>(snapshot.tokens.get())?.len()
+                )?,
+        "fetched token snapshot metadata differs from its token reference"
+    );
+    serde_json::from_str(snapshot.tokens.get()).context("failed to parse token snapshot catalog")
+}
+
+// `CheckpointObjectStore` never lists (production only puts and fetches), so the dedup
+// assertion enumerates token keys with its own S3 client instead of widening that API.
+async fn list_token_object_keys(
+    token_objects: TokenObjectStorage<'_>,
+) -> anyhow::Result<Vec<String>> {
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(token_objects.region.to_owned()))
+        .load()
+        .await;
+    let config = aws_sdk_s3::config::Builder::from(&shared_config)
+        .endpoint_url(token_objects.endpoint)
+        .force_path_style(true)
+        .build();
+    let output = aws_sdk_s3::Client::from_conf(config)
+        .list_objects_v2()
+        .bucket(token_objects.bucket)
+        .prefix(token_object_prefix(token_objects.prefix))
+        .send()
+        .await
+        .context("failed to list MinIO token objects")?;
+    let mut keys = output
+        .contents()
+        .iter()
+        .filter_map(|object| object.key().map(str::to_owned))
+        .collect::<Vec<_>>();
+    keys.sort();
+    Ok(keys)
+}
+
+fn token_object_prefix(prefix: &str) -> String {
+    let suffix = format!("chain={CHAIN_ID}/tokens/");
+    if prefix.is_empty() {
+        suffix
+    } else {
+        format!("{prefix}/{suffix}")
+    }
+}
+
+fn canonical_token_json(tokens: &[Token]) -> anyhow::Result<serde_json::Value> {
+    let mut tokens = tokens
+        .iter()
+        .cloned()
+        .map(BroadcasterTokenDto::from)
+        .collect::<Vec<_>>();
+    tokens.sort_by(|left, right| left.address.cmp(&right.address));
+    serde_json::to_value(tokens).context("failed to serialize expected token catalog")
+}
+
+fn component_token_addresses(checkpoint: &CheckpointArchive) -> anyhow::Result<BTreeSet<String>> {
+    let mut addresses = BTreeSet::new();
+    for payload in &checkpoint.payloads_json {
+        let value: serde_json::Value =
+            serde_json::from_str(payload).context("failed to parse checkpoint payload")?;
+        collect_component_token_addresses(&value, &mut addresses)?;
+    }
+    ensure!(
+        !addresses.is_empty(),
+        "checkpoint contains no component token references"
+    );
+    Ok(addresses)
+}
+
+fn collect_component_token_addresses(
+    value: &serde_json::Value,
+    addresses: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::Object(object) => {
+            // The spec pins the superset check to JSON level: walk the raw payloads for
+            // component objects instead of decoding them with Tycho types. Payloads are our
+            // own snake_case serialization, so `protocol_system` marks a component.
+            if object.contains_key("protocol_system") {
+                if let Some(tokens) = object.get("tokens").and_then(serde_json::Value::as_array) {
+                    for token in tokens {
+                        let address = token
+                            .as_str()
+                            .context("component token reference must be a JSON string")?;
+                        addresses.insert(address.to_owned());
+                    }
+                }
+            }
+            for child in object.values() {
+                collect_component_token_addresses(child, addresses)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_component_token_addresses(child, addresses)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn token_catalog_addresses(tokens: &serde_json::Value) -> anyhow::Result<BTreeSet<String>> {
+    tokens
+        .as_array()
+        .context("token catalog must be a JSON array")?
+        .iter()
+        .map(|token| {
+            token
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .context("token catalog entry is missing its address")
+        })
+        .collect()
+}
+
+fn initial_component_feed() -> FeedMessage<BlockHeader> {
+    let header = block_header(119, 0x6f, 0x6e);
+    let component = protocol_component(
+        "initial-pool",
+        vec![token_address(0x11), token_address(0x22)],
+    );
+    FeedMessage {
+        state_msgs: HashMap::from([(
+            "uniswap_v2".to_owned(),
+            StateSyncMessage {
+                header: header.clone(),
+                snapshots: Snapshot {
+                    states: HashMap::from([(
+                        component.id.clone(),
+                        ComponentWithState {
+                            state: ProtocolComponentState {
+                                component_id: component.id.clone(),
+                                attributes: HashMap::new(),
+                                balances: HashMap::new(),
+                            },
+                            component,
+                            component_tvl: Some(1.0),
+                            entrypoints: Vec::new(),
+                        },
+                    )]),
+                    vm_storage: HashMap::new(),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )]),
+        sync_states: HashMap::from([("uniswap_v2".to_owned(), SynchronizerState::Ready(header))]),
+    }
+}
+
+fn unchanged_catalog_feed() -> FeedMessage<BlockHeader> {
+    let header = block_header(120, 0x70, 0x6f);
+    FeedMessage {
+        state_msgs: HashMap::from([(
+            "uniswap_v2".to_owned(),
+            StateSyncMessage {
+                header: header.clone(),
+                snapshots: Snapshot::default(),
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )]),
+        sync_states: HashMap::from([("uniswap_v2".to_owned(), SynchronizerState::Ready(header))]),
+    }
+}
+
+fn catalog_change_feed(stream_token: Token) -> FeedMessage<BlockHeader> {
+    let header = block_header(121, 0x71, 0x70);
+    let mut changes = BlockAggregatedChanges::default();
+    changes
+        .new_tokens
+        .insert(stream_token.address.clone(), stream_token);
+    let component = protocol_component(
+        "stream-pool",
+        vec![token_address(0x22), token_address(0x33)],
+    );
+    changes
+        .new_protocol_components
+        .insert(component.id.clone(), component);
+    FeedMessage {
+        state_msgs: HashMap::from([(
+            "uniswap_v2".to_owned(),
+            StateSyncMessage {
+                header: header.clone(),
+                snapshots: Snapshot::default(),
+                deltas: Some(changes),
+                removed_components: HashMap::new(),
+            },
+        )]),
+        sync_states: HashMap::from([("uniswap_v2".to_owned(), SynchronizerState::Ready(header))]),
+    }
+}
+
+fn protocol_component(component_id: &str, tokens: Vec<Bytes>) -> ProtocolComponent {
+    ProtocolComponent {
+        id: component_id.to_owned(),
+        protocol_system: "uniswap_v2".to_owned(),
+        protocol_type_name: "uniswap_v2".to_owned(),
+        chain: Chain::Base,
+        tokens,
+        contract_addresses: Vec::new(),
+        static_attributes: HashMap::new(),
+        change: Default::default(),
+        creation_tx: Bytes::from([0x44; 32]),
+        created_at: Default::default(),
+    }
+}
+
+fn test_token(seed: u8, symbol: &str) -> Token {
+    Token::new(
+        &token_address(seed),
+        symbol,
+        18,
+        0,
+        &[Some(21_000)],
+        Chain::Base,
+        100,
+    )
+}
+
+fn token_address(seed: u8) -> Bytes {
+    Bytes::from([seed; 20])
+}
+
+fn block_header(number: u64, hash_seed: u8, parent_seed: u8) -> BlockHeader {
+    BlockHeader {
+        hash: Bytes::from([hash_seed; 32]),
+        number,
+        parent_hash: Bytes::from([parent_seed; 32]),
+        revert: false,
+        timestamp: number * 10,
+        partial_block_index: None,
+    }
 }
 
 fn assert_failed_boundary(failed_plan: &RangePlan, recorded_gap: RangeGap) -> anyhow::Result<()> {
@@ -179,6 +738,7 @@ async fn persist_checkpoint(
         id,
         &key,
         &encoded.info,
+        None,
         capture.block_times(),
         capture.position(),
         capture.chain_id(),

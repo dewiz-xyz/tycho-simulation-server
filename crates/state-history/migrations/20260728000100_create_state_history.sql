@@ -53,10 +53,23 @@ CREATE TABLE state_history.checkpoints (
     archive_sha256 TEXT,
     archive_bytes BIGINT,
     compressed_bytes BIGINT,
+    token_s3_key TEXT,
+    token_sha256 TEXT,
+    token_count BIGINT,
+    token_bytes BIGINT,
     status TEXT NOT NULL DEFAULT 'writing' CHECK (status IN ('writing', 'complete', 'failed')),
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
+    -- A partial token reference is unusable: readers cannot verify an object key without its hash.
+    -- Coupling to status makes the completion transaction the only writer of a reference.
+    CONSTRAINT checkpoints_token_reference_all_or_none CHECK (
+        num_nonnulls(token_s3_key, token_sha256, token_count, token_bytes) = 0
+        OR (
+            num_nonnulls(token_s3_key, token_sha256, token_count, token_bytes) = 4
+            AND status = 'complete'
+        )
+    ),
     UNIQUE (chain_id, generation, message_seq, kind)
 );
 CREATE INDEX checkpoints_selection ON state_history.checkpoints

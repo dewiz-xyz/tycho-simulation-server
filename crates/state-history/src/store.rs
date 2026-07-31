@@ -6,6 +6,7 @@ use sqlx::Connection;
 
 use crate::{
     BlockTimeObservation, CapturedState, CheckpointKind, DeltaEntry, GapRecord, StreamPosition,
+    TokenSnapshotRef,
 };
 
 const BLOCK_TIME_UPSERT: &str = r#"
@@ -273,15 +274,23 @@ impl StateHistoryStore {
         Ok(id)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn complete_checkpoint(
         conn: &mut sqlx::PgConnection,
         id: i64,
         s3_key: &str,
         archive: &EncodedArchiveInfo,
+        token_reference: Option<&TokenSnapshotRef>,
         block_times: &[BlockTimeObservation],
         source: StreamPosition,
         chain_id: u64,
     ) -> anyhow::Result<()> {
+        let token_count = token_reference
+            .map(|reference| db_i64(reference.token_count, "checkpoint token_count"))
+            .transpose()?;
+        let token_bytes = token_reference
+            .map(|reference| db_i64(reference.token_bytes, "checkpoint token_bytes"))
+            .transpose()?;
         let mut transaction = conn
             .begin()
             .await
@@ -289,7 +298,9 @@ impl StateHistoryStore {
         let result = sqlx::query(
             "UPDATE state_history.checkpoints
              SET s3_key = $2, archive_sha256 = $3, archive_bytes = $4,
-                 compressed_bytes = $5, status = 'complete', error = NULL, completed_at = now()
+                 compressed_bytes = $5, token_s3_key = $6, token_sha256 = $7,
+                 token_count = $8, token_bytes = $9, status = 'complete', error = NULL,
+                 completed_at = now()
              WHERE id = $1",
         )
         .bind(id)
@@ -300,6 +311,10 @@ impl StateHistoryStore {
             archive.compressed_bytes,
             "checkpoint compressed_bytes",
         )?)
+        .bind(token_reference.map(|reference| reference.s3_key.as_str()))
+        .bind(token_reference.map(|reference| reference.sha256.as_str()))
+        .bind(token_count)
+        .bind(token_bytes)
         .execute(&mut *transaction)
         .await
         .context("failed to complete state history checkpoint")?;
@@ -324,9 +339,11 @@ impl StateHistoryStore {
     }
 
     pub async fn fail_checkpoint(pool: &sqlx::PgPool, id: i64, error: &str) -> anyhow::Result<()> {
+        // A completed checkpoint can fail later, but a failed manifest must never expose a token reference.
         let result = sqlx::query(
             "UPDATE state_history.checkpoints
-             SET status = 'failed', error = $2, completed_at = now()
+             SET token_s3_key = NULL, token_sha256 = NULL, token_count = NULL,
+                 token_bytes = NULL, status = 'failed', error = $2, completed_at = now()
              WHERE id = $1",
         )
         .bind(id)
@@ -499,6 +516,69 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn checkpoint_token_reference_check_rejects_partial_columns(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let capture = test_capture(8453, 4, 20, CheckpointKind::Interval);
+        let mut connection = pool.acquire().await?;
+        let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
+        drop(connection);
+
+        let error = sqlx::query(
+            "UPDATE state_history.checkpoints
+             SET token_s3_key = $2
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind("state-history/chain=8453/tokens/partial.zst")
+        .execute(&pool)
+        .await
+        .err()
+        .context("partial token reference unexpectedly satisfied the CHECK constraint")?;
+
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.constraint()),
+            Some("checkpoints_token_reference_all_or_none")
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn checkpoint_token_reference_check_rejects_incomplete_status(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let capture = test_capture(8453, 4, 21, CheckpointKind::Interval);
+        let mut connection = pool.acquire().await?;
+        let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
+        drop(connection);
+
+        let error = sqlx::query(
+            "UPDATE state_history.checkpoints
+             SET token_s3_key = $2, token_sha256 = $3, token_count = 1, token_bytes = 64
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind("state-history/chain=8453/tokens/writing.zst")
+        .bind("writing-sha256")
+        .execute(&pool)
+        .await
+        .err()
+        .context("token reference on a writing row unexpectedly satisfied the CHECK constraint")?;
+
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.constraint()),
+            Some("checkpoints_token_reference_all_or_none")
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn checkpoint_lifecycle_writing_complete_failed(pool: PgPool) -> anyhow::Result<()> {
         // create → status 'writing'; complete_checkpoint writes s3 fields + block_times in one tx;
         // a second create at same (chain, gen, seq, kind) errors (UNIQUE); fail_checkpoint records error text.
@@ -518,6 +598,7 @@ mod tests {
             id,
             "checkpoints/8453/4/20.tar.zst",
             &archive,
+            None,
             &block_times,
             StreamPosition {
                 generation: 4,
@@ -583,6 +664,7 @@ mod tests {
             i64::MAX,
             "checkpoints/missing.tar.zst",
             &archive,
+            None,
             &[test_block_time("missing")],
             StreamPosition {
                 generation: 4,
