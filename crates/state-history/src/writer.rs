@@ -771,11 +771,13 @@ impl WriterTask {
             token_count: encoded.info.token_count,
             token_bytes: encoded.info.token_bytes,
         };
-        // Only the most recent successful PUT is memoized. A mismatch always writes.
+        // Only the most recent successful PUT is memoized. The full key is compared,
+        // not just the hash: a capture with a different S3 prefix must not reuse an
+        // object persisted under the old one. A mismatch always writes.
         if self
             .last_persisted_token
             .as_ref()
-            .is_some_and(|persisted| persisted.sha256 == reference.sha256)
+            .is_some_and(|persisted| persisted.s3_key == reference.s3_key)
         {
             return Some(reference);
         }
