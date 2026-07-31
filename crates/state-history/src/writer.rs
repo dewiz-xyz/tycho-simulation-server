@@ -780,8 +780,23 @@ impl WriterTask {
             return Some(reference);
         }
 
-        let put = self.put_token_snapshot(&reference.s3_key, encoded.bytes);
-        if let Err(error) = run_with_optional_deadline(deadline, "token snapshot upload", put).await
+        // A draining writer skips the PUT: the remaining deadline belongs to checkpoint
+        // completion, and token snapshots are enrichment the next capture recreates.
+        // Memo hits above still resolve because they cost nothing. Not a failure, so
+        // the memo and failure counter stay untouched.
+        if deadline.is_some() {
+            tracing::debug!(
+                chain_id = capture.chain_id(),
+                generation = capture.position().generation,
+                message_seq = capture.position().message_seq,
+                "skipped token snapshot persistence during writer drain"
+            );
+            return None;
+        }
+
+        if let Err(error) = self
+            .put_token_snapshot(&reference.s3_key, encoded.bytes)
+            .await
         {
             self.record_token_persistence_failure(capture, &error);
             return None;
@@ -1531,6 +1546,51 @@ mod tests {
             Some(first.sha256.as_str())
         );
         assert_eq!(token_object_count(BUCKET).await?, 1);
+        writer.shutdown(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn draining_writer_skips_token_persistence_without_recording_failure(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-writer-token-drain";
+        let probe = Arc::new(TokenPutProbe::default());
+        let writer = StateHistoryWriter::spawn_with_token_put_probe(
+            WriterConfig::default(),
+            writer_store(&pool).await?,
+            test_minio_store_for_bucket(BUCKET).await?,
+            Arc::new(NoBaseFee),
+            Arc::clone(&probe),
+        );
+
+        writer
+            .inner
+            .shutdown_deadline
+            .send_replace(Some(Instant::now() + Duration::from_secs(60)));
+        assert!(writer.request_checkpoint(test_capture_at(
+            50,
+            CheckpointKind::Interval,
+            test_token_snapshot(16),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 1).await?;
+        assert_eq!(checkpoint_token_reference(&pool, 50).await?, None);
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(writer.status().token_persistence_failures, 0);
+        assert_eq!(writer.status().checkpoints_failed, 0);
+
+        writer.inner.shutdown_deadline.send_replace(None);
+        assert!(writer.request_checkpoint(test_capture_at(
+            51,
+            CheckpointKind::Interval,
+            test_token_snapshot(16),
+        )));
+        wait_for_status(&writer, |status| status.checkpoints_completed == 2).await?;
+        checkpoint_token_reference(&pool, 51)
+            .await?
+            .context("post-drain checkpoint is missing its token reference")?;
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
         writer.shutdown(Duration::from_secs(5)).await;
         Ok(())
     }
