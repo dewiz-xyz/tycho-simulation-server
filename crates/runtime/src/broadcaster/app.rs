@@ -273,10 +273,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let (state_history_config, state_history) =
-        initialize_state_history(&config, Arc::clone(&tokens)).await?;
-    let redis_publisher =
-        build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let token_min_quality = u32::try_from(config.tuning.token_min_quality)
         .context("BROADCASTER_TOKEN_MIN_QUALITY must fit u32")?;
     let raw_cache = BroadcasterSnapshotCache::with_token_catalog(
@@ -285,6 +281,15 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         Arc::clone(&tokens),
         token_min_quality,
     );
+    // State history captures clone the store stream folds write into. Taking it
+    // from the cache keeps the snapshot superset guarantee a single-store fact.
+    let capture_tokens = raw_cache
+        .token_catalog_store()
+        .context("raw cache is missing its token catalog")?;
+    let (state_history_config, state_history) =
+        initialize_state_history(&config, capture_tokens).await?;
+    let redis_publisher =
+        build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
     let rfq_cache = rfq_backends

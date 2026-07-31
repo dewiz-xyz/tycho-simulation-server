@@ -402,6 +402,14 @@ impl BroadcasterSnapshotCache {
         )
     }
 
+    /// The store stream folds write into. Checkpoint captures must clone this
+    /// same store, or the snapshot superset guarantee silently splits in two.
+    pub fn token_catalog_store(&self) -> Option<Arc<TokenStore>> {
+        self.token_catalog
+            .as_ref()
+            .map(|catalog| Arc::clone(&catalog.tokens))
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_initial_generation(
         chain_id: u64,

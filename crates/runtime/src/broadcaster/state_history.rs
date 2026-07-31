@@ -255,6 +255,14 @@ pub(crate) fn test_state_history_runtime_with_tokens(
         tycho_simulation::tycho_common::models::Chain::Ethereum,
         std::time::Duration::from_secs(1),
     ));
+    test_state_history_runtime_with_store(queue_capacity, tokens)
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_history_runtime_with_store(
+    queue_capacity: usize,
+    tokens: Arc<TokenStore>,
+) -> (Arc<StateHistoryRuntime>, state_history::TestWriterProbe) {
     let (handle, probe) = state_history::test_writer_handle(queue_capacity);
     (
         Arc::new(StateHistoryRuntime::new(

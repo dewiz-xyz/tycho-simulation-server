@@ -3155,6 +3155,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_capture_clones_the_live_token_catalog() -> Result<()> {
+        // Pins that captures read the shared catalog store at capture time, not a
+        // copy taken when the runtime was built. A token folded from the stream
+        // after startup must reach the next capture's token snapshot.
+        let writer = ServiceFakeRedisWriter::default();
+        let store = Arc::new(crate::models::tokens::TokenStore::local_only(
+            Default::default(),
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+            Duration::from_secs(1),
+        ));
+        let (state_history, probe) =
+            super::super::state_history::test_state_history_runtime_with_store(
+                8,
+                Arc::clone(&store),
+            );
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+                .with_state_history(state_history),
+        );
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
+            .await?;
+
+        let token = dummy_token(9, "NINE");
+        store.insert_batch([token.clone()]).await;
+
+        let completed = BroadcasterServiceState::capture_state_history_checkpoint(
+            std::slice::from_ref(&service),
+            state_history::CheckpointKind::Interval,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(completed, Some(10));
+        timeout(Duration::from_secs(2), async {
+            while probe.token_snapshots().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("checkpoint token catalog was not enqueued"))?;
+        let token_snapshots = probe.token_snapshots();
+        assert_eq!(token_snapshots.len(), 1);
+        assert_eq!(token_snapshots[0].tokens.len(), 1);
+        assert_eq!(token_snapshots[0].tokens[0].address, token.address);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn state_history_recovery_commit_records_same_generation_boundary_slip_gap() -> Result<()>
     {
         let writer = ServiceFakeRedisWriter::default();
