@@ -547,6 +547,38 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn checkpoint_token_reference_check_rejects_incomplete_status(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let capture = test_capture(8453, 4, 21, CheckpointKind::Interval);
+        let mut connection = pool.acquire().await?;
+        let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
+        drop(connection);
+
+        let error = sqlx::query(
+            "UPDATE state_history.checkpoints
+             SET token_s3_key = $2, token_sha256 = $3, token_count = 1, token_bytes = 64
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind("state-history/chain=8453/tokens/writing.zst")
+        .bind("writing-sha256")
+        .execute(&pool)
+        .await
+        .err()
+        .context("token reference on a writing row unexpectedly satisfied the CHECK constraint")?;
+
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.constraint()),
+            Some("checkpoints_token_reference_all_or_none")
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn checkpoint_lifecycle_writing_complete_failed(pool: PgPool) -> anyhow::Result<()> {
         // create → status 'writing'; complete_checkpoint writes s3 fields + block_times in one tx;
         // a second create at same (chain, gen, seq, kind) errors (UNIQUE); fail_checkpoint records error text.
