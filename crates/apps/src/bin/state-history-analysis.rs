@@ -367,7 +367,7 @@ async fn checkpoint_capture(
         CheckpointKind::Interval,
         &export,
         capture_position,
-        Some(3),
+        3,
         block_number,
         None,
     )?;

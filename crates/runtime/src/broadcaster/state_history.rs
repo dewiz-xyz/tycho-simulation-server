@@ -81,7 +81,6 @@ impl StateHistoryUpdateProjection {
 
 pub(crate) struct BoundaryCheckpointRequest {
     pub(crate) position: StreamPosition,
-    pub(crate) state_version: u64,
     pub(crate) complete_native_block: Option<u64>,
     pub(crate) rfq_high_water_ms: Option<u64>,
     response: oneshot::Sender<Result<Option<u64>>>,
@@ -163,7 +162,6 @@ impl StateHistoryRuntime {
     pub(crate) async fn request_boundary_checkpoint(
         &self,
         position: StreamPosition,
-        state_version: u64,
         complete_native_block: Option<u64>,
         rfq_high_water_ms: Option<u64>,
     ) -> Result<Option<u64>> {
@@ -171,7 +169,6 @@ impl StateHistoryRuntime {
         self.boundary_requests
             .send(BoundaryCheckpointRequest {
                 position,
-                state_version,
                 complete_native_block,
                 rfq_high_water_ms,
                 response,
@@ -303,7 +300,7 @@ pub fn captured_state_from_export(
     kind: CheckpointKind,
     export: &BroadcasterSnapshotExport,
     position: StreamPosition,
-    state_version: Option<u64>,
+    state_version: u64,
     block_number: u64,
     rfq_observed_at_ms: Option<u64>,
 ) -> Result<CapturedState> {
@@ -361,7 +358,7 @@ pub fn captured_state_from_export(
     Ok(CapturedState::new(
         chain_id,
         position,
-        state_version,
+        Some(state_version),
         kind,
         block_number,
         rfq_observed_at_ms,
@@ -541,7 +538,7 @@ mod tests {
                 generation: 2,
                 message_seq: 12,
             },
-            None,
+            7,
             block_number,
             Some(1_710_000_000_000),
         ) else {
@@ -562,7 +559,7 @@ mod tests {
                 generation: 2,
                 message_seq: 1,
             },
-            None,
+            7,
             19_000_000,
             Some(1_710_000_000_000),
         )?;

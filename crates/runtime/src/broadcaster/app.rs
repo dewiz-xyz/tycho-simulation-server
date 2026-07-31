@@ -713,7 +713,6 @@ fn spawn_promotion_task(
                         let checkpoint = BroadcasterServiceState::capture_state_history_checkpoint(
                             &services,
                             CheckpointKind::Boundary,
-                            None,
                             Some(position),
                             requested_block_number,
                             requested_rfq_observed_at_ms,
@@ -814,7 +813,6 @@ fn spawn_state_history_checkpoint_task(
                     let result = BroadcasterServiceState::capture_state_history_checkpoint(
                         &services,
                         CheckpointKind::Boundary,
-                        Some(request.state_version),
                         Some(request.position),
                         request.complete_native_block,
                         request.rfq_high_water_ms,
@@ -839,7 +837,6 @@ fn spawn_state_history_checkpoint_task(
                     match BroadcasterServiceState::capture_state_history_checkpoint(
                         &services,
                         CheckpointKind::Interval,
-                        None,
                         None,
                         None,
                         None,

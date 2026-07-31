@@ -688,7 +688,6 @@ impl BroadcasterServiceState {
     pub(crate) async fn capture_state_history_checkpoint(
         services: &[Self],
         kind: CheckpointKind,
-        state_version: Option<u64>,
         position: Option<StreamPosition>,
         requested_block_number: Option<u64>,
         requested_rfq_observed_at_ms: Option<u64>,
@@ -785,11 +784,12 @@ impl BroadcasterServiceState {
         drop(gate);
 
         state_history.observe_rfq_export(&export)?;
+        // Only the pinned boundary version is guaranteed to describe this exported world.
         let state = crate::broadcaster::state_history::captured_state_from_export(
             kind,
             &export,
             capture_position,
-            state_version,
+            boundary.state_version,
             block_number,
             rfq_observed_at_ms,
         )?;
@@ -1293,7 +1293,6 @@ impl BroadcasterServiceState {
                 "Aligned Tycho replacement state published and committed"
             );
             let commit_position = publication.commit_position;
-            let target_state_version = publication.target_state_version;
 
             {
                 let mut recovery = self.recovery_publication.lock().await;
@@ -1318,7 +1317,6 @@ impl BroadcasterServiceState {
                     let checkpoint = state_history
                         .request_boundary_checkpoint(
                             commit_position,
-                            target_state_version,
                             block_number,
                             rfq_observed_at_ms,
                         )
@@ -3048,7 +3046,6 @@ mod tests {
             let result = BroadcasterServiceState::capture_state_history_checkpoint(
                 std::slice::from_ref(&checkpoint_service),
                 state_history::CheckpointKind::Boundary,
-                Some(request.state_version),
                 Some(request.position),
                 request.complete_native_block,
                 request.rfq_high_water_ms,
@@ -3084,7 +3081,11 @@ mod tests {
             checkpoints[0].kind(),
             state_history::CheckpointKind::Boundary
         );
-        assert!(checkpoints[0].state_version().is_some());
+        let capture_boundary = service.redis_publisher.replay_boundary().await?;
+        assert_eq!(
+            checkpoints[0].state_version(),
+            Some(capture_boundary.state_version)
+        );
         let requested = position_receiver
             .await
             .map_err(|_| anyhow!("recovery boundary checkpoint position was not captured"))?;
@@ -3126,7 +3127,6 @@ mod tests {
         let completed = BroadcasterServiceState::capture_state_history_checkpoint(
             std::slice::from_ref(&service),
             state_history::CheckpointKind::Interval,
-            None,
             None,
             None,
             None,
@@ -3200,7 +3200,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await?;
 
@@ -3253,7 +3252,6 @@ mod tests {
                 BroadcasterServiceState::capture_state_history_checkpoint(
                     std::slice::from_ref(&checkpoint_service),
                     state_history::CheckpointKind::Boundary,
-                    Some(request.state_version),
                     Some(request.position),
                     request.complete_native_block,
                     request.rfq_high_water_ms,
@@ -3291,6 +3289,11 @@ mod tests {
 
         let checkpoints = probe.checkpoints();
         assert_eq!(checkpoints.len(), 1);
+        let capture_boundary = service.redis_publisher.replay_boundary().await?;
+        assert_eq!(
+            checkpoints[0].state_version(),
+            Some(capture_boundary.state_version)
+        );
         let capture_position = checkpoints[0].position();
         let expected_from_message_seq = requested
             .message_seq
@@ -3408,7 +3411,6 @@ mod tests {
         let completed = BroadcasterServiceState::capture_state_history_checkpoint(
             std::slice::from_ref(&service),
             state_history::CheckpointKind::Boundary,
-            None,
             Some(state_history::StreamPosition {
                 generation: promotion_boundary.generation,
                 message_seq: promotion_boundary.exclusive_message_seq,
@@ -3434,6 +3436,10 @@ mod tests {
                 generation: pin_time_boundary.generation,
                 message_seq: pin_time_boundary.exclusive_message_seq,
             }
+        );
+        assert_eq!(
+            checkpoints[0].state_version(),
+            Some(pin_time_boundary.state_version)
         );
         assert!(pin_time_boundary.exclusive_message_seq > promotion_boundary.exclusive_message_seq);
         Ok(())

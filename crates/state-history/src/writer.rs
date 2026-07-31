@@ -908,10 +908,14 @@ impl WriterTask {
         let mut stopped = GapAccumulator::default();
         // The first command was already received, so include it with the commands still queued.
         if let Some(command) = first {
-            stopped.merge(command_gap(&command, GapReason::WriterStopped));
+            if let Some(gap) = command_gap(&command, GapReason::WriterStopped) {
+                stopped.merge(gap);
+            }
         }
         while let Ok(command) = self.commands.try_recv() {
-            stopped.merge(command_gap(&command, GapReason::WriterStopped));
+            if let Some(gap) = command_gap(&command, GapReason::WriterStopped) {
+                stopped.merge(gap);
+            }
         }
         let mut gaps = lock(&self.gaps);
         for gap in stopped.drain() {
@@ -947,10 +951,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn command_gap(command: &WriterCommand, reason: GapReason) -> GapRecord {
+fn command_gap(command: &WriterCommand, reason: GapReason) -> Option<GapRecord> {
     match command {
-        WriterCommand::Delta(delta) => delta_gap(delta, reason),
-        WriterCommand::Checkpoint(capture) => checkpoint_gap(capture.state(), reason),
+        WriterCommand::Delta(delta) => Some(delta_gap(delta, reason)),
+        // Interval checkpoints are replay accelerators, not lineage. Abandoning one
+        // loses no data, so a gap here would fail ranges that replay fine, matching
+        // the boundary-only rule in process_checkpoint.
+        WriterCommand::Checkpoint(capture)
+            if capture.state().kind() == CheckpointKind::Interval =>
+        {
+            None
+        }
+        WriterCommand::Checkpoint(capture) => Some(checkpoint_gap(capture.state(), reason)),
     }
 }
 
@@ -1156,6 +1168,25 @@ mod tests {
         Backend, BlockTimeObservation, CapturedState, CheckpointKind, CheckpointObjectStore,
         DeltaBackendCursor, DeltaEntry, GapReason, StateHistoryStore, StreamPosition,
     };
+
+    #[test]
+    fn stopped_interval_checkpoint_leaves_no_gap() {
+        assert!(command_gap(
+            &WriterCommand::Checkpoint(test_capture()),
+            GapReason::WriterStopped
+        )
+        .is_none());
+        let boundary = command_gap(
+            &WriterCommand::Checkpoint(test_boundary_capture()),
+            GapReason::WriterStopped,
+        );
+        assert!(boundary.is_some_and(|gap| gap.reason == GapReason::WriterStopped));
+        let delta = command_gap(
+            &WriterCommand::Delta(test_delta(3)),
+            GapReason::WriterStopped,
+        );
+        assert!(delta.is_some_and(|gap| gap.reason == GapReason::WriterStopped));
+    }
 
     #[test]
     fn gap_accumulator_coalesces_adjacent_and_overlapping() {

@@ -279,6 +279,8 @@ ORDER BY db.backend;
 
 Each `RangeLeg` contains a `CheckpointManifest` and zero or more ordered deltas to apply after that checkpoint. Boundary discovery uses the request end rather than the last stored delta. For every requested backend represented by a boundary, its checkpoint cursor must be at or below that backend's requested end. A trailing boundary can therefore close a range without a later delta, producing a leg with zero deltas.
 
+Delta payloads are stored and returned exactly as published. They are never truncated or rewritten. The backend list returned with each delta is filtered to the requested backends and range end, and replay consumers must apply only the partitions named there. A delta can contain one backend cursor inside the range and another beyond its end, so applying its whole payload would advance state past the requested end.
+
 `StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, downloads its S3 object, verifies the archive digest, and returns the decoded `CheckpointArchive`.
 
 Each checkpoint manifest exposes `token_reference: Option<TokenSnapshotRef>`. A checkpoint captured without a token reference returns `None`. It remains a valid replay anchor and never creates a gap. Range selection, `ensure_gap_free`, and backtest admission do not check token references.
