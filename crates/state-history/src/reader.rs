@@ -148,7 +148,13 @@ impl StateHistoryReader {
         &self,
         reference: &TokenSnapshotRef,
     ) -> anyhow::Result<RawTokenSnapshot> {
-        let bytes = self.objects.fetch(&reference.s3_key).await?;
+        // The object store's own context says "checkpoint object"; name the token
+        // snapshot here so a missing or corrupt sidecar is not triaged as an archive.
+        let bytes = self
+            .objects
+            .fetch(&reference.s3_key)
+            .await
+            .with_context(|| format!("failed to fetch token snapshot {}", reference.s3_key))?;
         decode_token_snapshot_raw(&bytes, &reference.sha256)
     }
 
@@ -2787,9 +2793,10 @@ mod tests {
             .err()
             .context("missing token snapshot must fail")?;
 
-        assert!(error.to_string().contains(&format!(
-            "failed to fetch checkpoint object s3://{BUCKET}/{key}"
-        )));
+        assert!(error
+            .to_string()
+            .contains(&format!("failed to fetch token snapshot {key}")));
+        assert!(format!("{error:#}").contains(&format!("s3://{BUCKET}/{key}")));
         Ok(())
     }
 
