@@ -321,8 +321,9 @@ async fn encode_attempt(
     prepared: &PreparedEncodeRoute,
     attempt_number: AttemptNumber,
 ) -> EncodeAttempt {
-    // Hints can mislabel a native pool as VM or RFQ, so pin before the route resolves its
-    // authoritative backends. The resolved native IDs decide whether the fence is armed.
+    // Protocol hints can label a native pool VM or RFQ, and the component-resolved lookup
+    // still serves it, so neither the pin nor the fence can follow backend_usage. Pin
+    // every attempt and key the fence on the pools the attempt resolved as native.
     let native_pin = state.native_state_store.pin().await;
     let execution =
         encode_attempt_with_pin(state, prepared, attempt_number, native_pin.clone()).await;
@@ -388,8 +389,11 @@ async fn encode_attempt_with_pin(
             }
         }
         Err(error) => {
-            // A failure can happen before every pool resolves. Hinted native IDs are safe to
-            // include because absent IDs compare as unchanged, while resolved IDs must survive.
+            // Failure can strike before every pool resolves, so widen the resolved view
+            // with the hinted pools. An id wrongly treated as native never registers as
+            // changed, while a missed RFQ hop would let a retry approved under the native
+            // floor run a firm quote inside block_in_place that the request timeout cannot
+            // interrupt.
             let mut native_pool_ids = resimulation.native_pool_ids;
             native_pool_ids.extend(normalized_native_pool_ids(&prepared.normalized));
             EncodeAttemptExecution {
@@ -480,6 +484,8 @@ impl NativeAttemptFence {
     }
 
     async fn evaluate(&self, state: &AppState) -> Option<NativeFenceEvaluation> {
+        // Every attempt holds a pin, but a route with no native pools must stay
+        // independent of native readiness, so only native involvement arms the fence.
         if self.native_pool_ids.is_empty() {
             return None;
         }

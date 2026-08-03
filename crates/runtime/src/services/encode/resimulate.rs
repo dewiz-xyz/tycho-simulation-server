@@ -124,6 +124,8 @@ pub(super) async fn resimulate_route_with_native_pin(
             native_token_protocol_allowlist,
         )
         .await;
+    // The fence needs the component-resolved backends even when the route failed partway,
+    // so the resolved view survives the result either way.
     let (native_pool_ids, uses_rfq) = resimulator.resolved_backends();
     ResimulationOutcome {
         result,
@@ -158,7 +160,7 @@ impl<'a> RouteResimulator<'a> {
         request_token_out: &Bytes,
         native_token_protocol_allowlist: &[String],
     ) -> Result<ResimulatedRouteInternal, AttemptError> {
-        // Resimulate in hop depth order to match build_route_swaps execution order.
+        // Resimulate in hop-depth order to match build_route_swaps execution order.
         for hop_index in 0..self.max_hop_depth() {
             for segment_index in 0..self.normalized.segments.len() {
                 self.resimulate_segment_hop(segment_index, hop_index)
@@ -176,14 +178,15 @@ impl<'a> RouteResimulator<'a> {
         Ok(ResimulatedRouteInternal { segments })
     }
 
-    // The cache records the authoritative backend as each pool resolves, including any
-    // progress made before a later pool fails.
+    // The cache holds exactly the pools the route loaded so far, including pools the store
+    // fallback served that are absent from the pin. Publication compares work by ID because
+    // reused pools carry route-local state Arcs.
     fn resolved_backends(&self) -> (HashSet<String>, bool) {
         let native_pool_ids = self
             .pool_cache
             .iter()
             .filter(|(_, entry)| entry.backend.is_native())
-            .map(|(pool_id, _)| pool_id.clone())
+            .map(|(id, _)| id.clone())
             .collect();
         let uses_rfq = self.pool_cache.values().any(|entry| entry.backend.is_rfq());
         (native_pool_ids, uses_rfq)

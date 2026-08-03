@@ -221,7 +221,9 @@ The repo-local analyzer uses a SimpleSwap, MultiSwap, and MegaSwap route matrix 
 Each encode attempt pins native state at the start and resimulates the route from that pin. Before
 returning, the service compares the route's own pools between the pinned and current published
 state by allocation identity. Updates that do not touch the route's pools never invalidate an
-encode.
+encode. The pin always covers the whole native publication and the fence keys on the pools the
+attempt actually resolved as native, so a request protocol hint that mislabels a native pool as
+VM or RFQ does not bypass the fence.
 
 If the route's pools did change, the service re-pins and retries once internally, whether the first
 attempt produced a result or a state-dependent error. Both attempts share the request timeout, and

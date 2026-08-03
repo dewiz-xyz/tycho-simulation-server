@@ -1255,6 +1255,8 @@ async fn encode_route_returns_deterministic_error_without_retry_after_publicatio
 
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_route_retries_for_native_pool_with_vm_protocol_hint() -> Result<()> {
+    // The hint says VM but the stored component is native. The fence must still hold a
+    // pin for the component-resolved native pool and catch the mid-attempt update.
     let config = EncodeFixtureConfig {
         request_pool_protocol: "vm:maverick_v2",
         enable_vm_pools: true,
