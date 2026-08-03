@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::future::select_all;
 use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
@@ -52,6 +53,7 @@ pub struct BroadcasterAppState {
     snapshot_session_ttl: Duration,
     last_reported_readiness: Arc<tokio::sync::Mutex<Option<BroadcasterReadiness>>>,
     state_history: Option<Arc<StateHistoryRuntime>>,
+    stop: CancellationToken,
 }
 
 impl BroadcasterAppState {
@@ -72,11 +74,17 @@ impl BroadcasterAppState {
             snapshot_session_ttl,
             last_reported_readiness: Arc::new(tokio::sync::Mutex::new(None)),
             state_history: None,
+            stop: CancellationToken::new(),
         }
     }
 
     pub fn with_state_history(mut self, state_history: Option<Arc<StateHistoryRuntime>>) -> Self {
         self.state_history = state_history;
+        self
+    }
+
+    fn with_stop(mut self, stop: CancellationToken) -> Self {
+        self.stop = stop;
         self
     }
 
@@ -206,6 +214,22 @@ impl BroadcasterAppState {
 
     pub fn begin_shutdown(&self) {
         self.redis_publisher.begin_shutdown();
+        self.stop.cancel();
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+
+    pub async fn stop_recovery_tasks(&self) {
+        if let Some(rfq_service) = &self.rfq_service {
+            tokio::join!(
+                self.raw_service.stop_recovery_tasks(),
+                rfq_service.stop_recovery_tasks()
+            );
+        } else {
+            self.raw_service.stop_recovery_tasks().await;
+        }
     }
 
     pub async fn shutdown_state_history(&self) {
@@ -252,10 +276,47 @@ impl BroadcasterAppState {
     }
 }
 
+pub struct BroadcasterTasks {
+    stop: CancellationToken,
+    feed_tasks: Vec<tokio::task::JoinHandle<()>>,
+    promotion_task: tokio::task::JoinHandle<()>,
+    heartbeat_task: tokio::task::JoinHandle<()>,
+}
+
+impl BroadcasterTasks {
+    pub async fn wait_for_feed(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.feed_tasks.is_empty(),
+            "No broadcaster feed tasks were started"
+        );
+        let (result, finished_index, remaining) = select_all(self.feed_tasks.iter_mut()).await;
+        drop(remaining);
+        self.feed_tasks.swap_remove(finished_index);
+        result.context("Broadcaster feed task failed")
+    }
+
+    pub async fn stop_and_wait(self) -> Result<()> {
+        self.stop.cancel();
+        let mut first_error = None;
+        for task in self
+            .feed_tasks
+            .into_iter()
+            .chain([self.promotion_task, self.heartbeat_task])
+        {
+            if let Err(error) = task.await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |error| {
+            Err(anyhow::anyhow!("Broadcaster task failed: {error}"))
+        })
+    }
+}
+
 pub struct BroadcasterServiceParts {
     pub config: BroadcasterConfig,
     pub app_state: BroadcasterAppState,
-    pub supervisors: Vec<tokio::task::JoinHandle<()>>,
+    pub tasks: BroadcasterTasks,
 }
 
 #[expect(
@@ -291,6 +352,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let redis_publisher =
         build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let raw_upstream_state = BroadcasterUpstreamState::default();
+    let stop = CancellationToken::new();
     let rfq_backends = rfq_configured_backends(&config);
     let rfq_cache = rfq_backends
         .as_ref()
@@ -344,6 +406,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
             supervisor_cfg.clone(),
             service.clone(),
             rfq_token_stores,
+            stop.clone(),
         ));
         Some(service)
     } else {
@@ -355,10 +418,11 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     };
     // New broadcasters warm their caches while passive. Readiness stays closed
     // until this local promotion loop wins the writer fence.
-    spawn_promotion_task(
+    let promotion_task = spawn_promotion_task(
         generation_services.clone(),
         Duration::from_secs(1),
         state_history.clone(),
+        stop.clone(),
     );
     spawn_snapshot_artifact_refresh_task(generation_services.clone(), Duration::from_secs(5 * 60));
     start_state_history_checkpoint_task(
@@ -371,8 +435,10 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         supervisor_cfg.clone(),
         Arc::clone(&raw_health),
         raw_service.clone(),
+        stop.clone(),
     ));
-    spawn_heartbeat_task(generation_services, heartbeat_interval);
+    let heartbeat_task =
+        spawn_heartbeat_task(generation_services, heartbeat_interval, stop.clone());
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
     let app_state = BroadcasterAppState::with_snapshot_session_ttl(
         raw_service,
@@ -382,13 +448,19 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         snapshot_session_ttl,
         redis_publisher,
     )
-    .with_state_history(state_history);
+    .with_state_history(state_history)
+    .with_stop(stop.clone());
     spawn_broadcaster_health_snapshot_task(app_state.clone(), heartbeat_interval);
 
     Ok(BroadcasterServiceParts {
         config,
         app_state,
-        supervisors,
+        tasks: BroadcasterTasks {
+            stop,
+            feed_tasks: supervisors,
+            promotion_task,
+            heartbeat_task,
+        },
     })
 }
 
@@ -546,6 +618,7 @@ fn spawn_broadcaster_stream_task(
     supervisor_cfg: StreamSupervisorConfig,
     health: Arc<StreamHealth>,
     service: BroadcasterServiceState,
+    stop: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tycho_url = config.tycho_url.clone();
@@ -578,7 +651,7 @@ fn spawn_broadcaster_stream_task(
             },
             health,
             supervisor_cfg,
-            BroadcasterStreamControls { service },
+            BroadcasterStreamControls { service, stop },
         )
         .await;
     })
@@ -589,6 +662,7 @@ fn spawn_broadcaster_rfq_stream_task(
     supervisor_cfg: StreamSupervisorConfig,
     service: BroadcasterServiceState,
     token_stores: RFQTokenStores,
+    stop: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tvl_threshold = config.tvl_threshold;
@@ -616,18 +690,26 @@ fn spawn_broadcaster_rfq_stream_task(
             },
             health,
             supervisor_cfg,
-            BroadcasterStreamControls { service },
+            BroadcasterStreamControls { service, stop },
         )
         .await;
     })
 }
 
-fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
+fn spawn_heartbeat_task(
+    services: Vec<BroadcasterServiceState>,
+    interval: Duration,
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             for service in &services {
                 if let Err(error) = service.broadcast_heartbeat().await {
                     info!(
@@ -638,7 +720,7 @@ fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Durati
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interval: Duration) {
@@ -651,17 +733,26 @@ fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interv
     });
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "promotion and its history checkpoint stay together so shutdown can await both"
+)]
 fn spawn_promotion_task(
     services: Vec<BroadcasterServiceState>,
     interval: Duration,
     state_history: Option<Arc<StateHistoryRuntime>>,
-) {
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         let mut refreshing_recovered_snapshot = false;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             let mode = services[0].publisher_mode().await;
             let result = match mode {
                 BroadcasterRedisPublisherMode::Passive => {
@@ -754,7 +845,7 @@ fn spawn_promotion_task(
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_snapshot_artifact_refresh_task(
@@ -873,12 +964,42 @@ fn spawn_state_history_checkpoint_task(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use simulator_core::broadcaster::BroadcasterBackend;
+    use tokio_util::sync::CancellationToken;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
-    use super::{raw_configured_backends, rfq_configured_backends};
+    use super::{raw_configured_backends, rfq_configured_backends, BroadcasterTasks};
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
+
+    #[tokio::test]
+    async fn stopping_tasks_waits_for_every_running_task() -> anyhow::Result<()> {
+        let stop = CancellationToken::new();
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let wait_for_stop = |stop: CancellationToken, stopped: Arc<AtomicUsize>| {
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                stopped.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let mut tasks = BroadcasterTasks {
+            stop: stop.clone(),
+            feed_tasks: vec![
+                tokio::spawn(async {}),
+                wait_for_stop(stop.clone(), Arc::clone(&stopped)),
+            ],
+            promotion_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
+            heartbeat_task: wait_for_stop(stop, Arc::clone(&stopped)),
+        };
+
+        tasks.wait_for_feed().await?;
+        tasks.stop_and_wait().await?;
+
+        assert_eq!(stopped.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
 
     fn test_config() -> BroadcasterConfig {
         BroadcasterConfig {

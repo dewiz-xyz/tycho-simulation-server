@@ -308,17 +308,10 @@ impl WriterHandle {
         drop(lock(&self.inner.commands).take());
         let join = lock(&self.inner.join).take();
         if let Some(join) = join {
-            match tokio::time::timeout_at(deadline + GAP_SHUTDOWN_GRACE, join).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::error!(%error, "state history writer task failed");
-                    self.inner.status.send_modify(|status| {
-                        status.healthy = false;
-                        status.last_error = Some(error.to_string());
-                    });
-                }
+            match join.await {
+                Ok(()) => {}
                 Err(error) => {
-                    tracing::error!(%error, "state history writer exceeded shutdown grace");
+                    tracing::error!(%error, "state history writer task failed");
                     self.inner.status.send_modify(|status| {
                         status.healthy = false;
                         status.last_error = Some(error.to_string());
@@ -555,44 +548,44 @@ impl WriterTask {
         let base_fees = self.resolve_base_fees(delta).await;
         let started_at = Instant::now();
         let retry_deadline = started_at + self.config.retry_window;
-        // The minimum preserves the retry window without letting a delta outlast shutdown.
-        let deadline = self
-            .shutdown_deadline()
-            .map_or(retry_deadline, |shutdown| shutdown.min(retry_deadline));
+        let shutdown_deadline = self.shutdown_deadline.clone();
         let mut delays = retry_delays(self.config.retry_window);
-
-        loop {
-            let attempt = async {
-                let mut transaction = self
-                    .store
-                    .pool()
-                    .begin()
-                    .await
-                    .context("failed to start delta transaction")?;
-                StateHistoryStore::insert_delta(&mut transaction, delta, &base_fees).await?;
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit delta transaction")
-            };
-            let result = run_before_deadline(deadline, "delta persistence", attempt).await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) if is_permanent_persistence_error(&error) => return Err(error),
-                Err(error) => {
-                    let Some(delay) = delays.next() else {
-                        return Err(error);
-                    };
-                    let Some(next_attempt_at) = Instant::now().checked_add(delay) else {
-                        return Err(error);
-                    };
-                    if next_attempt_at > deadline {
-                        return Err(error);
+        let persistence = async {
+            loop {
+                let attempt = async {
+                    let mut transaction = self
+                        .store
+                        .pool()
+                        .begin()
+                        .await
+                        .context("failed to start delta transaction")?;
+                    StateHistoryStore::insert_delta(&mut transaction, delta, &base_fees).await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit delta transaction")
+                };
+                let result =
+                    run_before_deadline(retry_deadline, "delta persistence", attempt).await;
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) if is_permanent_persistence_error(&error) => return Err(error),
+                    Err(error) => {
+                        let Some(delay) = delays.next() else {
+                            return Err(error);
+                        };
+                        let Some(next_attempt_at) = Instant::now().checked_add(delay) else {
+                            return Err(error);
+                        };
+                        if next_attempt_at > retry_deadline {
+                            return Err(error);
+                        }
+                        tokio::time::sleep_until(next_attempt_at).await;
                     }
-                    tokio::time::sleep_until(next_attempt_at).await;
                 }
             }
-        }
+        };
+        run_until_shutdown_deadline(shutdown_deadline, "delta persistence", persistence).await
     }
 
     async fn resolve_base_fees(&mut self, delta: &DeltaEntry) -> BTreeMap<u64, String> {
@@ -655,17 +648,18 @@ impl WriterTask {
             token_snapshot,
             token_s3_prefix,
         } = capture;
-        let deadline = self.shutdown_deadline();
-        let checkpoint_id = run_with_optional_deadline(deadline, "checkpoint creation", async {
-            let mut connection = self
-                .store
-                .pool()
-                .acquire()
-                .await
-                .context("failed to acquire checkpoint connection")?;
-            StateHistoryStore::create_checkpoint(&mut connection, &state).await
-        })
-        .await?;
+        let shutdown_deadline = self.shutdown_deadline.clone();
+        let checkpoint_id =
+            run_until_shutdown_deadline(shutdown_deadline.clone(), "checkpoint creation", async {
+                let mut connection = self
+                    .store
+                    .pool()
+                    .acquire()
+                    .await
+                    .context("failed to acquire checkpoint connection")?;
+                StateHistoryStore::create_checkpoint(&mut connection, &state).await
+            })
+            .await?;
 
         let result = self
             .finish_checkpoint(
@@ -673,22 +667,36 @@ impl WriterTask {
                 &state,
                 token_snapshot,
                 &token_s3_prefix,
-                deadline,
+                shutdown_deadline.clone(),
             )
             .await;
         if let Err(error) = &result {
-            if let Err(mark_error) = StateHistoryStore::fail_checkpoint(
-                self.store.pool(),
-                checkpoint_id,
-                &error.to_string(),
+            let error_message = error.to_string();
+            match run_until_shutdown_bound(
+                shutdown_deadline,
+                Duration::ZERO,
+                StateHistoryStore::fail_checkpoint(
+                    self.store.pool(),
+                    checkpoint_id,
+                    &error_message,
+                ),
             )
             .await
             {
-                tracing::error!(
-                    checkpoint_id,
-                    %mark_error,
-                    "failed to mark state history checkpoint as failed"
-                );
+                Some(Ok(())) => {}
+                Some(Err(mark_error)) => {
+                    tracing::error!(
+                        checkpoint_id,
+                        %mark_error,
+                        "failed to mark state history checkpoint as failed"
+                    );
+                }
+                None => {
+                    tracing::error!(
+                        checkpoint_id,
+                        "timed out while marking state history checkpoint as failed"
+                    );
+                }
             }
         }
         result
@@ -700,7 +708,7 @@ impl WriterTask {
         capture: &CapturedState,
         token_snapshot: TokenSnapshot,
         token_s3_prefix: &str,
-        deadline: Option<Instant>,
+        shutdown_deadline: watch::Receiver<Option<Instant>>,
     ) -> anyhow::Result<()> {
         let archive = CheckpointArchive {
             metadata: ArchiveMetadata {
@@ -716,7 +724,7 @@ impl WriterTask {
             payloads_json: capture.payloads_json().to_vec(),
         };
         let (encoded, encoded_token_snapshot) =
-            run_with_optional_deadline(deadline, "checkpoint encoding", async {
+            run_until_shutdown_deadline(shutdown_deadline.clone(), "checkpoint encoding", async {
                 tokio::task::spawn_blocking(move || {
                     let encoded_archive = encode_archive(archive)?;
                     let encoded_token_snapshot = encode_token_snapshot(token_snapshot);
@@ -730,16 +738,21 @@ impl WriterTask {
             .objects
             .key_for(capture.chain_id(), capture.position(), capture.kind());
         let archive_info = encoded.info;
-        run_with_optional_deadline(
-            deadline,
+        run_until_shutdown_deadline(
+            shutdown_deadline.clone(),
             "checkpoint upload",
             self.objects.put(&key, encoded.bytes),
         )
         .await?;
         let token_reference = self
-            .resolve_token_reference(capture, token_s3_prefix, encoded_token_snapshot, deadline)
+            .resolve_token_reference(
+                capture,
+                token_s3_prefix,
+                encoded_token_snapshot,
+                shutdown_deadline.clone(),
+            )
             .await;
-        run_with_optional_deadline(deadline, "checkpoint completion", async {
+        run_until_shutdown_deadline(shutdown_deadline, "checkpoint completion", async {
             let mut connection = self
                 .store
                 .pool()
@@ -766,7 +779,7 @@ impl WriterTask {
         capture: &CapturedState,
         token_s3_prefix: &str,
         encoded: anyhow::Result<EncodedTokenSnapshot>,
-        deadline: Option<Instant>,
+        shutdown_deadline: watch::Receiver<Option<Instant>>,
     ) -> Option<TokenSnapshotRef> {
         let encoded = match encoded {
             Ok(encoded) => encoded,
@@ -800,7 +813,7 @@ impl WriterTask {
         // completion, and token snapshots are enrichment the next capture recreates.
         // Memo hits above still resolve because they cost nothing. Not a failure, so
         // the memo and failure counter stay untouched.
-        if deadline.is_some() {
+        if shutdown_deadline.borrow().is_some() {
             tracing::debug!(
                 chain_id = capture.chain_id(),
                 generation = capture.position().generation,
@@ -810,12 +823,27 @@ impl WriterTask {
             return None;
         }
 
-        if let Err(error) = self
-            .put_token_snapshot(&reference.s3_key, encoded.bytes)
-            .await
+        match run_until_shutdown_bound(
+            shutdown_deadline,
+            Duration::ZERO,
+            self.put_token_snapshot(&reference.s3_key, encoded.bytes),
+        )
+        .await
         {
-            self.record_token_persistence_failure(capture, &error);
-            return None;
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                self.record_token_persistence_failure(capture, &error);
+                return None;
+            }
+            None => {
+                tracing::debug!(
+                    chain_id = capture.chain_id(),
+                    generation = capture.position().generation,
+                    message_seq = capture.position().message_seq,
+                    "stopped token snapshot persistence during writer drain"
+                );
+                return None;
+            }
         }
 
         self.last_persisted_token = Some(reference.clone());
@@ -1041,17 +1069,14 @@ async fn run_before_deadline<T>(
         .with_context(|| format!("{operation} exceeded its retry deadline"))?
 }
 
-async fn run_with_optional_deadline<T>(
-    deadline: Option<Instant>,
+async fn run_until_shutdown_deadline<T>(
+    shutdown_deadline: watch::Receiver<Option<Instant>>,
     operation: &str,
     future: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, future)
-            .await
-            .with_context(|| format!("{operation} exceeded the shutdown drain timeout"))?,
-        None => future.await,
-    }
+    run_until_shutdown_bound(shutdown_deadline, Duration::ZERO, future)
+        .await
+        .with_context(|| format!("{operation} exceeded the shutdown drain timeout"))?
 }
 
 async fn run_until_shutdown_bound<T>(
@@ -1733,6 +1758,74 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn shutdown_records_gap_for_write_already_in_progress(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let mut table_lock = pool.begin().await?;
+        sqlx::query("LOCK TABLE state_history.deltas IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *table_lock)
+            .await?;
+        let writer = StateHistoryWriter::spawn(
+            WriterConfig {
+                queue_capacity: 8,
+                retry_window: Duration::from_secs(30),
+            },
+            writer_store(&pool).await?,
+            test_object_store("state-history-writer-unused").await,
+            Arc::new(NoBaseFee),
+        );
+
+        assert!(writer.enqueue_delta(test_delta(1)));
+        wait_for_query_waiting_on_lock(&pool, "INSERT INTO state_history.deltas").await?;
+        writer.shutdown(Duration::from_millis(100)).await;
+
+        let reason: String = sqlx::query_scalar(
+            "SELECT reason FROM state_history.gaps
+             WHERE chain_id = 8453 AND generation = 7 AND from_message_seq = 1",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(reason, "write_failed");
+        table_lock.rollback().await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn shutdown_records_gap_for_checkpoint_already_in_progress(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let mut table_lock = pool.begin().await?;
+        sqlx::query("LOCK TABLE state_history.checkpoints IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *table_lock)
+            .await?;
+        let writer = StateHistoryWriter::spawn(
+            WriterConfig {
+                queue_capacity: 8,
+                retry_window: Duration::from_secs(30),
+            },
+            writer_store(&pool).await?,
+            test_object_store("state-history-writer-unused").await,
+            Arc::new(NoBaseFee),
+        );
+
+        assert!(writer.request_checkpoint(test_boundary_capture()));
+        wait_for_query_waiting_on_lock(&pool, "INSERT INTO state_history.checkpoints").await?;
+        writer.shutdown(Duration::from_millis(100)).await;
+
+        let reason: String = sqlx::query_scalar(
+            "SELECT reason FROM state_history.gaps
+             WHERE chain_id = 8453 AND generation = 7 AND from_message_seq = 10",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(reason, "checkpoint_failed");
+        table_lock.rollback().await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn shutdown_returns_within_deadline_when_gap_flush_cannot_persist(
         pool: sqlx::PgPool,
     ) -> anyhow::Result<()> {
@@ -1918,6 +2011,34 @@ mod tests {
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("writer status did not reach the expected state: {status:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_query_waiting_on_lock(
+        pool: &sqlx::PgPool,
+        query_fragment: &str,
+    ) -> anyhow::Result<()> {
+        let pattern = format!("%{query_fragment}%");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND wait_event_type = 'Lock'
+                      AND query LIKE $1
+                )",
+            )
+            .bind(&pattern)
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("writer query did not start waiting on the table lock");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

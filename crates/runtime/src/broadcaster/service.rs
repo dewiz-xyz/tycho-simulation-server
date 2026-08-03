@@ -371,6 +371,7 @@ pub struct BroadcasterServiceState {
     snapshot_refresh_active: Arc<AtomicBool>,
     recovery_publication: Arc<Mutex<RecoveryPublicationState>>,
     recovery_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    recovery_monitors: Arc<Mutex<Vec<JoinHandle<()>>>>,
     recovery_retry_backoff: Duration,
     native_progress_lease: Duration,
     next_recovery_source_id: Arc<AtomicU64>,
@@ -447,6 +448,7 @@ impl BroadcasterServiceState {
             snapshot_refresh_active: Arc::new(AtomicBool::new(false)),
             recovery_publication: Arc::new(Mutex::new(RecoveryPublicationState::default())),
             recovery_workers: Arc::new(Mutex::new(Vec::new())),
+            recovery_monitors: Arc::new(Mutex::new(Vec::new())),
             recovery_retry_backoff,
             native_progress_lease,
             next_recovery_source_id: Arc::new(AtomicU64::new(1)),
@@ -499,6 +501,30 @@ impl BroadcasterServiceState {
         let outcome = Self::cancel_recovery_publication_locked(&mut recovery);
         drop(recovery);
         Self::emit_recovery_abort(outcome);
+    }
+
+    pub(crate) async fn stop_recovery_tasks(&self) {
+        self.cancel_recovery_publication().await;
+
+        let workers = {
+            let mut workers = self.recovery_workers.lock().await;
+            std::mem::take(&mut *workers)
+        };
+        for worker in workers {
+            if let Err(error) = worker.await {
+                tracing::error!(%error, "Broadcaster recovery task failed while stopping");
+            }
+        }
+
+        let monitors = {
+            let mut monitors = self.recovery_monitors.lock().await;
+            std::mem::take(&mut *monitors)
+        };
+        // These timers never write to Redis. The recovery workers above own that work.
+        for monitor in monitors {
+            monitor.abort();
+            let _ = monitor.await;
+        }
     }
 
     fn cancel_recovery_publication_locked(
@@ -1396,9 +1422,9 @@ impl BroadcasterServiceState {
                 cancelled.store(true, Ordering::Release);
             }
         });
-        let mut workers = self.recovery_workers.lock().await;
-        workers.retain(|worker| !worker.is_finished());
-        workers.push(monitor);
+        let mut monitors = self.recovery_monitors.lock().await;
+        monitors.retain(|monitor| !monitor.is_finished());
+        monitors.push(monitor);
     }
 
     async fn finish_recovery_publication(
@@ -2569,6 +2595,38 @@ mod tests {
                 .map(|value| value.0 == self.0)
                 .unwrap_or(false)
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_recovery_tasks_waits_for_worker() {
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(ServiceFakeRedisWriter::default()),
+        ));
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        let recovery = Arc::clone(&service.recovery_publication);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = Arc::clone(&stopped);
+        let worker = tokio::spawn(async move {
+            loop {
+                if recovery.lock().await.cancelled.load(Ordering::Acquire) {
+                    task_stopped.store(true, Ordering::Release);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        service.recovery_workers.lock().await.push(worker);
+
+        service.stop_recovery_tasks().await;
+
+        assert!(stopped.load(Ordering::Acquire));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use rand::Rng;
 use tokio::time::{sleep, timeout, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tycho_simulation::{
     protocol::models::Update as TychoUpdate,
@@ -37,6 +38,7 @@ pub enum StreamRestartReason {
     SharedPublisherPaused,
     Stale,
     Ended,
+    Stopped,
 }
 
 impl StreamRestartReason {
@@ -48,6 +50,7 @@ impl StreamRestartReason {
             StreamRestartReason::SharedPublisherPaused => "shared_publisher_paused",
             StreamRestartReason::Stale => "stale",
             StreamRestartReason::Ended => "ended",
+            StreamRestartReason::Stopped => "stopped",
         }
     }
 }
@@ -76,6 +79,7 @@ pub struct StreamSupervisorConfig {
 #[derive(Debug, Clone)]
 pub struct BroadcasterStreamControls {
     pub service: BroadcasterServiceState,
+    pub stop: CancellationToken,
 }
 
 impl BroadcasterStreamControls {
@@ -113,6 +117,7 @@ pub async fn process_broadcaster_stream(
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
     pause_epoch: u64,
+    stop: &CancellationToken,
 ) -> StreamExit {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
@@ -124,6 +129,10 @@ pub async fn process_broadcaster_stream(
 
     loop {
         let message = tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                return stream_exit(StreamRestartReason::Stopped, None);
+            }
             () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
                 return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
             }
@@ -165,6 +174,7 @@ pub async fn process_broadcaster_raw_stream(
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
     pause_epoch: u64,
+    stop: &CancellationToken,
 ) -> StreamExit {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
@@ -176,6 +186,10 @@ pub async fn process_broadcaster_raw_stream(
 
     loop {
         let message = tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                return stream_exit(StreamRestartReason::Stopped, None);
+            }
             () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
                 return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
             }
@@ -599,9 +613,18 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        controls.service.wait_for_shared_publisher_resume().await;
+        tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            () = controls.service.wait_for_shared_publisher_resume() => {}
+        }
         let pause_epoch = controls.service.shared_publisher_pause_epoch();
-        let stream = match build_stream().await {
+        let built_stream = tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            result = build_stream() => result,
+        };
+        let stream = match built_stream {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
                 stream
@@ -615,7 +638,11 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
                     "Failed to build broadcaster stream"
                 );
                 let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
+                tokio::select! {
+                    biased;
+                    () = controls.stop.cancelled() => return,
+                    () = sleep(Duration::from_millis(backoff_ms)) => {}
+                }
                 backoff = next_backoff(backoff, cfg.restart_backoff_max);
                 continue;
             }
@@ -627,8 +654,13 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
             cfg.clone(),
             &controls.service,
             pause_epoch,
+            &controls.stop,
         )
         .await;
+
+        if exit.reason == StreamRestartReason::Stopped {
+            return;
+        }
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
@@ -666,7 +698,11 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
         }
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
-        sleep(Duration::from_millis(backoff_ms)).await;
+        tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            () = sleep(Duration::from_millis(backoff_ms)) => {}
+        }
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
     }
 }
@@ -690,9 +726,18 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        controls.service.wait_for_shared_publisher_resume().await;
+        tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            () = controls.service.wait_for_shared_publisher_resume() => {}
+        }
         let pause_epoch = controls.service.shared_publisher_pause_epoch();
-        let stream = match build_stream().await {
+        let built_stream = tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            result = build_stream() => result,
+        };
+        let stream = match built_stream {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
                 stream
@@ -706,7 +751,11 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
                     "Failed to build raw broadcaster stream"
                 );
                 let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
+                tokio::select! {
+                    biased;
+                    () = controls.stop.cancelled() => return,
+                    () = sleep(Duration::from_millis(backoff_ms)) => {}
+                }
                 backoff = next_backoff(backoff, cfg.restart_backoff_max);
                 continue;
             }
@@ -718,8 +767,13 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
             cfg.clone(),
             &controls.service,
             pause_epoch,
+            &controls.stop,
         )
         .await;
+
+        if exit.reason == StreamRestartReason::Stopped {
+            return;
+        }
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
@@ -762,7 +816,11 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
         }
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
-        sleep(Duration::from_millis(backoff_ms)).await;
+        tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return,
+            () = sleep(Duration::from_millis(backoff_ms)) => {}
+        }
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
     }
 }
@@ -807,12 +865,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::Mutex;
+    use futures::StreamExt;
+    use tokio::sync::{Mutex, Notify};
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use tycho_simulation::protocol::models::Update;
+    use tycho_simulation::tycho_client::feed::{BlockHeader, FeedMessage};
 
     use super::{
-        classify_stream_error, handle_broadcaster_update, StreamRestartReason,
-        StreamSupervisorConfig,
+        classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
+        process_broadcaster_stream, StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -820,6 +882,7 @@ mod tests {
     };
     use crate::broadcaster::service::BroadcasterServiceState;
     use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
+    use crate::broadcaster::state_history::test_state_history_runtime;
     use crate::config::MemoryConfig;
     use crate::models::stream_health::StreamHealth;
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
@@ -847,6 +910,95 @@ mod tests {
     fn classifies_other_messages() {
         let kind = classify_stream_error("stream closed by peer");
         assert_eq!(kind, "other");
+    }
+
+    #[tokio::test]
+    async fn decoded_stream_stops_while_waiting_for_updates() {
+        let service = test_service(8453, BroadcasterBackend::Rfq);
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let stream =
+            futures::stream::pending::<Result<Update, Box<dyn std::error::Error + Send + Sync>>>();
+
+        let exit = process_broadcaster_stream(
+            stream,
+            Arc::new(StreamHealth::new()),
+            test_supervisor_config(),
+            &service,
+            service.shared_publisher_pause_epoch(),
+            &stop,
+        )
+        .await;
+
+        assert_eq!(exit.reason, StreamRestartReason::Stopped);
+    }
+
+    #[tokio::test]
+    async fn raw_stream_stops_while_waiting_for_updates() {
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let stream = futures::stream::pending::<
+            Result<FeedMessage<BlockHeader>, Box<dyn std::error::Error + Send + Sync>>,
+        >();
+
+        let exit = process_broadcaster_raw_stream(
+            stream,
+            Arc::new(StreamHealth::new()),
+            test_supervisor_config(),
+            &service,
+            service.shared_publisher_pause_epoch(),
+            &stop,
+        )
+        .await;
+
+        assert_eq!(exit.reason, StreamRestartReason::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_current_update_before_stopping() -> anyhow::Result<()> {
+        let redis_writer = Arc::new(WaitAppendRedisWriter::default());
+        let (state_history, _) = test_state_history_runtime(8);
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(test_publisher_config(8453), redis_writer.clone())
+                .with_state_history(Arc::clone(&state_history)),
+        );
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "test_active",
+            )
+            .await?;
+        let service =
+            test_service_with_publisher(8453, BroadcasterBackend::Native, Arc::clone(&publisher));
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let task_service = service.clone();
+        let task = tokio::spawn(async move {
+            let stream =
+                futures::stream::iter([Ok(native_sync_update(10)), Ok(native_sync_update(11))])
+                    .chain(futures::stream::pending());
+            process_broadcaster_stream(
+                stream,
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                &task_service,
+                task_service.shared_publisher_pause_epoch(),
+                &task_stop,
+            )
+            .await
+        });
+
+        redis_writer.started.notified().await;
+        stop.cancel();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        redis_writer.release.notify_one();
+
+        let exit = timeout(Duration::from_secs(1), task).await??;
+        assert_eq!(exit.reason, StreamRestartReason::Stopped);
+        assert_eq!(state_history.handle.status().enqueued_deltas, 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -934,6 +1086,12 @@ mod tests {
     #[derive(Debug)]
     struct FailAppendRedisWriter;
 
+    #[derive(Debug, Default)]
+    struct WaitAppendRedisWriter {
+        started: Notify,
+        release: Notify,
+    }
+
     impl RedisStreamWriter for FailAppendRedisWriter {
         fn promote<'a>(
             &'a self,
@@ -962,18 +1120,75 @@ mod tests {
         }
     }
 
+    impl RedisStreamWriter for WaitAppendRedisWriter {
+        fn promote<'a>(
+            &'a self,
+            _command: RedisPromotionCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<RedisPromotionResult>> {
+            Box::pin(async move {
+                Ok(RedisPromotionResult {
+                    generation: 1,
+                    entry_id: "1-1".to_string(),
+                })
+            })
+        }
+
+        fn append_fenced<'a>(
+            &'a self,
+            command: RedisAppendCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(format!(
+                    "{}-{}",
+                    command.generation, command.entry.message_seq
+                ))
+            })
+        }
+
+        fn renew_writer<'a>(
+            &'a self,
+            _command: RedisRenewCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
     fn test_redis_publisher(chain_id: u64) -> Arc<BroadcasterRedisPublisher> {
         Arc::new(BroadcasterRedisPublisher::new(
-            BroadcasterRedisPublisherConfig {
-                stream_key: "stream:test".to_string(),
-                chain_id,
-                append_retry_window: Duration::from_millis(10),
-                maxlen: None,
-                writer_lease_ttl: Duration::from_secs(30),
-                recovery_max_buffered_native_blocks: 64,
-            },
+            test_publisher_config(chain_id),
             Arc::new(StreamTestRedisWriter),
         ))
+    }
+
+    fn test_publisher_config(chain_id: u64) -> BroadcasterRedisPublisherConfig {
+        BroadcasterRedisPublisherConfig {
+            stream_key: "stream:test".to_string(),
+            chain_id,
+            append_retry_window: Duration::from_millis(10),
+            maxlen: None,
+            writer_lease_ttl: Duration::from_secs(30),
+            recovery_max_buffered_native_blocks: 64,
+        }
+    }
+
+    fn test_service(chain_id: u64, backend: BroadcasterBackend) -> BroadcasterServiceState {
+        test_service_with_publisher(chain_id, backend, test_redis_publisher(chain_id))
+    }
+
+    fn test_service_with_publisher(
+        chain_id: u64,
+        backend: BroadcasterBackend,
+        publisher: Arc<BroadcasterRedisPublisher>,
+    ) -> BroadcasterServiceState {
+        BroadcasterServiceState::with_lifecycle_gate(
+            1024,
+            BroadcasterSnapshotCache::new(chain_id, vec![backend]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     fn native_sync_update(block_number: u64) -> Update {

@@ -6,29 +6,43 @@ async fn main() -> anyhow::Result<()> {
     let service = runtime::broadcaster::app::build_broadcaster_service().await?;
     let addr = std::net::SocketAddr::from((service.config.host, service.config.port));
     let app_state = service.app_state;
+    let mut tasks = service.tasks;
     let app = rpc::create_broadcaster_router(app_state.clone());
 
     let result = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            let server = axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(shutdown_signal(app_state.clone()));
-            let supervisor = wait_for_supervisor(service.supervisors);
+            let server = std::future::IntoFuture::into_future(
+                axum::serve(listener, app.into_make_service())
+                    .with_graceful_shutdown(shutdown_signal(app_state.clone())),
+            );
+            tokio::pin!(server);
+            let feed = tasks.wait_for_feed();
             tokio::select! {
-                result = server => {
+                result = &mut server => {
                     result.map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
                 },
-                result = supervisor => {
-                    // An early return here would skip the state history drain below.
-                    result.and_then(|()| {
-                        Err(anyhow::anyhow!("Broadcaster feed supervisor terminated unexpectedly"))
-                    })
+                result = feed => {
+                    if app_state.is_stopping() {
+                        let server_result = server
+                            .await
+                            .map_err(|error| anyhow::anyhow!("Failed to start server: {error}"));
+                        result.and(server_result)
+                    } else {
+                        // An early return here would skip the state history drain below.
+                        result.and_then(|()| {
+                            Err(anyhow::anyhow!("Broadcaster feed task stopped unexpectedly"))
+                        })
+                    }
                 }
             }
         }
         Err(error) => Err(error.into()),
     };
+    app_state.begin_shutdown();
+    let task_result = tasks.stop_and_wait().await;
+    app_state.stop_recovery_tasks().await;
     app_state.shutdown_state_history().await;
-    result
+    result.and(task_result)
 }
 
 async fn shutdown_signal(app_state: runtime::broadcaster::app::BroadcasterAppState) {
@@ -53,21 +67,4 @@ async fn shutdown_signal(app_state: runtime::broadcaster::app::BroadcasterAppSta
         () = terminate => {}
     }
     app_state.begin_shutdown();
-}
-
-async fn wait_for_supervisor(supervisors: Vec<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
-    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::channel(supervisors.len().max(1));
-    for supervisor in supervisors {
-        let finished_tx = finished_tx.clone();
-        tokio::spawn(async move {
-            let _ = finished_tx.send(supervisor.await).await;
-        });
-    }
-    drop(finished_tx);
-
-    finished_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("No broadcaster feed supervisors were started"))?
-        .map_err(|error| anyhow::anyhow!("Broadcaster feed supervisor panicked: {error}"))
 }

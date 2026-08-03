@@ -64,7 +64,7 @@ impl BlockTransport for ReqwestBlockTransport {
                 .await
                 .map_err(classify_request_error)?
                 .error_for_status()
-                .map_err(|error| RpcTransportError::Http(error.to_string()))?;
+                .map_err(|error| RpcTransportError::Http(error_message_without_url(error)))?;
 
             response
                 .json::<RpcResponse>()
@@ -76,19 +76,27 @@ impl BlockTransport for ReqwestBlockTransport {
 }
 
 fn classify_request_error(error: reqwest::Error) -> RpcTransportError {
-    if error.is_timeout() {
-        RpcTransportError::Timeout(error.to_string())
+    let is_timeout = error.is_timeout();
+    let message = error_message_without_url(error);
+    if is_timeout {
+        RpcTransportError::Timeout(message)
     } else {
-        RpcTransportError::Http(error.to_string())
+        RpcTransportError::Http(message)
     }
 }
 
 fn classify_decode_error(error: reqwest::Error) -> RpcTransportError {
-    if error.is_timeout() {
-        RpcTransportError::Timeout(error.to_string())
+    let is_timeout = error.is_timeout();
+    let message = error_message_without_url(error);
+    if is_timeout {
+        RpcTransportError::Timeout(message)
     } else {
-        RpcTransportError::Decode(error.to_string())
+        RpcTransportError::Decode(message)
     }
+}
+
+fn error_message_without_url(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 /// Resolves historical EIP-1559 base fees through an Ethereum JSON-RPC endpoint.
@@ -271,8 +279,12 @@ mod tests {
     };
 
     use state_history::BaseFeeSource;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    use super::{BlockTransport, RpcBaseFeeSource, RpcBlock, RpcTransportError};
+    use super::{
+        BlockTransport, ReqwestBlockTransport, RpcBaseFeeSource, RpcBlock, RpcTransportError,
+    };
 
     struct CountingTransport {
         calls: AtomicUsize,
@@ -361,5 +373,37 @@ mod tests {
             Some("1000000000".to_string())
         );
         assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_error_hides_url() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 4_096];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let url = format!("http://{address}/super-secret-token?key=super-secret-token");
+        let transport = ReqwestBlockTransport {
+            client: reqwest::Client::new(),
+        };
+
+        let message = match transport.get_block(&url, 100).await {
+            Err(RpcTransportError::Http(message)) => message,
+            Err(_) => anyhow::bail!("HTTP 500 returned the wrong error type"),
+            Ok(_) => anyhow::bail!("HTTP 500 returned a block"),
+        };
+
+        assert!(!message.contains("super-secret-token"));
+        assert!(!message.contains(&url));
+        server.await??;
+        Ok(())
     }
 }
