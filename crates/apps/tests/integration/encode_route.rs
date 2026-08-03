@@ -912,6 +912,41 @@ async fn add_native_echo_pool(
     Ok(())
 }
 
+async fn add_vm_echo_pool(
+    state: &AppState,
+    request: &RouteEncodeRequest,
+    pool_id: &str,
+) -> Result<()> {
+    let token_in = parse_bytes(&request.token_in)?;
+    let token_out = parse_bytes(&request.token_out)?;
+    let component = ProtocolComponent::new(
+        parse_bytes("0x00000000000000000000000000000000000000cc")?,
+        "vm:maverick_v2".to_string(),
+        "maverick_v2".to_string(),
+        state.chain,
+        vec![
+            make_token(&token_in, "TK1", state.chain),
+            make_token(&token_out, "TK2", state.chain),
+        ],
+        Vec::new(),
+        HashMap::new(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    state
+        .vm_state_store
+        .apply_update(Update::new(
+            43,
+            HashMap::from([(
+                pool_id.to_string(),
+                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+            )]),
+            HashMap::from([(pool_id.to_string(), component)]),
+        ))
+        .await;
+    Ok(())
+}
+
 async fn post_encode(
     app: axum::Router,
     request: &RouteEncodeRequest,
@@ -1215,6 +1250,74 @@ async fn encode_route_returns_deterministic_error_without_retry_after_publicatio
         "Encoded router address does not match request tychoRouterAddress"
     );
     assert_eq!(encoder.call_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_retries_for_native_pool_with_vm_protocol_hint() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        enable_vm_pools: true,
+        request_id: "req-hint-mismatch-retry",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_vm_echo_pool(&state, &request, "vm-ready").await?;
+    let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(encoder.call_count(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_aborts_for_native_pool_with_vm_protocol_hint_after_second_publication(
+) -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        enable_vm_pools: true,
+        request_id: "req-hint-mismatch-second-trip",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_vm_echo_pool(&state, &request, "vm-ready").await?;
+    let encoder = Arc::new(PublishUpdateOnEveryCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Native state changed while the route was being encoded; retry against the current version"
+    );
+    assert_eq!(encoder.call_count(), 2);
     Ok(())
 }
 

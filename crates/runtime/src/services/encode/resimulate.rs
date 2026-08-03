@@ -58,7 +58,7 @@ struct RouteResimulator<'a> {
     token_cache: TokenCache<'a>,
     pool_cache: HashMap<String, CachedPoolEntry>,
     rebuild_guard: Arc<SimulationRebuildGuard>,
-    native_pin: Option<PublishedStatePin>,
+    native_pin: PublishedStatePin,
 }
 
 struct SwapSimulationRequest {
@@ -80,7 +80,7 @@ async fn resimulate_route(
     native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
 ) -> Result<ResimulatedRouteInternal, AttemptError> {
-    let native_pin = Some(state.native_state_store.pin().await);
+    let native_pin = state.native_state_store.pin().await;
     resimulate_route_with_native_pin(
         state,
         normalized,
@@ -92,6 +92,13 @@ async fn resimulate_route(
         native_pin,
     )
     .await
+    .result
+}
+
+pub(super) struct ResimulationOutcome {
+    pub(super) result: Result<ResimulatedRouteInternal, AttemptError>,
+    pub(super) native_pool_ids: HashSet<String>,
+    pub(super) uses_rfq: bool,
 }
 
 #[expect(
@@ -106,24 +113,23 @@ pub(super) async fn resimulate_route_with_native_pin(
     request_token_out: &Bytes,
     native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
-    native_pin: Option<PublishedStatePin>,
-) -> Result<ResimulatedRouteInternal, AttemptError> {
+    native_pin: PublishedStatePin,
+) -> ResimulationOutcome {
     let mut resimulator =
         RouteResimulator::new(state, normalized, chain, rebuild_guard, native_pin);
-
-    // Resimulate in hop-depth order to match build_route_swaps execution order.
-    for hop_index in 0..resimulator.max_hop_depth() {
-        for segment_index in 0..normalized.segments.len() {
-            resimulator
-                .resimulate_segment_hop(segment_index, hop_index)
-                .await?;
-        }
+    let result = resimulator
+        .run(
+            request_token_in,
+            request_token_out,
+            native_token_protocol_allowlist,
+        )
+        .await;
+    let (native_pool_ids, uses_rfq) = resimulator.resolved_backends();
+    ResimulationOutcome {
+        result,
+        native_pool_ids,
+        uses_rfq,
     }
-
-    validate_request_tokens(request_token_in, request_token_out)?;
-    validate_native_request_tokens(normalized, chain, native_token_protocol_allowlist)?;
-    let segments = resimulator.build_resimulated_segments()?;
-    Ok(ResimulatedRouteInternal { segments })
 }
 
 impl<'a> RouteResimulator<'a> {
@@ -132,7 +138,7 @@ impl<'a> RouteResimulator<'a> {
         normalized: &'a NormalizedRouteInternal,
         chain: Chain,
         rebuild_guard: Arc<SimulationRebuildGuard>,
-        native_pin: Option<PublishedStatePin>,
+        native_pin: PublishedStatePin,
     ) -> Self {
         Self {
             state,
@@ -144,6 +150,43 @@ impl<'a> RouteResimulator<'a> {
             rebuild_guard,
             native_pin,
         }
+    }
+
+    async fn run(
+        &mut self,
+        request_token_in: &Bytes,
+        request_token_out: &Bytes,
+        native_token_protocol_allowlist: &[String],
+    ) -> Result<ResimulatedRouteInternal, AttemptError> {
+        // Resimulate in hop depth order to match build_route_swaps execution order.
+        for hop_index in 0..self.max_hop_depth() {
+            for segment_index in 0..self.normalized.segments.len() {
+                self.resimulate_segment_hop(segment_index, hop_index)
+                    .await?;
+            }
+        }
+
+        validate_request_tokens(request_token_in, request_token_out)?;
+        validate_native_request_tokens(
+            self.normalized,
+            self.chain,
+            native_token_protocol_allowlist,
+        )?;
+        let segments = self.build_resimulated_segments()?;
+        Ok(ResimulatedRouteInternal { segments })
+    }
+
+    // The cache records the authoritative backend as each pool resolves, including any
+    // progress made before a later pool fails.
+    fn resolved_backends(&self) -> (HashSet<String>, bool) {
+        let native_pool_ids = self
+            .pool_cache
+            .iter()
+            .filter(|(_, entry)| entry.backend.is_native())
+            .map(|(pool_id, _)| pool_id.clone())
+            .collect();
+        let uses_rfq = self.pool_cache.values().any(|entry| entry.backend.is_rfq());
+        (native_pool_ids, uses_rfq)
     }
 
     fn max_hop_depth(&self) -> usize {
@@ -245,11 +288,7 @@ impl<'a> RouteResimulator<'a> {
         )?;
         let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
-        let native_pin = pool_entry
-            .backend
-            .is_native()
-            .then_some(self.native_pin.as_ref())
-            .flatten();
+        let native_pin = pool_entry.backend.is_native().then_some(&self.native_pin);
         let token_in = self.token_cache.get(&sim_token_in, native_pin).await?;
         let token_out = self.token_cache.get(&sim_token_out, native_pin).await?;
         let (pre_state, result) = simulate_swap(SwapSimulationRequest {
@@ -293,11 +332,7 @@ impl<'a> RouteResimulator<'a> {
             return Ok(entry.clone());
         }
 
-        if let Some((pool_state, component)) = self
-            .native_pin
-            .as_ref()
-            .and_then(|pin| pin.pool_by_id(pool_id))
-        {
+        if let Some((pool_state, component)) = self.native_pin.pool_by_id(pool_id) {
             let entry = CachedPoolEntry {
                 backend: PoolBackend::from_component(component.as_ref()),
                 pool_state,
@@ -1137,6 +1172,88 @@ mod tests {
         assert_eq!(swaps[1].expected_amount_out, BigUint::from(10u32));
         assert_eq!(step_multiplier(swaps[0].pool_state.as_ref()), 1);
         assert_eq!(step_multiplier(swaps[1].pool_state.as_ref()), 2);
+    }
+
+    #[tokio::test]
+    async fn resimulation_outcome_keeps_resolved_native_pools_on_failure() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(Arc::clone(&tokens_store));
+
+        let component = component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-1".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-1".to_string(), component);
+        native_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            Arc::clone(&native_state_store),
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig::default(),
+        );
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-1"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 5000,
+                        },
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-missing"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 0,
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let rebuild_guard = test_rebuild_guard(&app_state).await;
+        let native_pin = app_state.native_state_store.pin().await;
+        let outcome = resimulate_route_with_native_pin(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            &token_in.address,
+            &token_out.address,
+            &app_state.native_token_protocol_allowlist,
+            rebuild_guard,
+            native_pin,
+        )
+        .await;
+
+        let error = match outcome.result {
+            Ok(_) => panic!("missing pool should fail"),
+            Err(error) => error,
+        };
+        assert!(error.is_state_dependent());
+        assert_eq!(
+            outcome.native_pool_ids,
+            HashSet::from(["pool-1".to_string()])
+        );
+        assert!(!outcome.uses_rfq);
     }
 
     #[tokio::test]
