@@ -27,7 +27,6 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const GAP_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const GAP_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-const BASE_FEE_CACHE_CAPACITY: usize = 4_096;
 
 pub struct WriterConfig {
     pub queue_capacity: usize,
@@ -79,21 +78,23 @@ impl CheckpointCapture {
 }
 
 pub trait BaseFeeSource: Send + Sync {
-    fn base_fee_wei(
-        &self,
+    fn base_fee_wei<'a>(
+        &'a self,
         chain_id: u64,
         block_number: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
+        block_hash: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 }
 
 pub struct NoBaseFee;
 
 impl BaseFeeSource for NoBaseFee {
-    fn base_fee_wei(
-        &self,
+    fn base_fee_wei<'a>(
+        &'a self,
         _chain_id: u64,
         _block_number: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        _block_hash: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async { None })
     }
 }
@@ -165,7 +166,6 @@ impl StateHistoryWriter {
             gaps: Arc::clone(&gaps),
             status: status_sender.clone(),
             shutdown_deadline: shutdown_deadline_receiver,
-            base_fee_cache: BTreeMap::new(),
             last_persisted_token: None,
             #[cfg(test)]
             token_put_probe,
@@ -473,7 +473,6 @@ struct WriterTask {
     gaps: Arc<Mutex<GapAccumulator>>,
     status: watch::Sender<WriterStatus>,
     shutdown_deadline: watch::Receiver<Option<Instant>>,
-    base_fee_cache: BTreeMap<(u64, u64), String>,
     last_persisted_token: Option<TokenSnapshotRef>,
     #[cfg(test)]
     token_put_probe: Option<Arc<TokenPutProbe>>,
@@ -588,28 +587,22 @@ impl WriterTask {
         run_until_shutdown_deadline(shutdown_deadline, "delta persistence", persistence).await
     }
 
-    async fn resolve_base_fees(&mut self, delta: &DeltaEntry) -> BTreeMap<u64, String> {
+    async fn resolve_base_fees(&self, delta: &DeltaEntry) -> BTreeMap<u64, String> {
         let mut resolved = BTreeMap::new();
         for observation in delta.block_times() {
-            let key = (delta.chain_id(), observation.block_number);
-            if let Some(value) = self.base_fee_cache.get(&key) {
-                resolved.insert(observation.block_number, value.clone());
-                continue;
-            }
             let Some(value) = run_until_shutdown_bound(
                 self.shutdown_deadline.clone(),
                 Duration::ZERO,
-                self.base_fee
-                    .base_fee_wei(delta.chain_id(), observation.block_number),
+                self.base_fee.base_fee_wei(
+                    delta.chain_id(),
+                    observation.block_number,
+                    observation.block_hash.as_deref(),
+                ),
             )
             .await
             .flatten() else {
                 continue;
             };
-            self.base_fee_cache.insert(key, value.clone());
-            if self.base_fee_cache.len() > BASE_FEE_CACHE_CAPACITY {
-                self.base_fee_cache.pop_first();
-            }
             resolved.insert(observation.block_number, value);
         }
         resolved
@@ -1864,11 +1857,12 @@ mod tests {
     struct HangingBaseFee;
 
     impl BaseFeeSource for HangingBaseFee {
-        fn base_fee_wei(
-            &self,
+        fn base_fee_wei<'a>(
+            &'a self,
             _chain_id: u64,
             _block_number: u64,
-        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+            _block_hash: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
     }
@@ -1876,11 +1870,12 @@ mod tests {
     struct TestBaseFee;
 
     impl BaseFeeSource for TestBaseFee {
-        fn base_fee_wei(
-            &self,
+        fn base_fee_wei<'a>(
+            &'a self,
             _chain_id: u64,
             block_number: u64,
-        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+            _block_hash: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
             Box::pin(async move { (block_number == 100).then(|| TEST_BASE_FEE_WEI.to_owned()) })
         }
     }

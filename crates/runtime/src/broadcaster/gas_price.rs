@@ -16,6 +16,7 @@ const CACHE_CAPACITY: usize = 4_096;
 #[serde(rename_all = "camelCase")]
 struct RpcBlock {
     base_fee_per_gas: Option<String>,
+    hash: Option<String>,
     number: Option<String>,
 }
 
@@ -103,7 +104,7 @@ fn error_message_without_url(error: reqwest::Error) -> String {
 pub struct RpcBaseFeeSource {
     rpc_url: String,
     transport: Arc<dyn BlockTransport>,
-    cache: Mutex<BTreeMap<(u64, u64), String>>,
+    cache: Mutex<BTreeMap<(u64, u64, String), String>>,
 }
 
 impl RpcBaseFeeSource {
@@ -126,9 +127,18 @@ impl RpcBaseFeeSource {
         }
     }
 
-    async fn resolve_base_fee(&self, chain_id: u64, block_number: u64) -> Option<String> {
-        let cache_key = (chain_id, block_number);
-        if let Some(base_fee) = self.cached_base_fee(cache_key) {
+    async fn resolve_base_fee(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        block_hash: Option<&str>,
+    ) -> Option<String> {
+        let cache_key =
+            block_hash.map(|block_hash| (chain_id, block_number, block_hash.to_owned()));
+        if let Some(base_fee) = cache_key
+            .as_ref()
+            .and_then(|cache_key| self.cached_base_fee(cache_key))
+        {
             return Some(base_fee);
         }
 
@@ -173,31 +183,7 @@ impl RpcBaseFeeSource {
             }
         };
 
-        let Some(echoed_number) = block.number.as_deref() else {
-            warn!(
-                scope = "state_history_base_fee",
-                chain_id, block_number, "Base fee RPC block number echo was missing"
-            );
-            return None;
-        };
-        let Ok(echoed_number) = parse_hex_u64(echoed_number) else {
-            warn!(
-                scope = "state_history_base_fee",
-                chain_id,
-                block_number,
-                echoed_number,
-                "Base fee RPC block number was not valid hex"
-            );
-            return None;
-        };
-        if echoed_number != block_number {
-            warn!(
-                scope = "state_history_base_fee",
-                chain_id,
-                block_number,
-                echoed_number,
-                "Base fee RPC returned a mismatched block number"
-            );
+        if !rpc_block_matches(&block, chain_id, block_number, block_hash) {
             return None;
         }
 
@@ -220,19 +206,21 @@ impl RpcBaseFeeSource {
         };
 
         let base_fee = base_fee.to_string();
-        self.cache_base_fee(cache_key, base_fee.clone());
+        if let Some(cache_key) = cache_key {
+            self.cache_base_fee(cache_key, base_fee.clone());
+        }
         Some(base_fee)
     }
 
-    fn cached_base_fee(&self, key: (u64, u64)) -> Option<String> {
+    fn cached_base_fee(&self, key: &(u64, u64, String)) -> Option<String> {
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
+            .get(key)
             .cloned()
     }
 
-    fn cache_base_fee(&self, key: (u64, u64), base_fee: String) {
+    fn cache_base_fee(&self, key: (u64, u64, String), base_fee: String) {
         let mut cache = self
             .cache
             .lock()
@@ -244,13 +232,48 @@ impl RpcBaseFeeSource {
     }
 }
 
+fn rpc_block_matches(
+    block: &RpcBlock,
+    chain_id: u64,
+    block_number: u64,
+    block_hash: Option<&str>,
+) -> bool {
+    let echoed_number = block
+        .number
+        .as_deref()
+        .and_then(|value| parse_hex_u64(value).ok());
+    if echoed_number != Some(block_number) {
+        warn!(
+            scope = "state_history_base_fee",
+            chain_id,
+            block_number,
+            actual_number = ?block.number,
+            "Base fee RPC returned a different block number"
+        );
+        return false;
+    }
+    if block_hash.is_some_and(|expected_hash| block.hash.as_deref() != Some(expected_hash)) {
+        warn!(
+            scope = "state_history_base_fee",
+            chain_id,
+            block_number,
+            expected_hash = ?block_hash,
+            actual_hash = ?block.hash,
+            "Base fee RPC returned a different block"
+        );
+        return false;
+    }
+    true
+}
+
 impl BaseFeeSource for RpcBaseFeeSource {
-    fn base_fee_wei(
-        &self,
+    fn base_fee_wei<'a>(
+        &'a self,
         chain_id: u64,
         block_number: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
-        Box::pin(self.resolve_base_fee(chain_id, block_number))
+        block_hash: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(self.resolve_base_fee(chain_id, block_number, block_hash))
     }
 }
 
@@ -328,11 +351,12 @@ mod tests {
     async fn parses_base_fee_hex_to_decimal_string() {
         let (source, _) = source_with_response(RpcBlock {
             base_fee_per_gas: Some("0x3b9aca00".to_string()),
+            hash: Some("block-100".to_string()),
             number: Some("0x64".to_string()),
         });
 
         assert_eq!(
-            source.base_fee_wei(1, 100).await,
+            source.base_fee_wei(1, 100, Some("block-100")).await,
             Some("1000000000".to_string())
         );
     }
@@ -341,38 +365,57 @@ mod tests {
     async fn rejects_mismatched_block_number_echo() {
         let (source, _) = source_with_response(RpcBlock {
             base_fee_per_gas: Some("0x3b9aca00".to_string()),
+            hash: Some("block-100".to_string()),
             number: Some("0x65".to_string()),
         });
 
-        assert_eq!(source.base_fee_wei(1, 100).await, None);
+        assert_eq!(source.base_fee_wei(1, 100, Some("block-100")).await, None);
     }
 
     #[tokio::test]
     async fn missing_base_fee_yields_none() {
         let (source, _) = source_with_response(RpcBlock {
             base_fee_per_gas: None,
+            hash: Some("block-100".to_string()),
             number: Some("0x64".to_string()),
         });
 
-        assert_eq!(source.base_fee_wei(1, 100).await, None);
+        assert_eq!(source.base_fee_wei(1, 100, Some("block-100")).await, None);
     }
 
     #[tokio::test]
     async fn cache_hits_skip_lookup() {
         let (source, transport) = source_with_response(RpcBlock {
             base_fee_per_gas: Some("0x3b9aca00".to_string()),
+            hash: Some("block-100".to_string()),
             number: Some("0x64".to_string()),
         });
 
         assert_eq!(
-            source.base_fee_wei(1, 100).await,
+            source.base_fee_wei(1, 100, Some("block-100")).await,
             Some("1000000000".to_string())
         );
         assert_eq!(
-            source.base_fee_wei(1, 100).await,
+            source.base_fee_wei(1, 100, Some("block-100")).await,
             Some("1000000000".to_string())
         );
         assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn changed_block_hash_misses_cache_and_rejects_old_block() {
+        let (source, transport) = source_with_response(RpcBlock {
+            base_fee_per_gas: Some("0x3b9aca00".to_string()),
+            hash: Some("old-block".to_string()),
+            number: Some("0x64".to_string()),
+        });
+
+        assert_eq!(
+            source.base_fee_wei(1, 100, Some("old-block")).await,
+            Some("1000000000".to_string())
+        );
+        assert_eq!(source.base_fee_wei(1, 100, Some("new-block")).await, None);
+        assert_eq!(transport.calls(), 2);
     }
 
     #[tokio::test]

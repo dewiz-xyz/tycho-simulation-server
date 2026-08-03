@@ -339,8 +339,9 @@ pub struct RangeLeg {
 pub struct StoredDelta {
     pub position: StreamPosition,
     pub observed_at_ms: u64,
-    pub payload: Box<RawValue>,
-    pub backends: Vec<DeltaBackendCursor>,
+    /// Exact stored payload. Apply only partitions listed in `applicable_backends`.
+    pub raw_payload: Box<RawValue>,
+    pub applicable_backends: Vec<DeltaBackendCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1231,8 +1232,8 @@ fn stored_delta(row: &DeltaRow, request: &RangeRequest) -> StoredDelta {
     StoredDelta {
         position: row.position,
         observed_at_ms: row.observed_at_ms,
-        payload: row.payload.clone(),
-        backends: row
+        raw_payload: row.payload.clone(),
+        applicable_backends: row
             .backends
             .iter()
             .filter(|cursor| {
@@ -1502,13 +1503,16 @@ mod tests {
 
         assert_eq!(legs.len(), 1);
         assert_eq!(legs[0].deltas.len(), 2);
-        assert_eq!(legs[0].deltas[0].backends[0].block_number, Some(90));
+        assert_eq!(
+            legs[0].deltas[0].applicable_backends[0].block_number,
+            Some(90)
+        );
         assert!(gaps.is_empty());
     }
 
     #[test]
     #[expect(clippy::expect_used)]
-    fn stored_delta_strips_cursor_past_its_backend_end() {
+    fn stored_delta_keeps_raw_payload_and_lists_only_in_range_backends() {
         let request = RangeRequest::new(8453, 100, 100, vec![Backend::Native, Backend::Vm])
             .expect("test request should be valid");
         let mut row = delta(1, 1, 101);
@@ -1521,9 +1525,9 @@ mod tests {
         let stored = stored_delta(&row, &request);
 
         assert_eq!(stored.position, position(1, 1));
-        assert_eq!(stored.payload.get(), row.payload.get());
+        assert_eq!(stored.raw_payload.get(), row.payload.get());
         assert_eq!(
-            stored.backends,
+            stored.applicable_backends,
             vec![DeltaBackendCursor {
                 backend: Backend::Vm,
                 block_number: Some(100),
@@ -3530,10 +3534,13 @@ mod tests {
         assert_eq!(plan.legs.len(), 2);
         assert_eq!(plan.legs[0].checkpoint.position, position(1, 0));
         assert_eq!(plan.legs[0].deltas[0].position, position(1, 1));
-        assert_eq!(plan.legs[0].deltas[0].backends.len(), 1);
-        assert_eq!(plan.legs[0].deltas[0].backends[0].backend, Backend::Native);
+        assert_eq!(plan.legs[0].deltas[0].applicable_backends.len(), 1);
+        assert_eq!(
+            plan.legs[0].deltas[0].applicable_backends[0].backend,
+            Backend::Native
+        );
         assert!(plan.legs[0].deltas[0]
-            .payload
+            .raw_payload
             .get()
             .contains(r#""vm_marker":true"#));
         assert_eq!(plan.legs[1].checkpoint.position, position(2, 1));
@@ -3979,8 +3986,14 @@ mod tests {
             {
                 assert_eq!(actual_delta.position, expected_delta.position);
                 assert_eq!(actual_delta.observed_at_ms, expected_delta.observed_at_ms);
-                assert_eq!(actual_delta.payload.get(), expected_delta.payload.get());
-                assert_eq!(actual_delta.backends, expected_delta.backends);
+                assert_eq!(
+                    actual_delta.raw_payload.get(),
+                    expected_delta.raw_payload.get()
+                );
+                assert_eq!(
+                    actual_delta.applicable_backends,
+                    expected_delta.applicable_backends
+                );
             }
         }
     }
