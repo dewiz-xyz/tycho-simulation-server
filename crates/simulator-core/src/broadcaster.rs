@@ -637,16 +637,9 @@ impl BroadcasterUpdateMessage {
         let mut partitions = BTreeMap::<BroadcasterBackend, Vec<BroadcasterProtocolMessage>>::new();
         let mut sync_statuses =
             BTreeMap::<BroadcasterBackend, BTreeMap<String, BroadcasterProtocolSyncStatus>>::new();
-        let mut block_numbers = BTreeMap::<BroadcasterBackend, u64>::new();
 
         for (protocol, status) in &feed.sync_states {
             let backend = backend_for_sync_state(protocol)?;
-            if let Some(block_number) = sync_state_block_number(status) {
-                block_numbers
-                    .entry(backend)
-                    .and_modify(|current| *current = (*current).max(block_number))
-                    .or_insert(block_number);
-            }
             sync_statuses.entry(backend).or_default().insert(
                 protocol.clone(),
                 BroadcasterProtocolSyncStatus::from_synchronizer_state(status),
@@ -687,7 +680,13 @@ impl BroadcasterUpdateMessage {
                     .iter()
                     .map(|message| message.message.header.clone().block_number_or_timestamp())
                     .max()
-                    .or_else(|| block_numbers.get(&backend).copied())
+                    .or_else(|| {
+                        statuses
+                            .values()
+                            .filter_map(|status| status.block.as_ref())
+                            .map(|block| block.number)
+                            .max()
+                    })
                     .unwrap_or_default();
                 Some(BroadcasterUpdatePartition::with_messages(
                     backend,
@@ -706,16 +705,6 @@ impl BroadcasterUpdateMessage {
             .iter()
             .find(|partition| partition.backend == BroadcasterBackend::Native)
             .and_then(BroadcasterUpdatePartition::complete_native_block)
-    }
-}
-
-fn sync_state_block_number(state: &SynchronizerState) -> Option<u64> {
-    match state {
-        SynchronizerState::Ready(header)
-        | SynchronizerState::Delayed(header)
-        | SynchronizerState::Stale(header)
-        | SynchronizerState::Advanced(header) => Some(header.clone().block_number_or_timestamp()),
-        SynchronizerState::Started | SynchronizerState::Ended(_) => None,
     }
 }
 

@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use redis::streams::{StreamId, StreamRangeReply};
 use redis::Value;
+use state_history::GapReason;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, timeout, Duration};
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
@@ -25,6 +26,7 @@ use super::{
     TokioRedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
+use crate::broadcaster::state_history::test_state_history_runtime;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
     BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry, BroadcasterUpdateMessage,
@@ -116,6 +118,117 @@ async fn passive_publisher_skips_appends_and_has_no_replay_boundary() -> Result<
         writer.appends().await.is_empty(),
         "passive warmup must not append Redis entries"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepted_update_reaches_state_history_queue() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let (state_history, _) = test_state_history_runtime(8);
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer))
+        .with_state_history(Arc::clone(&state_history));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    assert_eq!(state_history.handle.status().enqueued_deltas, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_failure_records_cursorless_write_failed_gap() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Rfq, 10, "rfq-1").await?;
+    let writer = FakeRedisWriter::default();
+    let (state_history, probe) = test_state_history_runtime(8);
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+        .with_state_history(Arc::clone(&state_history));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Rfq]), "test_active")
+        .await?;
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Rfq, u64::MAX, "rfq-overflow"))
+        .await?;
+
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    assert_eq!(writer.appends().await.len(), 2);
+    assert_eq!(state_history.handle.status().enqueued_deltas, 0);
+    assert_eq!(
+        probe.gaps(),
+        vec![state_history::GapRecord {
+            chain_id: Chain::Ethereum.id(),
+            generation: 1,
+            from_message_seq: 2,
+            to_message_seq: 2,
+            reason: GapReason::WriteFailed,
+            from_block_number: None,
+            to_block_number: None,
+            from_observed_at_ms: None,
+            to_observed_at_ms: None,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_and_progress_do_not_reach_state_history_queue() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let (state_history, _) = test_state_history_runtime(8);
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer))
+        .with_state_history(Arc::clone(&state_history));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    let heartbeat = raw_cache
+        .heartbeat()
+        .await?
+        .ok_or_else(|| anyhow!("ready cache should produce a heartbeat"))?;
+    let progress = BroadcasterPayload::Progress(BroadcasterProgress::new(
+        Chain::Ethereum.id(),
+        "chain-1-snapshot-1",
+        vec![BroadcasterBackend::Native],
+        "test",
+    )?);
+
+    publisher.publish_accepted_payload(heartbeat).await?;
+    publisher.publish_accepted_payload(progress).await?;
+
+    assert_eq!(state_history.handle.status().enqueued_deltas, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_failure_does_not_fail_publish() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let (state_history, _) = test_state_history_runtime(1);
+    state_history.handle.clone().shutdown(Duration::ZERO).await;
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+        .with_state_history(Arc::clone(&state_history));
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+        .await?;
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    assert_eq!(writer.appends().await.len(), 2);
+    assert_eq!(state_history.handle.status().dropped_deltas, 1);
     Ok(())
 }
 

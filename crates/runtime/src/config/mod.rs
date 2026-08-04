@@ -3,6 +3,7 @@ use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use simulator_core::broadcaster::BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
@@ -190,6 +191,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         hashflow_filename: resolved_chain.hashflow_filename,
         liquorice_url: resolved_chain.liquorice_url,
         api_key,
+        rpc_url: network.rpc_url,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
@@ -330,6 +332,20 @@ struct StreamConfig {
     stream_restart_backoff_min_ms: u64,
     stream_restart_backoff_max_ms: u64,
     stream_restart_backoff_jitter_pct: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateHistoryConfig {
+    pub database_url: String,
+    pub s3_bucket: String,
+    pub s3_prefix: String,
+    pub s3_region: String,
+    pub s3_endpoint_url: Option<String>,
+    pub s3_force_path_style: bool,
+    pub checkpoint_block_interval: u64,
+    pub checkpoint_poll_interval: Duration,
+    pub queue_capacity: usize,
+    pub retry_window: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -482,6 +498,67 @@ fn load_stream_config() -> StreamConfig {
         stream_restart_backoff_max_ms,
         stream_restart_backoff_jitter_pct,
     }
+}
+
+pub fn load_state_history_config() -> Option<StateHistoryConfig> {
+    let enabled: bool = parse_env_or_default("STATE_HISTORY_ENABLED", "false");
+    if !enabled {
+        return None;
+    }
+
+    let database_url = require_trimmed_env("STATE_HISTORY_DATABASE_URL");
+    let s3_bucket = require_trimmed_env("STATE_HISTORY_S3_BUCKET");
+    let s3_prefix =
+        optional_trimmed_env("STATE_HISTORY_S3_PREFIX").unwrap_or_else(|| "state-history".into());
+    let s3_prefix = s3_prefix
+        .strip_suffix('/')
+        .unwrap_or(&s3_prefix)
+        .to_string();
+    let s3_region =
+        optional_trimmed_env("STATE_HISTORY_S3_REGION").unwrap_or_else(|| "eu-central-1".into());
+    let s3_endpoint_url = optional_trimmed_env("STATE_HISTORY_S3_ENDPOINT_URL");
+    let s3_force_path_style = parse_env_or_default("STATE_HISTORY_S3_FORCE_PATH_STYLE", "false");
+    let checkpoint_block_interval = parse_value_or_panic(
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        &require_trimmed_env("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL"),
+    );
+    let checkpoint_poll_interval_secs =
+        parse_env_or_default("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "30");
+    let queue_capacity = parse_env_or_default("STATE_HISTORY_QUEUE_CAPACITY", "8192");
+    let retry_window_ms = parse_env_or_default("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "30000");
+
+    assert!(
+        checkpoint_block_interval > 0,
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"
+    );
+    assert!(
+        checkpoint_poll_interval_secs > 0,
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"
+    );
+    assert!(
+        queue_capacity > 0,
+        "STATE_HISTORY_QUEUE_CAPACITY must be > 0"
+    );
+    assert!(
+        retry_window_ms > 0,
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"
+    );
+
+    let checkpoint_poll_interval = Duration::from_secs(checkpoint_poll_interval_secs);
+    let retry_window = Duration::from_millis(retry_window_ms);
+
+    Some(StateHistoryConfig {
+        database_url,
+        s3_bucket,
+        s3_prefix,
+        s3_region,
+        s3_endpoint_url,
+        s3_force_path_style,
+        checkpoint_block_interval,
+        checkpoint_poll_interval,
+        queue_capacity,
+        retry_window,
+    })
 }
 
 pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
@@ -694,6 +771,7 @@ pub struct BroadcasterConfig {
     pub hashflow_filename: String,
     pub liquorice_url: Option<String>,
     pub api_key: String,
+    pub rpc_url: Option<String>,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,
@@ -799,7 +877,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -832,6 +910,19 @@ mod tests {
         "HASHFLOW_KEY",
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
+    ];
+    const STATE_HISTORY_ENV_KEYS: [&str; 11] = [
+        "STATE_HISTORY_ENABLED",
+        "STATE_HISTORY_DATABASE_URL",
+        "STATE_HISTORY_S3_BUCKET",
+        "STATE_HISTORY_S3_PREFIX",
+        "STATE_HISTORY_S3_REGION",
+        "STATE_HISTORY_S3_ENDPOINT_URL",
+        "STATE_HISTORY_S3_FORCE_PATH_STYLE",
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS",
+        "STATE_HISTORY_QUEUE_CAPACITY",
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS",
     ];
 
     fn clear_slippage_env() {
@@ -902,6 +993,39 @@ mod tests {
         for key in RFQ_CREDENTIAL_ENV_KEYS {
             std::env::remove_var(key);
         }
+    }
+
+    fn with_isolated_state_history_env<T>(test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved_env: Vec<_> = STATE_HISTORY_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in STATE_HISTORY_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+
+        let result = test();
+
+        for (key, value) in saved_env {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        result
+    }
+
+    fn set_required_state_history_env() {
+        std::env::set_var("STATE_HISTORY_ENABLED", "true");
+        std::env::set_var(
+            "STATE_HISTORY_DATABASE_URL",
+            "postgres://state-history:test@localhost/state_history",
+        );
+        std::env::set_var("STATE_HISTORY_S3_BUCKET", "state-history-test");
+        std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "300");
     }
 
     const CONFIG_TEST_ENV_KEYS: [&str; 11] = [
@@ -1929,5 +2053,128 @@ route_policy = " default "
         });
 
         assert!(message.contains("TOKEN_SNAPSHOT_TIMEOUT_MS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_disabled_reads_nothing() {
+        let config = with_isolated_state_history_env(|| {
+            for key in STATE_HISTORY_ENV_KEYS
+                .iter()
+                .copied()
+                .filter(|key| *key != "STATE_HISTORY_ENABLED")
+            {
+                std::env::set_var(key, "garbage");
+            }
+
+            load_state_history_config()
+        });
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn state_history_enabled_requires_database_url_bucket_interval() {
+        let messages = with_isolated_state_history_env(|| {
+            [
+                "STATE_HISTORY_DATABASE_URL",
+                "STATE_HISTORY_S3_BUCKET",
+                "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+            ]
+            .map(|missing| {
+                set_required_state_history_env();
+                std::env::remove_var(missing);
+                match std::panic::catch_unwind(load_state_history_config) {
+                    Ok(_) => unreachable!("enabled state history should require {missing}"),
+                    Err(panic) => panic_message(panic),
+                }
+            })
+        });
+
+        for (message, key) in messages.into_iter().zip([
+            "STATE_HISTORY_DATABASE_URL",
+            "STATE_HISTORY_S3_BUCKET",
+            "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        ]) {
+            assert!(message.contains(key), "expected {key} in `{message}`");
+        }
+    }
+
+    #[test]
+    fn state_history_rejects_zero_checkpoint_block_interval() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("checkpoint block interval must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_checkpoint_poll_interval() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("checkpoint poll interval must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_queue_capacity() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_QUEUE_CAPACITY", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history queue capacity must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_QUEUE_CAPACITY must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_write_retry_window() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history write retry window must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_defaults() {
+        let (defaults, trimmed_prefix) = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            let defaults = load_state_history_config()
+                .unwrap_or_else(|| unreachable!("state history should be enabled"));
+            std::env::set_var("STATE_HISTORY_S3_PREFIX", "foo/");
+            let trimmed_prefix = load_state_history_config()
+                .unwrap_or_else(|| unreachable!("state history should be enabled"))
+                .s3_prefix;
+            (defaults, trimmed_prefix)
+        });
+
+        assert_eq!(defaults.s3_prefix, "state-history");
+        assert_eq!(trimmed_prefix, "foo");
+        assert_eq!(defaults.s3_region, "eu-central-1");
+        assert_eq!(defaults.s3_endpoint_url, None);
+        assert!(!defaults.s3_force_path_style);
+        assert_eq!(defaults.checkpoint_poll_interval, Duration::from_secs(30));
+        assert_eq!(defaults.queue_capacity, 8_192);
+        assert_eq!(defaults.retry_window, Duration::from_millis(30_000));
     }
 }

@@ -10,10 +10,14 @@ use futures::future::BoxFuture;
 use rand::Rng;
 use redis::streams::StreamRangeReply;
 use serde_json::Value;
+use state_history::StreamPosition;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
+use crate::broadcaster::state_history::{
+    delta_entry_from_update, StateHistoryRuntime, StateHistoryUpdateProjection,
+};
 use crate::config::BroadcasterRedisConfig;
 use crate::metrics::{
     emit_broadcaster_redis_append_failure, emit_broadcaster_writer_fence_failure,
@@ -264,6 +268,7 @@ pub(crate) struct BroadcasterRecoveryPublication {
     pub(crate) recovery_id: String,
     pub(crate) target_state_version: u64,
     pub(crate) commit_entry_id: String,
+    pub(crate) commit_position: StreamPosition,
     pub(crate) replay_boundary: BroadcasterRedisReplayBoundary,
     pub(crate) encoded_bytes: usize,
     pub(crate) chunk_count: usize,
@@ -678,6 +683,7 @@ pub struct BroadcasterRedisPublisher {
     feed_gate: watch::Sender<FeedGateState>,
     feed_pause_guard: Arc<Mutex<()>>,
     deployment_admission: watch::Sender<BroadcasterDeploymentAdmissionSnapshot>,
+    state_history: Option<Arc<StateHistoryRuntime>>,
 }
 
 impl fmt::Debug for BroadcasterRedisPublisher {
@@ -959,7 +965,17 @@ impl BroadcasterRedisPublisher {
             feed_gate,
             feed_pause_guard: Arc::new(Mutex::new(())),
             deployment_admission,
+            state_history: None,
         }
+    }
+
+    pub fn with_state_history(mut self, state_history: Arc<StateHistoryRuntime>) -> Self {
+        self.state_history = Some(state_history);
+        self
+    }
+
+    pub(crate) fn state_history(&self) -> Option<Arc<StateHistoryRuntime>> {
+        self.state_history.as_ref().map(Arc::clone)
     }
 
     pub fn deployment_admission_snapshot(&self) -> BroadcasterDeploymentAdmissionSnapshot {
@@ -1113,7 +1129,17 @@ impl BroadcasterRedisPublisher {
         recovery_id
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "recovery queuing and active append ordering stay in one publication path"
+    )]
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
+        let history_update = self.state_history.as_ref().and_then(|_| match &payload {
+            BroadcasterPayload::Update(update) => {
+                Some(StateHistoryUpdateProjection::from_update(update))
+            }
+            _ => None,
+        });
         let mut recovery_gate = self.recovery_gate.lock().await;
         if recovery_gate.open_recovery_id.is_some() {
             if matches!(payload, BroadcasterPayload::Heartbeat(_)) {
@@ -1194,7 +1220,12 @@ impl BroadcasterRedisPublisher {
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
         match self.append_live_payload_locked(&mut guard, payload).await {
-            Ok(_) => Ok(()),
+            Ok((entry, _)) => {
+                if let (Some(state_history), Some(update)) = (&self.state_history, history_update) {
+                    enqueue_state_history_update(state_history, &guard, entry, update);
+                }
+                Ok(())
+            }
             Err(error) => {
                 if error.downcast_ref::<OversizedRedisEntry>().is_some() {
                     return Err(error);
@@ -1381,12 +1412,19 @@ impl BroadcasterRedisPublisher {
             commit_entry_id.ok_or_else(|| anyhow!("Redis recovery committed no entries"))?;
         guard.committed_state_version = target_state_version;
         self.drain_pending_payloads_locked(&mut guard).await?;
+        if let Some(state_history) = &self.state_history {
+            state_history.reset_rfq_high_water();
+        }
         let replay_boundary = self.replay_boundary_locked(&guard)?;
 
         Ok(BroadcasterRecoveryPublication {
             recovery_id,
             target_state_version,
             commit_entry_id,
+            commit_position: StreamPosition {
+                generation: guard.generation,
+                message_seq: commit_watermark,
+            },
             replay_boundary,
             encoded_bytes,
             chunk_count,
@@ -1852,6 +1890,9 @@ impl BroadcasterRedisPublisher {
         };
 
         guard.activate_generation(self.config.chain_id, promotion.generation);
+        if let Some(state_history) = &self.state_history {
+            state_history.reset_rfq_high_water();
+        }
         warn!(
             event = "redis_writer_promoted",
             stream_id = guard.stream_id.as_str(),
@@ -2128,6 +2169,56 @@ fn normalize_live_payload(
         | BroadcasterPayload::RecoveryCommit(_) => Err(anyhow!(
             "Redis broadcaster live payload cannot be a snapshot or recovery message"
         )),
+    }
+}
+
+fn enqueue_state_history_update(
+    state_history: &StateHistoryRuntime,
+    publisher: &BroadcasterRedisPublisherState,
+    entry: BroadcasterRedisStreamEntry,
+    update: Result<StateHistoryUpdateProjection>,
+) {
+    let result = update.and_then(|update| {
+        state_history.observe_rfq_update(&update);
+        delta_entry_from_update(
+            entry.chain_id,
+            publisher.generation,
+            entry.message_seq,
+            entry.published_at_ms,
+            update,
+            entry.payload_json,
+        )
+    });
+    match result {
+        Ok(Some(delta)) => {
+            if !state_history.handle.enqueue_delta(delta) {
+                warn!(
+                    event = "state_history_delta_enqueue_failed",
+                    chain_id = entry.chain_id,
+                    generation = publisher.generation,
+                    message_seq = entry.message_seq,
+                    "State history delta queue rejected an accepted update"
+                );
+            }
+        }
+        Err(error) => {
+            state_history.handle.record_delta_preparation_failure_gap(
+                entry.chain_id,
+                StreamPosition {
+                    generation: publisher.generation,
+                    message_seq: entry.message_seq,
+                },
+            );
+            warn!(
+                event = "state_history_delta_prepare_failed",
+                chain_id = entry.chain_id,
+                generation = publisher.generation,
+                message_seq = entry.message_seq,
+                %error,
+                "State history delta could not be prepared"
+            );
+        }
+        Ok(None) => {}
     }
 }
 

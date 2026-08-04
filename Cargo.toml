@@ -2,6 +2,7 @@
 members = [
     "crates/simulator-core",
     "crates/broadcaster-replay-client",
+    "crates/state-history",
     "crates/runtime",
     "crates/rpc",
     "crates/apps",
@@ -19,11 +20,14 @@ repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 alloy-primitives = "1.5.4"
 alloy-sol-types = "1.5.2"
 anyhow = "1.0"
+aws-config = "1"
+aws-sdk-s3 = "1"
 axum = "0.7"
 chrono = "0.4"
 csv = "1.4.0"
 dotenv = "0.15.0"
 futures = "0.3"
+hex = "0.4"
 jemalloc-ctl = "0.5"
 jemallocator = "0.5"
 num-bigint = "0.4"
@@ -34,7 +38,10 @@ redis = { version = "1.2.3", default-features = false, features = ["connection-m
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+thiserror = "2"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-stream = "0.1.18"
 tokio-util = "0.7"
@@ -46,6 +53,7 @@ tycho-common = "=0.341.8"
 tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
 tycho-simulation = "=0.341.8"
 typetag = "0.2"
+zstd = "0.13"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

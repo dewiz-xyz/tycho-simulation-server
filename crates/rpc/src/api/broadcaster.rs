@@ -64,10 +64,13 @@ mod tests {
     use tower::ServiceExt;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, FeedMessage, SynchronizerState,
+        },
         tycho_common::{
             dto::{PaginationResponse, ProtocolStateDelta, TokensRequestResponse},
-            models::{token::Token, Chain},
+            models::{blockchain::BlockAggregatedChanges, token::Token, Chain},
             simulation::{
                 errors::{SimulationError, TransitionError},
                 protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -256,6 +259,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "active");
+        assert!(body["state_history"].is_null());
         let Some(stream_id) = body["redis_publisher"]["stream_id"].as_str() else {
             bail!("expected redis publisher stream_id");
         };
@@ -634,6 +638,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_snapshot_includes_admitted_stream_token() -> Result<()> {
+        let stream_token = token_with_metadata(0x51, "STREAM", 18, 75);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(Vec::new(), stream_token, 75).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "STREAM");
+        assert_eq!(body["tokens"][0]["quality"], 75);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_includes_token_received_during_pending_replacement() -> Result<()> {
+        let stream_token = token_with_metadata(0x54, "RECOVERY", 18, 75);
+        let app = create_broadcaster_router(
+            build_state_with_recovery_stream_token(stream_token, 75).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "RECOVERY");
+        assert_eq!(body["tokens"][0]["quality"], 75);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_keeps_known_metadata_for_stream_duplicate() -> Result<()> {
+        let stored = token_with_metadata(0x52, "STORED", 6, 80);
+        let incoming = token_with_metadata(0x52, "INCOMING", 18, 100);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(vec![stored], incoming, 50).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "STORED");
+        assert_eq!(body["tokens"][0]["decimals"], 6);
+        assert_eq!(body["tokens"][0]["quality"], 80);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_excludes_stream_token_below_quality_floor() -> Result<()> {
+        let stream_token = token_with_metadata(0x53, "LOW", 18, 49);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(Vec::new(), stream_token, 50).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn token_lookup_fetches_cache_misses_from_broadcaster_store() -> Result<()> {
         let fetched = token(0x42, "FETCHED", Chain::Ethereum);
         let (tycho_url, request_count, server_task) =
@@ -887,6 +955,102 @@ mod tests {
             None,
             tokens,
             chain.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_stream_token(
+        initial_tokens: Vec<Token>,
+        stream_token: Token,
+        token_min_quality: u32,
+    ) -> Result<BroadcasterAppState> {
+        let tokens = token_store(
+            initial_tokens,
+            "http://127.0.0.1:1".to_string(),
+            Chain::Ethereum,
+        );
+        let cache = BroadcasterSnapshotCache::with_token_catalog(
+            Chain::Ethereum.id(),
+            vec![BroadcasterBackend::Native],
+            Arc::clone(&tokens),
+            token_min_quality,
+        );
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed_with_new_token(stream_token))
+            .await?;
+
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            tokens,
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_recovery_stream_token(
+        stream_token: Token,
+        token_min_quality: u32,
+    ) -> Result<BroadcasterAppState> {
+        let tokens = token_store(
+            Vec::new(),
+            "http://127.0.0.1:1".to_string(),
+            Chain::Ethereum,
+        );
+        let cache = BroadcasterSnapshotCache::with_token_catalog(
+            Chain::Ethereum.id(),
+            vec![BroadcasterBackend::Native],
+            Arc::clone(&tokens),
+            token_min_quality,
+        );
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache.clone(),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed(&["uniswap_v2", "sushiswap_v2"], 1, None))
+            .await?;
+
+        cache.begin_same_generation_recovery().await;
+        let published = service
+            .apply_feed_message(&raw_feed(&["uniswap_v2"], 2, Some(stream_token)))
+            .await?;
+        assert!(!published);
+        assert!(service.status_snapshot().await.snapshot.recovery_pending);
+
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            tokens,
+            Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
         ))
@@ -1379,6 +1543,66 @@ mod tests {
 
     fn token(seed: u8, symbol: &str, chain: Chain) -> Token {
         Token::new(&address(seed), symbol, 18, 0, &[Some(21_000)], chain, 100)
+    }
+
+    fn token_with_metadata(seed: u8, symbol: &str, decimals: u32, quality: u32) -> Token {
+        Token::new(
+            &address(seed),
+            symbol,
+            decimals,
+            0,
+            &[Some(21_000)],
+            Chain::Ethereum,
+            quality,
+        )
+    }
+
+    fn raw_feed_with_new_token(token: Token) -> FeedMessage<BlockHeader> {
+        raw_feed(&["uniswap_v2"], 1, Some(token))
+    }
+
+    fn raw_feed(
+        protocols: &[&str],
+        block_number: u64,
+        token: Option<Token>,
+    ) -> FeedMessage<BlockHeader> {
+        let header = BlockHeader {
+            hash: Bytes::from([(block_number + 1) as u8; 32]),
+            number: block_number,
+            parent_hash: Bytes::from([block_number as u8; 32]),
+            revert: false,
+            timestamp: block_number * 10,
+            partial_block_index: None,
+        };
+        FeedMessage {
+            state_msgs: protocols
+                .iter()
+                .map(|protocol| {
+                    let mut deltas = BlockAggregatedChanges::default();
+                    if let Some(token) = token.clone() {
+                        deltas.new_tokens.insert(token.address.clone(), token);
+                    }
+                    (
+                        (*protocol).to_string(),
+                        StateSyncMessage {
+                            header: header.clone(),
+                            snapshots: Snapshot::default(),
+                            deltas: Some(deltas),
+                            removed_components: HashMap::new(),
+                        },
+                    )
+                })
+                .collect(),
+            sync_states: protocols
+                .iter()
+                .map(|protocol| {
+                    (
+                        (*protocol).to_string(),
+                        SynchronizerState::Ready(header.clone()),
+                    )
+                })
+                .collect(),
+        }
     }
 
     fn token_store(
