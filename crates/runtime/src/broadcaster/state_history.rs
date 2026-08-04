@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -393,15 +393,22 @@ fn collect_message_block_times(
 ) -> Result<()> {
     for message in messages {
         let header = &message.message.header;
-        let timestamp_ms = seconds_to_ms(header.timestamp)?;
-        block_times
-            .entry(header.number)
-            .or_insert_with(|| BlockTimeObservation {
-                block_number: header.number,
-                timestamp_ms,
-                block_hash: Some(header.hash.to_string()),
-                parent_hash: Some(header.parent_hash.to_string()),
-            });
+        let observation = BlockTimeObservation {
+            block_number: header.number,
+            timestamp_ms: seconds_to_ms(header.timestamp)?,
+            block_hash: Some(header.hash.to_string()),
+            parent_hash: Some(header.parent_hash.to_string()),
+        };
+        match block_times.entry(header.number) {
+            Entry::Vacant(entry) => {
+                entry.insert(observation);
+            }
+            Entry::Occupied(entry) => anyhow::ensure!(
+                entry.get() == &observation,
+                "conflicting block metadata at height {}",
+                header.number
+            ),
+        }
     }
     Ok(())
 }
@@ -489,6 +496,47 @@ mod tests {
             .block_times()
             .iter()
             .any(|block| block.timestamp_ms == 1_700_000_000_000));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_block_metadata_is_deduplicated() -> Result<()> {
+        let envelope: BroadcasterEnvelope = serde_json::from_str(NATIVE_UPDATE)?;
+        let BroadcasterPayload::Update(mut update) = envelope.payload else {
+            unreachable!();
+        };
+        let message_count = update.partitions[0].messages.len();
+        let duplicate = update.partitions[0].messages[0].clone();
+        update.partitions[0].messages.push(duplicate);
+
+        let projection = StateHistoryUpdateProjection::from_update(&update)?;
+
+        assert_eq!(projection.block_times.len(), message_count);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_block_metadata_at_same_height_is_rejected() -> Result<()> {
+        let envelope: BroadcasterEnvelope = serde_json::from_str(NATIVE_UPDATE)?;
+        let BroadcasterPayload::Update(update) = envelope.payload else {
+            unreachable!();
+        };
+        let original = update.partitions[0].messages[0].clone();
+        let block_number = original.message.header.number;
+
+        let mut conflicting_hash = original.clone();
+        conflicting_hash.message.header.hash = original.message.header.parent_hash.clone();
+        let mut conflicting_update = update;
+        conflicting_update.partitions[0]
+            .messages
+            .push(conflicting_hash);
+
+        let Err(error) = StateHistoryUpdateProjection::from_update(&conflicting_update) else {
+            anyhow::bail!("conflicting block metadata was accepted");
+        };
+        assert!(error.to_string().contains(&format!(
+            "conflicting block metadata at height {block_number}"
+        )));
         Ok(())
     }
 
