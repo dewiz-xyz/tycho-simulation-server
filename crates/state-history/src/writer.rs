@@ -1109,14 +1109,12 @@ struct GapAccumulator {
 impl GapAccumulator {
     fn merge(&mut self, gap: GapRecord) {
         if let Some(last) = self.pending.last_mut() {
-            let adjacent_or_overlapping =
-                gap.from_message_seq <= last.to_message_seq.saturating_add(1);
-            let cursor_scope_matches = has_cursor_bounds(last) == has_cursor_bounds(&gap);
             if last.chain_id == gap.chain_id
                 && last.generation == gap.generation
                 && last.reason == gap.reason
-                && adjacent_or_overlapping
-                && cursor_scope_matches
+                && has_cursor_bounds(last) == has_cursor_bounds(&gap)
+                && gap.from_message_seq <= last.to_message_seq.saturating_add(1)
+                && last.from_message_seq <= gap.to_message_seq.saturating_add(1)
             {
                 last.from_message_seq = last.from_message_seq.min(gap.from_message_seq);
                 last.to_message_seq = last.to_message_seq.max(gap.to_message_seq);
@@ -1232,18 +1230,18 @@ mod tests {
     #[test]
     fn gap_accumulator_coalesces_adjacent_and_overlapping() {
         let mut acc = GapAccumulator::default();
-        acc.merge(test_gap(8453, 3, 10, 10, GapReason::QueueOverflow));
-        acc.merge(test_gap(8453, 3, 11, 11, GapReason::QueueOverflow)); // adjacent → extends
-        acc.merge(test_gap(8453, 3, 11, 13, GapReason::QueueOverflow)); // overlap → widens
-        acc.merge(test_gap(8453, 4, 1, 1, GapReason::QueueOverflow)); // new generation → new entry
-        acc.merge(test_gap(8453, 4, 3, 3, GapReason::QueueOverflow)); // hole → new entry
+        acc.merge(test_gap(8453, 3, 11, 13, GapReason::QueueOverflow));
+        acc.merge(test_gap(8453, 3, 10, 10, GapReason::QueueOverflow)); // reverse adjacent → extends
+        acc.merge(test_gap(8453, 3, 11, 11, GapReason::QueueOverflow)); // contained → unchanged
+        acc.merge(test_gap(8453, 4, 3, 3, GapReason::QueueOverflow)); // new generation → new entry
+        acc.merge(test_gap(8453, 4, 1, 1, GapReason::QueueOverflow)); // reverse hole → new entry
         let pending = acc.drain();
         assert_eq!(
             pending
                 .iter()
                 .map(|g| (g.generation, g.from_message_seq, g.to_message_seq))
                 .collect::<Vec<_>>(),
-            vec![(3, 10, 13), (4, 1, 1), (4, 3, 3)]
+            vec![(3, 10, 13), (4, 3, 3), (4, 1, 1)]
         );
     }
 
