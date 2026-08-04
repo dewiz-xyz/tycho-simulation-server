@@ -281,20 +281,20 @@ Each `RangeLeg` contains a `CheckpointManifest` and zero or more ordered deltas 
 
 `StoredDelta::raw_payload` is stored and returned exactly as published. It is never truncated or rewritten. `StoredDelta::applicable_backends` is filtered to the requested backends and range end, and replay consumers must apply only the partitions listed there. A delta can contain one backend cursor inside the range and another beyond its end, so applying its whole raw payload would advance state past the requested end.
 
-`StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, downloads its S3 object, verifies the archive digest, and returns the decoded `CheckpointArchive`.
+`StateHistoryReader::fetch_checkpoint(&CheckpointManifest)` accepts only a complete manifest, derives its expected S3 key, downloads the object, and verifies the digest, compressed and uncompressed byte lengths, and every decoded metadata field against the PostgreSQL manifest before returning the `CheckpointArchive`.
 
 Each checkpoint manifest exposes `token_reference: Option<TokenSnapshotRef>`. A checkpoint captured without a token reference returns `None`. It remains a valid replay anchor and never creates a gap. Range selection, `ensure_gap_free`, and backtest admission do not check token references.
 
-`StateHistoryReader::fetch_token_snapshot` has this signature:
+Use the manifest-aware token method for replay verification:
 
 ```rust
-pub async fn fetch_token_snapshot(
+pub async fn fetch_checkpoint_token_snapshot(
     &self,
-    reference: &TokenSnapshotRef,
-) -> anyhow::Result<RawTokenSnapshot>
+    manifest: &CheckpointManifest,
+) -> anyhow::Result<Option<RawTokenSnapshot>>
 ```
 
-The method fetches `reference.s3_key` and passes the bytes to `decode_token_snapshot_raw`. The codec verifies the object against `reference.sha256`, validates `TOKEN_SNAPSHOT_SCHEMA_VERSION`, and returns `RawTokenSnapshot { schema_version, chain_id, token_count, tokens }`. `tokens` is the original JSON array as `Box<RawValue>`. It is not decoded into Tycho types or re-serialized. Missing objects, invalid Zstandard data, SHA-256 mismatches, invalid JSON, and unsupported schema values return errors. Consumers can cache the result by `reference.sha256` and reuse it for every leg with the same token reference.
+The method derives the expected key from the checkpoint chain and token digest, then verifies the digest, uncompressed byte length, reference count, envelope count, array length, chain, embedded token chains, and strict address ordering. It returns `None` when the complete manifest has no token reference. The raw token array is returned without re-serialization, and no token values are logged. Missing or misassociated objects and every metadata mismatch return errors.
 
 Gap machinery covers stream data, which consists of checkpoint state and ordered deltas. A token snapshot is optional reference metadata in the same enrichment class as `base_fee_wei`. An absent reference is a caller decision, not evidence of missing stream data.
 
@@ -313,8 +313,11 @@ async fn load_range(reader: &StateHistoryReader) -> anyhow::Result<()> {
 
     for leg in &plan.range.legs {
         let checkpoint = reader.fetch_checkpoint(&leg.checkpoint).await?;
+        let tokens = reader
+            .fetch_checkpoint_token_snapshot(&leg.checkpoint)
+            .await?;
         // Restore checkpoint.payloads_json, then apply leg.deltas in order.
-        process_leg(checkpoint, &leg.deltas).await?;
+        process_leg(checkpoint, tokens, &leg.deltas).await?;
     }
 
     Ok(())
@@ -322,6 +325,8 @@ async fn load_range(reader: &StateHistoryReader) -> anyhow::Result<()> {
 ```
 
 Construct the reader with `StateHistoryReader::new(StateHistoryStore, CheckpointObjectStore)`. See `crates/state-history/src/reader.rs` for the complete API and replay plan types.
+
+`state-history-check` is the read-only operational wrapper around this flow. It reads the observer database URL and S3 settings from the state-history environment variables, selects a closed recent Base range, requires `ensure_gap_free()`, and verifies every replay-leg checkpoint and token object. It never runs migrations or writes PostgreSQL or S3. The production image intentionally does not contain this local tool.
 
 When replaying deltas with a Tycho decoder, set its `min_token_quality` to the broadcaster's `BROADCASTER_TOKEN_MIN_QUALITY` value. The broadcaster default is `0`, while Tycho 0.341.8 defaults the decoder floor to `100`. Without matching floors, the decoder refuses mid-stream `new_tokens` below quality `100` even though the checkpoint token snapshot includes tokens admitted by the broadcaster.
 
@@ -349,9 +354,11 @@ State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, 
 
 Token snapshots add no environment variables. They use the existing state history S3 settings. Stream token admission uses the existing `BROADCASTER_TOKEN_MIN_QUALITY` setting.
 
+`state-history-migrate` is a one-shot task. It requires `STATE_HISTORY_MIGRATION_DATABASE_URL` for the migration master and `STATE_HISTORY_WRITER_PASSWORD` for `state_history_writer`. It runs and verifies the exact embedded SQLx catalog, validates schema version 1, and converges `state_history_writer` plus the passwordless, `rds_iam`-enabled `state_history_observer`. It does not construct an S3 client or write application rows. The migration task must override the broadcaster image entrypoint with `/usr/local/bin/state-history-migrate`.
+
 ### `/status.state_history`
 
-The object mirrors the writer's 15 status fields. Its fields use camelCase. Optional fields are omitted when they have no value.
+The object mirrors the writer's 17 status fields. Its fields use camelCase. Optional fields are omitted when they have no value.
 
 | Field | Meaning |
 | --- | --- |
@@ -364,12 +371,16 @@ The object mirrors the writer's 15 status fields. Its fields use camelCase. Opti
 | `failedDeltas` | Deltas that exhausted persistence attempts or failed permanently. |
 | `recordedGaps` | Gap rows successfully persisted. |
 | `lastPersisted` | Last persisted stream position as `{ "generation", "messageSeq" }`. Omitted before the first persisted delta. |
+| `lastPersistedAtMs` | Unix timestamp in milliseconds when the latest delta transaction committed. |
 | `lastError` | Latest writer error text. Omitted when there is no current error. |
 | `checkpointsCompleted` | Checkpoints whose archive and manifest completed successfully. |
 | `checkpointsFailed` | Checkpoints whose archive or manifest lifecycle failed. |
-| `lastCheckpointStatus` | Latest checkpoint result, currently `complete` or `failed`. Omitted before the first result. |
+| `lastCheckpointStatus` | Latest checkpoint result: `complete`, `failed`, or `enqueue_failed`. Omitted before the first result. |
+| `lastSuccessfulCheckpointAtMs` | Unix timestamp in milliseconds when the latest successful checkpoint manifest transaction committed. |
 | `lastTokenSnapshotSha` | SHA-256 digest from the latest token snapshot successfully uploaded by this writer. Omitted before the first successful token snapshot upload. |
 | `tokenPersistenceFailures` | Token snapshot encoding or upload failures. The writer omits the token reference and proceeds with checkpoint completion. These failures do not change readiness. |
+
+The five-second broadcaster EMF snapshot adds no-dimension `Tycho/Simulation` metrics for queue length, capacity and utilization basis points; enqueued, persisted, dropped, and failed delta counts; the last persisted generation and message sequence; persisted-delta age; recorded gaps; completed and failed checkpoints; successful-checkpoint age; and token-persistence failures. Counter values are cumulative for the lifetime of the writer task.
 
 Gaps are honest reporting. They record losses the writer knows about, but their absence is not proof that a range is complete. Consumers should call `RangePlan::ensure_gap_free()` before using a replay plan.
 

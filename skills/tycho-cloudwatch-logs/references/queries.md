@@ -26,6 +26,7 @@ so these queries parse `@message` to extract `msg`, `level`, and structured fiel
 | resync | Resync lifecycle | Matches any "Resync" message. |
 | broadcaster-recovery | Broadcaster recovery lifecycle | Recovery start, alignment, commit, buffer warning, retry, and self-fencing events. |
 | broadcaster-redis | Broadcaster Redis health | Append/replay/rebootstrap errors, writer promotion, and fencing loss. |
+| state-history | State-history durability | Writer outcomes and periodic queue, progress, gap, checkpoint, and token metrics. |
 | stream-health | Stream startup and errors | Stream start/update plus stream errors and unexpected exits. |
 | stream-supervision | Stream supervision lifecycle | Restarts, stale streams, missing blocks, advanced state. |
 | vm-rebuild | VM rebuild lifecycle | VM rebuild start/success and cleanup failures. |
@@ -79,6 +80,7 @@ Quote-contract note:
 - VM rebuild: VM rebuild started OR VM rebuild completed OR Failed clearing TychoDB during VM rebuild
 - Storage errors: StorageError
 - Delta transition: DeltaTransitionError OR Failed to apply contract/balance update
+- State history: structured `state_history_*` events and `StateHistory*` EMF fields
 
 ## Metrics
 Use `cw_metrics.zsh` for ECS ContainerInsights memory/CPU checks.

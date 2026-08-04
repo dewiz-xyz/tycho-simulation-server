@@ -271,7 +271,7 @@ async fn run_token_snapshot_flow(
     let third_reference = required_token_reference(&third_manifest)?;
     assert_catalog_change(reader, first_reference, third_reference, token_objects).await?;
 
-    assert_token_snapshot_superset(reader, &third_manifest, third_reference, &stream_token).await?;
+    assert_token_snapshot_superset(reader, &third_manifest, &stream_token).await?;
 
     writer.shutdown(Duration::from_secs(5)).await;
     Ok(())
@@ -297,7 +297,7 @@ async fn assert_unchanged_catalog(
     );
     println!("PASS unchanged token catalog reused one token reference and one MinIO object");
 
-    let fetched_catalog = fetch_token_catalog(reader, first_reference).await?;
+    let fetched_catalog = fetch_token_catalog(reader, first_manifest).await?;
     ensure!(
         fetched_catalog == *expected_catalog,
         "reader token catalog differs from the exact seeded catalog"
@@ -334,12 +334,11 @@ async fn assert_catalog_change(
 async fn assert_token_snapshot_superset(
     reader: &StateHistoryReader,
     manifest: &CheckpointManifest,
-    reference: &TokenSnapshotRef,
     stream_token: &Token,
 ) -> anyhow::Result<()> {
     let checkpoint = reader.fetch_checkpoint(manifest).await?;
     let component_addresses = component_token_addresses(&checkpoint)?;
-    let fetched_catalog = fetch_token_catalog(reader, reference).await?;
+    let fetched_catalog = fetch_token_catalog(reader, manifest).await?;
     let catalog_addresses = token_catalog_addresses(&fetched_catalog)?;
     ensure!(
         component_addresses.contains(&stream_token.address.to_string()),
@@ -444,9 +443,13 @@ fn required_token_reference(manifest: &CheckpointManifest) -> anyhow::Result<&To
 
 async fn fetch_token_catalog(
     reader: &StateHistoryReader,
-    reference: &TokenSnapshotRef,
+    manifest: &CheckpointManifest,
 ) -> anyhow::Result<serde_json::Value> {
-    let snapshot = reader.fetch_token_snapshot(reference).await?;
+    let reference = required_token_reference(manifest)?;
+    let snapshot = reader
+        .fetch_checkpoint_token_snapshot(manifest)
+        .await?
+        .context("completed checkpoint is missing its token snapshot")?;
     ensure!(
         snapshot.chain_id == CHAIN_ID
             && snapshot.token_count == reference.token_count
