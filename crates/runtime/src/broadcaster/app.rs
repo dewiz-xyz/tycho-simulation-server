@@ -473,13 +473,33 @@ async fn initialize_state_history(
 )> {
     let state_history_config = load_state_history_config();
     let state_history = match state_history_config.as_ref() {
-        Some(state_history_config) => build_state_history_runtime(
+        Some(state_history_config) => match build_state_history_runtime(
             state_history_config,
             config.rpc_url.clone(),
             Arc::clone(&tokens),
         )
-        .await?
-        .map(Arc::new),
+        .await
+        {
+            Ok(runtime) => {
+                tracing::info!(
+                    event = "state_history_startup_complete",
+                    queue_capacity = state_history_config.queue_capacity,
+                    retry_window_ms = u64::try_from(state_history_config.retry_window.as_millis())
+                        .unwrap_or(u64::MAX),
+                    checkpoint_block_interval = state_history_config.checkpoint_block_interval,
+                    "state history startup complete"
+                );
+                runtime.map(Arc::new)
+            }
+            Err(error) => {
+                tracing::error!(
+                    event = "state_history_startup_failed",
+                    %error,
+                    "state history startup failed"
+                );
+                return Err(error);
+            }
+        },
         None => None,
     };
     Ok((state_history_config, state_history))

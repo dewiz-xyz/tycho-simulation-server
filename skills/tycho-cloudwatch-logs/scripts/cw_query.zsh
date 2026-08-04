@@ -22,7 +22,7 @@ Usage: cw_query.zsh [--since 30m] [--until now] [--limit 100]
                    [--log-group "/ecs/tycho-simulator"]
 
 Presets: block-updates, block-updates-window, block-updates-count,
-         readiness, resync, broadcaster-recovery, broadcaster-redis,
+         readiness, resync, broadcaster-recovery, broadcaster-redis, state-history,
          stream-health, stream-supervision,
          vm-rebuild, startup, server, timeouts, router-timeouts,
          simulate-requests, simulate-completions, simulate-successes, token-metadata,
@@ -143,6 +143,35 @@ fields @timestamp, @logStream
   or @message like /BroadcasterRedisRebootstrap/
 | sort @timestamp desc
 | display @timestamp, event, operation, reason, stream_id, error, @logStream
+| limit ${limit}
+QUERY
+      ;;
+    state-history)
+      cat <<QUERY
+fields @timestamp, @logStream
+| parse @message '"message":"*"' as msg
+| parse @message /"level":"(?<level>[^"]+)"/
+| parse @message /"event":"(?<event>[^"]+)"/
+| parse @message /"chain_id":(?<chain_id>[0-9]+)/
+| parse @message /"generation":(?<generation>[0-9]+)/
+| parse @message /"message_seq":(?<message_seq>[0-9]+)/
+| parse @message /"checkpoint_kind":"(?<checkpoint_kind>[^"]+)"/
+| parse @message /"reason":"(?<reason>[^"]+)"/
+| parse @message /"error":"(?<error>[^"]+)"/
+| parse @message /"StateHistoryQueueLength":(?<queue_len>[0-9]+)/
+| parse @message /"StateHistoryQueueUtilizationBps":(?<queue_utilization_bps>[0-9]+)/
+| parse @message /"StateHistoryPersistedDeltaCount":(?<persisted_deltas>[0-9]+)/
+| parse @message /"StateHistoryDroppedDeltaCount":(?<dropped_deltas>[0-9]+)/
+| parse @message /"StateHistoryFailedDeltaCount":(?<failed_deltas>[0-9]+)/
+| parse @message /"StateHistoryRecordedGapCount":(?<recorded_gaps>[0-9]+)/
+| parse @message /"StateHistoryCheckpointCompletedCount":(?<checkpoints_completed>[0-9]+)/
+| parse @message /"StateHistoryCheckpointFailedCount":(?<checkpoints_failed>[0-9]+)/
+| parse @message /"StateHistoryTokenPersistenceFailureCount":(?<token_failures>[0-9]+)/
+| filter event like /^state_history_/
+  or msg like /[Ss]tate history/
+  or @message like /"StateHistory/
+| sort @timestamp desc
+| display @timestamp, level, event, chain_id, generation, message_seq, checkpoint_kind, reason, queue_len, queue_utilization_bps, persisted_deltas, dropped_deltas, failed_deltas, recorded_gaps, checkpoints_completed, checkpoints_failed, token_failures, error, msg, @logStream
 | limit ${limit}
 QUERY
       ;;

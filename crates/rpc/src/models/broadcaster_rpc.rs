@@ -68,11 +68,15 @@ pub struct BroadcasterStateHistoryStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_persisted: Option<BroadcasterStateHistoryPosition>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub checkpoints_completed: u64,
     pub checkpoints_failed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_checkpoint_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_checkpoint_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_token_snapshot_sha: Option<String>,
     pub token_persistence_failures: u64,
@@ -90,10 +94,12 @@ impl From<WriterStatus> for BroadcasterStateHistoryStatus {
             failed_deltas: status.failed_deltas,
             recorded_gaps: status.recorded_gaps,
             last_persisted: status.last_persisted.map(Into::into),
+            last_persisted_at_ms: status.last_persisted_at_ms,
             last_error: status.last_error,
             checkpoints_completed: status.checkpoints_completed,
             checkpoints_failed: status.checkpoints_failed,
             last_checkpoint_status: status.last_checkpoint_status,
+            last_successful_checkpoint_at_ms: status.last_successful_checkpoint_at_ms,
             last_token_snapshot_sha: status.last_token_snapshot_sha,
             token_persistence_failures: status.token_persistence_failures,
         }
@@ -359,10 +365,12 @@ mod tests {
                     generation: 2,
                     message_seq: 3,
                 }),
+                last_persisted_at_ms: Some(1_000),
                 last_error: None,
                 checkpoints_completed: 2,
                 checkpoints_failed: 0,
                 last_checkpoint_status: Some("complete".to_owned()),
+                last_successful_checkpoint_at_ms: Some(2_000),
                 last_token_snapshot_sha: Some("token-sha".to_owned()),
                 token_persistence_failures: 1,
             }),
@@ -371,6 +379,8 @@ mod tests {
         let json = serde_json::to_value(payload)?;
         assert_eq!(json["status"], "ready");
         assert_eq!(json["state_history"]["lastTokenSnapshotSha"], "token-sha");
+        assert_eq!(json["state_history"]["lastPersistedAtMs"], 1_000);
+        assert_eq!(json["state_history"]["lastSuccessfulCheckpointAtMs"], 2_000);
         assert_eq!(json["state_history"]["tokenPersistenceFailures"], 1);
         assert_eq!(json["state_history"]["healthy"], true);
         Ok(())

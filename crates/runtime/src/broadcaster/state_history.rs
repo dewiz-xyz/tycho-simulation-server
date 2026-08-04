@@ -191,7 +191,11 @@ impl StateHistoryRuntime {
         if let Some(task) = task {
             task.cancellation.cancel();
             if let Err(error) = task.join.await {
-                tracing::warn!(%error, "State history checkpoint task failed during shutdown");
+                tracing::warn!(
+                    event = "state_history_checkpoint_task_shutdown_failed",
+                    %error,
+                    "state history checkpoint task failed during shutdown"
+                );
             }
         }
     }

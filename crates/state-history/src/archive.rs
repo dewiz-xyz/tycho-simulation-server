@@ -33,6 +33,13 @@ pub struct EncodedArchive {
     pub info: EncodedArchiveInfo,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedArchive {
+    pub archive: CheckpointArchive,
+    pub archive_bytes: u64,
+    pub compressed_bytes: u64,
+}
+
 #[derive(Serialize)]
 struct ArchiveEnvelope {
     schema_version: u32,
@@ -86,6 +93,13 @@ pub fn encode_archive(archive: CheckpointArchive) -> anyhow::Result<EncodedArchi
 }
 
 pub fn decode_archive(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<CheckpointArchive> {
+    Ok(decode_archive_with_info(bytes, expected_sha256)?.archive)
+}
+
+pub(crate) fn decode_archive_with_info(
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> anyhow::Result<DecodedArchive> {
     let archive_json =
         zstd::stream::decode_all(bytes).context("failed to decompress checkpoint archive")?;
     let actual_sha256 = hex::encode(Sha256::digest(&archive_json));
@@ -108,13 +122,19 @@ pub fn decode_archive(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<Che
         envelope.schema_version
     );
 
-    Ok(CheckpointArchive {
-        metadata: envelope.metadata,
-        payloads_json: envelope
-            .payloads
-            .into_iter()
-            .map(|payload| payload.get().to_owned())
-            .collect(),
+    Ok(DecodedArchive {
+        archive_bytes: u64::try_from(archive_json.len())
+            .context("checkpoint archive length exceeds u64")?,
+        compressed_bytes: u64::try_from(bytes.len())
+            .context("compressed checkpoint archive length exceeds u64")?,
+        archive: CheckpointArchive {
+            metadata: envelope.metadata,
+            payloads_json: envelope
+                .payloads
+                .into_iter()
+                .map(|payload| payload.get().to_owned())
+                .collect(),
+        },
     })
 }
 
@@ -128,7 +148,7 @@ pub fn checkpoint_s3_key(
         "chain={chain_id}/gen={}/seq={}/kind={}/checkpoint.zst",
         position.generation,
         position.message_seq,
-        crate::store::checkpoint_kind(kind)
+        kind.as_str()
     );
     if prefix.is_empty() {
         suffix
@@ -170,6 +190,10 @@ impl CheckpointObjectStore {
 
     pub fn key_for(&self, chain_id: u64, position: StreamPosition, kind: CheckpointKind) -> String {
         checkpoint_s3_key(&self.prefix, chain_id, position, kind)
+    }
+
+    pub fn token_key_for(&self, chain_id: u64, sha256: &str) -> String {
+        crate::token_snapshot_s3_key(&self.prefix, chain_id, sha256)
     }
 
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {

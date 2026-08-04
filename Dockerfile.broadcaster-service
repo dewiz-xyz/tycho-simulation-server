@@ -16,7 +16,10 @@ RUN --mount=type=secret,id=github_token \
     GIT_CONFIG_VALUE_0="ssh://git@github.com/pedrobergamini/" \
     GIT_CONFIG_KEY_1="url.https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/.insteadOf" \
     GIT_CONFIG_VALUE_1="git@github.com:pedrobergamini/" \
-    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p apps \
+        --bin dsolver-tycho-broadcaster-service \
+        --bin state-history-migrate \
+        --release
 
 
 FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
@@ -25,6 +28,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/dsolver-tycho-broadcaster-service /usr/local/bin/dsolver-tycho-broadcaster-service
+COPY --from=builder /app/target/release/state-history-migrate /usr/local/bin/state-history-migrate
 COPY --from=builder /app/simulator-manifest.toml /app/simulator-manifest.toml
 COPY --from=builder /app/hashflow_supported_tokens.csv /app/hashflow_supported_tokens.csv
 ENV HASHFLOW_FILENAME_CSV=/app/hashflow_supported_tokens.csv

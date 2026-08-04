@@ -73,6 +73,23 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace
 
+  state-history-storage:
+    name: state history storage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+      - name: Verify state history storage contract
+        run: scripts/verify_state_history.sh --repo .
+
   build:
     name: build
     runs-on: ubuntu-latest
@@ -91,3 +108,5 @@ jobs:
         run: cargo build -p apps --bin dsolver-simulator-service --release
       - name: Build broadcaster release binary
         run: cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+      - name: Build state history migration binary
+        run: cargo build -p apps --bin state-history-migrate --release

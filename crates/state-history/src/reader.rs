@@ -6,12 +6,14 @@ use std::{
 use anyhow::{ensure, Context};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
+use simulator_core::broadcaster::BroadcasterTokenDto;
 use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
 
 use crate::{
-    decode_archive, decode_token_snapshot_raw, Backend, CheckpointArchive, CheckpointKind,
-    CheckpointManifest, CheckpointObjectStore, CheckpointStatus, DeltaBackendCursor, ModelError,
-    RawTokenSnapshot, StateHistoryStore, StreamPosition, TokenSnapshotRef,
+    archive::decode_archive_with_info, tokens::decode_token_snapshot_raw_with_info, Backend,
+    CheckpointArchive, CheckpointKind, CheckpointManifest, CheckpointObjectStore, CheckpointStatus,
+    DeltaBackendCursor, ModelError, RawTokenSnapshot, StateHistoryStore, StreamPosition,
+    TokenSnapshotRef,
 };
 
 pub struct StateHistoryReader {
@@ -130,8 +132,52 @@ impl StateHistoryReader {
             .archive_sha256
             .as_deref()
             .context("complete checkpoint manifest is missing its archive sha256")?;
+        let expected_archive_bytes = manifest
+            .archive_bytes
+            .context("complete checkpoint manifest is missing its archive byte length")?;
+        let expected_compressed_bytes = manifest
+            .compressed_bytes
+            .context("complete checkpoint manifest is missing its compressed byte length")?;
+        let expected_key =
+            self.objects
+                .key_for(manifest.chain_id, manifest.position, manifest.kind);
+        ensure!(
+            key == expected_key,
+            "checkpoint manifest {} object key mismatch: expected {expected_key}, got {key}",
+            manifest.id
+        );
         let bytes = self.objects.fetch(key).await?;
-        decode_archive(&bytes, expected_sha256)
+        let decoded = decode_archive_with_info(&bytes, expected_sha256)?;
+        ensure!(
+            decoded.archive_bytes == expected_archive_bytes,
+            "checkpoint manifest {} archive length mismatch: expected {expected_archive_bytes}, got {}",
+            manifest.id,
+            decoded.archive_bytes
+        );
+        ensure!(
+            decoded.compressed_bytes == expected_compressed_bytes,
+            "checkpoint manifest {} compressed length mismatch: expected {expected_compressed_bytes}, got {}",
+            manifest.id,
+            decoded.compressed_bytes
+        );
+        let metadata = &decoded.archive.metadata;
+        ensure!(
+            metadata.chain_id == manifest.chain_id
+                && metadata.position == manifest.position
+                && metadata.state_version == manifest.state_version
+                && metadata.kind == manifest.kind
+                && metadata.block_number == manifest.block_number
+                && metadata.rfq_observed_at_ms == manifest.rfq_observed_at_ms
+                && metadata.backends == manifest.backends,
+            "checkpoint manifest {} metadata does not match its archive",
+            manifest.id
+        );
+        ensure!(
+            !decoded.archive.payloads_json.is_empty(),
+            "checkpoint manifest {} archive contains no payloads",
+            manifest.id
+        );
+        Ok(decoded.archive)
     }
 
     /// Fetches and verifies the token snapshot referenced by a checkpoint.
@@ -144,6 +190,38 @@ impl StateHistoryReader {
     /// Returns an error when the referenced object cannot be fetched, or when
     /// decompression, sha256 verification, envelope parsing, or schema
     /// validation fails.
+    pub async fn fetch_checkpoint_token_snapshot(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> anyhow::Result<Option<RawTokenSnapshot>> {
+        ensure!(
+            manifest.status == CheckpointStatus::Complete,
+            "checkpoint manifest {} is not complete",
+            manifest.id
+        );
+        let Some(reference) = manifest.token_reference.as_ref() else {
+            return Ok(None);
+        };
+        let expected_key = self
+            .objects
+            .token_key_for(manifest.chain_id, &reference.sha256);
+        ensure!(
+            reference.s3_key == expected_key,
+            "checkpoint manifest {} token object key mismatch: expected {expected_key}, got {}",
+            manifest.id,
+            reference.s3_key
+        );
+        let snapshot = self.fetch_token_snapshot(reference).await?;
+        ensure!(
+            snapshot.chain_id == manifest.chain_id,
+            "checkpoint manifest {} token chain mismatch: expected {}, got {}",
+            manifest.id,
+            manifest.chain_id,
+            snapshot.chain_id
+        );
+        Ok(Some(snapshot))
+    }
+
     pub async fn fetch_token_snapshot(
         &self,
         reference: &TokenSnapshotRef,
@@ -155,7 +233,49 @@ impl StateHistoryReader {
             .fetch(&reference.s3_key)
             .await
             .with_context(|| format!("failed to fetch token snapshot {}", reference.s3_key))?;
-        decode_token_snapshot_raw(&bytes, &reference.sha256)
+        let decoded = decode_token_snapshot_raw_with_info(&bytes, &reference.sha256)?;
+        let expected_key = self
+            .objects
+            .token_key_for(decoded.snapshot.chain_id, &reference.sha256);
+        ensure!(
+            reference.s3_key == expected_key,
+            "token snapshot object key mismatch: expected {expected_key}, got {}",
+            reference.s3_key
+        );
+        ensure!(
+            decoded.token_bytes == reference.token_bytes,
+            "token snapshot byte length mismatch: expected {}, got {}",
+            reference.token_bytes,
+            decoded.token_bytes
+        );
+        ensure!(
+            decoded.snapshot.token_count == reference.token_count,
+            "token snapshot count mismatch: expected {}, got {}",
+            reference.token_count,
+            decoded.snapshot.token_count
+        );
+        let tokens: Vec<BroadcasterTokenDto> = serde_json::from_str(decoded.snapshot.tokens.get())
+            .context("failed to parse token snapshot token array")?;
+        let actual_token_count =
+            u64::try_from(tokens.len()).context("token snapshot token count exceeds u64")?;
+        ensure!(
+            actual_token_count == decoded.snapshot.token_count,
+            "token snapshot envelope count mismatch: expected {}, got {actual_token_count}",
+            decoded.snapshot.token_count
+        );
+        ensure!(
+            tokens
+                .iter()
+                .all(|token| token.chain_id == decoded.snapshot.chain_id),
+            "token snapshot contains a token from a different chain"
+        );
+        ensure!(
+            tokens
+                .windows(2)
+                .all(|pair| pair[0].address < pair[1].address),
+            "token snapshot addresses are not strictly sorted and unique"
+        );
+        Ok(decoded.snapshot)
     }
 
     async fn begin_range_transaction(&self) -> anyhow::Result<Transaction<'_, Postgres>> {
@@ -3013,6 +3133,198 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
+    async fn checkpoint_fetch_rejects_manifest_drift(pool: PgPool) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-checkpoint-manifest-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let objects = test_object_store(BUCKET).await;
+        let manifest = persist_checkpoint(
+            &pool,
+            &objects,
+            capture(3, 7, 123, CheckpointKind::Boundary, r#"{"state":"bound"}"#)?,
+        )
+        .await?;
+        let reader = StateHistoryReader::new(StateHistoryStore::from_pool(pool), objects);
+
+        let mut wrong_key = manifest.clone();
+        wrong_key.s3_key = Some("wrong/checkpoint.zst".to_owned());
+        assert!(reader
+            .fetch_checkpoint(&wrong_key)
+            .await
+            .is_err_and(|error| error.to_string().contains("object key mismatch")));
+
+        let mut wrong_archive_length = manifest.clone();
+        wrong_archive_length.archive_bytes =
+            wrong_archive_length.archive_bytes.map(|value| value + 1);
+        assert!(reader
+            .fetch_checkpoint(&wrong_archive_length)
+            .await
+            .is_err_and(|error| error.to_string().contains("archive length mismatch")));
+
+        let mut wrong_compressed_length = manifest.clone();
+        wrong_compressed_length.compressed_bytes = wrong_compressed_length
+            .compressed_bytes
+            .map(|value| value + 1);
+        assert!(reader
+            .fetch_checkpoint(&wrong_compressed_length)
+            .await
+            .is_err_and(|error| error.to_string().contains("compressed length mismatch")));
+
+        let mut wrong_metadata = manifest;
+        wrong_metadata.block_number += 1;
+        assert!(reader
+            .fetch_checkpoint(&wrong_metadata)
+            .await
+            .is_err_and(|error| error.to_string().contains("metadata does not match")));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn checkpoint_token_fetch_binds_manifest_and_reference(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-token-manifest-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let objects = test_object_store(BUCKET).await;
+        let encoded = encode_token_snapshot(test_token_snapshot()?)?;
+        let key = token_snapshot_s3_key("reader", 8453, &encoded.info.sha256);
+        objects.put(&key, encoded.bytes).await?;
+        let reference = TokenSnapshotRef {
+            s3_key: key,
+            sha256: encoded.info.sha256,
+            token_count: encoded.info.token_count,
+            token_bytes: encoded.info.token_bytes,
+        };
+        let mut checkpoint = manifest(
+            1,
+            1,
+            100,
+            CheckpointKind::Boundary,
+            CheckpointStatus::Complete,
+        );
+        checkpoint.token_reference = Some(reference.clone());
+        let reader = StateHistoryReader::new(StateHistoryStore::from_pool(pool), objects);
+
+        assert!(reader
+            .fetch_checkpoint_token_snapshot(&checkpoint)
+            .await?
+            .is_some());
+
+        let mut missing = checkpoint.clone();
+        missing.token_reference = None;
+        assert!(reader
+            .fetch_checkpoint_token_snapshot(&missing)
+            .await?
+            .is_none());
+
+        let mut wrong_count = checkpoint.clone();
+        wrong_count
+            .token_reference
+            .as_mut()
+            .context("test token reference is missing")?
+            .token_count += 1;
+        assert!(reader
+            .fetch_checkpoint_token_snapshot(&wrong_count)
+            .await
+            .is_err_and(|error| error.to_string().contains("count mismatch")));
+
+        let mut wrong_length = checkpoint.clone();
+        wrong_length
+            .token_reference
+            .as_mut()
+            .context("test token reference is missing")?
+            .token_bytes += 1;
+        assert!(reader
+            .fetch_checkpoint_token_snapshot(&wrong_length)
+            .await
+            .is_err_and(|error| error.to_string().contains("byte length mismatch")));
+
+        let mut wrong_chain = checkpoint;
+        wrong_chain.chain_id = 1;
+        assert!(reader
+            .fetch_checkpoint_token_snapshot(&wrong_chain)
+            .await
+            .is_err_and(|error| error.to_string().contains("token object key mismatch")));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn token_fetch_rejects_noncanonical_catalogs(pool: PgPool) -> anyhow::Result<()> {
+        const BUCKET: &str = "state-history-token-canonical-reader-test";
+
+        configure_test_aws();
+        create_test_bucket(BUCKET).await?;
+        let objects = test_object_store(BUCKET).await;
+        let reader = StateHistoryReader::new(
+            StateHistoryStore::from_pool(pool),
+            test_object_store(BUCKET).await,
+        );
+        let canonical_tokens = expected_test_tokens();
+
+        let envelope_count = put_raw_token_snapshot(
+            &objects,
+            json!({
+                "schema_version": TOKEN_SNAPSHOT_SCHEMA_VERSION,
+                "chain_id": 8453,
+                "token_count": 3,
+                "tokens": canonical_tokens,
+            }),
+            3,
+        )
+        .await?;
+        assert!(reader
+            .fetch_token_snapshot(&envelope_count)
+            .await
+            .is_err_and(|error| error.to_string().contains("envelope count mismatch")));
+
+        let mut reversed = expected_test_tokens()
+            .as_array()
+            .context("test tokens are not an array")?
+            .clone();
+        reversed.reverse();
+        let reversed = put_raw_token_snapshot(
+            &objects,
+            json!({
+                "schema_version": TOKEN_SNAPSHOT_SCHEMA_VERSION,
+                "chain_id": 8453,
+                "token_count": 2,
+                "tokens": reversed,
+            }),
+            2,
+        )
+        .await?;
+        assert!(reader
+            .fetch_token_snapshot(&reversed)
+            .await
+            .is_err_and(|error| error.to_string().contains("strictly sorted and unique")));
+
+        let mut wrong_chain_tokens = expected_test_tokens();
+        wrong_chain_tokens[0]["chainId"] = json!(1);
+        let wrong_chain = put_raw_token_snapshot(
+            &objects,
+            json!({
+                "schema_version": TOKEN_SNAPSHOT_SCHEMA_VERSION,
+                "chain_id": 8453,
+                "token_count": 2,
+                "tokens": wrong_chain_tokens,
+            }),
+            2,
+        )
+        .await?;
+        assert!(reader
+            .fetch_token_snapshot(&wrong_chain)
+            .await
+            .is_err_and(|error| error.to_string().contains("different chain")));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
     async fn resolve_range_uses_complete_boundary_when_range_has_no_deltas(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -3761,6 +4073,25 @@ mod tests {
                 "quality": 90,
             }
         ])
+    }
+
+    async fn put_raw_token_snapshot(
+        objects: &CheckpointObjectStore,
+        envelope: serde_json::Value,
+        token_count: u64,
+    ) -> anyhow::Result<TokenSnapshotRef> {
+        let snapshot_json = serde_json::to_vec(&envelope)?;
+        let sha256 = hex::encode(Sha256::digest(&snapshot_json));
+        let token_bytes = u64::try_from(snapshot_json.len())?;
+        let compressed = zstd::stream::encode_all(snapshot_json.as_slice(), 3)?;
+        let s3_key = token_snapshot_s3_key("reader", 8453, &sha256);
+        objects.put(&s3_key, compressed).await?;
+        Ok(TokenSnapshotRef {
+            s3_key,
+            sha256,
+            token_count,
+            token_bytes,
+        })
     }
 
     async fn seed_block_times(

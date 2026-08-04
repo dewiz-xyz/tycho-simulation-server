@@ -57,6 +57,7 @@ Start with `references/queries.md` for copyable ERC4626 pair filters built on to
 | resync | Inspect resync lifecycle. |
 | broadcaster-recovery | Inspect private recovery start, phase changes, commit, retries, and failure. |
 | broadcaster-redis | Inspect Redis append, replay, rebootstrapping, promotion, and writer-fencing failures. |
+| state-history | Inspect state-history writer events and periodic health metrics. |
 | stream-health | Stream startup and errors. |
 | stream-supervision | Stream supervision and restart lifecycle. |
 | vm-rebuild | VM rebuild lifecycle. |
@@ -116,6 +117,16 @@ Quick checks for memory and CPU utilization using ECS ContainerInsights.
   `zsh skills/tycho-cloudwatch-logs/scripts/cw_metrics.zsh --since 12h --metrics memory,cpu`
 - Pivot spike check:
   `zsh skills/tycho-cloudwatch-logs/scripts/cw_metrics.zsh --since 2h --pivot 2026-02-04T11:38:00Z --window 10m`
+
+State-history rollout logs come from the shared broadcaster:
+
+```bash
+AWS_PROFILE=dsolver-prod AWS_REGION=eu-central-1 \
+zsh skills/tycho-cloudwatch-logs/scripts/cw_query.zsh \
+  --preset state-history \
+  --log-group /ecs/broadcaster-production/broadcaster \
+  --since 30m
+```
 
 ## Override defaults
 - Set `TYCHO_LOG_GROUP` for another log group.

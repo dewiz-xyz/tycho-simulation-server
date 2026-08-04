@@ -22,6 +22,12 @@ pub struct RawTokenSnapshot {
     pub tokens: Box<RawValue>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedRawTokenSnapshot {
+    pub snapshot: RawTokenSnapshot,
+    pub token_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedTokenSnapshot {
     pub bytes: Vec<u8>,
@@ -144,13 +150,40 @@ pub fn decode_token_snapshot_raw(
     bytes: &[u8],
     expected_sha256: &str,
 ) -> anyhow::Result<RawTokenSnapshot> {
-    decode_verified_token_snapshot(bytes, expected_sha256)
+    Ok(decode_token_snapshot_raw_with_info(bytes, expected_sha256)?.snapshot)
+}
+
+pub(crate) fn decode_token_snapshot_raw_with_info(
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> anyhow::Result<DecodedRawTokenSnapshot> {
+    let snapshot_json = decode_verified_token_snapshot_bytes(bytes, expected_sha256)?;
+    let snapshot: RawTokenSnapshot =
+        serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
+    validate_schema_version(&snapshot)?;
+
+    Ok(DecodedRawTokenSnapshot {
+        snapshot,
+        token_bytes: u64::try_from(snapshot_json.len())
+            .context("token snapshot length exceeds u64")?,
+    })
 }
 
 fn decode_verified_token_snapshot<T>(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<T>
 where
     T: DeserializeOwned + DecodedTokenSnapshot,
 {
+    let snapshot_json = decode_verified_token_snapshot_bytes(bytes, expected_sha256)?;
+    let envelope: T =
+        serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
+    validate_schema_version(&envelope)?;
+    Ok(envelope)
+}
+
+fn decode_verified_token_snapshot_bytes(
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> anyhow::Result<Vec<u8>> {
     let snapshot_json =
         zstd::stream::decode_all(bytes).context("failed to decompress token snapshot")?;
     let actual_sha256 = hex::encode(Sha256::digest(&snapshot_json));
@@ -162,8 +195,10 @@ where
         .into());
     }
 
-    let envelope: T =
-        serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
+    Ok(snapshot_json)
+}
+
+fn validate_schema_version<T: DecodedTokenSnapshot>(envelope: &T) -> anyhow::Result<()> {
     if envelope.schema_version() != TOKEN_SNAPSHOT_SCHEMA_VERSION {
         return Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
             found: envelope.schema_version(),
@@ -171,8 +206,7 @@ where
         }
         .into());
     }
-
-    Ok(envelope)
+    Ok(())
 }
 
 pub fn token_snapshot_s3_key(prefix: &str, chain_id: u64, sha256: &str) -> String {

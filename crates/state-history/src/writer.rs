@@ -4,7 +4,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -150,10 +150,12 @@ impl StateHistoryWriter {
             failed_deltas: 0,
             recorded_gaps: 0,
             last_persisted: None,
+            last_persisted_at_ms: None,
             last_error: None,
             checkpoints_completed: 0,
             checkpoints_failed: 0,
             last_checkpoint_status: None,
+            last_successful_checkpoint_at_ms: None,
             last_token_snapshot_sha: None,
             token_persistence_failures: 0,
         });
@@ -193,7 +195,7 @@ impl WriterHandle {
     pub fn enqueue_delta(&self, delta: DeltaEntry) -> bool {
         let commands = lock(&self.inner.commands);
         let Some(sender) = commands.as_ref() else {
-            self.record_dropped_delta(delta, 0);
+            self.record_dropped_delta(delta, 0, GapReason::WriterStopped);
             return false;
         };
 
@@ -208,10 +210,16 @@ impl WriterHandle {
             }
             Err(error) => {
                 let queue_len = queue_len(sender);
-                let WriterCommand::Delta(delta) = error.into_inner() else {
+                let (command, reason) = match error {
+                    mpsc::error::TrySendError::Full(command) => (command, GapReason::QueueOverflow),
+                    mpsc::error::TrySendError::Closed(command) => {
+                        (command, GapReason::WriterStopped)
+                    }
+                };
+                let WriterCommand::Delta(delta) = command else {
                     return false;
                 };
-                self.record_dropped_delta(delta, queue_len);
+                self.record_dropped_delta(delta, queue_len, reason);
                 false
             }
         }
@@ -220,6 +228,7 @@ impl WriterHandle {
     pub fn request_checkpoint(&self, capture: CheckpointCapture) -> bool {
         let commands = lock(&self.inner.commands);
         let Some(sender) = commands.as_ref() else {
+            self.record_checkpoint_enqueue_failure(&capture, 0, "writer_stopped");
             return false;
         };
         match sender.try_send(WriterCommand::Checkpoint(capture)) {
@@ -230,11 +239,16 @@ impl WriterHandle {
                     .send_modify(|status| status.queue_len = queue_len);
                 true
             }
-            Err(_) => {
+            Err(error) => {
                 let queue_len = queue_len(sender);
-                self.inner
-                    .status
-                    .send_modify(|status| status.queue_len = queue_len);
+                let (command, reason) = match error {
+                    mpsc::error::TrySendError::Full(command) => (command, "queue_overflow"),
+                    mpsc::error::TrySendError::Closed(command) => (command, "writer_stopped"),
+                };
+                let WriterCommand::Checkpoint(capture) = command else {
+                    return false;
+                };
+                self.record_checkpoint_enqueue_failure(&capture, queue_len, reason);
                 false
             }
         }
@@ -309,9 +323,18 @@ impl WriterHandle {
         let join = lock(&self.inner.join).take();
         if let Some(join) = join {
             match join.await {
-                Ok(()) => {}
+                Ok(()) => {
+                    tracing::info!(
+                        event = "state_history_shutdown_complete",
+                        "state history writer shutdown complete"
+                    );
+                }
                 Err(error) => {
-                    tracing::error!(%error, "state history writer task failed");
+                    tracing::error!(
+                        event = "state_history_writer_shutdown_failed",
+                        %error,
+                        "state history writer task failed"
+                    );
                     self.inner.status.send_modify(|status| {
                         status.healthy = false;
                         status.last_error = Some(error.to_string());
@@ -321,12 +344,49 @@ impl WriterHandle {
         }
     }
 
-    fn record_dropped_delta(&self, delta: DeltaEntry, queue_len: u64) {
+    fn record_dropped_delta(&self, delta: DeltaEntry, queue_len: u64, reason: GapReason) {
         // Gap recording bypasses the channel so it still works when the queue is the problem.
-        lock(&self.inner.gaps).merge(delta_gap(&delta, GapReason::QueueOverflow));
+        let position = delta.position();
+        tracing::error!(
+            event = "state_history_delta_enqueue_failed",
+            chain_id = delta.chain_id(),
+            generation = position.generation,
+            message_seq = position.message_seq,
+            reason = reason.as_str(),
+            queue_len,
+            "state history delta enqueue failed"
+        );
+        lock(&self.inner.gaps).merge(delta_gap(&delta, reason));
         self.inner.status.send_modify(|status| {
             status.dropped_deltas += 1;
             status.queue_len = queue_len;
+        });
+    }
+
+    fn record_checkpoint_enqueue_failure(
+        &self,
+        capture: &CheckpointCapture,
+        queue_len: u64,
+        reason: &'static str,
+    ) {
+        let state = capture.state();
+        tracing::error!(
+            event = "state_history_checkpoint_enqueue_failed",
+            chain_id = state.chain_id(),
+            generation = state.position().generation,
+            message_seq = state.position().message_seq,
+            checkpoint_kind = state.kind().as_str(),
+            block_number = state.block_number(),
+            reason,
+            queue_len,
+            "state history checkpoint enqueue failed"
+        );
+        self.inner.status.send_modify(|status| {
+            status.healthy = false;
+            status.queue_len = queue_len;
+            status.checkpoints_failed += 1;
+            status.last_checkpoint_status = Some("enqueue_failed".to_owned());
+            status.last_error = Some(format!("checkpoint enqueue failed: {reason}"));
         });
     }
 }
@@ -369,10 +429,12 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
         failed_deltas: 0,
         recorded_gaps: 0,
         last_persisted: None,
+        last_persisted_at_ms: None,
         last_error: None,
         checkpoints_completed: 0,
         checkpoints_failed: 0,
         last_checkpoint_status: None,
+        last_successful_checkpoint_at_ms: None,
         last_token_snapshot_sha: None,
         token_persistence_failures: 0,
     });
@@ -391,6 +453,7 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
                             u64::try_from(command_receiver.len()).unwrap_or(u64::MAX);
                         status.persisted_deltas += 1;
                         status.last_persisted = Some(delta.position());
+                        status.last_persisted_at_ms = Some(unix_timestamp_ms());
                     });
                 }
                 WriterCommand::Checkpoint(capture) => {
@@ -401,6 +464,7 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
                             u64::try_from(command_receiver.len()).unwrap_or(u64::MAX);
                         status.checkpoints_completed += 1;
                         status.last_checkpoint_status = Some("complete".to_string());
+                        status.last_successful_checkpoint_at_ms = Some(unix_timestamp_ms());
                     });
                 }
             }
@@ -436,10 +500,12 @@ pub struct WriterStatus {
     pub failed_deltas: u64,
     pub recorded_gaps: u64,
     pub last_persisted: Option<StreamPosition>,
+    pub last_persisted_at_ms: Option<u64>,
     pub last_error: Option<String>,
     pub checkpoints_completed: u64,
     pub checkpoints_failed: u64,
     pub last_checkpoint_status: Option<String>,
+    pub last_successful_checkpoint_at_ms: Option<u64>,
     pub last_token_snapshot_sha: Option<String>,
     pub token_persistence_failures: u64,
 }
@@ -529,10 +595,22 @@ impl WriterTask {
                     status.healthy = true;
                     status.persisted_deltas += 1;
                     status.last_persisted = Some(position);
+                    status.last_persisted_at_ms = Some(unix_timestamp_ms());
                     status.last_error = None;
                 });
             }
             Err(error) => {
+                tracing::error!(
+                    event = "state_history_delta_persistence_failed",
+                    chain_id = delta.chain_id(),
+                    generation = position.generation,
+                    message_seq = position.message_seq,
+                    observed_at_ms = delta.observed_at_ms(),
+                    retry_window_ms = u64::try_from(self.config.retry_window.as_millis())
+                        .unwrap_or(u64::MAX),
+                    %error,
+                    "state history delta persistence failed"
+                );
                 lock(&self.gaps).merge(delta_gap(&delta, GapReason::WriteFailed));
                 self.status.send_modify(|status| {
                     status.healthy = false;
@@ -609,19 +687,53 @@ impl WriterTask {
     }
 
     async fn process_checkpoint(&mut self, capture: CheckpointCapture) {
+        let started_at = Instant::now();
+        let chain_id = capture.state().chain_id();
+        let position = capture.state().position();
+        let kind = capture.state().kind();
+        let block_number = capture.state().block_number();
+        let state_version = capture.state().state_version();
+        let rfq_observed_at_ms = capture.state().rfq_observed_at_ms();
         let boundary_gap = (capture.state().kind() == CheckpointKind::Boundary)
             .then(|| checkpoint_gap(capture.state(), GapReason::CheckpointFailed));
         match self.execute_checkpoint(capture).await {
             Ok(()) => {
+                tracing::info!(
+                    event = "state_history_checkpoint_completed",
+                    chain_id,
+                    generation = position.generation,
+                    message_seq = position.message_seq,
+                    checkpoint_kind = kind.as_str(),
+                    ?state_version,
+                    block_number,
+                    ?rfq_observed_at_ms,
+                    duration_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "state history checkpoint completed"
+                );
                 self.status.send_modify(|status| {
                     status.healthy = true;
                     status.checkpoints_completed += 1;
                     status.last_checkpoint_status = Some("complete".to_owned());
+                    status.last_successful_checkpoint_at_ms = Some(unix_timestamp_ms());
                     status.last_error = None;
                 });
             }
             Err(error) => {
-                tracing::error!(%error, "state history checkpoint failed");
+                tracing::error!(
+                    event = "state_history_checkpoint_failed",
+                    chain_id,
+                    generation = position.generation,
+                    message_seq = position.message_seq,
+                    checkpoint_kind = kind.as_str(),
+                    ?state_version,
+                    block_number,
+                    ?rfq_observed_at_ms,
+                    duration_ms = u64::try_from(started_at.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    %error,
+                    "state history checkpoint failed"
+                );
                 if let Some(gap) = boundary_gap {
                     lock(&self.gaps).merge(gap);
                 }
@@ -679,14 +791,19 @@ impl WriterTask {
                 Some(Ok(())) => {}
                 Some(Err(mark_error)) => {
                     tracing::error!(
+                        event = "state_history_checkpoint_status_update_failed",
                         checkpoint_id,
+                        target_status = "failed",
                         %mark_error,
                         "failed to mark state history checkpoint as failed"
                     );
                 }
                 None => {
                     tracing::error!(
+                        event = "state_history_checkpoint_status_update_failed",
                         checkpoint_id,
+                        target_status = "failed",
+                        reason = "timeout",
                         "timed out while marking state history checkpoint as failed"
                     );
                 }
@@ -777,7 +894,7 @@ impl WriterTask {
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.record_token_persistence_failure(capture, &error);
+                self.record_token_persistence_failure(capture, "encode", &error);
                 return None;
             }
         };
@@ -825,7 +942,7 @@ impl WriterTask {
         {
             Some(Ok(())) => {}
             Some(Err(error)) => {
-                self.record_token_persistence_failure(capture, &error);
+                self.record_token_persistence_failure(capture, "upload", &error);
                 return None;
             }
             None => {
@@ -859,13 +976,20 @@ impl WriterTask {
         self.objects.put(key, bytes).await
     }
 
-    fn record_token_persistence_failure(&mut self, capture: &CapturedState, error: &anyhow::Error) {
+    fn record_token_persistence_failure(
+        &mut self,
+        capture: &CapturedState,
+        stage: &'static str,
+        error: &anyhow::Error,
+    ) {
         // A failed attempt invalidates the memo so identical content must prove durability again.
         self.last_persisted_token = None;
         tracing::warn!(
+            event = "state_history_token_persistence_failed",
             chain_id = capture.chain_id(),
             generation = capture.position().generation,
             message_seq = capture.position().message_seq,
+            stage,
             %error,
             "state history token snapshot persistence failed"
         );
@@ -885,6 +1009,7 @@ impl WriterTask {
         // A lost gap record turns a known hole into an invisible one, so normal operation retries forever.
         let persistence = async {
             let mut delay = INITIAL_RETRY_DELAY;
+            let mut reported_retry = false;
             loop {
                 let result = async {
                     let mut connection = self
@@ -898,6 +1023,15 @@ impl WriterTask {
                 .await;
                 match result {
                     Ok(()) => {
+                        tracing::warn!(
+                            event = "state_history_gap_recorded",
+                            chain_id = gap.chain_id,
+                            generation = gap.generation,
+                            from_message_seq = gap.from_message_seq,
+                            to_message_seq = gap.to_message_seq,
+                            reason = gap.reason.as_str(),
+                            "state history gap recorded"
+                        );
                         self.status.send_modify(|status| {
                             status.healthy = true;
                             status.recorded_gaps += 1;
@@ -906,14 +1040,36 @@ impl WriterTask {
                         return;
                     }
                     Err(error) if is_permanent_persistence_error(&error) => {
-                        tracing::error!(%error, "permanent state history gap persistence failure");
+                        tracing::error!(
+                            event = "state_history_gap_persistence_failed",
+                            chain_id = gap.chain_id,
+                            generation = gap.generation,
+                            from_message_seq = gap.from_message_seq,
+                            to_message_seq = gap.to_message_seq,
+                            reason = gap.reason.as_str(),
+                            %error,
+                            "permanent state history gap persistence failure"
+                        );
                         self.status.send_modify(|status| {
                             status.healthy = false;
                             status.last_error = Some(error.to_string());
                         });
                         return;
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        if !reported_retry {
+                            tracing::warn!(
+                                event = "state_history_gap_persistence_retrying",
+                                chain_id = gap.chain_id,
+                                generation = gap.generation,
+                                from_message_seq = gap.from_message_seq,
+                                to_message_seq = gap.to_message_seq,
+                                reason = gap.reason.as_str(),
+                                %error,
+                                "state history gap persistence will retry"
+                            );
+                            reported_retry = true;
+                        }
                         tokio::time::sleep(delay).await;
                         delay = cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
                     }
@@ -929,6 +1085,7 @@ impl WriterTask {
         .is_none()
         {
             tracing::error!(
+                event = "state_history_gap_shutdown_dropped",
                 chain_id = gap.chain_id,
                 generation = gap.generation,
                 from_message_seq = gap.from_message_seq,
@@ -973,6 +1130,13 @@ impl WriterTask {
         self.shutdown_deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn queue_len(sender: &mpsc::Sender<WriterCommand>) -> u64 {
@@ -1362,6 +1526,7 @@ mod tests {
                 message_seq: 3,
             })
         );
+        assert!(status.last_persisted_at_ms.is_some());
         writer.shutdown(Duration::from_secs(5)).await;
         Ok(())
     }
@@ -1468,6 +1633,7 @@ mod tests {
             writer.status().last_checkpoint_status.as_deref(),
             Some("complete")
         );
+        assert!(writer.status().last_successful_checkpoint_at_ms.is_some());
         writer.shutdown(Duration::from_secs(5)).await;
         Ok(())
     }

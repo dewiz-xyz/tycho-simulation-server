@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
-use sqlx::Connection;
+use sqlx::{migrate::Migrator, Connection, Postgres, Transaction};
 
 use crate::{
-    BlockTimeObservation, CapturedState, CheckpointKind, DeltaEntry, GapRecord, StreamPosition,
-    TokenSnapshotRef,
+    BlockTimeObservation, CapturedState, DeltaEntry, GapRecord, StreamPosition, TokenSnapshotRef,
 };
 
 const BLOCK_TIME_UPSERT: &str = r#"
@@ -28,6 +27,11 @@ const BLOCK_TIME_UPSERT: &str = r#"
     WHERE (EXCLUDED.source_generation, EXCLUDED.source_message_seq)
         > (bt.source_generation, bt.source_message_seq)
 "#;
+
+pub static STATE_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+pub const STATE_HISTORY_WRITER_ROLE: &str = "state_history_writer";
+pub const STATE_HISTORY_OBSERVER_ROLE: &str = "state_history_observer";
 
 pub struct StateHistoryStore {
     pool: sqlx::PgPool,
@@ -82,11 +86,185 @@ impl StateHistoryStore {
         Ok(())
     }
 
+    pub async fn latest_block_number(&self, chain_id: u64) -> anyhow::Result<Option<u64>> {
+        let block_number: Option<i64> = sqlx::query_scalar(
+            "SELECT max(block_number) FROM state_history.block_times WHERE chain_id = $1",
+        )
+        .bind(db_i64(chain_id, "block time chain_id")?)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to read the latest state history block number")?;
+        block_number
+            .map(|value| u64::try_from(value).context("latest block number is negative"))
+            .transpose()
+    }
+
     pub async fn run_migrations(&self) -> anyhow::Result<()> {
-        sqlx::migrate!("./migrations")
+        STATE_HISTORY_MIGRATOR
             .run(&self.pool)
             .await
             .context("failed to run state history migrations")?;
+        Ok(())
+    }
+
+    pub async fn validate_migration_catalog(&self) -> anyhow::Result<()> {
+        let applied: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to read the SQLx migration catalog")?;
+        let expected = STATE_HISTORY_MIGRATOR
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+            .collect::<Vec<_>>();
+
+        ensure!(
+            applied.len() == expected.len(),
+            "state history migration catalog has {} entries; expected {}",
+            applied.len(),
+            expected.len()
+        );
+        for ((version, description, success, checksum), migration) in applied.iter().zip(expected) {
+            ensure!(
+                *version == migration.version,
+                "state history migration catalog version mismatch: expected {}, got {version}",
+                migration.version
+            );
+            ensure!(
+                *success,
+                "state history migration {version} is marked unsuccessful"
+            );
+            ensure!(
+                description == migration.description.as_ref(),
+                "state history migration {version} description mismatch: expected {}, got {description}",
+                migration.description
+            );
+            ensure!(
+                checksum.as_slice() == migration.checksum.as_ref(),
+                "state history migration {version} checksum does not match the embedded migration"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn provision_runtime_roles(&self, writer_password: &str) -> anyhow::Result<()> {
+        ensure!(
+            !writer_password.is_empty(),
+            "state history writer password is empty"
+        );
+        let rds_iam_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam')")
+                .fetch_one(&self.pool)
+                .await
+                .context("failed to verify the RDS IAM database role")?;
+        ensure!(
+            rds_iam_exists,
+            "required PostgreSQL role rds_iam does not exist"
+        );
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start state history role transaction")?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('state-history-runtime-roles', 0))",
+        )
+        .execute(&mut *transaction)
+        .await
+        .context("failed to lock state history role provisioning")?;
+        create_runtime_roles(&mut transaction).await?;
+        set_runtime_writer_password(&mut transaction, writer_password).await?;
+        apply_runtime_role_grants(&mut transaction).await?;
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit state history runtime roles")?;
+        self.validate_runtime_roles().await?;
+        Ok(())
+    }
+
+    async fn validate_runtime_roles(&self) -> anyhow::Result<()> {
+        let roles_valid: bool = sqlx::query_scalar(
+            r#"
+            SELECT
+                writer.rolcanlogin AND NOT writer.rolsuper AND NOT writer.rolcreatedb
+                    AND NOT writer.rolcreaterole AND NOT writer.rolreplication
+                    AND NOT writer.rolbypassrls AND writer.rolinherit
+                    AND observer.rolcanlogin AND NOT observer.rolsuper
+                    AND NOT observer.rolcreatedb AND NOT observer.rolcreaterole
+                    AND NOT observer.rolreplication AND NOT observer.rolbypassrls
+                    AND observer.rolinherit
+                    AND COALESCE('default_transaction_read_only=on' = ANY(observer.rolconfig), false)
+                    AND pg_has_role('state_history_observer', 'rds_iam', 'MEMBER')
+            FROM pg_roles AS writer
+            CROSS JOIN pg_roles AS observer
+            WHERE writer.rolname = 'state_history_writer'
+              AND observer.rolname = 'state_history_observer'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to validate state history role attributes")?;
+        ensure!(
+            roles_valid,
+            "state history runtime role attributes are invalid"
+        );
+
+        let table_privileges_valid: bool = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(bool_and(
+                has_table_privilege('state_history_writer', format('%I.%I', schemaname, tablename), 'SELECT')
+                AND has_table_privilege('state_history_writer', format('%I.%I', schemaname, tablename), 'INSERT')
+                AND has_table_privilege('state_history_writer', format('%I.%I', schemaname, tablename), 'UPDATE')
+                AND NOT has_table_privilege('state_history_writer', format('%I.%I', schemaname, tablename), 'DELETE')
+                AND has_table_privilege('state_history_observer', format('%I.%I', schemaname, tablename), 'SELECT')
+                AND NOT has_table_privilege('state_history_observer', format('%I.%I', schemaname, tablename), 'INSERT')
+                AND NOT has_table_privilege('state_history_observer', format('%I.%I', schemaname, tablename), 'UPDATE')
+                AND NOT has_table_privilege('state_history_observer', format('%I.%I', schemaname, tablename), 'DELETE')
+            ), false)
+            FROM pg_tables
+            WHERE schemaname = 'state_history'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to validate state history table privileges")?;
+        ensure!(
+            table_privileges_valid,
+            "state history table privileges are invalid"
+        );
+
+        let other_privileges_valid: bool = sqlx::query_scalar(
+            r#"
+            SELECT
+                has_database_privilege('state_history_writer', current_database(), 'CONNECT')
+                AND has_database_privilege('state_history_observer', current_database(), 'CONNECT')
+                AND has_schema_privilege('state_history_writer', 'state_history', 'USAGE')
+                AND has_schema_privilege('state_history_observer', 'state_history', 'USAGE')
+                AND has_table_privilege('state_history_observer', 'public._sqlx_migrations', 'SELECT')
+                AND NOT has_table_privilege('state_history_writer', 'public._sqlx_migrations', 'SELECT')
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_sequences
+                    WHERE schemaname = 'state_history'
+                      AND NOT has_sequence_privilege(
+                          'state_history_writer',
+                          format('%I.%I', schemaname, sequencename),
+                          'USAGE'
+                      )
+                )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to validate state history schema privileges")?;
+        ensure!(
+            other_privileges_valid,
+            "state history schema privileges are invalid"
+        );
         Ok(())
     }
 
@@ -259,7 +437,7 @@ impl StateHistoryStore {
                 .map(|value| db_i64(value, "checkpoint state_version"))
                 .transpose()?,
         )
-        .bind(checkpoint_kind(capture.kind()))
+        .bind(capture.kind().as_str())
         .bind(db_i64(capture.block_number(), "checkpoint block_number")?)
         .bind(
             capture
@@ -359,6 +537,104 @@ impl StateHistoryStore {
     }
 }
 
+async fn create_runtime_roles(transaction: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'state_history_writer') THEN
+                CREATE ROLE state_history_writer LOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'state_history_observer') THEN
+                CREATE ROLE state_history_observer LOGIN;
+            END IF;
+        END
+        $$
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create state history runtime roles")?;
+    Ok(())
+}
+
+async fn set_runtime_writer_password(
+    transaction: &mut Transaction<'_, Postgres>,
+    writer_password: &str,
+) -> anyhow::Result<()> {
+    // Keep the password bound as data. PostgreSQL utility statements cannot accept a password
+    // parameter directly, so the fixed PL/pgSQL block quotes it on the server.
+    sqlx::query("SELECT set_config('state_history.writer_password', $1, true)")
+        .bind(writer_password)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to stage the state history writer password")?;
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            EXECUTE format(
+                'ALTER ROLE state_history_writer LOGIN PASSWORD %L',
+                current_setting('state_history.writer_password')
+            );
+        END
+        $$
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to set the state history writer password")?;
+    sqlx::query("SELECT set_config('state_history.writer_password', '', true)")
+        .execute(&mut **transaction)
+        .await
+        .context("failed to clear the staged state history writer password")?;
+    Ok(())
+}
+
+async fn apply_runtime_role_grants(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    for statement in [
+        "ALTER ROLE state_history_writer NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+        "ALTER ROLE state_history_writer SET default_transaction_read_only = off",
+        "ALTER ROLE state_history_observer LOGIN PASSWORD NULL NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+        "ALTER ROLE state_history_observer SET default_transaction_read_only = on",
+        "GRANT rds_iam TO state_history_observer",
+        "REVOKE ALL ON SCHEMA state_history FROM state_history_writer, state_history_observer",
+        "REVOKE ALL ON ALL TABLES IN SCHEMA state_history FROM state_history_writer, state_history_observer",
+        "REVOKE ALL ON ALL SEQUENCES IN SCHEMA state_history FROM state_history_writer, state_history_observer",
+        "REVOKE ALL ON TABLE public._sqlx_migrations FROM state_history_writer, state_history_observer",
+        "GRANT USAGE ON SCHEMA state_history TO state_history_writer, state_history_observer",
+        "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA state_history TO state_history_writer",
+        "GRANT USAGE ON ALL SEQUENCES IN SCHEMA state_history TO state_history_writer",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA state_history TO state_history_observer",
+        "GRANT USAGE ON SCHEMA public TO state_history_observer",
+        "GRANT SELECT ON TABLE public._sqlx_migrations TO state_history_observer",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA state_history REVOKE ALL ON TABLES FROM state_history_writer, state_history_observer",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA state_history REVOKE ALL ON SEQUENCES FROM state_history_writer, state_history_observer",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA state_history GRANT SELECT, INSERT, UPDATE ON TABLES TO state_history_writer",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA state_history GRANT USAGE ON SEQUENCES TO state_history_writer",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA state_history GRANT SELECT ON TABLES TO state_history_observer",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut **transaction)
+            .await
+            .with_context(|| format!("failed to apply state history role grant: {statement}"))?;
+    }
+
+    let connect_grant: String = sqlx::query_scalar(
+        "SELECT format('GRANT CONNECT ON DATABASE %I TO state_history_writer, state_history_observer', current_database())",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to prepare state history database connect grant")?;
+    sqlx::query(&connect_grant)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to grant state history database access")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaInsertOutcome {
     Inserted(i64),
@@ -407,13 +683,6 @@ fn db_i64(value: u64, field: &str) -> anyhow::Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} exceeds PostgreSQL BIGINT"))
 }
 
-pub(crate) const fn checkpoint_kind(kind: CheckpointKind) -> &'static str {
-    match kind {
-        CheckpointKind::Boundary => "boundary",
-        CheckpointKind::Interval => "interval",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -425,6 +694,22 @@ mod tests {
         Backend, BlockTimeObservation, CapturedState, CheckpointKind, DeltaBackendCursor,
         DeltaEntry, GapReason, GapRecord, StreamPosition,
     };
+
+    #[test]
+    fn embedded_migration_catalog_matches_schema_version_one() {
+        let migrations = STATE_HISTORY_MIGRATOR
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+            .collect::<Vec<_>>();
+
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].version, 20_260_728_000_100);
+        assert_eq!(migrations[0].description, "create state history");
+        assert_eq!(
+            hex::encode(migrations[0].checksum.as_ref()),
+            "7e6f16f9c3faa11685000d13138297e01c39d192d239ac149edf24bfb51826300e6535b6e655398461e03171c6308884"
+        );
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]

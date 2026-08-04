@@ -2191,15 +2191,7 @@ fn enqueue_state_history_update(
     });
     match result {
         Ok(Some(delta)) => {
-            if !state_history.handle.enqueue_delta(delta) {
-                warn!(
-                    event = "state_history_delta_enqueue_failed",
-                    chain_id = entry.chain_id,
-                    generation = publisher.generation,
-                    message_seq = entry.message_seq,
-                    "State history delta queue rejected an accepted update"
-                );
-            }
+            state_history.handle.enqueue_delta(delta);
         }
         Err(error) => {
             state_history.handle.record_delta_preparation_failure_gap(

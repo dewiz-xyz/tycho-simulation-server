@@ -236,6 +236,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace
 cargo build -p apps --bin dsolver-simulator-service --release
 cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+cargo build -p apps --bin state-history-migrate --release
+scripts/verify_state_history.sh --repo .
 ```
 
 Local analysis harness:
