@@ -345,12 +345,12 @@ State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, 
 | `STATE_HISTORY_S3_REGION` | S3 region. Defaults to `eu-central-1`. |
 | `STATE_HISTORY_S3_ENDPOINT_URL` | Optional custom S3 endpoint for compatible local services. |
 | `STATE_HISTORY_S3_FORCE_PATH_STYLE` | Forces path-style S3 requests. Defaults to `false`. |
-| `STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL` | Required positive interval between checkpoint targets. Use `300` in production. |
+| `STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL` | Required positive interval between checkpoint targets. Use `1800` in production. |
 | `STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS` | Seconds between checkpoint eligibility checks. Defaults to `30`. |
 | `STATE_HISTORY_QUEUE_CAPACITY` | In-memory writer command queue capacity. Defaults to `8192`. |
 | `STATE_HISTORY_WRITE_RETRY_WINDOW_MS` | Maximum delta write retry window in milliseconds. Defaults to `30000`. |
 
-`.env.example` contains the complete local example block. The recommended production value is `STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL=300`.
+`.env.example` contains the complete local example block. The recommended production value is `STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL=1800`.
 
 Token snapshots add no environment variables. They use the existing state history S3 settings. Stream token admission uses the existing `BROADCASTER_TOKEN_MIN_QUALITY` setting.
 
