@@ -175,6 +175,7 @@ impl StateHistoryStore {
         .await
         .context("failed to lock state history role provisioning")?;
         create_runtime_roles(&mut transaction).await?;
+        ensure_runtime_roles_are_restricted(&mut transaction).await?;
         set_runtime_writer_password(&mut transaction, writer_password).await?;
         apply_runtime_role_grants(&mut transaction).await?;
 
@@ -558,6 +559,35 @@ async fn create_runtime_roles(transaction: &mut Transaction<'_, Postgres>) -> an
     Ok(())
 }
 
+async fn ensure_runtime_roles_are_restricted(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    // RDS administrators cannot clear superuser-only attributes, so reject an elevated existing
+    // role before changing its credentials or grants. Fresh roles already use these safe defaults.
+    let roles_restricted: bool = sqlx::query_scalar(
+        r#"
+        SELECT
+            NOT writer.rolsuper AND NOT writer.rolcreatedb AND NOT writer.rolcreaterole
+                AND NOT writer.rolreplication AND NOT writer.rolbypassrls
+                AND NOT observer.rolsuper AND NOT observer.rolcreatedb
+                AND NOT observer.rolcreaterole AND NOT observer.rolreplication
+                AND NOT observer.rolbypassrls
+        FROM pg_roles AS writer
+        CROSS JOIN pg_roles AS observer
+        WHERE writer.rolname = 'state_history_writer'
+          AND observer.rolname = 'state_history_observer'
+        "#,
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to validate state history runtime role restrictions")?;
+    ensure!(
+        roles_restricted,
+        "state history runtime roles have privileged attributes"
+    );
+    Ok(())
+}
+
 async fn set_runtime_writer_password(
     transaction: &mut Transaction<'_, Postgres>,
     writer_password: &str,
@@ -595,9 +625,9 @@ async fn apply_runtime_role_grants(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
     for statement in [
-        "ALTER ROLE state_history_writer NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+        "ALTER ROLE state_history_writer LOGIN INHERIT",
         "ALTER ROLE state_history_writer SET default_transaction_read_only = off",
-        "ALTER ROLE state_history_observer LOGIN PASSWORD NULL NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+        "ALTER ROLE state_history_observer LOGIN PASSWORD NULL INHERIT",
         "ALTER ROLE state_history_observer SET default_transaction_read_only = on",
         "GRANT rds_iam TO state_history_observer",
         "REVOKE ALL ON SCHEMA state_history FROM state_history_writer, state_history_observer",
