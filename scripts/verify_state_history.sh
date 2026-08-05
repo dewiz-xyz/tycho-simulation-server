@@ -63,7 +63,7 @@ cleanup() {
 trap cleanup EXIT
 
 export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:55432/state_history"
-export STATE_HISTORY_MIGRATION_DATABASE_URL="$DATABASE_URL"
+export STATE_HISTORY_MIGRATION_DATABASE_URL="postgres://state_history_migration:state-history-migration-test-password@127.0.0.1:55432/state_history"
 export STATE_HISTORY_WRITER_PASSWORD="state-history-writer-test-password"
 export AWS_ACCESS_KEY_ID="minioadmin"
 export AWS_SECRET_ACCESS_KEY="minioadmin"
@@ -83,8 +83,14 @@ echo "Starting local state history storage stack..."
   docker compose -p "$compose_project" -f "$compose_file" up -d --wait --wait-timeout 120 postgres minio
   docker compose -p "$compose_project" -f "$compose_file" run --rm minio-init
   docker compose -p "$compose_project" -f "$compose_file" exec -T postgres \
-    psql -U postgres -d state_history -v ON_ERROR_STOP=1 -c \
-    "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam') THEN CREATE ROLE rds_iam NOLOGIN; END IF; END \$\$;"
+    psql -U postgres -d state_history -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE rds_iam NOLOGIN;
+CREATE ROLE state_history_migration
+    LOGIN PASSWORD 'state-history-migration-test-password'
+    CREATEDB CREATEROLE NOSUPERUSER NOREPLICATION NOBYPASSRLS;
+GRANT rds_iam TO state_history_migration WITH ADMIN OPTION;
+ALTER DATABASE state_history OWNER TO state_history_migration;
+SQL
 )
 
 echo "Running the state history migration task twice..."
