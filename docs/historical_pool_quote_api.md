@@ -231,7 +231,7 @@ docker build \
 
 The final image runs as user ID `10001` and contains only the service binary plus TLS runtime packages. The service dependency graph has no private Git dependency, so the image build receives no Git token.
 
-`.github/workflows/build-historical-quote-service.yml` is manual and build only. It uses the dedicated `AWS_HISTORICAL_QUOTE_ECR_ROLE_ARN` GitHub secret and further restricts the assumed session to ECR login plus image pushes to this service's repository. It pushes immutable `${{ github.sha }}` and convenience `latest` tags, then stops. The workflow cannot update ECS, change IAM, run Pulumi, run a consistency check, or deploy the image.
+`.github/workflows/build-historical-quote-service.yml` is manual and build only. It uses the dedicated `AWS_HISTORICAL_QUOTE_ECR_ROLE_ARN` GitHub secret and further restricts the assumed session to ECR login plus image pushes to this service's repository. It pushes only the immutable `${{ github.sha }}` tag, then stops. The workflow cannot update ECS, change IAM, run Pulumi, run a consistency check, or deploy the image.
 
 ## First rollout checklist
 
