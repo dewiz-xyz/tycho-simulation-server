@@ -115,6 +115,8 @@ The shared `broadcaster-replay-client` crate owns that bootstrap and Redis repla
 
 Optional broadcaster state history persists full-state checkpoints, token snapshots, and ordered deltas for historical replay and analysis. See [docs/state_history.md](docs/state_history.md) for the segment model, PostgreSQL schema, S3 objects, Rust reader API, environment variables, status fields, and retention contract.
 
+The separate Historical Pool Quote API reconstructs retained Base state for one exact component and token direction. It uses an HTTP-only Rust CLI and has no direct broadcaster, Redis, primary database, or state-history write path. See [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md) for the mental model, CLI, API, limits, image, and operator workflow.
+
 Broadcaster deployments use four modes:
 
 - `Passive` warms upstream/cache state, but does not append Redis deltas or serve snapshot sessions.
@@ -237,6 +239,8 @@ cargo nextest run --workspace
 cargo build -p apps --bin dsolver-simulator-service --release
 cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
 cargo build -p apps --bin state-history-migrate --release
+cargo build -p historical-quote-service --release
+cargo build -p dsolver-history --release
 scripts/verify_state_history.sh --repo .
 ```
 
@@ -274,6 +278,7 @@ Container builds:
 ```bash
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.simulator-service -t dsolver-simulator-service .
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
+docker build -f Dockerfile.historical-quote-service -t historical-quote-service:test .
 ```
 
 Useful helpers:
@@ -291,6 +296,7 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
+- [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md): Historical Pool Quote API, CLI, limits, and operator workflow
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
 - `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
