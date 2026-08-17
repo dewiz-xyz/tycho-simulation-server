@@ -515,6 +515,7 @@ impl BroadcasterSnapshotCache {
         guard.replacement = None;
     }
 
+    #[cfg(test)]
     pub(crate) async fn replacement_pending(&self) -> bool {
         self.inner.read().await.replacement.is_some()
     }

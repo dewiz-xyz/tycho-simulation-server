@@ -88,6 +88,12 @@ impl BroadcasterStreamControls {
             .mark_stream_disconnected(reason, last_error)
             .await;
     }
+
+    async fn mark_disconnected_for_exit(&self, reason: &str, last_error: Option<String>) {
+        self.service
+            .mark_stream_disconnected_for_exit(reason, last_error)
+            .await;
+    }
 }
 
 enum StreamMessage {
@@ -707,14 +713,15 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     }
 }
 
-pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
+pub async fn run_broadcaster_raw_stream_once<F, Fut, S>(
     build_stream: F,
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     controls: BroadcasterStreamControls,
-) where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = anyhow::Result<(tokio::task::JoinHandle<()>, S)>> + Send,
     S: futures::Stream<
             Item = Result<
                 FeedMessage<BlockHeader>,
@@ -723,105 +730,95 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
         > + Unpin
         + Send,
 {
-    let mut backoff = cfg.restart_backoff_min;
-
-    loop {
-        tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            () = controls.service.wait_for_shared_publisher_resume() => {}
+    tokio::select! {
+        biased;
+        () = controls.stop.cancelled() => return Ok(()),
+        () = controls.service.wait_for_shared_publisher_resume() => {}
+    }
+    let pause_epoch = controls.service.shared_publisher_pause_epoch();
+    let built_stream = tokio::select! {
+        biased;
+        () = controls.stop.cancelled() => return Ok(()),
+        result = build_stream() => result,
+    };
+    let (mut lifecycle_task, stream) = match built_stream {
+        Ok(built_stream) => {
+            controls.service.mark_upstream_connected().await;
+            built_stream
         }
-        let pause_epoch = controls.service.shared_publisher_pause_epoch();
-        let built_stream = tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            result = build_stream() => result,
-        };
-        let stream = match built_stream {
-            Ok(stream) => {
-                controls.service.mark_upstream_connected().await;
-                stream
-            }
-            Err(err) => {
-                controls.service.mark_build_failed(err.to_string()).await;
-                warn!(
-                    event = "stream_build_failed",
-                    stream = StreamKind::Broadcaster.as_str(),
-                    error = %err,
-                    "Failed to build raw broadcaster stream"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                tokio::select! {
-                    biased;
-                    () = controls.stop.cancelled() => return,
-                    () = sleep(Duration::from_millis(backoff_ms)) => {}
-                }
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
-                continue;
-            }
-        };
-
-        let exit = process_broadcaster_raw_stream(
-            stream,
-            Arc::clone(&health),
-            cfg.clone(),
-            &controls.service,
-            pause_epoch,
-            &controls.stop,
-        )
-        .await;
-
-        if exit.reason == StreamRestartReason::Stopped {
-            return;
-        }
-
-        let restart_count = health.increment_restart().await;
-        health.reset_bursts().await;
-        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-        let has_received_update = health.has_received_update().await;
-        let recovery_completed = controls
-            .service
-            .reconnect_backoff_can_reset(cfg.readiness_stale)
-            .await;
-        if recovery_completed {
-            backoff = cfg.restart_backoff_min;
-        }
-        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-        let last_block = health.last_block().await;
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "stream_restart",
-            stream = StreamKind::Broadcaster.as_str(),
-            reason = exit.reason.as_str(),
-            restart_count,
-            backoff_ms,
-            started_age_ms,
-            has_received_update,
-            recovery_completed,
-            last_block,
-            last_update_age_ms,
-            "Restarting raw broadcaster stream"
-        );
-
-        controls
-            .mark_disconnected(exit.reason.as_str(), exit.last_error.clone())
-            .await;
-        if controls.service.redis_publisher_is_retired().await {
+        Err(error) => {
+            controls.service.mark_build_failed(error.to_string()).await;
             error!(
-                event = "broadcaster_writer_fence_lost",
-                "Raw broadcaster feed supervisor is terminating after writer fencing loss"
+                event = "broadcaster_raw_feed_fatal",
+                stage = "build",
+                stream = StreamKind::Broadcaster.as_str(),
+                error = %error,
+                "Raw broadcaster stream build failed; terminating the process"
             );
-            return;
+            return Err(error.context("Failed to build raw broadcaster stream"));
         }
-        maybe_purge_allocator("broadcaster_restart", cfg.memory);
+    };
 
-        tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            () = sleep(Duration::from_millis(backoff_ms)) => {}
+    let mut processing = Box::pin(process_broadcaster_raw_stream(
+        stream,
+        Arc::clone(&health),
+        cfg,
+        &controls.service,
+        pause_epoch,
+        &controls.stop,
+    ));
+    enum Completion {
+        Stream(StreamExit),
+        LifecycleTask(Result<(), tokio::task::JoinError>),
+    }
+    let completion = tokio::select! {
+        biased;
+        exit = &mut processing => Completion::Stream(exit),
+        result = &mut lifecycle_task => Completion::LifecycleTask(result),
+    };
+    drop(processing);
+
+    match completion {
+        Completion::LifecycleTask(result) => {
+            let error = match result {
+                Ok(()) => "Tycho raw stream lifecycle task stopped unexpectedly".to_string(),
+                Err(error) => format!("Tycho raw stream lifecycle task failed: {error}"),
+            };
+            controls
+                .mark_disconnected_for_exit("lifecycle_task_ended", Some(error.clone()))
+                .await;
+            error!(
+                event = "broadcaster_raw_feed_fatal",
+                stage = "lifecycle_task",
+                stream = StreamKind::Broadcaster.as_str(),
+                error,
+                "Raw broadcaster lifecycle task ended; terminating the process"
+            );
+            Err(anyhow::anyhow!(error))
         }
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
+        Completion::Stream(exit) if exit.reason == StreamRestartReason::Stopped => Ok(()),
+        Completion::Stream(exit) => {
+            controls
+                .mark_disconnected_for_exit(exit.reason.as_str(), exit.last_error.clone())
+                .await;
+            error!(
+                event = "broadcaster_raw_feed_fatal",
+                stage = "stream",
+                stream = StreamKind::Broadcaster.as_str(),
+                reason = exit.reason.as_str(),
+                last_error = exit.last_error.as_deref().unwrap_or_default(),
+                "Raw broadcaster stream ended; terminating the process"
+            );
+            let detail = exit
+                .last_error
+                .map(|error| format!("; {error}"))
+                .unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "Raw broadcaster stream ended: {}{}",
+                exit.reason.as_str(),
+                detail
+            ))
+        }
     }
 }
 
@@ -862,11 +859,15 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::error::Error;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
-    use futures::StreamExt;
-    use tokio::sync::{Mutex, Notify};
+    use futures::{stream::BoxStream, StreamExt};
+    use tokio::sync::{mpsc, Mutex, Notify};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use tycho_simulation::protocol::models::Update;
@@ -874,7 +875,8 @@ mod tests {
 
     use super::{
         classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, StreamRestartReason, StreamSupervisorConfig,
+        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls,
+        StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -887,6 +889,9 @@ mod tests {
     use crate::models::stream_health::StreamHealth;
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
     use tycho_simulation::tycho_common::Bytes;
+
+    type RawTestItem = Result<FeedMessage<BlockHeader>, Box<dyn Error + Send + Sync>>;
+    type TestRawStream = BoxStream<'static, RawTestItem>;
 
     #[test]
     fn classifies_state_decoding_failure_messages() {
@@ -953,6 +958,184 @@ mod tests {
         .await;
 
         assert_eq!(exit.reason, StreamRestartReason::Stopped);
+    }
+
+    #[tokio::test]
+    async fn raw_feed_build_failure_does_not_retry_in_process() -> anyhow::Result<()> {
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let status_service = service.clone();
+        let stop = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::clone(&calls);
+        let result = timeout(
+            Duration::from_secs(1),
+            run_broadcaster_raw_stream_once(
+                move || async move {
+                    build_calls.fetch_add(1, Ordering::Relaxed);
+                    Err::<(tokio::task::JoinHandle<()>, TestRawStream), _>(anyhow::anyhow!(
+                        "planned build failure"
+                    ))
+                },
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                BroadcasterStreamControls { service, stop },
+            ),
+        )
+        .await?;
+        let Err(error) = result else {
+            return Err(anyhow::anyhow!(
+                "build failure should end the process feed task"
+            ));
+        };
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("planned build failure"));
+        let status = status_service.status_snapshot().await;
+        assert!(!status.upstream.connected);
+        assert_eq!(
+            status.upstream.last_disconnect_reason.as_deref(),
+            Some("build_failed")
+        );
+        assert_eq!(
+            status.upstream.last_error.as_deref(),
+            Some("planned build failure")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_feed_end_does_not_build_replacement_in_process() -> anyhow::Result<()> {
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let _gate_guard = lifecycle_gate.lock().await;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            1024,
+            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            test_redis_publisher(8453),
+            Arc::clone(&lifecycle_gate),
+        );
+        let status_service = service.clone();
+        let stop = CancellationToken::new();
+        let lifecycle_stop = CancellationToken::new();
+        let task_lifecycle_stop = lifecycle_stop.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::clone(&calls);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            run_broadcaster_raw_stream_once(
+                move || async move {
+                    build_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok((
+                        tokio::spawn(async move {
+                            task_lifecycle_stop.cancelled().await;
+                        }),
+                        futures::stream::empty().boxed(),
+                    ))
+                },
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                BroadcasterStreamControls { service, stop },
+            ),
+        )
+        .await?;
+        let Err(error) = result else {
+            return Err(anyhow::anyhow!(
+                "ended raw stream should end the process feed task"
+            ));
+        };
+        lifecycle_stop.cancel();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("ended"));
+        let status = status_service.status_snapshot().await;
+        assert_eq!(
+            status.upstream.last_disconnect_reason.as_deref(),
+            Some("ended")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_lifecycle_task_completion_ends_feed_process() -> anyhow::Result<()> {
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let status_service = service.clone();
+        let stop = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::clone(&calls);
+        let (sender, receiver) = mpsc::channel::<RawTestItem>(1);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            run_broadcaster_raw_stream_once(
+                move || async move {
+                    build_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok((
+                        tokio::spawn(async {}),
+                        tokio_stream::wrappers::ReceiverStream::new(receiver).boxed(),
+                    ))
+                },
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                BroadcasterStreamControls { service, stop },
+            ),
+        )
+        .await?;
+        let Err(error) = result else {
+            return Err(anyhow::anyhow!(
+                "lifecycle task completion should end the process feed task"
+            ));
+        };
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("stopped unexpectedly"));
+        assert!(sender.is_closed(), "raw stream receiver should be dropped");
+        let status = status_service.status_snapshot().await;
+        assert_eq!(
+            status.upstream.last_disconnect_reason.as_deref(),
+            Some("lifecycle_task_ended")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_feed_stop_is_clean_and_does_not_rebuild() -> anyhow::Result<()> {
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let lifecycle_stop = CancellationToken::new();
+        let task_lifecycle_stop = lifecycle_stop.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::clone(&calls);
+        let built = Arc::new(Notify::new());
+        let build_notifier = Arc::clone(&built);
+
+        let task = tokio::spawn(run_broadcaster_raw_stream_once(
+            move || async move {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                build_notifier.notify_one();
+                Ok((
+                    tokio::spawn(async move {
+                        task_lifecycle_stop.cancelled().await;
+                    }),
+                    futures::stream::pending().boxed(),
+                ))
+            },
+            Arc::new(StreamHealth::new()),
+            test_supervisor_config(),
+            BroadcasterStreamControls {
+                service,
+                stop: task_stop,
+            },
+        ));
+
+        timeout(Duration::from_secs(1), built.notified()).await?;
+        stop.cancel();
+        timeout(Duration::from_secs(1), task).await???;
+        lifecycle_stop.cancel();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
     #[tokio::test]

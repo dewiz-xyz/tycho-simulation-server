@@ -32,7 +32,7 @@ use crate::services::stream_builder::{
     build_broadcaster_raw_stream, build_rfq_stream, BroadcasterProtocols, RFQConfig, RFQTokenStores,
 };
 use crate::stream::{
-    supervise_broadcaster_raw_stream, supervise_broadcaster_stream, BroadcasterStreamControls,
+    run_broadcaster_raw_stream_once, supervise_broadcaster_stream, BroadcasterStreamControls,
     StreamSupervisorConfig,
 };
 use simulator_core::broadcaster::{
@@ -278,7 +278,7 @@ impl BroadcasterAppState {
 
 pub struct BroadcasterTasks {
     stop: CancellationToken,
-    feed_tasks: Vec<tokio::task::JoinHandle<()>>,
+    feed_tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
     promotion_task: tokio::task::JoinHandle<()>,
     heartbeat_task: tokio::task::JoinHandle<()>,
 }
@@ -292,24 +292,32 @@ impl BroadcasterTasks {
         let (result, finished_index, remaining) = select_all(self.feed_tasks.iter_mut()).await;
         drop(remaining);
         self.feed_tasks.swap_remove(finished_index);
-        result.context("Broadcaster feed task failed")
+        result.context("Broadcaster feed task failed")?
     }
 
     pub async fn stop_and_wait(self) -> Result<()> {
         self.stop.cancel();
         let mut first_error = None;
-        for task in self
-            .feed_tasks
-            .into_iter()
-            .chain([self.promotion_task, self.heartbeat_task])
-        {
-            if let Err(error) = task.await {
-                first_error.get_or_insert(error);
+        for task in self.feed_tasks {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| anyhow::anyhow!(error));
+                }
             }
         }
-        first_error.map_or(Ok(()), |error| {
-            Err(anyhow::anyhow!("Broadcaster task failed: {error}"))
-        })
+        for task in [self.promotion_task, self.heartbeat_task] {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| anyhow::anyhow!(error));
+            }
+        }
+        first_error.map_or(
+            Ok(()),
+            |error| Err(error.context("Broadcaster task failed")),
+        )
     }
 }
 
@@ -639,7 +647,7 @@ fn spawn_broadcaster_stream_task(
     health: Arc<StreamHealth>,
     service: BroadcasterServiceState,
     stop: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<()>> {
     let chain = config.chain_profile.chain;
     let tycho_url = config.tycho_url.clone();
     let api_key = config.api_key.clone();
@@ -652,28 +660,23 @@ fn spawn_broadcaster_stream_task(
 
     tokio::spawn(async move {
         info!("Starting broadcaster upstream supervisor...");
-        supervise_broadcaster_raw_stream(
-            move || {
-                let tycho_url = tycho_url.clone();
-                let api_key = api_key.clone();
-                let protocols = protocols.clone();
-                async move {
-                    build_broadcaster_raw_stream(
-                        &tycho_url,
-                        &api_key,
-                        tvl_threshold,
-                        tvl_keep_threshold,
-                        chain,
-                        &protocols,
-                    )
-                    .await
-                }
+        run_broadcaster_raw_stream_once(
+            move || async move {
+                build_broadcaster_raw_stream(
+                    &tycho_url,
+                    &api_key,
+                    tvl_threshold,
+                    tvl_keep_threshold,
+                    chain,
+                    &protocols,
+                )
+                .await
             },
             health,
             supervisor_cfg,
             BroadcasterStreamControls { service, stop },
         )
-        .await;
+        .await
     })
 }
 
@@ -683,7 +686,7 @@ fn spawn_broadcaster_rfq_stream_task(
     service: BroadcasterServiceState,
     token_stores: RFQTokenStores,
     stop: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<()>> {
     let chain = config.chain_profile.chain;
     let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
@@ -713,6 +716,7 @@ fn spawn_broadcaster_rfq_stream_task(
             BroadcasterStreamControls { service, stop },
         )
         .await;
+        Ok(())
     })
 }
 
@@ -1004,11 +1008,17 @@ mod tests {
                 stopped.fetch_add(1, Ordering::Relaxed);
             })
         };
+        let feed_stop = stop.clone();
+        let feed_stopped = Arc::clone(&stopped);
         let mut tasks = BroadcasterTasks {
             stop: stop.clone(),
             feed_tasks: vec![
-                tokio::spawn(async {}),
-                wait_for_stop(stop.clone(), Arc::clone(&stopped)),
+                tokio::spawn(async { Ok(()) }),
+                tokio::spawn(async move {
+                    feed_stop.cancelled().await;
+                    feed_stopped.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }),
             ],
             promotion_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
             heartbeat_task: wait_for_stop(stop, Arc::clone(&stopped)),
@@ -1018,6 +1028,34 @@ mod tests {
         tasks.stop_and_wait().await?;
 
         assert_eq!(stopped.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_feed_propagates_feed_error() -> anyhow::Result<()> {
+        let stop = CancellationToken::new();
+        let wait_for_stop = |stop: CancellationToken| {
+            tokio::spawn(async move {
+                stop.cancelled().await;
+            })
+        };
+        let mut tasks = BroadcasterTasks {
+            stop: stop.clone(),
+            feed_tasks: vec![tokio::spawn(async {
+                Err(anyhow::anyhow!("planned feed failure"))
+            })],
+            promotion_task: wait_for_stop(stop.clone()),
+            heartbeat_task: wait_for_stop(stop),
+        };
+
+        let result = tasks.wait_for_feed().await;
+        let Err(error) = result else {
+            return Err(anyhow::anyhow!(
+                "feed failure should reach the process boundary"
+            ));
+        };
+        assert!(format!("{error:#}").contains("planned feed failure"));
+        tasks.stop_and_wait().await?;
         Ok(())
     }
 

@@ -496,6 +496,15 @@ impl BroadcasterServiceState {
         }
     }
 
+    pub(crate) async fn mark_stream_disconnected_for_exit(
+        &self,
+        reason: impl Into<String>,
+        last_error: Option<String>,
+    ) {
+        // Fatal feed paths must reach main before the process shutdown deadline can start.
+        self.upstream.mark_disconnected(reason, last_error).await;
+    }
+
     async fn cancel_recovery_publication(&self) {
         let mut recovery = self.recovery_publication.lock().await;
         let outcome = Self::cancel_recovery_publication_locked(&mut recovery);
@@ -625,6 +634,7 @@ impl BroadcasterServiceState {
             .flatten()
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconnect_backoff_can_reset(&self, freshness: Duration) -> bool {
         if self.cache.replacement_pending().await {
             return false;

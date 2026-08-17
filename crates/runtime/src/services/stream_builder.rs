@@ -68,7 +68,8 @@ pub async fn build_broadcaster_raw_stream(
     tvl_keep_threshold: f64,
     chain: Chain,
     protocols: &BroadcasterProtocols,
-) -> Result<
+) -> Result<(
+    tokio::task::JoinHandle<()>,
     impl futures::Stream<
             Item = Result<
                 FeedMessage<BlockHeader>,
@@ -76,7 +77,7 @@ pub async fn build_broadcaster_raw_stream(
             >,
         > + Unpin
         + Send,
-> {
+)> {
     let (mut builder, tvl_filter) = raw_base_builder(
         tycho_url,
         api_key,
@@ -89,10 +90,15 @@ pub async fn build_broadcaster_raw_stream(
         builder = builder.exchange(protocol, tvl_filter.clone());
     }
 
-    let (_handle, rx) = builder.build().await?;
-    Ok(ReceiverStream::new(rx).map(|item| {
-        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
-    }))
+    let (lifecycle_task, rx) = builder.build().await?;
+    Ok((
+        lifecycle_task,
+        ReceiverStream::new(rx).map(|item| {
+            item.map_err(
+                |err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) },
+            )
+        }),
+    ))
 }
 
 pub async fn build_broadcaster_subscription_decoder(
