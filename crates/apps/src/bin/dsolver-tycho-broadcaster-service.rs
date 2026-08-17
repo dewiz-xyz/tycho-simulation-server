@@ -2,6 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::net::TcpListener;
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -16,7 +17,7 @@ async fn main() -> Result<()> {
     let mut tasks = service.tasks;
     let app = rpc::create_broadcaster_router(app_state.clone());
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
             app_state.begin_shutdown();
