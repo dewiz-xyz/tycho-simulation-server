@@ -19,6 +19,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tycho-simulation.workspace = true
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
 rpc = { path = "../rpc" }
