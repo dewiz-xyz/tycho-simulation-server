@@ -1,6 +1,8 @@
 # Historical Pool Quote API
 
-The Historical Pool Quote API reconstructs retained Base state and returns directed pool quotes for one exact component and token direction. It is separate from the live broadcaster and simulator request path.
+The Historical Pool Quote API reconstructs retained Base state and returns directed pool quotes for one exact component and token direction. This document covers the service boundary, reconstruction semantics, HTTP contract, configuration, sizing, and operator workflow.
+
+Client users should start with the [Historical Pool Quote Client Guide](historical_pool_quote_client.md). Agents helping with client requests should use the repo-local [`historical-pool-quote-cli` skill](../skills/historical-pool-quote-cli/SKILL.md).
 
 The first release is for bounded interactive analysis. It is not a route replay service, a pool discovery service, a public endpoint, or a data export system.
 
@@ -22,90 +24,23 @@ Clients use the stable Tailscale Service URL and one bearer token. They do not r
 
 The service logs request and job identifiers, normalized dimensions, work counts, duration, decoded bytes, state, and outcome counts. It does not log authorization headers, tokens or token digests, request bodies, full responses, SQL text, storage object names, raw state, or dependency error details.
 
-## Install the CLI
-
-Install `dsolver-history` from a repository checkout.
-
-```bash
-cargo install --path crates/dsolver-history --locked
-```
-
-Set the private service URL and bearer token in the environment.
-
-```bash
-export DSOLVER_HISTORY_URL=https://historical-pool-quote-api.example.ts.net
-export DSOLVER_HISTORY_TOKEN='<token from the approved secret channel>'
-```
-
-There is no token command-line option. This keeps the token out of process listings and shell history.
-
-## Request quotes
-
-Use a checked JSON request when the input has several start blocks, lags, or amounts.
-
-```bash
-dsolver-history quotes \
-  --request crates/dsolver-history/tests/fixtures/quote_request.json \
-  --pretty
-```
-
-Direct flags are useful for a small request.
-
-```bash
-dsolver-history quotes \
-  --chain-id 8453 \
-  --backend native \
-  --protocol uniswap_v3 \
-  --component-id '<component ID>' \
-  --token-in '<token address>' \
-  --token-out '<token address>' \
-  --start-block 34000000 \
-  --end-block-inclusive 34000010 \
-  --lag 1,3,5 \
-  --amount-in 1000000,5000000 \
-  --timeout-ms 600000
-```
-
-`quotes` submits the job, polls it, and writes grouped JSON to stdout. Job identifiers, progress, and retry notices go to stderr. Use `--submit-only` to stop after admission. Use `--job-envelope` to keep the lifecycle envelope in the final JSON.
-
-Use `--output PATH` for atomic file publication. The command refuses to replace an existing file unless `--force` is present.
-
-## Read partial outcomes
-
-A completed job contains every requested cell. Partial outcomes do not fail the job.
-
-- `ok` contains `amountOut` in token smallest units and safe provenance.
-- `unavailable` means that state could not be reconstructed safely for that cell. Reasons include a gap, replica cutoff, missing token snapshot, missing RFQ observation, missing block boundary, broken canonical lineage, or invalid state application.
-- `quote_failed` means state existed but the selected component and direction did not produce a quote.
-
-If the start state is unavailable, the start and its targets are unavailable. If the start quote fails but target states are safe, target quotes still run. A gap affects only the start-to-target intervals that cross it.
-
-On-chain provenance includes the canonical block hash, final stream position, anchor checkpoint position, token snapshot digest when used, and service revision. RFQ provenance also includes its observation cursor, time, and age at the next-block boundary. Responses do not expose storage object names or database row identifiers.
-
-## Job delivery and interruption
+## Job lifecycle and delivery
 
 Jobs are in memory. A deployment or task restart can lose them.
 
 The first terminal `GET /jobs/{jobId}` selects the terminal body for delivery. The service removes the retained result only after it finishes writing that body. If the write fails, it releases the delivery lease so a later poll can retry. A successful terminal poll consumes the result. Later polls return `job_not_found`.
 
-The high-level `quotes` and `verify` commands can recompute once after `job_not_found` when they still own the original request and time remains. Generic `job get` and `job wait` cannot recompute because they do not have the request body.
+The high-level `quotes` and `verify` CLI commands can recompute once after `job_not_found` when they still own the original request and time remains. Generic `job get` and `job wait` cannot recompute because they do not have the request body. See the [client guide](historical_pool_quote_client.md) for command behavior, interruption, output, and exit codes.
 
-On Ctrl-C, the CLI requests cancellation, waits briefly for acknowledgement, and exits with status `130`. Cancellation is cooperative. A simulator call that has already started cannot stop in the middle.
+## Coverage and status semantics
 
-Quote command exit status is `0` for a completed job, including partial outcomes; `1` for transport, service, or terminal job failure; `2` for usage, configuration, authentication, or admission rejection; and `130` for interruption.
+Coverage returns `visibleThroughBlock`, continuous safe intervals, and known gaps. Protected status returns revisions, enabled backends, safe dependency summaries, queue and terminal counts, decoded-byte reservation, draining state, and configured limits.
 
-## Coverage and service status
-
-```bash
-dsolver-history coverage --chain-id 8453 --backend native,rfq --pretty
-dsolver-history service status --pretty
-```
-
-Coverage returns `visibleThroughBlock`, continuous safe intervals, and known gaps. Protected status returns revisions, enabled backends, safe dependency summaries, queue and terminal counts, decoded-byte reservation, draining state, and the configured limits.
+Coverage describes safe reconstruction for the requested backends. It does not prove that an exact component exists or can quote. Replica delay lowers `visibleThroughBlock`; it does not create a stored gap.
 
 ## Manual historical state consistency check
 
-`dsolver-history verify` replaces the old `state-history-check` binary. The CLI sends the request to the service. It needs no database URL or AWS credential.
+`dsolver-history verify` replaces the old `state-history-check` binary. The CLI sends the request to the service and needs no database URL or AWS credential.
 
 ```bash
 dsolver-history verify \
@@ -215,7 +150,7 @@ Authorized read-only production measurements on 2026-08-14 used `dsolver-prod` i
 
 The `1,024 MiB` job reservation leaves 36.2% of the reservation unused by the larger measured decoded plan. Four reservations exactly fill the `4,096 MiB` scheduler budget. Actual state retention is bounded separately by the four-job limit and task memory: four times the larger measured one-job footprint is `32,185,612,576` bytes. A `49,152 MiB` task leaves 37.6% headroom over that conservative no-sharing bound. The RFQ sample exercised production retention for 1,099 real `StatePoint` values; its one known-gap outcome is an approved partial result and carries no quote facts.
 
-The Phase 8 sizing input is therefore `8192` CPU units and `49152 MiB` task memory. AWS Fargate pairs 48 GiB with the 8-vCPU tier; the 4-vCPU tier stops at 30 GiB. See the [AWS Fargate CPU and memory combinations](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-tasks-services.html#fargate-task-defs-cpu-memory). The measured reconstruction used `2.75 s` of user CPU and `0.96 s` of system CPU, so memory, rather than CPU time, selects the tier.
+The deployment sizing input is therefore `8192` CPU units and `49152 MiB` task memory. AWS Fargate pairs 48 GiB with the 8-vCPU tier; the 4-vCPU tier stops at 30 GiB. See the [AWS Fargate CPU and memory combinations](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-tasks-services.html#fargate-task-defs-cpu-memory). The measured reconstruction used `2.75 s` of user CPU and `0.96 s` of system CPU, so memory, rather than CPU time, selects the tier.
 
 The `600000` ms default deadline is 2.5 times the slower completed production reconstruction, and the `900000` ms maximum allows a caller to spend more of the end-to-end budget on queueing or variable replica and object-store latency. Deadlines include queue time, replica planning, object reads, decompression, reconstruction, quotes, and terminal serialization. A separate interior RFQ measurement did not return before the 900-second measurement stop and was excluded from the completed-run ratios; the service fails such work with `deadline_exceeded` rather than extending its resource ownership. Four job planners can each own one SQL connection; the fifth connection is reserved for protected status and coverage reads.
 

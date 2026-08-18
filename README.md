@@ -115,7 +115,7 @@ The shared `broadcaster-replay-client` crate owns that bootstrap and Redis repla
 
 Optional broadcaster state history persists full-state checkpoints, token snapshots, and ordered deltas for historical replay and analysis. See [docs/state_history.md](docs/state_history.md) for the segment model, PostgreSQL schema, S3 objects, Rust reader API, environment variables, status fields, and retention contract.
 
-The separate Historical Pool Quote API reconstructs retained Base state for one exact component and token direction. It uses an HTTP-only Rust CLI and has no direct broadcaster, Redis, primary database, or state-history write path. See [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md) for the mental model, CLI, API, limits, image, and operator workflow.
+The separate Historical Pool Quote API reconstructs retained Base state for one exact component and token direction. It uses an HTTP-only Rust CLI and has no direct broadcaster, Redis, primary database, or state-history write path. Client users should start with [docs/historical_pool_quote_client.md](docs/historical_pool_quote_client.md); maintainers can use [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md) for the service, API, limits, image, and operator workflow.
 
 Broadcaster deployments use four modes:
 
@@ -296,8 +296,10 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
-- [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md): Historical Pool Quote API, CLI, limits, and operator workflow
+- [docs/historical_pool_quote_client.md](docs/historical_pool_quote_client.md): client guide for historical Base pool quotes through `dsolver-history`
+- [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md): service architecture, HTTP API, limits, and operator workflow
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
+- [skills/historical-pool-quote-cli/SKILL.md](skills/historical-pool-quote-cli/SKILL.md): repo-local workflow for requesting and interpreting historical pool quotes
 - `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
 
