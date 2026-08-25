@@ -454,7 +454,7 @@ async fn authentication_and_admission_errors_exit_two() {
 }
 
 #[tokio::test]
-async fn job_not_found_recomputes_once_with_same_id_and_remaining_deadline() {
+async fn job_not_found_recomputes_once_with_the_exact_request_body() {
     let api = MockApi::start(vec![
         Spec::json(
             StatusCode::ACCEPTED,
@@ -483,14 +483,49 @@ async fn job_not_found_recomputes_once_with_same_id_and_remaining_deadline() {
         .filter(|record| record.path == "/jobs/quote")
         .collect::<Vec<_>>();
     assert_eq!(submissions.len(), 2);
-    assert_eq!(
-        submissions[0].body["requestId"],
-        submissions[1].body["requestId"]
-    );
-    assert!(
-        submissions[1].body["timeoutMs"].as_u64().unwrap()
-            <= submissions[0].body["timeoutMs"].as_u64().unwrap()
-    );
+    assert_eq!(submissions[0].body, submissions[1].body);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recomputing once"));
+}
+
+#[tokio::test]
+async fn verify_job_not_found_recomputes_once_with_the_exact_request_body() {
+    let api = MockApi::start(vec![
+        Spec::json(
+            StatusCode::ACCEPTED,
+            submission(
+                JOB_ONE,
+                VERIFY_REQUEST_ID,
+                "historicalStateConsistencyCheck",
+            ),
+        ),
+        Spec::json(StatusCode::NOT_FOUND, api_error("job_not_found")),
+        Spec::json(
+            StatusCode::ACCEPTED,
+            submission(
+                JOB_TWO,
+                VERIFY_REQUEST_ID,
+                "historicalStateConsistencyCheck",
+            ),
+        ),
+        Spec::json(StatusCode::OK, completed_verify(JOB_TWO, "pass")),
+    ])
+    .await;
+    let output = run_cli(
+        &api,
+        ["verify", "--request"],
+        Some(fixture("verify_request.json")),
+        None,
+    )
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let submissions = api
+        .records()
+        .into_iter()
+        .filter(|record| record.path == "/jobs/consistency-check")
+        .collect::<Vec<_>>();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(submissions[0].body, submissions[1].body);
     assert!(String::from_utf8_lossy(&output.stderr).contains("recomputing once"));
 }
 

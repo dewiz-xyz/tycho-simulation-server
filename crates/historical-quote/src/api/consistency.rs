@@ -20,6 +20,7 @@ use super::{
 )]
 pub struct ConsistencyCheckRequest {
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub request_id: Uuid,
     #[schema(minimum = 1, maximum = 1)]
     pub api_revision: u32,
@@ -324,6 +325,7 @@ pub struct StorageVerificationSummary {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConsistencyCheckReport {
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub request_id: Uuid,
     #[schema(minimum = 8453, maximum = 8453)]
     pub chain_id: u64,

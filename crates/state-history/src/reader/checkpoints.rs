@@ -80,9 +80,18 @@ pub struct CheckpointPair {
 #[derive(Debug, Clone)]
 pub struct CheckpointPairReplayPlan {
     pub pair: CheckpointPair,
+    pub earlier_token_anchor: TokenAnchor,
+    pub target_token_anchor: TokenAnchor,
     pub deltas: Vec<StoredDelta>,
     pub gaps: Vec<RangeGap>,
     pub estimated_decoded_bytes: u64,
+}
+
+struct RetainedCheckpointPair {
+    earlier: CheckpointManifest,
+    target: CheckpointManifest,
+    earlier_token_anchor: TokenAnchor,
+    target_token_anchor: TokenAnchor,
 }
 
 impl<P: ReadConnectionProvider> StateHistoryReader<P> {
@@ -108,20 +117,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             "selected checkpoint does not match the retained checkpoint at its position"
         );
 
-        let anchor = if stored.token_reference.is_some() {
-            TokenAnchor::Available {
-                checkpoint: Box::new(stored),
-                used_fallback: false,
-            }
-        } else {
-            match token_fallback_in_segment(&mut transaction, &stored).await? {
-                Some(checkpoint) => TokenAnchor::Available {
-                    checkpoint: Box::new(checkpoint),
-                    used_fallback: true,
-                },
-                None => TokenAnchor::Missing,
-            }
-        };
+        let anchor = token_anchor_in_transaction(&mut transaction, stored).await?;
         transaction
             .commit()
             .await
@@ -195,31 +191,18 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .await
             .context("failed to acquire checkpoint pair plan connection")?;
         let mut transaction = begin_range_transaction(&mut connection).await?;
-        let earlier = exact_checkpoint(
-            &mut transaction,
-            pair.earlier.chain_id,
-            pair.earlier.position,
-        )
-        .await?
-        .context("earlier checkpoint is not retained as complete")?;
-        let target = exact_checkpoint(&mut transaction, pair.target.chain_id, pair.target.position)
-            .await?
-            .context("target checkpoint is not retained as complete")?;
-        ensure!(
-            earlier.id == pair.earlier.id && target.id == pair.target.id,
-            "checkpoint pair does not match retained checkpoint identity"
-        );
-        let segment_start =
-            segment_boundary_position(&mut transaction, target.chain_id, target.position)
-                .await?
-                .context("target checkpoint has no complete segment boundary")?;
-        ensure!(
-            earlier.position >= segment_start,
-            "checkpoint pair must stay in the same segment"
-        );
-
+        let RetainedCheckpointPair {
+            earlier,
+            target,
+            earlier_token_anchor,
+            target_token_anchor,
+        } = retained_checkpoint_pair(&mut transaction, pair).await?;
         let (checkpoint_compressed_bytes, checkpoint_decoded_bytes) =
-            declared_pair_checkpoint_bytes(&earlier, &target)?;
+            declared_pair_checkpoint_bytes(
+                &earlier,
+                &target,
+                [&earlier_token_anchor, &target_token_anchor],
+            )?;
         limits.check_compressed(checkpoint_compressed_bytes)?;
         limits.check_decoded(checkpoint_decoded_bytes)?;
         let remaining_compressed_bytes = limits
@@ -266,6 +249,8 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .context("failed to commit checkpoint pair plan transaction")?;
         Ok(CheckpointPairReplayPlan {
             pair: CheckpointPair { earlier, target },
+            earlier_token_anchor,
+            target_token_anchor,
             deltas,
             gaps,
             estimated_decoded_bytes: checkpoint_decoded_bytes
@@ -275,9 +260,42 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
     }
 }
 
+async fn retained_checkpoint_pair(
+    connection: &mut sqlx::PgConnection,
+    pair: &CheckpointPair,
+) -> anyhow::Result<RetainedCheckpointPair> {
+    let earlier = exact_checkpoint(connection, pair.earlier.chain_id, pair.earlier.position)
+        .await?
+        .context("earlier checkpoint is not retained as complete")?;
+    let target = exact_checkpoint(connection, pair.target.chain_id, pair.target.position)
+        .await?
+        .context("target checkpoint is not retained as complete")?;
+    ensure!(
+        earlier.id == pair.earlier.id && target.id == pair.target.id,
+        "checkpoint pair does not match retained checkpoint identity"
+    );
+    let segment_start = segment_boundary_position(connection, target.chain_id, target.position)
+        .await?
+        .context("target checkpoint has no complete segment boundary")?;
+    ensure!(
+        earlier.position >= segment_start,
+        "checkpoint pair must stay in the same segment"
+    );
+
+    let earlier_token_anchor = token_anchor_in_transaction(connection, earlier.clone()).await?;
+    let target_token_anchor = token_anchor_in_transaction(connection, target.clone()).await?;
+    Ok(RetainedCheckpointPair {
+        earlier,
+        target,
+        earlier_token_anchor,
+        target_token_anchor,
+    })
+}
+
 fn declared_pair_checkpoint_bytes(
     earlier: &CheckpointManifest,
     target: &CheckpointManifest,
+    token_anchors: [&TokenAnchor; 2],
 ) -> anyhow::Result<(u64, u64)> {
     let mut compressed_bytes = 0_u64;
     let mut decoded_bytes = 0_u64;
@@ -297,7 +315,12 @@ fn declared_pair_checkpoint_bytes(
                     .context("complete checkpoint is missing its archive byte length")?,
             )
             .context("checkpoint pair decoded byte estimate overflowed")?;
-        if let Some(reference) = manifest
+    }
+    for anchor in token_anchors {
+        let TokenAnchor::Available { checkpoint, .. } = anchor else {
+            continue;
+        };
+        if let Some(reference) = checkpoint
             .token_reference
             .as_ref()
             .filter(|reference| token_digests.insert(reference.sha256.clone()))
@@ -521,6 +544,27 @@ pub(super) async fn token_fallback_in_segment(
     row.as_ref().map(manifest_from_row).transpose()
 }
 
+async fn token_anchor_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    selected: CheckpointManifest,
+) -> anyhow::Result<TokenAnchor> {
+    if selected.token_reference.is_some() {
+        return Ok(TokenAnchor::Available {
+            checkpoint: Box::new(selected),
+            used_fallback: false,
+        });
+    }
+    Ok(
+        match token_fallback_in_segment(connection, &selected).await? {
+            Some(checkpoint) => TokenAnchor::Available {
+                checkpoint: Box::new(checkpoint),
+                used_fallback: true,
+            },
+            None => TokenAnchor::Missing,
+        },
+    )
+}
+
 async fn range_checkpoint_pairs(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
@@ -529,13 +573,56 @@ async fn range_checkpoint_pairs(
     max_pairs: Option<usize>,
 ) -> anyhow::Result<Vec<CheckpointPair>> {
     let mut rows = sqlx::query(
-        "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+        "WITH in_range AS (
+             SELECT generation, message_seq
+             FROM state_history.checkpoints
+             WHERE chain_id = $1 AND status = 'complete'
+               AND block_number BETWEEN $2 AND $3
+         ),
+         first_position AS (
+             SELECT generation, message_seq
+             FROM in_range
+             ORDER BY generation, message_seq
+             LIMIT 1
+         ),
+         last_position AS (
+             SELECT generation, message_seq
+             FROM in_range
+             ORDER BY generation DESC, message_seq DESC
+             LIMIT 1
+         ),
+         first_segment_boundary AS (
+             SELECT checkpoint.generation, checkpoint.message_seq
+             FROM state_history.checkpoints checkpoint
+             CROSS JOIN first_position first
+             WHERE checkpoint.chain_id = $1 AND checkpoint.status = 'complete'
+               AND checkpoint.kind = 'boundary'
+               AND (checkpoint.generation, checkpoint.message_seq)
+                   <= (first.generation, first.message_seq)
+             ORDER BY checkpoint.generation DESC, checkpoint.message_seq DESC
+             LIMIT 1
+         ),
+         selected_span AS (
+             SELECT
+                 COALESCE(boundary.generation, first.generation) AS start_generation,
+                 COALESCE(boundary.message_seq, first.message_seq) AS start_message_seq,
+                 last.generation AS end_generation,
+                 last.message_seq AS end_message_seq
+             FROM first_position first
+             CROSS JOIN last_position last
+             LEFT JOIN first_segment_boundary boundary ON true
+         )
+         SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
                 rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints
+         CROSS JOIN selected_span span
          WHERE chain_id = $1 AND status = 'complete'
-           AND block_number BETWEEN $2 AND $3
+           AND (generation, message_seq)
+               >= (span.start_generation, span.start_message_seq)
+           AND (generation, message_seq)
+               <= (span.end_generation, span.end_message_seq)
          ORDER BY generation, message_seq, kind",
     )
     .bind(database_i64(chain_id, "checkpoint pair chain_id")?)
@@ -568,12 +655,16 @@ async fn range_checkpoint_pairs(
             continue;
         }
         if let Some(earlier) = previous.replace(manifest.clone()) {
-            pairs.push(CheckpointPair {
-                earlier,
-                target: manifest,
-            });
-            if sentinel_limit == Some(pairs.len()) {
-                break;
+            if manifest.block_number >= bounds.start
+                && manifest.block_number <= bounds.end_inclusive
+            {
+                pairs.push(CheckpointPair {
+                    earlier,
+                    target: manifest,
+                });
+                if sentinel_limit == Some(pairs.len()) {
+                    break;
+                }
             }
         }
     }

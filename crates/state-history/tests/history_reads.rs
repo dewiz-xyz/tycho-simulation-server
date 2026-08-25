@@ -347,6 +347,18 @@ async fn checkpoint_pairs_are_adjacent_and_never_cross_segments(
     assert_eq!(pairs[2].earlier.position, position(2, 0));
     assert_eq!(pairs[2].target.position, position(2, 10));
 
+    let narrow_pairs = reader
+        .resolve_checkpoint_pairs(&CheckpointPairQuery::new(
+            CHAIN_ID,
+            CheckpointPairSelection::BlockRange(BlockInterval::new(110, 120)?),
+        ))
+        .await?;
+    assert_eq!(narrow_pairs.len(), 2);
+    assert_eq!(narrow_pairs[0].earlier.position, position(1, 0));
+    assert_eq!(narrow_pairs[0].target.position, position(1, 10));
+    assert_eq!(narrow_pairs[1].earlier.position, position(1, 10));
+    assert_eq!(narrow_pairs[1].target.position, position(1, 20));
+
     let bounded_pairs = reader
         .resolve_checkpoint_pairs(
             &CheckpointPairQuery::new(
@@ -403,6 +415,105 @@ async fn backend_filter_keeps_incompatible_boundaries_as_segment_breaks(
     assert_eq!(pairs.len(), 1);
     assert_eq!(pairs[0].earlier.position, position(1, 0));
     assert_eq!(pairs[0].target.position, position(1, 10));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn backend_filter_projects_out_incompatible_intervals_before_pairing(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(&pool, 1, 10, 110, CheckpointKind::Interval, true).await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        20,
+        120,
+        CheckpointKind::Interval,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    seed_checkpoint(&pool, 1, 30, 130, CheckpointKind::Interval, true).await?;
+    seed_checkpoint(&pool, 1, 40, 140, CheckpointKind::Interval, true).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let pairs = reader
+        .resolve_checkpoint_pairs(&CheckpointPairQuery::for_backends(
+            CHAIN_ID,
+            CheckpointPairSelection::BlockRange(BlockInterval::new(130, 140)?),
+            vec![Backend::Native],
+        ))
+        .await?;
+
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0].earlier.position, position(1, 10));
+    assert_eq!(pairs[0].target.position, position(1, 30));
+    assert_eq!(pairs[1].earlier.position, position(1, 30));
+    assert_eq!(pairs[1].target.position, position(1, 40));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn range_pairs_remain_globally_adjacent_across_nonmonotonic_blocks(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(&pool, 1, 10, 110, CheckpointKind::Interval, true).await?;
+    seed_checkpoint(&pool, 1, 15, 999, CheckpointKind::Interval, true).await?;
+    seed_checkpoint(&pool, 1, 20, 120, CheckpointKind::Interval, true).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let pairs = reader
+        .resolve_checkpoint_pairs(&CheckpointPairQuery::new(
+            CHAIN_ID,
+            CheckpointPairSelection::BlockRange(BlockInterval::new(110, 120)?),
+        ))
+        .await?;
+
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0].earlier.position, position(1, 0));
+    assert_eq!(pairs[0].target.position, position(1, 10));
+    assert_eq!(pairs[1].earlier.position, position(1, 15));
+    assert_eq!(pairs[1].target.position, position(1, 20));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn checkpoint_pair_plan_accounts_for_fallback_token_anchor_once(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let fallback = seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    let earlier = seed_checkpoint(&pool, 1, 10, 110, CheckpointKind::Interval, false).await?;
+    let target = seed_checkpoint(&pool, 1, 20, 120, CheckpointKind::Interval, false).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let plan = reader
+        .plan_checkpoint_pair(
+            &state_history::CheckpointPair { earlier, target },
+            vec![Backend::Native],
+            ReadLimits::new(1_000, 2_100)?,
+        )
+        .await?;
+
+    assert_eq!(
+        plan.earlier_token_anchor,
+        TokenAnchor::Available {
+            checkpoint: Box::new(fallback.clone()),
+            used_fallback: true,
+        }
+    );
+    assert_eq!(
+        plan.target_token_anchor,
+        TokenAnchor::Available {
+            checkpoint: Box::new(fallback),
+            used_fallback: true,
+        }
+    );
+    assert_eq!(plan.estimated_decoded_bytes, 2_100);
     Ok(())
 }
 

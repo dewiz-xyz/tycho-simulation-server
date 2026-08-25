@@ -401,7 +401,8 @@
             "required": true,
             "schema": {
               "type": "string",
-              "format": "uuid"
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
             }
           },
           {
@@ -490,7 +491,8 @@
             "required": true,
             "schema": {
               "type": "string",
-              "format": "uuid"
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
             }
           },
           {
@@ -914,7 +916,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "selection": {
             "$ref": "#/components/schemas/ConsistencySelection"
@@ -979,7 +982,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "selection": {
             "$ref": "#/components/schemas/ConsistencySelection"
@@ -1594,7 +1598,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "results": {
             "type": "array",
@@ -1702,7 +1707,8 @@
           },
           "jobId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "jobType": {
             "$ref": "#/components/schemas/JobType"
@@ -1720,7 +1726,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "result": {
             "oneOf": [
@@ -1847,7 +1854,8 @@
           },
           "jobId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "jobType": {
             "$ref": "#/components/schemas/JobType"
@@ -1865,7 +1873,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "reused": {
             "type": "boolean"
@@ -2106,7 +2115,8 @@
           },
           "requestId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
           },
           "timeoutMs": {
             "type": "integer",

@@ -3,7 +3,7 @@ use std::future::Future;
 use state_history::{
     CheckpointArchive, CheckpointManifest, CheckpointPairQuery, CheckpointPairReplayPlan,
     CoverageQuery, CoverageSnapshot, RawTokenSnapshot, ReadConnectionProvider, ReadLimitError,
-    ReadLimits, StateHistoryReader, TargetPlan, TargetPlanQuery,
+    ReadLimits, StateHistoryReader, TargetPlan, TargetPlanQuery, TokenAnchor,
 };
 
 use crate::HistoricalError;
@@ -40,6 +40,11 @@ pub trait HistorySource: Send + Sync + 'static {
         manifest: CheckpointManifest,
         limits: ReadLimits,
     ) -> impl Future<Output = Result<Option<RawTokenSnapshot>, HistoricalError>> + Send;
+
+    fn select_token_anchor(
+        &self,
+        manifest: CheckpointManifest,
+    ) -> impl Future<Output = Result<TokenAnchor, HistoricalError>> + Send;
 
     fn resolve_checkpoint_pairs(
         &self,
@@ -88,6 +93,15 @@ where
         StateHistoryReader::fetch_checkpoint_token_snapshot_with_limit(self, &manifest, limits)
             .await
             .map_err(|error| storage_fetch_error("token snapshot fetch", error))
+    }
+
+    async fn select_token_anchor(
+        &self,
+        manifest: CheckpointManifest,
+    ) -> Result<TokenAnchor, HistoricalError> {
+        StateHistoryReader::select_token_anchor(self, &manifest)
+            .await
+            .map_err(|error| HistoricalError::history_read("token anchor selection", error))
     }
 
     async fn resolve_checkpoint_pairs(

@@ -50,7 +50,7 @@ pub async fn execute(
 
 async fn quote_flow(
     client: &HistoryClient,
-    mut request: QuoteJobRequest,
+    request: QuoteJobRequest,
     submit_only: bool,
     job_envelope: bool,
     output: &OutputOptions,
@@ -90,8 +90,6 @@ async fn quote_flow(
                 return Ok(EXIT_OPERATION_FAILED);
             }
             Err(error) if error.is_job_not_found() && !recomputed => {
-                let remaining = remaining_millis(deadline)?;
-                request.timeout_ms = remaining;
                 recomputed = true;
                 eprintln!(
                     "job result was not found; recomputing once with request {}",
@@ -176,20 +174,6 @@ fn direct_quote_request(args: DirectQuoteArgs) -> Result<QuoteJobRequest, CliErr
         "amountsIn": args.amount_in,
     }))
     .map_err(|error| CliError::usage(error.to_string()))
-}
-
-fn remaining_millis(deadline: Instant) -> Result<u64, CliError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| CliError::operation("request deadline expired before recomputation"))?;
-    let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    if millis == 0 {
-        Err(CliError::operation(
-            "request deadline expired before recomputation",
-        ))
-    } else {
-        Ok(millis)
-    }
 }
 
 fn request_deadline(timeout_ms: u64) -> Result<Instant, CliError> {

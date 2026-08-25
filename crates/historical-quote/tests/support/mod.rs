@@ -20,7 +20,7 @@ use state_history::{
     CheckpointKind, CheckpointManifest, CheckpointPair, CheckpointPairQuery,
     CheckpointPairReplayPlan, CheckpointStatus, CoverageQuery, CoverageSnapshot,
     DeltaBackendCursor, RangeGap, RangeGapKind, RangeLeg, RawTokenSnapshot, ReadLimits,
-    StoredDelta, StreamPosition, TargetPlan, TargetPlanQuery, TokenSnapshotRef,
+    StoredDelta, StreamPosition, TargetPlan, TargetPlanQuery, TokenAnchor, TokenSnapshotRef,
     ARCHIVE_SCHEMA_VERSION, DELTA_PAYLOAD_FORMAT_VERSION, TOKEN_SNAPSHOT_SCHEMA_VERSION,
 };
 use uuid::Uuid;
@@ -99,6 +99,8 @@ impl FixtureSource {
         let pair = CheckpointPair { earlier, target };
         source.pairs = vec![pair.clone()];
         source.pair_plan = Some(CheckpointPairReplayPlan {
+            earlier_token_anchor: own_token_anchor(&pair.earlier),
+            target_token_anchor: own_token_anchor(&pair.target),
             pair,
             deltas: vec![native_delta(2, 101)?],
             gaps: Vec::new(),
@@ -191,6 +193,8 @@ impl FixtureSource {
         let pair = CheckpointPair { earlier, target };
         source.pairs = vec![pair.clone()];
         source.pair_plan = Some(CheckpointPairReplayPlan {
+            earlier_token_anchor: own_token_anchor(&pair.earlier),
+            target_token_anchor: own_token_anchor(&pair.target),
             pair,
             deltas: vec![rfq_delta(2, 3_000)?],
             gaps: Vec::new(),
@@ -244,6 +248,13 @@ impl HistorySource for FixtureSource {
     ) -> impl Future<Output = Result<Option<RawTokenSnapshot>, HistoricalError>> + Send {
         self.token_fetches.fetch_add(1, Ordering::SeqCst);
         std::future::ready(Ok(self.token_snapshots.get(&manifest.id).cloned()))
+    }
+
+    fn select_token_anchor(
+        &self,
+        manifest: CheckpointManifest,
+    ) -> impl Future<Output = Result<TokenAnchor, HistoricalError>> + Send {
+        std::future::ready(Ok(own_token_anchor(&manifest)))
     }
 
     fn resolve_checkpoint_pairs(
@@ -409,6 +420,17 @@ pub fn manifest(
         }),
         status: CheckpointStatus::Complete,
         error: None,
+    }
+}
+
+fn own_token_anchor(manifest: &CheckpointManifest) -> TokenAnchor {
+    if manifest.token_reference.is_some() {
+        TokenAnchor::Available {
+            checkpoint: Box::new(manifest.clone()),
+            used_fallback: false,
+        }
+    } else {
+        TokenAnchor::Missing
     }
 }
 

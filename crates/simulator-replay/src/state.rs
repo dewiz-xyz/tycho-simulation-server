@@ -647,6 +647,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{ExactPoolQuote, ReplayBackend};
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;
@@ -911,5 +912,53 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
+    }
+
+    #[test]
+    fn exact_quote_remaps_native_and_wrapped_tokens_to_the_selected_component() {
+        let native = Chain::Ethereum.native_token();
+        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let token_out = token(53, "TKNX");
+        let tokens = HashMap::from([
+            (native.address.clone(), native.clone()),
+            (wrapped.address.clone(), wrapped.clone()),
+            (token_out.address.clone(), token_out.clone()),
+        ]);
+
+        let native_pool = component(
+            54,
+            "rocketpool",
+            "rocketpool",
+            vec![native.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(tokens.clone(), Some(wrapped.address.clone()));
+        world.apply(pair_update("pool-native", native_pool));
+        let native_alias = world.pin().quote(&ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "rocketpool".to_owned(),
+            component_id: "pool-native".to_owned(),
+            token_in: wrapped.address.clone(),
+            token_out: token_out.address.clone(),
+            amount_in: alloy_primitives::U256::from(10_u64),
+        });
+        assert_eq!(native_alias, Ok(alloy_primitives::U256::from(10_u64)));
+
+        let wrapped_pool = component(
+            55,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![wrapped.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(tokens, Some(wrapped.address.clone()));
+        world.apply(pair_update("pool-wrapped", wrapped_pool));
+        let wrapped_alias = world.pin().quote(&ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "pool-wrapped".to_owned(),
+            token_in: native.address,
+            token_out: token_out.address,
+            amount_in: alloy_primitives::U256::from(11_u64),
+        });
+        assert_eq!(wrapped_alias, Ok(alloy_primitives::U256::from(11_u64)));
     }
 }

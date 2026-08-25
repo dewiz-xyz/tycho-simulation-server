@@ -58,8 +58,10 @@ pub enum JobProgress {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobSubmission {
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub job_id: Uuid,
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub request_id: Uuid,
     pub job_type: JobType,
     pub state: JobState,
@@ -113,8 +115,10 @@ pub struct JobFailure {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobEnvelope {
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub job_id: Uuid,
     #[serde(deserialize_with = "deserialize_uuid_v4")]
+    #[schema(schema_with = crate::api::common::uuid_v4_schema)]
     pub request_id: Uuid,
     pub job_type: JobType,
     pub state: JobState,

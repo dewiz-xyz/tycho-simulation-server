@@ -80,7 +80,9 @@ pub(crate) fn post_consistency_job() {}
     get,
     path = "/jobs/{jobId}",
     params(
-        ("jobId" = uuid::Uuid, Path, description = "Opaque UUID version 4 job ID"),
+        ("jobId" = uuid::Uuid, Path,
+            pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+            description = "Opaque UUID version 4 job ID"),
         ("X-DSolver-History-API-Revision" = u32, Header, minimum = 1, maximum = 1,
             description = "Exact API revision")
     ),
@@ -101,7 +103,9 @@ pub(crate) fn get_job() {}
     post,
     path = "/jobs/{jobId}/cancel",
     params(
-        ("jobId" = uuid::Uuid, Path, description = "Opaque UUID version 4 job ID"),
+        ("jobId" = uuid::Uuid, Path,
+            pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+            description = "Opaque UUID version 4 job ID"),
         ("X-DSolver-History-API-Revision" = u32, Header, minimum = 1, maximum = 1,
             description = "Exact API revision")
     ),

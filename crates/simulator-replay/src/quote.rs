@@ -82,19 +82,24 @@ impl StatePoint {
                 actual: component.protocol_system.clone(),
             });
         }
-        if !component_supports_direction(component.as_ref(), &request.token_in, &request.token_out)
+        let requested_token_in = self
+            .token(&request.token_in)
+            .ok_or_else(|| ReplayQuoteError::TokenMissing(request.token_in.clone()))?;
+        let requested_token_out = self
+            .token(&request.token_out)
+            .ok_or_else(|| ReplayQuoteError::TokenMissing(request.token_out.clone()))?;
+        let (token_in, token_out) = simulation_tokens_for_component(
+            &requested_token_in,
+            &requested_token_out,
+            component.as_ref(),
+        );
+        if !component_supports_direction(component.as_ref(), &token_in.address, &token_out.address)
         {
             return Err(ReplayQuoteError::DirectionUnsupported(
                 request.component_id.clone(),
             ));
         }
 
-        let token_in = self
-            .token(&request.token_in)
-            .ok_or_else(|| ReplayQuoteError::TokenMissing(request.token_in.clone()))?;
-        let token_out = self
-            .token(&request.token_out)
-            .ok_or_else(|| ReplayQuoteError::TokenMissing(request.token_out.clone()))?;
         let amount_in = BigUint::from_bytes_be(&request.amount_in.to_be_bytes::<32>());
         let result = catch_unwind(AssertUnwindSafe(|| {
             simulate_amount_out(pool_state.as_ref(), amount_in, &token_in, &token_out)
@@ -111,6 +116,41 @@ impl StatePoint {
             return Err(ReplayQuoteError::AmountOverflow);
         }
         Ok(U256::from_be_slice(&bytes))
+    }
+}
+
+fn simulation_tokens_for_component(
+    token_in: &Token,
+    token_out: &Token,
+    component: &ProtocolComponent,
+) -> (Token, Token) {
+    (
+        remap_native_token_for_component(token_in, component),
+        remap_native_token_for_component(token_out, component),
+    )
+}
+
+fn remap_native_token_for_component(requested: &Token, component: &ProtocolComponent) -> Token {
+    let native = requested.chain.native_token();
+    let wrapped = requested.chain.wrapped_native_token();
+    if native.address == wrapped.address {
+        return requested.clone();
+    }
+
+    let has_native = component
+        .tokens
+        .iter()
+        .any(|token| token.address == native.address);
+    let has_wrapped = component
+        .tokens
+        .iter()
+        .any(|token| token.address == wrapped.address);
+    if requested.address == wrapped.address && has_native && !has_wrapped {
+        native
+    } else if requested.address == native.address && has_wrapped && !has_native {
+        wrapped
+    } else {
+        requested.clone()
     }
 }
 

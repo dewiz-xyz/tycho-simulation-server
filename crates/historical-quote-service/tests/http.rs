@@ -72,6 +72,30 @@ async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
 }
 
 #[tokio::test]
+async fn job_paths_require_uuid_version_four_before_lookup() {
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    for job_id in [
+        "not-a-uuid",
+        "00000000-0000-1000-8000-000000000000",
+        "00000000-0000-4000-0000-000000000000",
+    ] {
+        let path = format!("/jobs/{job_id}");
+        let response = send(&app, request("GET", &path, None, true, true)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["details"]["field"], "jobId");
+    }
+
+    let unknown = format!("/jobs/{}", Uuid::new_v4());
+    assert_eq!(
+        send(&app, request("GET", &unknown, None, true, true))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    registry.begin_shutdown().await;
+}
+
+#[tokio::test]
 async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once() {
     let (app, registry) = test_app(Arc::new(ImmediateExecutor));
     let request_id = Uuid::new_v4();
@@ -120,7 +144,7 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
     let request_id = Uuid::new_v4();
     let mut body = serde_json::to_value(quote_request(request_id, 60_000))
         .expect("quote request must serialize");
-    body["blocks"]["endInclusive"] = serde_json::json!(1_900);
+    body["blocks"]["endInclusive"] = serde_json::json!(1_890);
     body["lags"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     body["amountsIn"] = serde_json::json!(["1", "2"]);
     let response = send(
@@ -131,10 +155,10 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let error = json_body(response).await;
     assert_eq!(error["code"], "comparison_budget_exceeded");
-    assert_eq!(error["details"]["startBlockCount"], 1_801);
+    assert_eq!(error["details"]["startBlockCount"], 1_791);
     assert_eq!(error["details"]["lagCount"], 10);
     assert_eq!(error["details"]["inputAmountCount"], 2);
-    assert_eq!(error["details"]["combinationCount"], 36_020);
+    assert_eq!(error["details"]["combinationCount"], 35_820);
     assert_eq!(error["details"]["maxCombinationCount"], 20_000);
     assert!(error.get("stack").is_none());
 
@@ -170,6 +194,43 @@ async fn span_and_deadline_limits_fail_at_admission() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["details"]["field"], "blocks");
+
+    let mut exact_span = serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_TIMEOUT_MS))
+        .expect("quote request must serialize");
+    exact_span["lags"] = serde_json::json!([DEFAULT_MAX_BLOCK_SPAN]);
+    assert_eq!(
+        send(
+            &app,
+            request("POST", "/jobs/quote", Some(&exact_span), true, false),
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let mut lagged_over_span =
+        serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_TIMEOUT_MS))
+            .expect("quote request must serialize");
+    lagged_over_span["lags"] = serde_json::json!([DEFAULT_MAX_BLOCK_SPAN + 1]);
+    let response = send(
+        &app,
+        request("POST", "/jobs/quote", Some(&lagged_over_span), true, false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["details"]["field"], "blocks");
+
+    let mut overflow = serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_TIMEOUT_MS))
+        .expect("quote request must serialize");
+    overflow["blocks"]["start"] = serde_json::json!(u64::MAX);
+    overflow["blocks"]["endInclusive"] = serde_json::json!(u64::MAX);
+    let response = send(
+        &app,
+        request("POST", "/jobs/quote", Some(&overflow), true, false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["details"]["field"], "lags");
 
     let over_deadline =
         serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_MAX_TIMEOUT_MS + 1))
