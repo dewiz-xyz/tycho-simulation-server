@@ -1,0 +1,16 @@
+name: Build Historical Pool Quote API
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  select-master:
+    name: Select master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require master
+        run: |
+          echo "::error::Run this workflow from the master branch."
+          exit 1
