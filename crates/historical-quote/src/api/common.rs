@@ -7,7 +7,10 @@ use utoipa::openapi::{
     KnownFormat, RefOr,
 };
 use utoipa::{PartialSchema, ToSchema};
-use uuid::{Uuid, Version};
+use uuid::{Uuid, Variant, Version};
+
+pub(crate) const UUID_V4_PATTERN: &str =
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
 
 /// The only public API revision served by V1.
 pub const API_REVISION: u32 = 1;
@@ -384,12 +387,26 @@ pub(crate) fn unique_amounts_schema() -> RefOr<Schema> {
         .into()
 }
 
+pub(crate) fn uuid_v4_schema() -> RefOr<Schema> {
+    ObjectBuilder::new()
+        .schema_type(Type::String)
+        .format(Some(SchemaFormat::KnownFormat(KnownFormat::Uuid)))
+        .pattern(Some(UUID_V4_PATTERN))
+        .into()
+}
+
+/// Returns whether a UUID has the version and variant required by the API.
+#[must_use]
+pub fn is_uuid_v4(uuid: Uuid) -> bool {
+    uuid.get_version() == Some(Version::Random) && uuid.get_variant() == Variant::RFC4122
+}
+
 pub(crate) fn deserialize_uuid_v4<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
 where
     D: Deserializer<'de>,
 {
     let uuid = Uuid::deserialize(deserializer)?;
-    if uuid.get_version() == Some(Version::Random) {
+    if is_uuid_v4(uuid) {
         Ok(uuid)
     } else {
         Err(de::Error::custom("value must be a UUID version 4"))

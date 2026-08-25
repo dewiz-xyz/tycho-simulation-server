@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use historical_quote::api::{
-    Backend, ComparisonBudgetDetails, ConsistencyCheckRequest, ConsistencySelection,
+    is_uuid_v4, Backend, ComparisonBudgetDetails, ConsistencyCheckRequest, ConsistencySelection,
     CoverageRequest, DependencyHealth, DependencyState, QuoteJobRequest, ReadyResponse,
     StatusResponse, API_REVISION,
 };
@@ -162,20 +162,28 @@ pub async fn status(
 fn validate_quote(state: &AppState, request: &QuoteJobRequest) -> Result<(), HttpError> {
     validate_timeout(state, request.timeout_ms)?;
     validate_backends(state, &[request.pool.backend])?;
-    let span = request.blocks.end_inclusive - request.blocks.start;
+    let max_lag = request
+        .lags
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| HttpError::invalid("lags must not be empty", None))?;
+    let furthest_target = request
+        .blocks
+        .end_inclusive
+        .checked_add(max_lag)
+        .ok_or_else(|| {
+            HttpError::invalid(
+                "target block exceeds the block number range",
+                Some(serde_json::json!({"field": "lags"})),
+            )
+        })?;
+    let span = furthest_target - request.blocks.start;
     if span > state.config.max_block_span {
         return Err(HttpError::invalid(
             "requested block span exceeds the configured maximum",
             Some(serde_json::json!({"field": "blocks"})),
         ));
-    }
-    for lag in &request.lags {
-        if request.blocks.end_inclusive.checked_add(*lag).is_none() {
-            return Err(HttpError::invalid(
-                "target block exceeds the block number range",
-                Some(serde_json::json!({"field": "lags"})),
-            ));
-        }
     }
     let dimensions = quote_dimensions(request)?;
     if dimensions.combination_count > state.config.max_combination_count {
@@ -324,7 +332,20 @@ fn require_revision_header(headers: &HeaderMap) -> Result<(), HttpError> {
 }
 
 fn parse_job_id(value: &str) -> Result<Uuid, HttpError> {
-    Uuid::parse_str(value).map_err(|_| HttpError::job_not_found())
+    let job_id = Uuid::parse_str(value).map_err(|_| {
+        HttpError::invalid(
+            "jobId must be a UUID version 4",
+            Some(serde_json::json!({"field": "jobId"})),
+        )
+    })?;
+    if is_uuid_v4(job_id) {
+        Ok(job_id)
+    } else {
+        Err(HttpError::invalid(
+            "jobId must be a UUID version 4",
+            Some(serde_json::json!({"field": "jobId"})),
+        ))
+    }
 }
 
 fn insert_integer_header(response: &mut Response, name: axum::http::HeaderName, value: u64) {

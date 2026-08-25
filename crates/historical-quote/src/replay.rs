@@ -9,6 +9,7 @@ use simulator_replay::{
 use state_history::{
     Backend as HistoryBackend, BlockInterval, CheckpointManifest, RangeGap, RangeGapKind, RangeLeg,
     ReadLimits, StoredDelta, StreamPosition as HistoryPosition, TargetPlan, TargetPlanQuery,
+    TokenAnchor,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -259,15 +260,43 @@ pub(crate) async fn restore_checkpoint<S: HistorySource>(
     cancellation: &CancellationToken,
 ) -> Result<Option<RestoredWorld>, HistoricalError> {
     check_cancelled(cancellation)?;
+    let token_anchor = if backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Native | Backend::Vm))
+    {
+        source.select_token_anchor(manifest.clone()).await?
+    } else {
+        TokenAnchor::Missing
+    };
+    restore_checkpoint_with_token_anchor(
+        source,
+        manifest,
+        &token_anchor,
+        backends,
+        limits,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
+    source: &S,
+    manifest: &CheckpointManifest,
+    token_anchor: &TokenAnchor,
+    backends: &BTreeSet<Backend>,
+    limits: ReadLimits,
+    cancellation: &CancellationToken,
+) -> Result<Option<RestoredWorld>, HistoricalError> {
+    check_cancelled(cancellation)?;
     let needs_tokens = backends
         .iter()
         .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
     let (tokens, token_snapshot_digest) = if needs_tokens {
-        if manifest.token_reference.is_none() {
+        let TokenAnchor::Available { checkpoint, .. } = token_anchor else {
             return Ok(None);
-        }
+        };
         let snapshot = source
-            .fetch_checkpoint_token_snapshot(manifest.clone(), limits)
+            .fetch_checkpoint_token_snapshot(checkpoint.as_ref().clone(), limits)
             .await?
             .ok_or_else(|| {
                 HistoricalError::HistoricalDataInvalid(
@@ -276,7 +305,7 @@ pub(crate) async fn restore_checkpoint<S: HistorySource>(
             })?;
         let tokens = decode_token_map(snapshot.chain_id, snapshot.tokens.as_ref())
             .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
-        let digest = manifest
+        let digest = checkpoint
             .token_reference
             .as_ref()
             .map(|reference| format!("sha256:{}", reference.sha256));

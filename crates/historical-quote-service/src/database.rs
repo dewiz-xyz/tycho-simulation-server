@@ -11,6 +11,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ReplicaDatabaseConfig;
 
+// Vendored from AWS's official global RDS bundle so TLS does not depend on host trust files:
+// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+const AWS_RDS_GLOBAL_CA_BUNDLE: &[u8] = include_bytes!("../assets/aws-rds-global-bundle.pem");
+
 type DatabaseFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DatabaseError>> + Send + 'a>>;
 
 pub trait IamTokenProvider: Send + Sync + 'static {
@@ -87,6 +91,7 @@ impl PostgresConnectionFactory {
             .username(&config.username)
             .database(&config.database)
             .ssl_mode(PgSslMode::VerifyFull)
+            .ssl_root_cert_from_pem(AWS_RDS_GLOBAL_CA_BUNDLE.to_vec())
             .disable_statement_logging();
         Self { base_options }
     }
@@ -340,6 +345,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn compiled_rds_bundle_contains_multiple_pem_certificates() -> Result<(), std::str::Utf8Error> {
+        let bundle = std::str::from_utf8(AWS_RDS_GLOBAL_CA_BUNDLE)?;
+        assert!(bundle.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(bundle.matches("-----BEGIN CERTIFICATE-----").count() > 1);
+        assert!(bundle.trim_end().ends_with("-----END CERTIFICATE-----"));
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct FakeTokenProvider {

@@ -21,7 +21,7 @@ use crate::api::{
 use crate::quote_job::quote_failure_reason;
 use crate::replay::{
     apply_all_pair_deltas, check_cancelled, history_backend, history_position, public_position,
-    replay_backend, restore_checkpoint,
+    replay_backend, restore_checkpoint_with_token_anchor,
 };
 use crate::{EngineProgress, HistoricalError, HistorySource};
 
@@ -145,17 +145,19 @@ impl<S: HistorySource> ConsistencyChecker<S> {
         let backends = request.backends.iter().copied().collect::<BTreeSet<_>>();
         self.validate_rfq_token_objects(&plan, &backends, cancellation)
             .await?;
-        let direct = restore_checkpoint(
+        let direct = restore_checkpoint_with_token_anchor(
             self.source.as_ref(),
             &plan.pair.target,
+            &plan.target_token_anchor,
             &backends,
             self.read_limits,
             cancellation,
         )
         .await?;
-        let replayed = restore_checkpoint(
+        let replayed = restore_checkpoint_with_token_anchor(
             self.source.as_ref(),
             &plan.pair.earlier,
+            &plan.earlier_token_anchor,
             &backends,
             self.read_limits,
             cancellation,
@@ -245,21 +247,21 @@ impl<S: HistorySource> ConsistencyChecker<S> {
         {
             return Ok(());
         }
-        for manifest in [&plan.pair.earlier, &plan.pair.target] {
+        for anchor in [&plan.earlier_token_anchor, &plan.target_token_anchor] {
             check_cancelled(cancellation)?;
-            if manifest.token_reference.is_none() {
+            let state_history::TokenAnchor::Available { checkpoint, .. } = anchor else {
                 return Err(invalid_storage(
                     "checkpoint requires a token snapshot reference for storage verification",
                 ));
-            }
+            };
             let snapshot = self
                 .source
-                .fetch_checkpoint_token_snapshot(manifest.clone(), self.read_limits)
+                .fetch_checkpoint_token_snapshot(checkpoint.as_ref().clone(), self.read_limits)
                 .await?
                 .ok_or_else(|| {
                     invalid_storage("checkpoint token reference resolved without a token snapshot")
                 })?;
-            if snapshot.chain_id != manifest.chain_id {
+            if snapshot.chain_id != checkpoint.chain_id {
                 return Err(invalid_storage(
                     "checkpoint token snapshot chain does not match the manifest",
                 ));
@@ -292,8 +294,12 @@ impl StorageEvidence {
         }
         for manifest in [&plan.pair.earlier, &plan.pair.target] {
             self.checkpoint_positions.insert(manifest.position);
-            if let Some(reference) = &manifest.token_reference {
-                self.token_digests.insert(reference.sha256.clone());
+        }
+        for anchor in [&plan.earlier_token_anchor, &plan.target_token_anchor] {
+            if let state_history::TokenAnchor::Available { checkpoint, .. } = anchor {
+                if let Some(reference) = &checkpoint.token_reference {
+                    self.token_digests.insert(reference.sha256.clone());
+                }
             }
         }
     }

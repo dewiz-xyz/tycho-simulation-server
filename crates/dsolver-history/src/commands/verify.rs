@@ -51,7 +51,7 @@ pub async fn execute(
 
 async fn verify_flow(
     client: &HistoryClient,
-    mut request: ConsistencyCheckRequest,
+    request: ConsistencyCheckRequest,
     job_envelope: bool,
     output: &OutputOptions,
     deadline: Instant,
@@ -91,7 +91,6 @@ async fn verify_flow(
                 return Ok(verify_exit(report));
             }
             Err(error) if error.is_job_not_found() && !recomputed => {
-                request.timeout_ms = remaining_millis(deadline)?;
                 recomputed = true;
                 eprintln!(
                     "verification result was not found; recomputing once with request {}",
@@ -215,20 +214,6 @@ fn verify_exit(report: &ConsistencyCheckReport) -> u8 {
         EXIT_OPERATION_FAILED
     } else {
         EXIT_SUCCESS
-    }
-}
-
-fn remaining_millis(deadline: Instant) -> Result<u64, CliError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| CliError::operation("request deadline expired before recomputation"))?;
-    let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    if millis == 0 {
-        Err(CliError::operation(
-            "request deadline expired before recomputation",
-        ))
-    } else {
-        Ok(millis)
     }
 }
 

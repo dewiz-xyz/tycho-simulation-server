@@ -87,6 +87,43 @@ async fn rfq_verification_reads_token_objects_and_rejects_missing_references(
 }
 
 #[tokio::test]
+async fn verification_uses_same_segment_token_fallback_evidence(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = support::rfq_quote_request().pool;
+    let mut source = FixtureSource::rfq_consistency(false)?;
+    let fallback = support::manifest(
+        12,
+        99,
+        support::position(0),
+        state_history::Backend::Rfq,
+        true,
+        Some(900),
+    );
+    source
+        .token_snapshots
+        .insert(fallback.id, support::native_tokens()?);
+    let plan = source
+        .pair_plan
+        .as_mut()
+        .ok_or("fixture pair plan must exist")?;
+    plan.earlier_token_anchor = state_history::TokenAnchor::Available {
+        checkpoint: Box::new(fallback.clone()),
+        used_fallback: true,
+    };
+    plan.target_token_anchor = state_history::TokenAnchor::Available {
+        checkpoint: Box::new(fallback),
+        used_fallback: true,
+    };
+
+    let report = checker(Arc::new(source), 100)
+        .execute(&consistency_request(pool), &CancellationToken::new(), &())
+        .await?;
+
+    assert_eq!(report.storage.token_objects_verified, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_delta_order_or_backend_metadata_fails_storage_verification(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut unordered = FixtureSource::native_consistency(true)?;

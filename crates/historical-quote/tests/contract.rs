@@ -157,6 +157,11 @@ fn request_requires_uuid_version_four() {
 
     let error = serde_json::from_value::<QuoteJobRequest>(value).unwrap_err();
     assert!(error.to_string().contains("UUID version 4"));
+
+    let mut reserved_variant = quote_request_value();
+    reserved_variant["requestId"] = json!("00000000-0000-4000-0000-000000000000");
+    let error = serde_json::from_value::<QuoteJobRequest>(reserved_variant).unwrap_err();
+    assert!(error.to_string().contains("UUID version 4"));
 }
 
 #[test]
@@ -594,6 +599,10 @@ fn openapi_validation_matches_boundary_rules() {
         .any(|field| field == "step"));
 
     let quote_request = &schemas["QuoteJobRequest"]["properties"];
+    let uuid_v4_pattern =
+        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+    assert_eq!(quote_request["requestId"]["format"], "uuid");
+    assert_eq!(quote_request["requestId"]["pattern"], uuid_v4_pattern);
     assert_eq!(quote_request["lags"]["minItems"], 1);
     assert_eq!(quote_request["lags"]["uniqueItems"], true);
     assert_eq!(quote_request["lags"]["items"]["minimum"], 1);
@@ -609,6 +618,38 @@ fn openapi_validation_matches_boundary_rules() {
         schemas["QuoteComparisonRequest"]["properties"]["amountsIn"]["uniqueItems"],
         true
     );
+
+    for schema in [
+        "ConsistencyCheckReport",
+        "ConsistencyCheckRequest",
+        "HistoricalQuoteResult",
+    ] {
+        assert_eq!(
+            schemas[schema]["properties"]["requestId"]["pattern"],
+            uuid_v4_pattern
+        );
+    }
+    for schema in ["JobEnvelope", "JobSubmission"] {
+        assert_eq!(
+            schemas[schema]["properties"]["jobId"]["pattern"],
+            uuid_v4_pattern
+        );
+        assert_eq!(
+            schemas[schema]["properties"]["requestId"]["pattern"],
+            uuid_v4_pattern
+        );
+    }
+    for path in ["/jobs/{jobId}", "/jobs/{jobId}/cancel"] {
+        let operation = if path.ends_with("cancel") {
+            &document["paths"][path]["post"]
+        } else {
+            &document["paths"][path]["get"]
+        };
+        assert_eq!(
+            operation["parameters"][0]["schema"]["pattern"],
+            uuid_v4_pattern
+        );
+    }
 
     for schema in [
         "ConsistencyQuoteOutcome",
