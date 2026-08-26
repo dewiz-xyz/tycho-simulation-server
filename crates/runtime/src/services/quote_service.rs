@@ -42,7 +42,7 @@ impl QuoteService {
 
         let computation = match self.run_quote_computation(&request, started_at).await {
             Ok(computation) => computation,
-            Err(timeout_result) => return timeout_result,
+            Err(timeout_result) => return *timeout_result,
         };
 
         let latency_ms = started_at.elapsed().as_millis() as u64;
@@ -62,16 +62,17 @@ impl QuoteService {
         &self,
         request: &AmountOutRequest,
         started_at: Instant,
-    ) -> Result<QuoteComputation, QuoteResult> {
+    ) -> Result<QuoteComputation, Box<QuoteResult>> {
         let cancel_token = CancellationToken::new();
         let mut cancel_guard = CancelOnDrop::new(cancel_token.clone());
         let request_timeout = self.state.request_timeout();
         let computation = get_amounts_out(self.state.clone(), request.clone(), Some(cancel_token));
 
         let Ok(computation) = tokio::time::timeout(request_timeout, computation).await else {
-            return Err(self
-                .build_request_guard_timeout_result(request, started_at, request_timeout)
-                .await);
+            return Err(Box::new(
+                self.build_request_guard_timeout_result(request, started_at, request_timeout)
+                    .await,
+            ));
         };
 
         cancel_guard.disarm();

@@ -8,21 +8,45 @@ use historical_quote::api::{ApiError, ApiErrorCode};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BearerKey {
+    id: String,
+    digest: [u8; 32],
+}
+
+impl BearerKey {
+    #[must_use]
+    pub fn new(id: String, digest: [u8; 32]) -> Self {
+        Self { id, digest }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 #[derive(Clone)]
 pub struct BearerTokenVerifier {
-    expected_digest: [u8; 32],
+    keys: Vec<BearerKey>,
 }
 
 impl BearerTokenVerifier {
     #[must_use]
-    pub const fn new(expected_digest: [u8; 32]) -> Self {
-        Self { expected_digest }
+    pub fn new(keys: Vec<BearerKey>) -> Self {
+        Self { keys }
     }
 
     #[must_use]
-    pub fn verify(&self, presented: &str) -> bool {
+    pub fn verify(&self, presented: &str) -> Option<&str> {
         let candidate: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
-        bool::from(candidate.ct_eq(&self.expected_digest))
+        let mut matched_id = None;
+        for key in &self.keys {
+            if bool::from(candidate.ct_eq(&key.digest)) {
+                matched_id = Some(key.id());
+            }
+        }
+        matched_id
     }
 }
 
@@ -36,7 +60,13 @@ pub async fn require_bearer(
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_value);
-    if token.is_some_and(|token| verifier.verify(token)) {
+    if let Some(key_id) = token.and_then(|token| verifier.verify(token)) {
+        tracing::info!(
+            bearer_key_id = key_id,
+            method = %request.method(),
+            path = request.uri().path(),
+            "historical quote API request authenticated"
+        );
         return next.run(request).await;
     }
     (
@@ -62,13 +92,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verifies_only_the_token_matching_the_configured_digest() {
-        let expected_digest = Sha256::digest(b"expected-token").into();
-        let verifier = BearerTokenVerifier::new(expected_digest);
+    fn identifies_each_matching_bearer_key() {
+        let verifier = BearerTokenVerifier::new(vec![
+            BearerKey::new(
+                "edson".to_owned(),
+                Sha256::digest(b"edson-test-token").into(),
+            ),
+            BearerKey::new(
+                "pedro".to_owned(),
+                Sha256::digest(b"pedro-test-token").into(),
+            ),
+        ]);
 
-        assert!(verifier.verify("expected-token"));
-        assert!(!verifier.verify("wrong-token"));
-        assert!(!verifier.verify(""));
+        assert_eq!(verifier.verify("edson-test-token"), Some("edson"));
+        assert_eq!(verifier.verify("pedro-test-token"), Some("pedro"));
+        assert_eq!(verifier.verify("unknown-token"), None);
+        assert_eq!(verifier.verify(""), None);
     }
 
     #[test]

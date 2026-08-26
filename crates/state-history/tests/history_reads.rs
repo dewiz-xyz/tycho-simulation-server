@@ -71,6 +71,172 @@ async fn coverage_splits_on_gap_and_reports_cutoff(pool: PgPool) -> anyhow::Resu
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
+async fn bounded_native_coverage_reports_only_intersecting_unclipped_gaps(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 121).await?;
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_delta(&pool, 1, 40, 120, 1, &[Backend::Native]).await?;
+    seed_gap(&pool, 1, 2, 3, Some((90, 110)), None).await?;
+    seed_gap(&pool, 1, 4, 5, Some((1_000, 1_010)), None).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_block, Some(90));
+    assert_eq!(snapshot.known_gaps[0].to_block_inclusive, Some(110));
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(111, 120)?]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn bounded_rfq_coverage_reports_only_time_gaps_mapped_into_the_range(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 121).await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    seed_delta(&pool, 1, 40, 120, 1, &[Backend::Rfq]).await?;
+    seed_gap(&pool, 1, 2, 3, None, Some((108_000, 110_000))).await?;
+    seed_gap(&pool, 1, 4, 5, None, Some((1_000_000, 1_010_000))).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Rfq],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_observed_at_ms, Some(108_000));
+    assert_eq!(snapshot.known_gaps[0].to_observed_at_ms, Some(110_000));
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(100, 107)?, BlockInterval::new(111, 120)?]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn bounded_rfq_coverage_preserves_the_global_projection_hull(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 90, 131).await?;
+    sqlx::query(
+        "UPDATE state_history.block_times
+         SET timestamp_ms = CASE block_number
+             WHEN 99 THEN 1500
+             WHEN 100 THEN 3000
+             WHEN 121 THEN 1500
+             WHEN 122 THEN 3000
+         END
+         WHERE chain_id = $1 AND block_number IN (99, 100, 121, 122)",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    seed_gap(&pool, 1, 2, 3, None, Some((1_000, 2_000))).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Rfq],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert!(snapshot.continuous_intervals.is_empty());
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_observed_at_ms, Some(1_000));
+    assert_eq!(snapshot.known_gaps[0].to_observed_at_ms, Some(2_000));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn mixed_coverage_reports_each_intersecting_gap_once(pool: PgPool) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 121).await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        true,
+        &[Backend::Native, Backend::Rfq],
+    )
+    .await?;
+    seed_delta(&pool, 1, 40, 120, 1, &[Backend::Native, Backend::Rfq]).await?;
+    seed_gap(&pool, 1, 2, 2, Some((104, 105)), Some((104_000, 105_000))).await?;
+    seed_gap(&pool, 1, 4, 4, Some((108, 108)), None).await?;
+    seed_gap(&pool, 1, 6, 6, None, Some((112_000, 112_000))).await?;
+    seed_gap(&pool, 1, 8, 8, Some((1_000, 1_001)), None).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native, Backend::Rfq],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert_eq!(snapshot.known_gaps.len(), 3);
+    assert_eq!(
+        snapshot
+            .known_gaps
+            .iter()
+            .map(|gap| gap.from_position)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(position(1, 2)),
+            Some(position(1, 4)),
+            Some(position(1, 6))
+        ]
+    );
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![
+            BlockInterval::new(100, 103)?,
+            BlockInterval::new(106, 107)?,
+            BlockInterval::new(109, 111)?,
+            BlockInterval::new(113, 120)?,
+        ]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
 async fn coverage_starts_at_the_first_retained_checkpoint(pool: PgPool) -> anyhow::Result<()> {
     seed_block_times(&pool, 90, 110).await?;
     seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
@@ -129,6 +295,44 @@ async fn rfq_coverage_excludes_block_without_next_boundary(pool: PgPool) -> anyh
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
+async fn mixed_coverage_excludes_a_lineage_hole_and_its_missing_rfq_successor(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 103).await?;
+    sqlx::query(
+        "DELETE FROM state_history.block_times
+         WHERE chain_id = $1 AND block_number = 101",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        true,
+        &[Backend::Native, Backend::Rfq],
+    )
+    .await?;
+    seed_delta(&pool, 1, 1, 102, 1, &[Backend::Native, Backend::Rfq]).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native, Backend::Rfq],
+            Some(BlockInterval::new(100, 102)?),
+        )?)
+        .await?;
+
+    assert!(snapshot.continuous_intervals.is_empty());
+    assert!(snapshot.known_gaps.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
 async fn cursorless_gap_uses_its_full_span_for_boundary_projection(
     pool: PgPool,
 ) -> anyhow::Result<()> {
@@ -152,6 +356,91 @@ async fn cursorless_gap_uses_its_full_span_for_boundary_projection(
         snapshot.continuous_intervals,
         vec![BlockInterval::new(115, 120)?]
     );
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_block, None);
+    assert_eq!(snapshot.known_gaps[0].from_observed_at_ms, None);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn one_sided_gap_uses_conservative_boundary_projection(pool: PgPool) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 120).await?;
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(&pool, 1, 10, 105, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(&pool, 1, 30, 115, CheckpointKind::Boundary, true).await?;
+    seed_delta(&pool, 1, 40, 120, 1, &[Backend::Native]).await?;
+    seed_gap_with_cursors(
+        &pool,
+        1,
+        12,
+        20,
+        GapCursors {
+            from_block: Some(106),
+            ..GapCursors::default()
+        },
+    )
+    .await?;
+    seed_gap(&pool, 1, 32, 32, None, Some((118_000, 118_000))).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_block, Some(106));
+    assert_eq!(snapshot.known_gaps[0].to_block_inclusive, None);
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(100, 104)?, BlockInterval::new(115, 120)?]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn coverage_ignores_gaps_fully_identified_for_another_backend(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 121).await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        true,
+        &[Backend::Native, Backend::Rfq],
+    )
+    .await?;
+    seed_delta(&pool, 1, 40, 120, 1, &[Backend::Native, Backend::Rfq]).await?;
+    seed_gap(&pool, 1, 2, 2, Some((108, 108)), None).await?;
+    seed_gap(&pool, 1, 4, 4, None, Some((112_000, 112_000))).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let native = reader
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+    let rfq = reader
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Rfq],
+            Some(BlockInterval::new(100, 120)?),
+        )?)
+        .await?;
+
+    assert_eq!(native.known_gaps.len(), 1);
+    assert_eq!(native.known_gaps[0].from_position, Some(position(1, 2)));
+    assert_eq!(rfq.known_gaps.len(), 1);
+    assert_eq!(rfq.known_gaps[0].from_position, Some(position(1, 4)));
     Ok(())
 }
 
@@ -714,6 +1003,36 @@ async fn seed_gap(
     block_bounds: Option<(u64, u64)>,
     time_bounds: Option<(u64, u64)>,
 ) -> anyhow::Result<()> {
+    seed_gap_with_cursors(
+        pool,
+        generation,
+        from_message_seq,
+        to_message_seq,
+        GapCursors {
+            from_block: block_bounds.map(|bounds| bounds.0),
+            to_block: block_bounds.map(|bounds| bounds.1),
+            from_observed_at_ms: time_bounds.map(|bounds| bounds.0),
+            to_observed_at_ms: time_bounds.map(|bounds| bounds.1),
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Default)]
+struct GapCursors {
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    from_observed_at_ms: Option<u64>,
+    to_observed_at_ms: Option<u64>,
+}
+
+async fn seed_gap_with_cursors(
+    pool: &PgPool,
+    generation: u64,
+    from_message_seq: u64,
+    to_message_seq: u64,
+    cursors: GapCursors,
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO state_history.gaps
             (chain_id, generation, from_message_seq, to_message_seq, reason,
@@ -724,26 +1043,10 @@ async fn seed_gap(
     .bind(database_i64(generation)?)
     .bind(database_i64(from_message_seq)?)
     .bind(database_i64(to_message_seq)?)
-    .bind(
-        block_bounds
-            .map(|bounds| database_i64(bounds.0))
-            .transpose()?,
-    )
-    .bind(
-        block_bounds
-            .map(|bounds| database_i64(bounds.1))
-            .transpose()?,
-    )
-    .bind(
-        time_bounds
-            .map(|bounds| database_i64(bounds.0))
-            .transpose()?,
-    )
-    .bind(
-        time_bounds
-            .map(|bounds| database_i64(bounds.1))
-            .transpose()?,
-    )
+    .bind(cursors.from_block.map(database_i64).transpose()?)
+    .bind(cursors.to_block.map(database_i64).transpose()?)
+    .bind(cursors.from_observed_at_ms.map(database_i64).transpose()?)
+    .bind(cursors.to_observed_at_ms.map(database_i64).transpose()?)
     .execute(pool)
     .await?;
     Ok(())

@@ -27,7 +27,7 @@ Ask for a missing selector when guessing it could query a different pool, direct
 ## Run the request
 
 1. Confirm `DSOLVER_HISTORY_URL` and `DSOLVER_HISTORY_TOKEN` are set without printing the token.
-2. Check `coverage` first when the requested range may be near the replica cutoff or a known gap.
+2. Check bounded `coverage` for the intended range before submitting work. Use unbounded coverage only for retained-history inventory or diagnosis.
 3. Use direct flags for a small one-off request. Use reviewed request JSON for repeated or multidimensional work.
 4. Use `--output` when the result should become an artifact; do not replace an existing file unless the user intends it.
 5. Let the high-level `quotes` command own submission, polling, and its single safe recomputation after `job_not_found`.
@@ -43,6 +43,8 @@ Treat each `(start block, input amount)` independently. Its start quote appears 
 - `quote_failed` means safe state existed but the component and direction did not quote. Report the typed reason.
 
 A process exit code of `0` means the job completed, not that every cell is `ok`. Never convert `unavailable` or `quote_failed` into a zero quote or silently drop those cells.
+
+For bounded coverage, `knownGaps` contains original, unclipped gaps whose projected unsafe interval intersects the effective requested range. Do not treat an omitted gap as proof that it does not exist outside that range.
 
 Finish with the request dimensions, output location or returned JSON, outcome counts, visible cutoff, and material gaps or failures. Distinguish observations from interpretation.
 

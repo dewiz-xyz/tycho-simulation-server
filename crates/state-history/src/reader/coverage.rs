@@ -5,8 +5,8 @@ use sqlx::Row;
 
 use super::{
     begin_range_transaction, database_backends, database_i64, database_u64, gap_from_row,
-    manifest_from_row, resolve_range_in_transaction, GapRow, RangeGap, RangeGapKind, RangeLeg,
-    RangeRequest, ReadConnectionProvider, ReadLimits, StateHistoryReader,
+    resolve_range_in_transaction, GapRow, RangeGap, RangeGapKind, RangeLeg, RangeRequest,
+    ReadConnectionProvider, ReadLimits, StateHistoryReader,
 };
 use crate::{Backend, BlockTimeObservation, ModelError, StreamPosition};
 
@@ -62,6 +62,38 @@ pub struct CoverageSnapshot {
     pub visible_through_block: u64,
     pub continuous_intervals: Vec<BlockInterval>,
     pub known_gaps: Vec<RangeGap>,
+}
+
+#[derive(Debug)]
+struct GapProjection {
+    gap_index: usize,
+    unsafe_intervals: Vec<BlockInterval>,
+}
+
+#[derive(Debug, Default)]
+struct PendingGapProjection {
+    unsafe_intervals: Vec<BlockInterval>,
+    rfq_time_bounds: Option<(u64, u64)>,
+    needs_conservative_projection: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoundaryPoint {
+    position: StreamPosition,
+    block_number: u64,
+}
+
+#[derive(Debug)]
+struct CoverageBlockRow {
+    block_number: u64,
+    block_hash: Option<String>,
+    parent_hash: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CoverageBlockAnalysis {
+    lineage_invalid_intervals: Vec<BlockInterval>,
+    missing_rfq_boundary_intervals: Vec<BlockInterval>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +168,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let interval_end = requested_end.min(visible_through_block);
 
         let gap_rows = coverage_gap_rows(&mut transaction, query.chain_id).await?;
-        let known_gaps = gap_rows.iter().map(range_gap).collect::<Vec<_>>();
-        let mut unsafe_intervals = project_gap_intervals(
+        let gap_projections = project_gap_intervals(
             &mut transaction,
             query,
             &gap_rows,
@@ -145,26 +176,25 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             interval_end,
         )
         .await?;
-        unsafe_intervals.extend(
-            lineage_invalid_intervals(
-                &mut transaction,
-                query.chain_id,
-                retained_start,
-                interval_end,
-            )
-            .await?,
-        );
-        if query.backends.binary_search(&Backend::Rfq).is_ok() {
-            unsafe_intervals.extend(
-                missing_rfq_boundary_intervals(
-                    &mut transaction,
-                    query.chain_id,
-                    retained_start,
-                    interval_end,
-                )
-                .await?,
-            );
-        }
+        let known_gaps = gap_projections
+            .iter()
+            .map(|projection| range_gap(&gap_rows[projection.gap_index]))
+            .collect::<Vec<_>>();
+        let mut unsafe_intervals = gap_projections
+            .into_iter()
+            .flat_map(|projection| projection.unsafe_intervals)
+            .collect::<Vec<_>>();
+        let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
+        let block_analysis = coverage_block_analysis(
+            &mut transaction,
+            query.chain_id,
+            retained_start,
+            interval_end,
+            includes_rfq,
+        )
+        .await?;
+        unsafe_intervals.extend(block_analysis.lineage_invalid_intervals);
+        unsafe_intervals.extend(block_analysis.missing_rfq_boundary_intervals);
         let continuous_intervals = if retained_start > interval_end {
             Vec::new()
         } else {
@@ -492,68 +522,111 @@ async fn project_gap_intervals(
     gaps: &[GapRow],
     start: u64,
     end: u64,
-) -> anyhow::Result<Vec<BlockInterval>> {
-    let mut projected = Vec::new();
-    for gap in gaps {
-        let includes_block_backend = query
-            .backends
-            .iter()
-            .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
-        let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
-        let no_bounds = gap.from_block_number.is_none()
-            && gap.to_block_number.is_none()
-            && gap.from_observed_at_ms.is_none()
-            && gap.to_observed_at_ms.is_none();
-        let mut needs_conservative_projection = no_bounds;
+) -> anyhow::Result<Vec<GapProjection>> {
+    if start > end || gaps.is_empty() {
+        return Ok(Vec::new());
+    }
 
-        if includes_block_backend {
-            match (gap.from_block_number, gap.to_block_number) {
-                (Some(from), Some(to)) => push_clipped(&mut projected, from, to, start, end)?,
-                (None, None) => {}
-                _ => needs_conservative_projection = true,
+    let includes_block_backend = query
+        .backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
+    let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
+    let mut pending = gaps
+        .iter()
+        .map(|gap| pending_gap_projection(gap, start, end, includes_block_backend, includes_rfq))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let rfq_bounds = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(gap_index, projection)| {
+            projection
+                .rfq_time_bounds
+                .map(|(from_ms, to_ms)| (gap_index, from_ms, to_ms))
+        })
+        .collect::<Vec<_>>();
+    for (gap_index, interval) in
+        batch_rfq_gap_intervals(connection, query.chain_id, &rfq_bounds, start, end).await?
+    {
+        pending
+            .get_mut(gap_index)
+            .context("RFQ projection returned an unknown gap index")?
+            .unsafe_intervals
+            .push(interval);
+    }
+
+    if pending
+        .iter()
+        .any(|projection| projection.needs_conservative_projection)
+    {
+        let boundaries = compatible_boundary_points(connection, query).await?;
+        for (gap, projection) in gaps.iter().zip(&mut pending) {
+            if !projection.needs_conservative_projection {
+                continue;
             }
-        }
-        if includes_rfq {
-            match (gap.from_observed_at_ms, gap.to_observed_at_ms) {
-                (Some(from), Some(to)) => {
-                    if let Some(interval) =
-                        rfq_time_gap_to_blocks(connection, query.chain_id, from, to).await?
-                    {
-                        push_clipped(
-                            &mut projected,
-                            interval.start,
-                            interval.end_inclusive,
-                            start,
-                            end,
-                        )?;
-                    }
-                }
-                (None, None) => {}
-                _ => needs_conservative_projection = true,
-            }
-        }
-        if needs_conservative_projection {
-            let (prior, next) = surrounding_boundaries(connection, query, gap).await?;
-            let unsafe_start = prior.unwrap_or(start).max(start);
-            let unsafe_end = next.map_or(end, |block| block.saturating_sub(1)).min(end);
-            if unsafe_start <= unsafe_end {
-                projected.push(BlockInterval::new(unsafe_start, unsafe_end)?);
+            let (prior, next) = surrounding_boundary_blocks(&boundaries, gap);
+            if let Some(interval) = conservative_gap_interval(prior, next, start, end)? {
+                projection.unsafe_intervals.push(interval);
             }
         }
     }
-    Ok(projected)
+
+    Ok(pending
+        .into_iter()
+        .enumerate()
+        .filter_map(|(gap_index, projection)| {
+            (!projection.unsafe_intervals.is_empty()).then_some(GapProjection {
+                gap_index,
+                unsafe_intervals: merge_intervals(projection.unsafe_intervals),
+            })
+        })
+        .collect())
 }
 
-async fn surrounding_boundaries(
+fn pending_gap_projection(
+    gap: &GapRow,
+    start: u64,
+    end: u64,
+    includes_block_backend: bool,
+    includes_rfq: bool,
+) -> anyhow::Result<PendingGapProjection> {
+    let block_bounds = ordered_bounds(gap.from_block_number, gap.to_block_number);
+    let rfq_time_bounds = ordered_bounds(gap.from_observed_at_ms, gap.to_observed_at_ms);
+    let mut projection = PendingGapProjection::default();
+
+    if includes_block_backend {
+        match (gap.from_block_number, gap.to_block_number) {
+            (Some(from), Some(to)) if from <= to => {
+                push_clipped(&mut projection.unsafe_intervals, from, to, start, end)?;
+            }
+            (None, None) if rfq_time_bounds.is_some() => {}
+            _ => projection.needs_conservative_projection = true,
+        }
+    }
+    if includes_rfq {
+        match (gap.from_observed_at_ms, gap.to_observed_at_ms) {
+            (Some(from), Some(to)) if from <= to => {
+                projection.rfq_time_bounds = Some((from, to));
+            }
+            (None, None) if block_bounds.is_some() => {}
+            _ => projection.needs_conservative_projection = true,
+        }
+    }
+
+    Ok(projection)
+}
+
+fn ordered_bounds(from: Option<u64>, to: Option<u64>) -> Option<(u64, u64)> {
+    from.zip(to).filter(|(from, to)| from <= to)
+}
+
+async fn compatible_boundary_points(
     connection: &mut sqlx::PgConnection,
     query: &CoverageQuery,
-    gap: &GapRow,
-) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+) -> anyhow::Result<Vec<BoundaryPoint>> {
     let rows = sqlx::query(
-        "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
-                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
-                status, error
+        "SELECT generation, message_seq, block_number, backends
          FROM state_history.checkpoints
          WHERE chain_id = $1 AND status = 'complete' AND kind = 'boundary'
            AND backends @> $2::text[]
@@ -563,132 +636,229 @@ async fn surrounding_boundaries(
     .bind(database_backends(&query.backends))
     .fetch_all(connection)
     .await?;
-    let from_position = StreamPosition {
+
+    rows.into_iter()
+        .map(|row| {
+            let backend_values: Vec<String> = row.try_get("backends")?;
+            backend_values
+                .into_iter()
+                .map(|backend| backend.parse::<Backend>())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundaryPoint {
+                position: StreamPosition {
+                    generation: database_u64(row.try_get("generation")?, "boundary generation")?,
+                    message_seq: database_u64(row.try_get("message_seq")?, "boundary message_seq")?,
+                },
+                block_number: database_u64(row.try_get("block_number")?, "boundary block")?,
+            })
+        })
+        .collect()
+}
+
+fn surrounding_boundary_blocks(
+    boundaries: &[BoundaryPoint],
+    gap: &GapRow,
+) -> (Option<u64>, Option<u64>) {
+    let from = StreamPosition {
         generation: gap.generation,
         message_seq: gap.from_message_seq,
     };
-    let to_position = StreamPosition {
+    let to = StreamPosition {
         generation: gap.generation,
         message_seq: gap.to_message_seq,
     };
-    let manifests = rows
-        .iter()
-        .map(manifest_from_row)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let prior = manifests
-        .iter()
-        .filter(|manifest| manifest.position < from_position)
-        .map(|manifest| manifest.block_number)
-        .next_back();
-    let next = manifests
-        .iter()
-        .find(|manifest| manifest.position > to_position)
-        .map(|manifest| manifest.block_number);
-    Ok((prior, next))
+    let prior_index = boundaries.partition_point(|point| point.position < from);
+    let next_index = boundaries.partition_point(|point| point.position <= to);
+    let prior = prior_index
+        .checked_sub(1)
+        .map(|index| boundaries[index].block_number);
+    let next = boundaries.get(next_index).map(|point| point.block_number);
+    (prior, next)
 }
 
-async fn rfq_time_gap_to_blocks(
-    connection: &mut sqlx::PgConnection,
-    chain_id: u64,
-    from_ms: u64,
-    to_ms: u64,
-) -> anyhow::Result<Option<BlockInterval>> {
-    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT min(current.block_number), max(current.block_number)
-         FROM state_history.block_times current
-         JOIN state_history.block_times next
-           ON next.chain_id = current.chain_id AND next.block_number = current.block_number + 1
-         WHERE current.chain_id = $1
-           AND next.timestamp_ms > $2
-           AND current.timestamp_ms <= $3",
-    )
-    .bind(database_i64(chain_id, "coverage chain_id")?)
-    .bind(database_i64(from_ms, "coverage RFQ gap start")?)
-    .bind(database_i64(to_ms, "coverage RFQ gap end")?)
-    .fetch_one(connection)
-    .await?;
-    match row {
-        (Some(start), Some(end)) => Ok(Some(BlockInterval::new(
-            database_u64(start, "coverage RFQ gap block start")?,
-            database_u64(end, "coverage RFQ gap block end")?,
-        )?)),
-        (None, None) => Ok(None),
-        _ => anyhow::bail!("RFQ gap projection returned incomplete bounds"),
-    }
-}
-
-async fn missing_rfq_boundary_intervals(
-    connection: &mut sqlx::PgConnection,
-    chain_id: u64,
+fn conservative_gap_interval(
+    prior: Option<u64>,
+    next: Option<u64>,
     start: u64,
     end: u64,
-) -> anyhow::Result<Vec<BlockInterval>> {
-    if start > end {
-        return Ok(Vec::new());
+) -> anyhow::Result<Option<BlockInterval>> {
+    if matches!((prior, next), (Some(prior), Some(next)) if prior > next) {
+        // Stream and block order disagree, so the gap's block reach is unknowable.
+        return Ok(Some(BlockInterval::new(start, end)?));
     }
-    let rows: Vec<i64> = sqlx::query_scalar(
-        "SELECT current.block_number
-         FROM state_history.block_times current
-         LEFT JOIN state_history.block_times successor
-           ON successor.chain_id = current.chain_id
-          AND successor.block_number = current.block_number + 1
-         WHERE current.chain_id = $1
-           AND current.block_number BETWEEN $2 AND $3
-           AND successor.block_number IS NULL
-         ORDER BY current.block_number",
-    )
-    .bind(database_i64(chain_id, "coverage chain_id")?)
-    .bind(database_i64(start, "coverage RFQ boundary start")?)
-    .bind(database_i64(end, "coverage RFQ boundary end")?)
-    .fetch_all(connection)
-    .await
-    .context("failed to select missing RFQ next-block boundaries")?;
-    let intervals = rows
-        .into_iter()
-        .map(|block| {
-            let block = database_u64(block, "coverage RFQ missing boundary block")?;
-            BlockInterval::new(block, block).map_err(anyhow::Error::from)
+
+    let unsafe_start = prior.unwrap_or(start).max(start);
+    let unsafe_end = next.map_or(end, |block| block.saturating_sub(1)).min(end);
+    Ok((unsafe_start <= unsafe_end)
+        .then(|| BlockInterval::new(unsafe_start, unsafe_end))
+        .transpose()?)
+}
+
+async fn batch_rfq_gap_intervals(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    bounds: &[(usize, u64, u64)],
+    start: u64,
+    end: u64,
+) -> anyhow::Result<BTreeMap<usize, BlockInterval>> {
+    if bounds.is_empty() || start > end {
+        return Ok(BTreeMap::new());
+    }
+
+    let gap_indices = bounds
+        .iter()
+        .map(|(gap_index, _, _)| {
+            i64::try_from(*gap_index).context("coverage RFQ gap index exceeds PostgreSQL bigint")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(merge_intervals(intervals))
+    let from_ms = bounds
+        .iter()
+        .map(|(_, from_ms, _)| database_i64(*from_ms, "coverage RFQ gap start"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let to_ms = bounds
+        .iter()
+        .map(|(_, _, to_ms)| database_i64(*to_ms, "coverage RFQ gap end"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // Aggregate the global matching hull before clipping, matching the legacy fail-closed behavior
+    // when block-time pairs are missing or non-contiguous.
+    let rows = sqlx::query(
+        "WITH requested_gap(gap_index, from_ms, to_ms) AS (
+             SELECT * FROM unnest($2::bigint[], $3::bigint[], $4::bigint[])
+         )
+         SELECT requested_gap.gap_index,
+                min(current.block_number) AS start_block,
+                max(current.block_number) AS end_block
+         FROM requested_gap
+         JOIN state_history.block_times current
+           ON current.chain_id = $1
+         JOIN state_history.block_times successor
+           ON successor.chain_id = current.chain_id
+          AND successor.block_number = current.block_number + 1
+          AND successor.timestamp_ms > requested_gap.from_ms
+         WHERE current.timestamp_ms <= requested_gap.to_ms
+         GROUP BY requested_gap.gap_index
+         ORDER BY requested_gap.gap_index",
+    )
+    .bind(database_i64(chain_id, "coverage chain_id")?)
+    .bind(gap_indices)
+    .bind(from_ms)
+    .bind(to_ms)
+    .fetch_all(connection)
+    .await
+    .context("failed to batch project coverage RFQ gaps")?;
+
+    let mut projected = BTreeMap::new();
+    for row in rows {
+        let gap_index = usize::try_from(database_u64(
+            row.try_get("gap_index")?,
+            "coverage RFQ gap index",
+        )?)
+        .context("coverage RFQ gap index exceeds usize")?;
+        let projected_start =
+            database_u64(row.try_get("start_block")?, "coverage RFQ gap block start")?;
+        let projected_end = database_u64(row.try_get("end_block")?, "coverage RFQ gap block end")?;
+        let clipped_start = projected_start.max(start);
+        let clipped_end = projected_end.min(end);
+        if clipped_start > clipped_end {
+            continue;
+        }
+        let interval = BlockInterval::new(clipped_start, clipped_end)?;
+        if projected.insert(gap_index, interval).is_some() {
+            anyhow::bail!("RFQ gap projection returned a duplicate gap index");
+        }
+    }
+    Ok(projected)
 }
 
-pub(super) async fn lineage_invalid_intervals(
+async fn coverage_block_analysis(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
     start: u64,
     end: u64,
-) -> anyhow::Result<Vec<BlockInterval>> {
+    includes_rfq: bool,
+) -> anyhow::Result<CoverageBlockAnalysis> {
     if start > end {
-        return Ok(Vec::new());
+        return Ok(CoverageBlockAnalysis::default());
     }
+    let fetch_end = if includes_rfq {
+        end.saturating_add(1)
+    } else {
+        end
+    };
+    let rows = coverage_block_rows(connection, chain_id, start, fetch_end).await?;
+    analyze_coverage_blocks(&rows, start, end, includes_rfq)
+}
+
+async fn coverage_block_rows(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<Vec<CoverageBlockRow>> {
     let rows = sqlx::query(
         "SELECT block_number, block_hash, parent_hash
          FROM state_history.block_times
          WHERE chain_id = $1 AND block_number BETWEEN $2 AND $3
          ORDER BY block_number",
     )
-    .bind(database_i64(chain_id, "lineage chain_id")?)
-    .bind(database_i64(start, "lineage start")?)
-    .bind(database_i64(end, "lineage end")?)
+    .bind(database_i64(chain_id, "coverage block chain_id")?)
+    .bind(database_i64(start, "coverage block start")?)
+    .bind(database_i64(end, "coverage block end")?)
     .fetch_all(connection)
     .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CoverageBlockRow {
+                block_number: database_u64(row.try_get("block_number")?, "coverage block")?,
+                block_hash: row.try_get("block_hash")?,
+                parent_hash: row.try_get("parent_hash")?,
+            })
+        })
+        .collect()
+}
+
+fn analyze_coverage_blocks(
+    rows: &[CoverageBlockRow],
+    start: u64,
+    end: u64,
+    includes_rfq: bool,
+) -> anyhow::Result<CoverageBlockAnalysis> {
+    let missing_rfq_boundary_intervals = if includes_rfq {
+        missing_rfq_intervals_from_rows(rows, start, end)
+    } else {
+        Vec::new()
+    };
+    Ok(CoverageBlockAnalysis {
+        lineage_invalid_intervals: lineage_intervals_from_rows(rows, start, end)?,
+        missing_rfq_boundary_intervals,
+    })
+}
+
+fn lineage_intervals_from_rows(
+    rows: &[CoverageBlockRow],
+    start: u64,
+    end: u64,
+) -> anyhow::Result<Vec<BlockInterval>> {
     let mut invalid = Vec::new();
-    let mut previous: Option<(u64, String)> = None;
+    let mut previous: Option<(u64, &str)> = None;
     let mut expected_block = start;
     for row in rows {
-        let block = database_u64(row.try_get("block_number")?, "lineage block")?;
-        let hash: Option<String> = row.try_get("block_hash")?;
-        let parent: Option<String> = row.try_get("parent_hash")?;
+        let block = row.block_number;
+        if block > end {
+            break;
+        }
+        let hash = row.block_hash.as_deref();
+        let parent = row.parent_hash.as_deref();
         let had_missing_predecessor = block > expected_block;
         if had_missing_predecessor {
             invalid.push(BlockInterval::new(expected_block, block - 1)?);
             previous = None;
         }
-        let is_invalid = match (&previous, hash.as_ref(), parent.as_ref()) {
+        let is_invalid = match (&previous, hash, parent) {
             (_, None, _) | (_, _, None) => true,
             (Some((previous_block, previous_hash)), Some(_), Some(parent_hash)) => {
-                block != previous_block.saturating_add(1) || parent_hash != previous_hash
+                block != previous_block.saturating_add(1) || parent_hash != *previous_hash
             }
             (None, Some(_), Some(_)) => block != start || had_missing_predecessor,
         };
@@ -704,6 +874,42 @@ pub(super) async fn lineage_invalid_intervals(
         invalid.push(BlockInterval::new(expected_block, end)?);
     }
     Ok(merge_intervals(invalid))
+}
+
+fn missing_rfq_intervals_from_rows(
+    rows: &[CoverageBlockRow],
+    start: u64,
+    end: u64,
+) -> Vec<BlockInterval> {
+    let missing = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.block_number >= start && row.block_number <= end)
+        .filter(|(index, row)| {
+            row.block_number.checked_add(1).is_none_or(|successor| {
+                rows.get(index + 1)
+                    .is_none_or(|next| next.block_number != successor)
+            })
+        })
+        .map(|(_, row)| BlockInterval {
+            start: row.block_number,
+            end_inclusive: row.block_number,
+        })
+        .collect();
+    merge_intervals(missing)
+}
+
+pub(super) async fn lineage_invalid_intervals(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<Vec<BlockInterval>> {
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let rows = coverage_block_rows(connection, chain_id, start, end).await?;
+    lineage_intervals_from_rows(&rows, start, end)
 }
 
 fn push_clipped(
@@ -767,4 +973,177 @@ fn merge_intervals(mut intervals: Vec<BlockInterval>) -> Vec<BlockInterval> {
         merged.push(interval);
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        analyze_coverage_blocks, conservative_gap_interval, pending_gap_projection,
+        surrounding_boundary_blocks, BlockInterval, BoundaryPoint, CoverageBlockRow, GapRow,
+        StreamPosition,
+    };
+
+    fn block(block_number: u64) -> CoverageBlockRow {
+        CoverageBlockRow {
+            block_number,
+            block_hash: Some(format!("hash-{block_number}")),
+            parent_hash: Some(format!("hash-{}", block_number.saturating_sub(1))),
+        }
+    }
+
+    fn gap(from_message_seq: u64, to_message_seq: u64) -> GapRow {
+        GapRow {
+            generation: 1,
+            from_message_seq,
+            to_message_seq,
+            reason: "write_failed".to_string(),
+            from_block_number: None,
+            to_block_number: None,
+            from_observed_at_ms: None,
+            to_observed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn combined_analysis_marks_lineage_hole_and_missing_rfq_successor() -> anyhow::Result<()> {
+        let rows = vec![block(100), block(102), block(103)];
+        let analysis = analyze_coverage_blocks(&rows, 100, 102, true)?;
+
+        assert_eq!(
+            analysis.lineage_invalid_intervals,
+            vec![BlockInterval::new(101, 102)?]
+        );
+        assert_eq!(
+            analysis.missing_rfq_boundary_intervals,
+            vec![BlockInterval::new(100, 100)?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn combined_analysis_checks_successor_beyond_requested_end() -> anyhow::Result<()> {
+        let rows = vec![block(100), block(101)];
+        let analysis = analyze_coverage_blocks(&rows, 100, 101, true)?;
+
+        assert!(analysis.lineage_invalid_intervals.is_empty());
+        assert_eq!(
+            analysis.missing_rfq_boundary_intervals,
+            vec![BlockInterval::new(101, 101)?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn combined_analysis_accepts_successor_beyond_requested_end() -> anyhow::Result<()> {
+        let mut successor = block(102);
+        successor.block_hash = None;
+        successor.parent_hash = None;
+        let rows = vec![block(100), block(101), successor];
+        let analysis = analyze_coverage_blocks(&rows, 100, 101, true)?;
+
+        assert!(analysis.lineage_invalid_intervals.is_empty());
+        assert!(analysis.missing_rfq_boundary_intervals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn combined_analysis_skips_successor_checks_without_rfq() -> anyhow::Result<()> {
+        let rows = vec![block(100), block(101)];
+        let analysis = analyze_coverage_blocks(&rows, 100, 101, false)?;
+
+        assert!(analysis.lineage_invalid_intervals.is_empty());
+        assert!(analysis.missing_rfq_boundary_intervals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reversed_gap_bounds_require_conservative_projection() -> anyhow::Result<()> {
+        let mut gap = gap(10, 20);
+        gap.from_block_number = Some(110);
+        gap.to_block_number = Some(105);
+        gap.from_observed_at_ms = Some(110_000);
+        gap.to_observed_at_ms = Some(105_000);
+
+        let projection = pending_gap_projection(&gap, 100, 120, true, true)?;
+
+        assert!(projection.unsafe_intervals.is_empty());
+        assert!(projection.rfq_time_bounds.is_none());
+        assert!(projection.needs_conservative_projection);
+        Ok(())
+    }
+
+    #[test]
+    fn inconsistent_boundary_order_falls_back_to_the_full_range() -> anyhow::Result<()> {
+        assert_eq!(
+            conservative_gap_interval(Some(115), Some(105), 100, 120)?,
+            Some(BlockInterval::new(100, 120)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_boundary_blocks_preserve_the_empty_legacy_span() -> anyhow::Result<()> {
+        assert_eq!(
+            conservative_gap_interval(Some(110), Some(110), 100, 120)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surrounding_boundaries_are_strict_and_reusable() {
+        let boundaries = [
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 9,
+                },
+                block_number: 104,
+            },
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 10,
+                },
+                block_number: 105,
+            },
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 20,
+                },
+                block_number: 115,
+            },
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 21,
+                },
+                block_number: 116,
+            },
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 30,
+                },
+                block_number: 125,
+            },
+            BoundaryPoint {
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 31,
+                },
+                block_number: 126,
+            },
+        ];
+
+        assert_eq!(
+            surrounding_boundary_blocks(&boundaries, &gap(10, 20)),
+            (Some(104), Some(116))
+        );
+        assert_eq!(
+            surrounding_boundary_blocks(&boundaries, &gap(20, 30)),
+            (Some(105), Some(126))
+        );
+    }
 }

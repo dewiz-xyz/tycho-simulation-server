@@ -72,7 +72,7 @@ pub struct QuoteComputation {
 }
 
 type CandidatePool = (String, Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-type PoolTask = Pin<Box<dyn Future<Output = Result<PoolSimOutcome, QuoteFailure>> + Send>>;
+type PoolTask = Pin<Box<dyn Future<Output = Result<PoolSimOutcome, Box<QuoteFailure>>> + Send>>;
 
 fn build_request_exit(
     responses: Vec<AmountOutResponse>,
@@ -1097,7 +1097,7 @@ impl QuoteRequestRunner {
 
     fn handle_pool_task_outcome(
         &mut self,
-        outcome: Result<PoolSimOutcome, QuoteFailure>,
+        outcome: Result<PoolSimOutcome, Box<QuoteFailure>>,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
         rfq_first_gases: &mut Vec<u64>,
@@ -1106,7 +1106,7 @@ impl QuoteRequestRunner {
             Ok(PoolSimOutcome::Simulated(result)) => {
                 self.handle_simulated_pool_result(result, prepared, vm_first_gases, rfq_first_gases)
             }
-            Err(failure) => self.handle_pool_failure(failure, prepared.expected_len),
+            Err(failure) => self.handle_pool_failure(*failure, prepared.expected_len),
         }
     }
 
@@ -1925,7 +1925,7 @@ impl PoolSimulationRunner {
     }
 }
 
-async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, QuoteFailure> {
+async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Box<QuoteFailure>> {
     let SimulatePoolInput {
         descriptor,
         pool_state,
@@ -1965,21 +1965,21 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
                 "{}: Quote computation panicked: {}",
                 descriptor, panic_message
             );
-            Err(make_failure(
+            Err(Box::new(make_failure(
                 QuoteFailureKind::Internal,
                 message,
                 Some(context),
-            ))
+            )))
         }
         Err(SimulationExecutionError::ResultDropped) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation result dropped", descriptor);
-            Err(make_failure(
+            Err(Box::new(make_failure(
                 QuoteFailureKind::Internal,
                 message,
                 Some(context),
-            ))
+            )))
         }
     }
 }

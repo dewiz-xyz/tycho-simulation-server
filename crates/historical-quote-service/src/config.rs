@@ -1,11 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
 use historical_quote::api::{Backend, ServiceLimits, API_REVISION};
+use serde::Deserialize;
 
+use crate::auth::BearerKey;
 use crate::jobs::JobLimits;
 
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:3100";
@@ -27,6 +29,23 @@ const DEFAULT_DATABASE_PORT: u16 = 5_432;
 const DEFAULT_DATABASE_CONNECTIONS: usize = 5;
 const DEFAULT_DATABASE_CONNECTION_LIFETIME_SECONDS: u64 = 3_600;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
+const BEARER_KEYS_ENV: &str = "DSOLVER_HISTORY_BEARER_KEYS_JSON";
+const BEARER_KEY_SCHEMA_VERSION: u32 = 1;
+const MAX_BEARER_KEYS: usize = 32;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BearerKeySetDocument {
+    schema_version: u32,
+    keys: Vec<BearerKeyDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BearerKeyDocument {
+    id: String,
+    sha256: String,
+}
 
 #[derive(Clone)]
 pub struct ServiceConfig {
@@ -34,7 +53,7 @@ pub struct ServiceConfig {
     pub supported_chain_id: u64,
     pub service_revision: String,
     pub enabled_backends: Vec<Backend>,
-    pub expected_bearer_digest: [u8; 32],
+    pub bearer_keys: Vec<BearerKey>,
     pub scheduler: JobLimits,
     pub max_combination_count: u64,
     pub max_block_span: u64,
@@ -97,7 +116,7 @@ impl ServiceConfig {
             ));
         }
         let enabled_backends = parse_backends(&required("DSOLVER_HISTORY_ENABLED_BACKENDS")?)?;
-        let expected_bearer_digest = parse_digest(&required("DSOLVER_HISTORY_TOKEN_SHA256")?)?;
+        let bearer_keys = parse_bearer_keys(&required(BEARER_KEYS_ENV)?)?;
         let workload = workload_config()?;
 
         let username = required("DSOLVER_HISTORY_REPLICA_DB_USER")?;
@@ -112,7 +131,7 @@ impl ServiceConfig {
             supported_chain_id,
             service_revision,
             enabled_backends,
-            expected_bearer_digest,
+            bearer_keys,
             scheduler: workload.scheduler,
             max_combination_count: workload.max_combination_count,
             max_block_span: workload.max_block_span,
@@ -360,12 +379,61 @@ fn parse_backends(value: &str) -> Result<Vec<Backend>, ConfigError> {
     Ok(backends)
 }
 
-fn parse_digest(value: &str) -> Result<[u8; 32], ConfigError> {
-    let decoded =
-        hex::decode(value).map_err(|_| ConfigError::Malformed("DSOLVER_HISTORY_TOKEN_SHA256"))?;
-    decoded
-        .try_into()
-        .map_err(|_| ConfigError::Malformed("DSOLVER_HISTORY_TOKEN_SHA256"))
+fn parse_bearer_keys(value: &str) -> Result<Vec<BearerKey>, ConfigError> {
+    let document: BearerKeySetDocument =
+        serde_json::from_str(value).map_err(|_| ConfigError::Malformed(BEARER_KEYS_ENV))?;
+    if document.schema_version != BEARER_KEY_SCHEMA_VERSION {
+        return Err(ConfigError::Invalid(format!(
+            "{BEARER_KEYS_ENV} schemaVersion must be {BEARER_KEY_SCHEMA_VERSION}"
+        )));
+    }
+    if !(1..=MAX_BEARER_KEYS).contains(&document.keys.len()) {
+        return Err(ConfigError::Invalid(format!(
+            "{BEARER_KEYS_ENV} must contain between 1 and {MAX_BEARER_KEYS} keys"
+        )));
+    }
+
+    let mut ids = HashSet::with_capacity(document.keys.len());
+    let mut digests = HashSet::with_capacity(document.keys.len());
+    let mut keys = Vec::with_capacity(document.keys.len());
+    for entry in document.keys {
+        if !valid_bearer_key_id(&entry.id) {
+            return Err(ConfigError::Invalid(format!(
+                "{BEARER_KEYS_ENV} contains invalid key id: {}",
+                entry.id
+            )));
+        }
+        if !ids.insert(entry.id.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "{BEARER_KEYS_ENV} contains duplicate key id: {}",
+                entry.id
+            )));
+        }
+        let decoded =
+            hex::decode(entry.sha256).map_err(|_| ConfigError::Malformed(BEARER_KEYS_ENV))?;
+        let digest: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| ConfigError::Malformed(BEARER_KEYS_ENV))?;
+        if !digests.insert(digest) {
+            return Err(ConfigError::Invalid(format!(
+                "{BEARER_KEYS_ENV} contains duplicate key digest"
+            )));
+        }
+        keys.push(BearerKey::new(entry.id, digest));
+    }
+    keys.sort_by(|left, right| left.id().cmp(right.id()));
+    Ok(keys)
+}
+
+fn valid_bearer_key_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(|byte| is_alphanumeric(*byte))
+        && bytes.last().is_some_and(|byte| is_alphanumeric(*byte))
+        && bytes
+            .iter()
+            .all(|byte| is_alphanumeric(*byte) || *byte == b'-')
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -380,13 +448,29 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::BearerTokenVerifier;
+
     use super::{
-        DEFAULT_DATABASE_CONNECTIONS, DEFAULT_DECODED_BYTE_BUDGET,
+        parse_bearer_keys, ConfigError, DEFAULT_DATABASE_CONNECTIONS, DEFAULT_DECODED_BYTE_BUDGET,
         DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE,
         DEFAULT_MAX_BLOCK_SPAN, DEFAULT_MAX_COMBINATION_COUNT, DEFAULT_MAX_CONSISTENCY_PAIRS,
         DEFAULT_MAX_QUOTE_SELECTORS, DEFAULT_MAX_STRUCTURED_DIFFERENCES, DEFAULT_MAX_TIMEOUT_MS,
         DEFAULT_TIMEOUT_MS,
     };
+
+    const TWO_KEY_DOCUMENT: &str = r#"{
+      "schemaVersion": 1,
+      "keys": [
+        {
+          "id": "edson",
+          "sha256": "1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284"
+        },
+        {
+          "id": "pedro",
+          "sha256": "d719bd017de0757f0c4699827f750fdf39e0a75faa755e52894b7d2ea119b3d3"
+        }
+      ]
+    }"#;
 
     #[test]
     fn measured_workload_defaults_cover_the_release_benchmark_envelope() {
@@ -401,5 +485,159 @@ mod tests {
         assert_eq!(DEFAULT_MAX_QUOTE_SELECTORS, 20);
         assert_eq!(DEFAULT_MAX_AMOUNTS_PER_QUOTE, 20);
         assert_eq!(DEFAULT_MAX_STRUCTURED_DIFFERENCES, 100);
+    }
+
+    #[test]
+    fn parses_two_labeled_bearer_keys() -> Result<(), ConfigError> {
+        let keys = parse_bearer_keys(TWO_KEY_DOCUMENT)?;
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].id(), "edson");
+        assert_eq!(keys[1].id(), "pedro");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_key_sets() {
+        assert_invalid(r#"{"schemaVersion":1,"keys":[]}"#);
+
+        let keys = (0..33)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("key-{index}"),
+                    "sha256": format!("{index:064x}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let document = serde_json::json!({"schemaVersion": 1, "keys": keys}).to_string();
+        assert_invalid(&document);
+    }
+
+    #[test]
+    fn rejects_invalid_key_ids() {
+        let too_long = "a".repeat(64);
+        for invalid_id in [
+            "",
+            "-leading",
+            "trailing-",
+            "Uppercase",
+            "has_underscore",
+            too_long.as_str(),
+        ] {
+            let document = serde_json::json!({
+                "schemaVersion": 1,
+                "keys": [{
+                    "id": invalid_id,
+                    "sha256": "1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284",
+                }],
+            })
+            .to_string();
+            assert_invalid(&document);
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_key_ids() {
+        assert_invalid(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [
+                {"id":"duplicate","sha256":"1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284"},
+                {"id":"duplicate","sha256":"d719bd017de0757f0c4699827f750fdf39e0a75faa755e52894b7d2ea119b3d3"}
+              ]
+            }"#,
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_decoded_digests() {
+        assert_invalid(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [
+                {"id":"first","sha256":"1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284"},
+                {"id":"second","sha256":"1D3CC6FE0FB79818F1AA777581E8D57C58FE78584A7F16CEF29EFB5030F7C284"}
+              ]
+            }"#,
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_schema_versions() {
+        assert_invalid(
+            r#"{
+              "schemaVersion": 2,
+              "keys": [{"id":"key","sha256":"1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284"}]
+            }"#,
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_json_and_unknown_fields() {
+        assert_malformed("{not-json");
+        assert_malformed(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [{"id":"key","sha256":"1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284"}],
+              "extra": true
+            }"#,
+        );
+        assert_malformed(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [{
+                "id":"key",
+                "sha256":"1d3cc6fe0fb79818f1aa777581e8d57c58fe78584a7f16cef29efb5030f7c284",
+                "extra": true
+              }]
+            }"#,
+        );
+    }
+
+    #[test]
+    fn rejects_non_hex_and_wrong_length_digests() {
+        assert_malformed(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [{"id":"key","sha256":"not-a-hex-digest"}]
+            }"#,
+        );
+        assert_malformed(
+            r#"{
+              "schemaVersion": 1,
+              "keys": [{"id":"key","sha256":"00000000000000000000000000000000000000000000000000000000000000"}]
+            }"#,
+        );
+    }
+
+    #[test]
+    fn arbitrary_valid_key_id_parses_and_authenticates() -> Result<(), ConfigError> {
+        let document = r#"{
+          "schemaVersion": 1,
+          "keys": [{
+            "id": "analytics-job-7",
+            "sha256": "d719bd017de0757f0c4699827f750fdf39e0a75faa755e52894b7d2ea119b3d3"
+          }]
+        }"#;
+
+        let keys = parse_bearer_keys(document)?;
+        let verifier = BearerTokenVerifier::new(keys);
+
+        assert_eq!(verifier.verify("pedro-test-token"), Some("analytics-job-7"));
+        Ok(())
+    }
+
+    fn assert_invalid(document: &str) {
+        assert!(matches!(
+            parse_bearer_keys(document),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    fn assert_malformed(document: &str) {
+        assert!(matches!(
+            parse_bearer_keys(document),
+            Err(ConfigError::Malformed(_))
+        ));
     }
 }

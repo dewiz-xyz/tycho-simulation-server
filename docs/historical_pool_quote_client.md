@@ -40,7 +40,7 @@ From a repository checkout, install the client:
 cargo install --path crates/dsolver-history --locked
 ```
 
-Connect to the approved private network, then set the service URL and bearer token supplied through the approved secret channel:
+Each consumer receives a unique opaque bearer token. The server derives its audit key ID from the matching digest; clients do not send the key ID. Connect to the approved private network, then set the service URL and token supplied through the approved secret channel:
 
 ```bash
 export DSOLVER_HISTORY_URL='https://historical-pool-quote-api.example.ts.net'
@@ -57,7 +57,18 @@ dsolver-history service status --pretty
 
 ## Check coverage first
 
-Coverage tells you which block intervals can be reconstructed safely through the read replica:
+Coverage tells you which block intervals can be reconstructed safely through the read replica. Use the bounded form as the normal preflight for the range you intend to query:
+
+```bash
+dsolver-history coverage \
+  --chain-id 8453 \
+  --backend native,rfq \
+  --start-block 34000000 \
+  --end-block-inclusive 34001799 \
+  --pretty
+```
+
+Use unbounded coverage only when you need a retained-history inventory or diagnosis. It scans retained history and is not the routine per-request health check:
 
 ```bash
 dsolver-history coverage \
@@ -66,22 +77,11 @@ dsolver-history coverage \
   --pretty
 ```
 
-You can restrict the response to the range you intend to query:
-
-```bash
-dsolver-history coverage \
-  --chain-id 8453 \
-  --backend native \
-  --start-block 34000000 \
-  --end-block-inclusive 34001800 \
-  --pretty
-```
-
 Read these fields before choosing a request range:
 
 - `visibleThroughBlock` is the newest block currently visible on the replica.
 - `continuousIntervals` are ranges that can be reconstructed safely for all requested backends.
-- `knownGaps` identifies known unsafe intervals.
+- `knownGaps` contains original, unclipped gaps whose projected unsafe interval intersects the effective requested range.
 
 Coverage does not prove that a component exists or can quote. Replica delay lowers `visibleThroughBlock`; it is not a stored gap.
 
