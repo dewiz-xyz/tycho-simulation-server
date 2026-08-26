@@ -51,7 +51,7 @@ pub struct StatusDependencies {
 pub struct ServiceDependencyError;
 
 pub fn router(state: AppState) -> Router {
-    let verifier = BearerTokenVerifier::new(state.config.expected_bearer_digest);
+    let verifier = BearerTokenVerifier::new(state.config.bearer_keys.clone());
     let protected = Router::new()
         .route("/jobs/quote", post(handlers::submit_quote))
         .route(

@@ -21,6 +21,7 @@ use historical_quote::EngineProgress;
 use historical_quote_service::app::{
     router, AppState, CoverageResolver, ServiceDependencyError, StatusDependencies, StatusProbe,
 };
+use historical_quote_service::auth::BearerKey;
 use historical_quote_service::config::{
     ObjectStoreConfig, ReplicaDatabaseConfig, ServiceConfig, DEFAULT_DECODED_BYTE_BUDGET,
     DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE, DEFAULT_MAX_BLOCK_SPAN,
@@ -38,36 +39,61 @@ mod support;
 
 use support::{consistency_request, quote_request, ControlledExecutor};
 
-const TOKEN: &str = "test-token";
+const EDSON_TOKEN: &str = "edson-test-token";
+const PEDRO_TOKEN: &str = "pedro-test-token";
 const REVISION_HEADER: &str = "x-dsolver-history-api-revision";
 
 #[tokio::test]
 async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
     let (app, registry) = test_app(Arc::new(ImmediateExecutor));
     assert_eq!(
-        send(&app, request("GET", "/ready", None, false, false))
+        send(&app, request("GET", "/ready", None, None, false))
             .await
             .status(),
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, request("GET", "/status", None, false, false))
+        send(&app, request("GET", "/status", None, None, false))
             .await
             .status(),
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        send(&app, request("GET", "/status", None, true, false))
-            .await
-            .status(),
+        send(
+            &app,
+            request("GET", "/status", None, Some(EDSON_TOKEN), false),
+        )
+        .await
+        .status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        send(&app, request("GET", "/status", None, true, true))
-            .await
-            .status(),
+        send(
+            &app,
+            request("GET", "/status", None, Some(EDSON_TOKEN), true),
+        )
+        .await
+        .status(),
         StatusCode::OK
     );
+    registry.begin_shutdown().await;
+}
+
+#[tokio::test]
+async fn each_configured_bearer_key_authenticates_independently() {
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+
+    for token in [EDSON_TOKEN, PEDRO_TOKEN] {
+        let response = send(&app, request("GET", "/status", None, Some(token), true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let unknown = send(
+        &app,
+        request("GET", "/status", None, Some("unknown-token"), true),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
     registry.begin_shutdown().await;
 }
 
@@ -80,16 +106,19 @@ async fn job_paths_require_uuid_version_four_before_lookup() {
         "00000000-0000-4000-0000-000000000000",
     ] {
         let path = format!("/jobs/{job_id}");
-        let response = send(&app, request("GET", &path, None, true, true)).await;
+        let response = send(&app, request("GET", &path, None, Some(EDSON_TOKEN), true)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["details"]["field"], "jobId");
     }
 
     let unknown = format!("/jobs/{}", Uuid::new_v4());
     assert_eq!(
-        send(&app, request("GET", &unknown, None, true, true))
-            .await
-            .status(),
+        send(
+            &app,
+            request("GET", &unknown, None, Some(EDSON_TOKEN), true),
+        )
+        .await
+        .status(),
         StatusCode::NOT_FOUND
     );
     registry.begin_shutdown().await;
@@ -103,7 +132,7 @@ async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once
         .expect("quote request must serialize");
     let submitted = send(
         &app,
-        request("POST", "/jobs/quote", Some(&body), true, false),
+        request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false),
     )
     .await;
     assert_eq!(submitted.status(), StatusCode::ACCEPTED);
@@ -116,7 +145,7 @@ async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once
     wait_terminal(&registry, &location).await;
     let reused = send(
         &app,
-        request("POST", "/jobs/quote", Some(&body), true, false),
+        request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false),
     )
     .await;
     assert_eq!(reused.status(), StatusCode::OK);
@@ -124,15 +153,22 @@ async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once
     assert_eq!(reused_body["reused"], true);
     assert!(reused_body.get("result").is_none());
 
-    let terminal = send(&app, request("GET", &location, None, true, true)).await;
+    let terminal = send(
+        &app,
+        request("GET", &location, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(terminal.status(), StatusCode::OK);
     let terminal_body = json_body(terminal).await;
     assert_eq!(terminal_body["state"], "completed");
     assert!(terminal_body.get("result").is_some());
     assert_eq!(
-        send(&app, request("GET", &location, None, true, true))
-            .await
-            .status(),
+        send(
+            &app,
+            request("GET", &location, None, Some(EDSON_TOKEN), true),
+        )
+        .await
+        .status(),
         StatusCode::NOT_FOUND
     );
     registry.begin_shutdown().await;
@@ -149,7 +185,7 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
     body["amountsIn"] = serde_json::json!(["1", "2"]);
     let response = send(
         &app,
-        request("POST", "/jobs/quote", Some(&body), true, false),
+        request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false),
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -167,7 +203,7 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
         Request::builder()
             .method("POST")
             .uri("/jobs/quote")
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(AUTHORIZATION, format!("Bearer {EDSON_TOKEN}"))
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from("{not-json"))
             .expect("request must build"),
@@ -189,7 +225,13 @@ async fn span_and_deadline_limits_fail_at_admission() {
     over_span["blocks"]["endInclusive"] = serde_json::json!(1_901);
     let response = send(
         &app,
-        request("POST", "/jobs/quote", Some(&over_span), true, false),
+        request(
+            "POST",
+            "/jobs/quote",
+            Some(&over_span),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -201,7 +243,13 @@ async fn span_and_deadline_limits_fail_at_admission() {
     assert_eq!(
         send(
             &app,
-            request("POST", "/jobs/quote", Some(&exact_span), true, false),
+            request(
+                "POST",
+                "/jobs/quote",
+                Some(&exact_span),
+                Some(EDSON_TOKEN),
+                false,
+            ),
         )
         .await
         .status(),
@@ -214,7 +262,13 @@ async fn span_and_deadline_limits_fail_at_admission() {
     lagged_over_span["lags"] = serde_json::json!([DEFAULT_MAX_BLOCK_SPAN + 1]);
     let response = send(
         &app,
-        request("POST", "/jobs/quote", Some(&lagged_over_span), true, false),
+        request(
+            "POST",
+            "/jobs/quote",
+            Some(&lagged_over_span),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -226,7 +280,13 @@ async fn span_and_deadline_limits_fail_at_admission() {
     overflow["blocks"]["endInclusive"] = serde_json::json!(u64::MAX);
     let response = send(
         &app,
-        request("POST", "/jobs/quote", Some(&overflow), true, false),
+        request(
+            "POST",
+            "/jobs/quote",
+            Some(&overflow),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -237,7 +297,13 @@ async fn span_and_deadline_limits_fail_at_admission() {
             .expect("quote request must serialize");
     let response = send(
         &app,
-        request("POST", "/jobs/quote", Some(&over_deadline), true, false),
+        request(
+            "POST",
+            "/jobs/quote",
+            Some(&over_deadline),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -253,7 +319,7 @@ async fn cancellation_is_retry_safe_and_does_not_consume_the_terminal_envelope()
         .expect("quote request must serialize");
     let submitted = send(
         &app,
-        request("POST", "/jobs/quote", Some(&body), true, false),
+        request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false),
     )
     .await;
     let location = submitted.headers()["location"]
@@ -264,15 +330,27 @@ async fn cancellation_is_retry_safe_and_does_not_consume_the_terminal_envelope()
     assert!(!started.job_id.is_nil());
     started.progress.quote_comparison_completed();
     let cancel_path = format!("{location}/cancel");
-    let running = send(&app, request("POST", &cancel_path, None, true, true)).await;
+    let running = send(
+        &app,
+        request("POST", &cancel_path, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(running.status(), StatusCode::OK);
     assert_eq!(json_body(running).await["cancellationRequested"], true);
     wait_terminal(&registry, &location).await;
 
-    let cancelled = send(&app, request("POST", &cancel_path, None, true, true)).await;
+    let cancelled = send(
+        &app,
+        request("POST", &cancel_path, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(cancelled.status(), StatusCode::OK);
     assert_eq!(json_body(cancelled).await["state"], "cancelled");
-    let poll = send(&app, request("GET", &location, None, true, true)).await;
+    let poll = send(
+        &app,
+        request("GET", &location, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(poll.status(), StatusCode::OK);
     assert_eq!(json_body(poll).await["state"], "cancelled");
     registry.begin_shutdown().await;
@@ -286,7 +364,7 @@ async fn incomplete_terminal_body_delivery_releases_the_lease() {
         .expect("quote request must serialize");
     let submitted = send(
         &app,
-        request("POST", "/jobs/quote", Some(&body), true, false),
+        request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false),
     )
     .await;
     let location = submitted.headers()["location"]
@@ -296,11 +374,19 @@ async fn incomplete_terminal_body_delivery_releases_the_lease() {
     executor.next_started().await.complete_quote();
     wait_terminal(&registry, &location).await;
 
-    let selected = send(&app, request("GET", &location, None, true, true)).await;
+    let selected = send(
+        &app,
+        request("GET", &location, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(selected.status(), StatusCode::OK);
     drop(selected);
     tokio::task::yield_now().await;
-    let retried = send(&app, request("GET", &location, None, true, true)).await;
+    let retried = send(
+        &app,
+        request("GET", &location, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     assert_eq!(retried.status(), StatusCode::OK);
     assert_eq!(json_body(retried).await["state"], "completed");
     registry.begin_shutdown().await;
@@ -314,7 +400,13 @@ async fn consistency_submission_uses_the_shared_job_lifecycle() {
     let body = serde_json::to_value(consistency).expect("consistency request must serialize");
     let submitted = send(
         &app,
-        request("POST", "/jobs/consistency-check", Some(&body), true, false),
+        request(
+            "POST",
+            "/jobs/consistency-check",
+            Some(&body),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(submitted.status(), StatusCode::ACCEPTED);
@@ -344,7 +436,7 @@ async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
         assert!(matches!(
             send(
                 &app,
-                request("POST", "/jobs/quote", Some(&body), true, false)
+                request("POST", "/jobs/quote", Some(&body), Some(EDSON_TOKEN), false,)
             )
             .await
             .status(),
@@ -355,14 +447,14 @@ async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
         }
     }
     assert_eq!(
-        send(&app, request("GET", "/ready", None, false, false))
+        send(&app, request("GET", "/ready", None, None, false))
             .await
             .status(),
         StatusCode::OK
     );
     registry.begin_shutdown().await;
     assert_eq!(
-        send(&app, request("GET", "/ready", None, false, false))
+        send(&app, request("GET", "/ready", None, None, false))
             .await
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
@@ -372,7 +464,11 @@ async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
 #[tokio::test]
 async fn protected_status_and_coverage_return_bounded_safe_data() {
     let (app, registry) = test_app(Arc::new(ImmediateExecutor));
-    let status = send(&app, request("GET", "/status", None, true, true)).await;
+    let status = send(
+        &app,
+        request("GET", "/status", None, Some(EDSON_TOKEN), true),
+    )
+    .await;
     let status = json_body(status).await;
     assert_eq!(status["apiRevision"], 1);
     assert_eq!(status["visibleThroughBlock"], 123);
@@ -394,7 +490,13 @@ async fn protected_status_and_coverage_return_bounded_safe_data() {
     });
     let coverage = send(
         &app,
-        request("POST", "/coverage", Some(&coverage_request), true, false),
+        request(
+            "POST",
+            "/coverage",
+            Some(&coverage_request),
+            Some(EDSON_TOKEN),
+            false,
+        ),
     )
     .await;
     assert_eq!(coverage.status(), StatusCode::OK);
@@ -433,7 +535,16 @@ fn test_config() -> ServiceConfig {
         supported_chain_id: 8_453,
         service_revision: "test-revision".to_owned(),
         enabled_backends: vec![Backend::Native, Backend::Rfq],
-        expected_bearer_digest: Sha256::digest(TOKEN.as_bytes()).into(),
+        bearer_keys: vec![
+            BearerKey::new(
+                "edson".to_owned(),
+                Sha256::digest(EDSON_TOKEN.as_bytes()).into(),
+            ),
+            BearerKey::new(
+                "pedro".to_owned(),
+                Sha256::digest(PEDRO_TOKEN.as_bytes()).into(),
+            ),
+        ],
         scheduler: test_job_limits(),
         max_combination_count: DEFAULT_MAX_COMBINATION_COUNT,
         max_block_span: DEFAULT_MAX_BLOCK_SPAN,
@@ -549,12 +660,12 @@ fn request(
     method: &str,
     uri: &str,
     body: Option<&serde_json::Value>,
-    authenticated: bool,
+    bearer_token: Option<&str>,
     revision: bool,
 ) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
-    if authenticated {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+    if let Some(token) = bearer_token {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
     }
     if revision {
         builder = builder.header(REVISION_HEADER, "1");

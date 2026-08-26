@@ -18,11 +18,11 @@ State reconstruction coverage reports continuous block intervals that are safe f
 
 The service runs as a separate process and task. It can read a dedicated PostgreSQL replica as `state_history_observer` and read the existing state-history objects. It has no primary database address, Redis endpoint, broadcaster URL, or object write permission.
 
-Clients use the stable Tailscale Service URL and one bearer token. They do not receive a database URL, AWS credential, object-store credential, internal load balancer address, or direct state-history access.
+Clients use the stable Tailscale Service URL and a bearer token issued from the configured key set. Each credential has a trusted key ID for audit attribution. Clients do not receive a database URL, AWS credential, object-store credential, internal load balancer address, or direct state-history access.
 
 `GET /ready` is open only for the private load balancer health check. Every other endpoint requires the bearer token. Bodyless protected requests also require `X-DSolver-History-API-Revision: 1`.
 
-The service logs request and job identifiers, normalized dimensions, work counts, duration, decoded bytes, state, and outcome counts. It does not log authorization headers, tokens or token digests, request bodies, full responses, SQL text, storage object names, raw state, or dependency error details.
+The service logs request and job identifiers, normalized dimensions, work counts, duration, decoded bytes, state, and outcome counts. Successful authentication adds only the trusted `bearer_key_id`, request method, and path. It does not log authorization headers, tokens or token digests, request bodies, full responses, SQL text, storage object names, raw state, or dependency error details.
 
 ## Job lifecycle and delivery
 
@@ -37,6 +37,10 @@ The high-level `quotes` and `verify` CLI commands can recompute once after `job_
 Coverage returns `visibleThroughBlock`, continuous safe intervals, and known gaps. Protected status returns revisions, enabled backends, safe dependency summaries, queue and terminal counts, decoded-byte reservation, draining state, and configured limits.
 
 Coverage describes safe reconstruction for the requested backends. It does not prove that an exact component exists or can quote. Replica delay lowers `visibleThroughBlock`; it does not create a stored gap.
+
+Use bounded coverage as the normal preflight for a quote or consistency-check range. `knownGaps` returns an original, unclipped gap only when its projected unsafe interval intersects the effective requested range. Complete block bounds apply to native and VM state; complete observation-time bounds apply to RFQ state. One-sided and entirely cursorless gaps project conservatively. A missing bound domain is ignored when the other domain completely identifies the gap.
+
+Unbounded coverage remains available for retained-history inventory and diagnosis. It scans retained history and should not be used as the routine per-request health check.
 
 ## Manual historical state consistency check
 
@@ -72,7 +76,15 @@ The checked OpenAPI 3.1 contract is `openapi/historical-pool-quote-api.json`.
 
 The service supports Base chain ID `8453`. The first production backend list is `native,rfq`; `vm` remains disabled until exact VM state export and process isolation are proven.
 
-Required service and authentication settings are `DSOLVER_HISTORY_SERVICE_REVISION`, `DSOLVER_HISTORY_API_REVISION`, `DSOLVER_HISTORY_CHAIN_ID`, `DSOLVER_HISTORY_ENABLED_BACKENDS`, and `DSOLVER_HISTORY_TOKEN_SHA256`. The token setting is a lowercase or uppercase hexadecimal SHA-256 digest, not the bearer token.
+Required service and authentication settings are `DSOLVER_HISTORY_SERVICE_REVISION`, `DSOLVER_HISTORY_API_REVISION`, `DSOLVER_HISTORY_CHAIN_ID`, `DSOLVER_HISTORY_ENABLED_BACKENDS`, and `DSOLVER_HISTORY_BEARER_KEYS_JSON`. The key-set setting contains digests, not bearer tokens:
+
+```json
+{"schemaVersion":1,"keys":[{"id":"edson","sha256":"<64 hexadecimal characters>"},{"id":"pedro","sha256":"<64 hexadecimal characters>"}]}
+```
+
+The document accepts 1 to 32 keys. IDs are arbitrary non-secret audit and revocation labels supplied entirely by configuration; `edson` and `pedro` are examples, not reserved names. The server derives the ID from the matching digest, so clients never send it. Plaintext tokens remain outside AWS. Adding, rotating, or removing a key requires a new secret version and a new task deployment.
+
+IDs use lowercase letters, digits, and interior hyphens, are 1 to 63 characters long, and must be unique. SHA-256 values decode to exactly 32 bytes and must also be unique. Unknown fields, unsupported schema versions, malformed IDs or digests, and duplicate IDs or digests stop the service before it listens.
 
 Replica settings are `DSOLVER_HISTORY_REPLICA_DB_HOST`, `DSOLVER_HISTORY_REPLICA_DB_NAME`, and `DSOLVER_HISTORY_REPLICA_DB_USER`. The user must be `state_history_observer`. The optional port defaults to `5432`, the physical connection limit defaults to `5`, and connection lifetime defaults to one hour. Four connections cover the running-job limit; the fifth keeps protected status and coverage reads available while every job is planning. Each new physical connection gets a fresh RDS IAM login token.
 
@@ -177,7 +189,7 @@ This is a human checklist. No code gate consumes the consistency result.
 3. Confirm the read replica sees schema version 2, its cutoff, and `ReplicaLag`.
 4. Confirm no primary, Redis, or broadcaster route or credential exists.
 5. Deploy the shared replay broadcaster revision, then the API revision, through their approved workflows.
-6. Run coverage for Base native and RFQ.
+6. Run bounded coverage for the selected Base native and RFQ range.
 7. Select at least one recent adjacent checkpoint pair in one segment.
 8. Run `dsolver-history verify` for selected native and Bebop pools and amounts.
 9. Record `pass`, `mismatch`, `gap`, or `notComparable` with the selected range.
