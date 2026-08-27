@@ -610,6 +610,28 @@
         "responses": {
           "200": {
             "description": "Protected service status",
+            "headers": {
+              "X-DSolver-History-Auth-Refresh-Age-Seconds": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds since the last successful key-set refresh"
+              },
+              "X-DSolver-History-Auth-Refresh-State": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "healthy or degraded"
+              },
+              "X-DSolver-History-Auth-Version": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Active bearer key-set version used to authenticate this request"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

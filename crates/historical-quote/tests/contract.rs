@@ -586,6 +586,49 @@ fn openapi_covers_exact_routes_security_headers_and_union_fields() {
     clippy::expect_used,
     reason = "the generated document must contain these contract objects"
 )]
+fn status_refresh_metadata_does_not_change_revision_one_json() {
+    let document = historical_quote::openapi::document_value();
+    let response = &document["paths"]["/status"]["get"]["responses"]["200"];
+    let headers = response["headers"].as_object().expect("status headers");
+    assert_eq!(headers.len(), 3);
+    for name in [
+        "X-DSolver-History-Auth-Version",
+        "X-DSolver-History-Auth-Refresh-Age-Seconds",
+        "X-DSolver-History-Auth-Refresh-State",
+    ] {
+        assert!(headers.contains_key(name));
+    }
+    assert_eq!(API_REVISION, 1);
+    assert_eq!(
+        response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/StatusResponse"
+    );
+    let fields = document["components"]["schemas"]["StatusResponse"]["properties"]
+        .as_object()
+        .expect("status fields");
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "apiRevision",
+            "database",
+            "draining",
+            "enabledBackends",
+            "jobs",
+            "limits",
+            "objectStore",
+            "reservedDecodedBytes",
+            "serviceRevision",
+            "supportedChainId",
+            "visibleThroughBlock"
+        ]
+    );
+}
+
+#[test]
+#[expect(
+    clippy::expect_used,
+    reason = "the generated document must contain these contract objects"
+)]
 fn openapi_validation_matches_boundary_rules() {
     let document = historical_quote::openapi::document_value();
     let schemas = &document["components"]["schemas"];

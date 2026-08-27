@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -15,13 +15,15 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use historical_quote::api::{
     Backend, CoverageRequest, CoverageResponse, DependencyHealth, DependencyState,
-    HistoricalQuoteResult, JobResult,
+    HistoricalQuoteResult, JobResult, StatusResponse,
 };
 use historical_quote::EngineProgress;
 use historical_quote_service::app::{
     router, AppState, CoverageResolver, ServiceDependencyError, StatusDependencies, StatusProbe,
 };
-use historical_quote_service::auth::BearerKey;
+use historical_quote_service::auth::{
+    BearerKeySetError, BearerKeySetHandle, BearerKeySetReloader, KeySetSource, KeySetVersion,
+};
 use historical_quote_service::config::{
     ObjectStoreConfig, ReplicaDatabaseConfig, ServiceConfig, DEFAULT_DECODED_BYTE_BUDGET,
     DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE, DEFAULT_MAX_BLOCK_SPAN,
@@ -32,6 +34,7 @@ use historical_quote_service::jobs::{
     ExecutionContext, JobExecutionError, JobExecutor, JobLimits, JobRegistry, JobRequest, JobRunner,
 };
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -42,10 +45,14 @@ use support::{consistency_request, quote_request, ControlledExecutor};
 const EDSON_TOKEN: &str = "edson-test-token";
 const PEDRO_TOKEN: &str = "pedro-test-token";
 const REVISION_HEADER: &str = "x-dsolver-history-api-revision";
+const INITIAL_KEY_VERSION: &str = "00000000-0000-4000-8000-000000000001";
+const AUTH_VERSION_HEADER: &str = "x-dsolver-history-auth-version";
+const AUTH_AGE_HEADER: &str = "x-dsolver-history-auth-refresh-age-seconds";
+const AUTH_STATE_HEADER: &str = "x-dsolver-history-auth-refresh-state";
 
 #[tokio::test]
 async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     assert_eq!(
         send(&app, request("GET", "/ready", None, None, false))
             .await
@@ -81,7 +88,7 @@ async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
 
 #[tokio::test]
 async fn each_configured_bearer_key_authenticates_independently() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
 
     for token in [EDSON_TOKEN, PEDRO_TOKEN] {
         let response = send(&app, request("GET", "/status", None, Some(token), true)).await;
@@ -99,7 +106,7 @@ async fn each_configured_bearer_key_authenticates_independently() {
 
 #[tokio::test]
 async fn job_paths_require_uuid_version_four_before_lookup() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     for job_id in [
         "not-a-uuid",
         "00000000-0000-1000-8000-000000000000",
@@ -125,8 +132,160 @@ async fn job_paths_require_uuid_version_four_before_lookup() {
 }
 
 #[tokio::test]
+async fn key_changes_take_effect_without_rebuilding_the_router() {
+    let source = Arc::new(MutableKeySource::new());
+    let (keys, mut reloader) = BearerKeySetReloader::load(source.clone())
+        .await
+        .expect("load keys");
+    let (app, registry) = test_app_with_keys(
+        Arc::new(ImmediateExecutor),
+        test_job_limits(),
+        keys,
+        Arc::new(StaticStatus),
+    );
+    let base = [("edson", EDSON_TOKEN), ("pedro", PEDRO_TOKEN)];
+    for entries in [
+        [base.to_vec(), vec![("analytics", "analytics-old")]].concat(),
+        [base.to_vec(), vec![("analytics", "analytics-new")]].concat(),
+        base.to_vec(),
+    ] {
+        let version = Uuid::new_v4().to_string();
+        source.replace(&version, &entries);
+        reloader.refresh_once().await.expect("reload keys");
+        for token in [EDSON_TOKEN, PEDRO_TOKEN, "analytics-old", "analytics-new"] {
+            let response = send(&app, request("GET", "/status", None, Some(token), true)).await;
+            if entries.iter().any(|(_, accepted)| *accepted == token) {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[AUTH_VERSION_HEADER], version);
+                assert_eq!(response.headers()[AUTH_STATE_HEADER], "healthy");
+                let status: StatusResponse = serde_json::from_value(json_body(response).await)
+                    .expect("unchanged status body");
+                assert_eq!(status.api_revision, 1);
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_no_auth_metadata(&response);
+            }
+        }
+    }
+    assert_no_auth_metadata(&send(&app, request("GET", "/ready", None, None, false)).await);
+    assert_no_auth_metadata(
+        &send(
+            &app,
+            request("GET", "/status", None, Some(PEDRO_TOKEN), false),
+        )
+        .await,
+    );
+    registry.begin_shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_refresh_keeps_authentication_and_exposes_degradation() {
+    let source = Arc::new(MutableKeySource::new());
+    let (keys, mut reloader) = BearerKeySetReloader::load(source.clone())
+        .await
+        .expect("load keys");
+    let (app, registry) = test_app_with_keys(
+        Arc::new(ImmediateExecutor),
+        test_job_limits(),
+        keys,
+        Arc::new(StaticStatus),
+    );
+    source.replace(&Uuid::new_v4().to_string(), &[]);
+    assert!(reloader.refresh_once().await.is_err());
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let response = send(
+        &app,
+        request("GET", "/status", None, Some(PEDRO_TOKEN), true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[AUTH_VERSION_HEADER], INITIAL_KEY_VERSION);
+    assert_eq!(response.headers()[AUTH_STATE_HEADER], "degraded");
+    assert_eq!(response.headers()[AUTH_AGE_HEADER], "60");
+    source.replace(
+        INITIAL_KEY_VERSION,
+        &[("edson", EDSON_TOKEN), ("pedro", PEDRO_TOKEN)],
+    );
+    reloader.refresh_once().await.expect("recover refresh");
+    let recovered = send(
+        &app,
+        request("GET", "/status", None, Some(PEDRO_TOKEN), true),
+    )
+    .await;
+    assert_eq!(recovered.headers()[AUTH_STATE_HEADER], "healthy");
+    assert_eq!(recovered.headers()[AUTH_AGE_HEADER], "0");
+    registry.begin_shutdown().await;
+}
+
+#[tokio::test]
+async fn status_headers_describe_the_snapshot_that_authenticated_the_request() {
+    let source = Arc::new(MutableKeySource::new());
+    let (keys, mut reloader) = BearerKeySetReloader::load(source.clone())
+        .await
+        .expect("load keys");
+    let status = Arc::new(BlockedStatus::default());
+    let (app, registry) = test_app_with_keys(
+        Arc::new(ImmediateExecutor),
+        test_job_limits(),
+        keys,
+        status.clone(),
+    );
+    let admitted_app = app.clone();
+    let admitted = tokio::spawn(async move {
+        send(
+            &admitted_app,
+            request("GET", "/status", None, Some(EDSON_TOKEN), true),
+        )
+        .await
+    });
+    status.entered.notified().await;
+    source.replace(&Uuid::new_v4().to_string(), &[("pedro", PEDRO_TOKEN)]);
+    reloader
+        .refresh_once()
+        .await
+        .expect("revoke admitted token");
+    status.release.notify_one();
+    let response = admitted.await.expect("admitted request completes");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[AUTH_VERSION_HEADER], INITIAL_KEY_VERSION);
+    let revoked = send(
+        &app,
+        request("GET", "/status", None, Some(EDSON_TOKEN), true),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    assert_no_auth_metadata(&revoked);
+    registry.begin_shutdown().await;
+}
+
+fn assert_no_auth_metadata(response: &axum::response::Response) {
+    for name in [AUTH_VERSION_HEADER, AUTH_AGE_HEADER, AUTH_STATE_HEADER] {
+        assert!(!response.headers().contains_key(name));
+    }
+}
+
+#[derive(Default)]
+struct BlockedStatus {
+    entered: Notify,
+    release: Notify,
+}
+
+impl StatusProbe for BlockedStatus {
+    fn probe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<StatusDependencies, ServiceDependencyError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            StaticStatus.probe().await
+        })
+    }
+}
+
+#[tokio::test]
 async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     let request_id = Uuid::new_v4();
     let body = serde_json::to_value(quote_request(request_id, 60_000))
         .expect("quote request must serialize");
@@ -176,7 +335,7 @@ async fn quote_submission_reuses_retained_work_and_consumes_terminal_result_once
 
 #[tokio::test]
 async fn admission_errors_use_safe_shapes_and_budget_details() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     let request_id = Uuid::new_v4();
     let mut body = serde_json::to_value(quote_request(request_id, 60_000))
         .expect("quote request must serialize");
@@ -219,7 +378,7 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
 
 #[tokio::test]
 async fn span_and_deadline_limits_fail_at_admission() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     let mut over_span = serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_TIMEOUT_MS))
         .expect("quote request must serialize");
     over_span["blocks"]["endInclusive"] = serde_json::json!(1_901);
@@ -314,7 +473,7 @@ async fn span_and_deadline_limits_fail_at_admission() {
 #[tokio::test]
 async fn cancellation_is_retry_safe_and_does_not_consume_the_terminal_envelope() {
     let executor = Arc::new(ControlledExecutor::default());
-    let (app, registry) = test_app(executor.clone());
+    let (app, registry) = test_app(executor.clone()).await;
     let body = serde_json::to_value(quote_request(Uuid::new_v4(), 60_000))
         .expect("quote request must serialize");
     let submitted = send(
@@ -359,7 +518,7 @@ async fn cancellation_is_retry_safe_and_does_not_consume_the_terminal_envelope()
 #[tokio::test]
 async fn incomplete_terminal_body_delivery_releases_the_lease() {
     let executor = Arc::new(ControlledExecutor::default());
-    let (app, registry) = test_app(executor.clone());
+    let (app, registry) = test_app(executor.clone()).await;
     let body = serde_json::to_value(quote_request(Uuid::new_v4(), 60_000))
         .expect("quote request must serialize");
     let submitted = send(
@@ -395,7 +554,7 @@ async fn incomplete_terminal_body_delivery_releases_the_lease() {
 #[tokio::test]
 async fn consistency_submission_uses_the_shared_job_lifecycle() {
     let executor = Arc::new(ControlledExecutor::default());
-    let (app, registry) = test_app(executor.clone());
+    let (app, registry) = test_app(executor.clone()).await;
     let consistency = consistency_request(Uuid::new_v4(), 60_000);
     let body = serde_json::to_value(consistency).expect("consistency request must serialize");
     let submitted = send(
@@ -429,7 +588,8 @@ async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
             max_waiting: 1,
             ..JobLimits::default()
         },
-    );
+    )
+    .await;
     for _ in 0..2 {
         let body = serde_json::to_value(quote_request(Uuid::new_v4(), 60_000))
             .expect("quote request must serialize");
@@ -463,7 +623,7 @@ async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
 
 #[tokio::test]
 async fn protected_status_and_coverage_return_bounded_safe_data() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     let status = send(
         &app,
         request("GET", "/status", None, Some(EDSON_TOKEN), true),
@@ -504,14 +664,30 @@ async fn protected_status_and_coverage_return_bounded_safe_data() {
     registry.begin_shutdown().await;
 }
 
-fn test_app<E>(executor: Arc<E>) -> (axum::Router, JobRegistry)
+async fn test_app<E>(executor: Arc<E>) -> (axum::Router, JobRegistry)
 where
     E: JobExecutor,
 {
-    test_app_with_limits(executor, test_job_limits())
+    test_app_with_limits(executor, test_job_limits()).await
 }
 
-fn test_app_with_limits<E>(executor: Arc<E>, limits: JobLimits) -> (axum::Router, JobRegistry)
+async fn test_app_with_limits<E>(executor: Arc<E>, limits: JobLimits) -> (axum::Router, JobRegistry)
+where
+    E: JobExecutor,
+{
+    let source = Arc::new(MutableKeySource::new());
+    let (bearer_keys, _) = BearerKeySetReloader::load(source)
+        .await
+        .expect("initial key document must load");
+    test_app_with_keys(executor, limits, bearer_keys, Arc::new(StaticStatus))
+}
+
+fn test_app_with_keys<E>(
+    executor: Arc<E>,
+    limits: JobLimits,
+    bearer_keys: BearerKeySetHandle,
+    status: Arc<dyn StatusProbe>,
+) -> (axum::Router, JobRegistry)
 where
     E: JobExecutor,
 {
@@ -522,9 +698,10 @@ where
     tokio::spawn(runner.run());
     let app = router(AppState {
         config: Arc::new(config),
+        bearer_keys,
         registry: registry.clone(),
         coverage: Arc::new(StaticCoverage),
-        status: Arc::new(StaticStatus),
+        status,
     });
     (app, registry)
 }
@@ -535,16 +712,8 @@ fn test_config() -> ServiceConfig {
         supported_chain_id: 8_453,
         service_revision: "test-revision".to_owned(),
         enabled_backends: vec![Backend::Native, Backend::Rfq],
-        bearer_keys: vec![
-            BearerKey::new(
-                "edson".to_owned(),
-                Sha256::digest(EDSON_TOKEN.as_bytes()).into(),
-            ),
-            BearerKey::new(
-                "pedro".to_owned(),
-                Sha256::digest(PEDRO_TOKEN.as_bytes()).into(),
-            ),
-        ],
+        bearer_key_set_secret_arn:
+            "arn:aws:secretsmanager:eu-central-1:123456789012:secret:test-123456".to_owned(),
         scheduler: test_job_limits(),
         max_combination_count: DEFAULT_MAX_COMBINATION_COUNT,
         max_block_span: DEFAULT_MAX_BLOCK_SPAN,
@@ -581,6 +750,60 @@ fn test_job_limits() -> JobLimits {
         decoded_byte_budget: DEFAULT_DECODED_BYTE_BUDGET,
         max_terminal_jobs: 20,
         terminal_ttl: Duration::from_secs(3_600),
+    }
+}
+
+struct MutableKeySource {
+    version: Mutex<KeySetVersion>,
+}
+
+impl MutableKeySource {
+    fn new() -> Self {
+        Self {
+            version: Mutex::new(key_version(
+                INITIAL_KEY_VERSION,
+                &[("edson", EDSON_TOKEN), ("pedro", PEDRO_TOKEN)],
+            )),
+        }
+    }
+
+    fn replace(&self, version: &str, keys: &[(&str, &str)]) {
+        *self
+            .version
+            .lock()
+            .expect("key fixture lock must be available") = key_version(version, keys);
+    }
+}
+
+impl KeySetSource for MutableKeySource {
+    fn read_current(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<KeySetVersion, BearerKeySetError>> + Send + '_>> {
+        let version = self
+            .version
+            .lock()
+            .expect("key fixture lock must be available");
+        let current = KeySetVersion {
+            version_id: version.version_id.clone(),
+            document: version.document.clone(),
+        };
+        Box::pin(async move { Ok(current) })
+    }
+}
+
+fn key_version(version: &str, keys: &[(&str, &str)]) -> KeySetVersion {
+    let entries: Vec<_> = keys
+        .iter()
+        .map(|(id, token)| {
+            serde_json::json!({
+                "id": id,
+                "sha256": hex::encode(Sha256::digest(token.as_bytes())),
+            })
+        })
+        .collect();
+    KeySetVersion {
+        version_id: version.to_owned(),
+        document: serde_json::json!({"schemaVersion": 1, "keys": entries}).to_string(),
     }
 }
 

@@ -76,15 +76,37 @@ The checked OpenAPI 3.1 contract is `openapi/historical-pool-quote-api.json`.
 
 The service supports Base chain ID `8453`. The first production backend list is `native,rfq`; `vm` remains disabled until exact VM state export and process isolation are proven.
 
-Required service and authentication settings are `DSOLVER_HISTORY_SERVICE_REVISION`, `DSOLVER_HISTORY_API_REVISION`, `DSOLVER_HISTORY_CHAIN_ID`, `DSOLVER_HISTORY_ENABLED_BACKENDS`, and `DSOLVER_HISTORY_BEARER_KEYS_JSON`. The key-set setting contains digests, not bearer tokens:
+Required service and authentication settings are `DSOLVER_HISTORY_SERVICE_REVISION`, `DSOLVER_HISTORY_API_REVISION`, `DSOLVER_HISTORY_CHAIN_ID`, `DSOLVER_HISTORY_ENABLED_BACKENDS`, and `DSOLVER_HISTORY_BEARER_KEY_SET_SECRET_ARN`. The last setting is the full base ARN of a Secrets Manager secret, without a version suffix. Its `AWSCURRENT` version contains digests, not bearer tokens.
 
 ```json
 {"schemaVersion":1,"keys":[{"id":"edson","sha256":"<64 hexadecimal characters>"},{"id":"pedro","sha256":"<64 hexadecimal characters>"}]}
 ```
 
-The document accepts 1 to 32 keys. IDs are arbitrary non-secret audit and revocation labels supplied entirely by configuration; `edson` and `pedro` are examples, not reserved names. The server derives the ID from the matching digest, so clients never send it. Plaintext tokens remain outside AWS. Adding, rotating, or removing a key requires a new secret version and a new task deployment.
+The document accepts 1 to 32 keys. IDs are arbitrary non-secret audit and revocation labels supplied entirely by configuration; `edson` and `pedro` are examples, not reserved names. The server derives the ID from the matching digest, so clients never send it. Plaintext tokens remain outside AWS. Adding, rotating, or removing a key publishes a new secret version; the running service reloads it without a deployment.
 
 IDs use lowercase letters, digits, and interior hyphens, are 1 to 63 characters long, and must be unique. SHA-256 values decode to exactly 32 bytes and must also be unique. Unknown fields, unsupported schema versions, malformed IDs or digests, and duplicate IDs or digests stop the service before it listens.
+
+The service reads `AWSCURRENT` before opening the listener, then every 30 seconds. Each read has a 10-second total deadline, including SDK retries. The task role needs `secretsmanager:GetSecretValue` for this one secret. Reads never happen on the request path. A new document replaces the complete active set only after validation; in-flight requests keep the snapshot that authenticated them.
+
+After startup, failed reads or invalid documents keep the last valid set indefinitely. This preserves existing access during an AWS outage, but also delays revocations until a valid refresh succeeds. Restarting during that outage cannot load keys and fails closed. Authentication failures remain `401`; refresh degradation does not change `/ready` or cancel accepted jobs.
+
+Successful authenticated `/status` responses add these headers without changing revision-1 JSON.
+
+| Header | Meaning |
+| --- | --- |
+| `X-DSolver-History-Auth-Version` | Secret version that authenticated this request. |
+| `X-DSolver-History-Auth-Refresh-Age-Seconds` | Whole seconds since that snapshot's last successful refresh. |
+| `X-DSolver-History-Auth-Refresh-State` | `degraded` after a failed read or at least 60 seconds without a successful refresh; otherwise `healthy`. |
+
+Unauthorized responses and `/ready` expose none of this metadata. A request admitted just before a replacement may complete with the previous version in its response; a fresh request checks the new snapshot.
+
+### Key management
+
+Follow the [key management guide in solver-iac](https://github.com/dewiz-xyz/solver-iac/blob/main/docs/historical-pool-quote-keys.md). Generate tokens locally, retain the token file privately, and dispatch `Manage Historical Quote API Keys` with only the operation, audit ID, and digest. `list` returns IDs and the current version; `create` adds an ID, `rotate` replaces its digest, and `revoke` removes it. The last key cannot be revoked. The workflow uses OIDC and publishes only digests; no token download or service deployment is involved.
+
+Workflow success proves publication, not application. Use the local probe through the Tailscale Service URL to confirm the expected version, healthy refresh state, and intended token acceptance. Under healthy reads, allow the 30-second polling interval plus read latency; this is not a guaranteed revocation deadline. For rotation without a client interruption, create a second ID, switch the client, then revoke the original ID.
+
+The initial runtime cutover still needs one task deployment. Keep key edits paused, allow active jobs to finish and consume their results, and retain the old task execution role's secret-read permission until the new runtime is verified. Remove that obsolete permission in a separate IaC apply. A later rollback to the old binary must restore its permission first and inject the latest approved valid document, not an earlier version containing revoked credentials.
 
 Replica settings are `DSOLVER_HISTORY_REPLICA_DB_HOST`, `DSOLVER_HISTORY_REPLICA_DB_NAME`, and `DSOLVER_HISTORY_REPLICA_DB_USER`. The user must be `state_history_observer`. The optional port defaults to `5432`, the physical connection limit defaults to `5`, and connection lifetime defaults to one hour. Four connections cover the running-job limit; the fifth keeps protected status and coverage reads available while every job is planning. Each new physical connection gets a fresh RDS IAM login token.
 
