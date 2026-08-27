@@ -15,7 +15,7 @@ use historical_quote::{
 };
 use state_history::{ReadConnectionProvider, ReadLimits, StateHistoryReader};
 
-use crate::auth::{require_bearer, BearerTokenVerifier};
+use crate::auth::{require_bearer, BearerKeySetHandle};
 use crate::config::ServiceConfig;
 use crate::http::handlers;
 use crate::jobs::{ExecutionContext, JobExecutionError, JobExecutor, JobRegistry, JobRequest};
@@ -26,6 +26,7 @@ type ServiceFuture<'a, T> =
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServiceConfig>,
+    pub bearer_keys: BearerKeySetHandle,
     pub registry: JobRegistry,
     pub coverage: Arc<dyn CoverageResolver>,
     pub status: Arc<dyn StatusProbe>,
@@ -51,7 +52,6 @@ pub struct StatusDependencies {
 pub struct ServiceDependencyError;
 
 pub fn router(state: AppState) -> Router {
-    let verifier = BearerTokenVerifier::new(state.config.bearer_keys.clone());
     let protected = Router::new()
         .route("/jobs/quote", post(handlers::submit_quote))
         .route(
@@ -62,7 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/:job_id/cancel", post(handlers::cancel_job))
         .route("/coverage", post(handlers::coverage))
         .route("/status", get(handlers::status))
-        .route_layer(middleware::from_fn_with_state(verifier, require_bearer));
+        .route_layer(middleware::from_fn_with_state(
+            state.bearer_keys.clone(),
+            require_bearer,
+        ));
     Router::new()
         .route("/ready", get(handlers::ready))
         .merge(protected)

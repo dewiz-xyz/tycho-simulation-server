@@ -146,7 +146,12 @@ pub(crate) fn post_coverage() {}
             description = "Exact API revision")
     ),
     responses(
-        (status = 200, description = "Protected service status", body = StatusResponse),
+        (status = 200, description = "Protected service status", body = StatusResponse,
+            headers(
+                ("X-DSolver-History-Auth-Version" = String, description = "Active bearer key-set version used to authenticate this request"),
+                ("X-DSolver-History-Auth-Refresh-Age-Seconds" = u64, description = "Seconds since the last successful key-set refresh"),
+                ("X-DSolver-History-Auth-Refresh-State" = String, description = "healthy or degraded")
+            )),
         (status = 400, description = "API revision is invalid", body = ApiError),
         (status = 401, description = "Bearer token is absent or wrong", body = ApiError),
         (status = 503, description = "Status cannot be read safely", body = ApiError,

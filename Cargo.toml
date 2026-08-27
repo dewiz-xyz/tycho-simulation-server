@@ -27,6 +27,7 @@ anyhow = "1.0"
 aws-config = "1"
 aws-sdk-rds = "1"
 aws-sdk-s3 = "1"
+aws-sdk-secretsmanager = "1"
 axum = "0.7"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use historical_quote::api::{
     is_uuid_v4, Backend, ComparisonBudgetDetails, ConsistencyCheckRequest, ConsistencySelection,
     CoverageRequest, DependencyHealth, DependencyState, QuoteJobRequest, ReadyResponse,
@@ -12,6 +14,7 @@ use historical_quote::api::{
 use uuid::Uuid;
 
 use crate::app::{AppState, StatusDependencies};
+use crate::auth::BearerKeySetSnapshot;
 use crate::http::error::HttpError;
 use crate::jobs::{
     terminal_response_body, CancelOutcome, JobRequest, PollOutcome, ScheduledJob, SubmitOutcome,
@@ -134,6 +137,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 
 pub async fn status(
     State(state): State<AppState>,
+    Extension(bearer_keys): Extension<Arc<BearerKeySetSnapshot>>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     require_revision_header(&headers)?;
@@ -143,7 +147,7 @@ pub async fn status(
         .probe()
         .await
         .unwrap_or_else(|_| unavailable_dependencies());
-    Ok(Json(StatusResponse {
+    let mut response = Json(StatusResponse {
         service_revision: state.config.service_revision.clone(),
         api_revision: API_REVISION,
         supported_chain_id: state.config.supported_chain_id,
@@ -156,7 +160,27 @@ pub async fn status(
         limits: state.config.public_limits(),
         draining: scheduler.draining,
     })
-    .into_response())
+    .into_response();
+    // Use the version that admitted this request, even if a refresh finished during the probe.
+    let metadata = bearer_keys.metadata();
+    response.headers_mut().insert(
+        "x-dsolver-history-auth-version",
+        HeaderValue::from_str(&metadata.version_id)
+            .map_err(|_| HttpError::unavailable(RETRY_AFTER_SECONDS))?,
+    );
+    response.headers_mut().insert(
+        "x-dsolver-history-auth-refresh-age-seconds",
+        HeaderValue::from(metadata.refresh_age_seconds),
+    );
+    response.headers_mut().insert(
+        "x-dsolver-history-auth-refresh-state",
+        HeaderValue::from_static(if metadata.degraded {
+            "degraded"
+        } else {
+            "healthy"
+        }),
+    );
+    Ok(response)
 }
 
 fn validate_quote(state: &AppState, request: &QuoteJobRequest) -> Result<(), HttpError> {
