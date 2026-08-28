@@ -2,9 +2,15 @@ mod support;
 
 use std::sync::Arc;
 
-use historical_quote::api::{QuoteFailureReason, QuoteOutcome, UnavailableReason};
+use alloy_primitives::U256;
+use historical_quote::api::{
+    HistoricalQuoteResult, QuoteFailureReason, QuoteOutcome, UnavailableReason,
+};
 use historical_quote::{HistoricalQuoteExecutor, HistoricalReconstructor};
-use simulator_replay::acquire_vm_world_lease;
+use simulator_replay::{
+    acquire_vm_world_lease, decode_token_map, DecoderConfig, ExactPoolQuote, ReplayBackend,
+    ReplayDecoder, ReplayWorld,
+};
 use state_history::ReadLimits;
 use tokio_util::sync::CancellationToken;
 
@@ -286,6 +292,176 @@ async fn missing_token_anchor_and_apply_anomaly_fail_closed(
 }
 
 #[tokio::test]
+async fn absent_removal_preserves_historical_quote_amounts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = native_quote_request(100, 100);
+    let control = executor(Arc::new(FixtureSource::native()?))
+        .execute(&request, &CancellationToken::new(), &())
+        .await?;
+    let mut source = FixtureSource::native()?;
+    support::add_removal(&mut source.target_plan.legs[0].deltas[0], "absent")?;
+    let actual = executor(Arc::new(source))
+        .execute(&request, &CancellationToken::new(), &())
+        .await?;
+
+    assert_quote_amounts_match(&actual, &control)
+}
+
+#[tokio::test]
+async fn present_removal_does_not_leave_stale_quotes() -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native()?;
+    support::add_removal(
+        &mut source.target_plan.legs[0].deltas[0],
+        support::NATIVE_COMPONENT,
+    )?;
+    let result = executor(Arc::new(source))
+        .execute(
+            &native_quote_request(100, 100),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await?;
+
+    assert_eq!(result.results.len(), 2);
+    for row in result.results {
+        successful_amount(&row.start_outcome)?;
+        assert_eq!(row.targets.len(), 2);
+        for target in row.targets {
+            assert!(matches!(
+                target.outcome,
+                QuoteOutcome::QuoteFailed {
+                    reason: QuoteFailureReason::ComponentNotFound
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_update_stays_fatal_beside_absent_removal() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut source = FixtureSource::native_with_apply_anomaly()?;
+    support::add_removal(&mut source.target_plan.legs[0].deltas[0], "absent")?;
+    source.target_plan.legs[0]
+        .deltas
+        .push(support::native_delta(3, 102)?);
+    let result = executor(Arc::new(source))
+        .execute(
+            &native_quote_request(100, 100),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await?;
+
+    assert_eq!(result.results.len(), 2);
+    for row in result.results {
+        successful_amount(&row.start_outcome)?;
+        assert_eq!(row.targets.len(), 2);
+        for target in row.targets {
+            assert!(matches!(
+                target.outcome,
+                QuoteOutcome::Unavailable {
+                    reason: UnavailableReason::StateApplicationInvalid,
+                    ..
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn skipped_raw_pool_removal_preserves_healthy_quote() -> Result<(), Box<dyn std::error::Error>>
+{
+    let source = FixtureSource::native()?;
+    let quote = ExactPoolQuote {
+        backend: ReplayBackend::Native,
+        protocol: "uniswap_v2".to_owned(),
+        component_id: support::NATIVE_COMPONENT.to_owned(),
+        token_in: support::TOKEN_A.parse()?,
+        token_out: support::TOKEN_B.parse()?,
+        amount_in: U256::from(1_000_000_u64),
+    };
+    let snapshot = support::native_tokens()?;
+    let tokens = decode_token_map(snapshot.chain_id, snapshot.tokens.as_ref())?;
+    assert!(tokens.contains_key(&quote.token_in));
+    assert!(tokens.contains_key(&quote.token_out));
+    let decoder = ReplayDecoder::new(DecoderConfig::retained_v1(), tokens.clone()).await?;
+    let decoded = decoder
+        .decode_checkpoint_payloads(&source.archives[&1].payloads_json, &[ReplayBackend::Native])
+        .await?;
+    let mut world = ReplayWorld::new(tokens, None);
+    let restored = world.restore(decoded.update.ok_or("fixture checkpoint did not decode")?);
+    assert!(!restored.has_anomalies());
+    let expected = world.pin().quote(&quote)?;
+    assert!(expected > U256::ZERO);
+
+    let skipped = decoder
+        .decode_snapshot_messages(
+            ReplayBackend::Native,
+            vec![support::skipped_v4_message(101, false)],
+        )
+        .await?
+        .ok_or("skipped snapshot must still produce an update")?;
+    assert!(skipped.new_pairs.is_empty());
+    assert!(skipped.states.is_empty());
+    assert!(skipped.removed_pairs.is_empty());
+    assert!(!world.apply(skipped).has_anomalies());
+    assert!(world
+        .pin()
+        .pool_by_id(support::SKIPPED_V4_COMPONENT)
+        .is_none());
+    assert_eq!(world.pin().quote(&quote)?, expected);
+
+    let removed = decoder
+        .decode_snapshot_messages(
+            ReplayBackend::Native,
+            vec![support::skipped_v4_message(102, true)],
+        )
+        .await?
+        .ok_or("raw removal must produce an update")?;
+    assert_eq!(removed.removed_pairs.len(), 1);
+    assert!(removed
+        .removed_pairs
+        .contains_key(support::SKIPPED_V4_COMPONENT));
+    let report = world.apply(removed);
+    assert_eq!(report.removed_unknown_pair, 1);
+    assert!(report.has_anomalies());
+    assert!(!report.has_state_integrity_errors());
+    assert_eq!(
+        report.anomaly_samples,
+        vec![format!(
+            "removed_unknown_pair:{}",
+            support::SKIPPED_V4_COMPONENT
+        )]
+    );
+    assert_eq!(world.pin().quote(&quote)?, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_absent_removal_preserves_historical_quote_amounts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = native_quote_request(100, 100);
+    let control = executor(Arc::new(FixtureSource::native()?))
+        .execute(&request, &CancellationToken::new(), &())
+        .await?;
+    let mut source = FixtureSource::native()?;
+    support::add_checkpoint_absent_removal(
+        source
+            .archives
+            .get_mut(&1)
+            .ok_or("missing fixture archive")?,
+    )?;
+    let actual = executor(Arc::new(source))
+        .execute(&request, &CancellationToken::new(), &())
+        .await?;
+
+    assert_quote_amounts_match(&actual, &control)
+}
+
+#[tokio::test]
 async fn vm_world_lease_serializes_complete_world_lifetimes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first = acquire_vm_world_lease().await;
@@ -295,6 +471,39 @@ async fn vm_world_lease_serializes_complete_world_lifetimes(
     drop(first);
     let second = waiting.await?;
     drop(second);
+    Ok(())
+}
+
+fn successful_amount(outcome: &QuoteOutcome) -> Result<&str, Box<dyn std::error::Error>> {
+    match outcome {
+        QuoteOutcome::Ok { amount_out, .. } => Ok(amount_out.as_str()),
+        _ => Err(format!("expected a successful quote amount, got {outcome:?}").into()),
+    }
+}
+
+fn assert_quote_amounts_match(
+    actual: &HistoricalQuoteResult,
+    control: &HistoricalQuoteResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(actual.results.len(), 2);
+    assert_eq!(actual.results.len(), control.results.len());
+    for (actual, control) in actual.results.iter().zip(&control.results) {
+        assert_eq!(actual.start_block, control.start_block);
+        assert_eq!(actual.amount_in, control.amount_in);
+        assert_eq!(
+            successful_amount(&actual.start_outcome)?,
+            successful_amount(&control.start_outcome)?,
+        );
+        assert_eq!(actual.targets.len(), 2);
+        assert_eq!(actual.targets.len(), control.targets.len());
+        for (actual, control) in actual.targets.iter().zip(&control.targets) {
+            assert_eq!(actual.target_block, control.target_block);
+            assert_eq!(
+                successful_amount(&actual.outcome)?,
+                successful_amount(&control.outcome)?,
+            );
+        }
+    }
     Ok(())
 }
 
