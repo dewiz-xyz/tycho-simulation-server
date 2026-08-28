@@ -3,7 +3,8 @@ mod support;
 use std::sync::Arc;
 
 use historical_quote::api::{
-    Backend, PairStatus, PoolSelector, QuoteFailureReason, StreamPosition,
+    Backend, ConsistencyPairReport, ConsistencyQuoteOutcome, PairStatus, PoolSelector,
+    QuoteFailureReason, StreamPosition,
 };
 use historical_quote::{ConsistencyChecker, HistoricalError};
 use serde_json::{json, Value};
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 use state_history::{
     checkpoint_s3_key, encode_archive, token_snapshot_s3_key, validate_checkpoint_object_bytes,
     validate_checkpoint_token_object_bytes, CheckpointArchive, CheckpointKind, CheckpointManifest,
-    EncodedArchive, ReadLimitError, ReadLimits, TokenSnapshotRef,
+    EncodedArchive, ReadLimitError, ReadLimits, TokenAnchor, TokenSnapshotRef,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +37,109 @@ async fn direct_target_matches_earlier_checkpoint_plus_deltas(
     );
     assert_eq!(report.pairs[0].total_difference_count, 0);
     assert_eq!(report.pairs[0].direct_state, report.pairs[0].replayed_state);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_removal_preserves_consistency() -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native_consistency(true)?;
+    let plan = source
+        .pair_plan
+        .as_mut()
+        .ok_or("missing fixture pair plan")?;
+    support::add_removal(&mut plan.deltas[0], "absent")?;
+    let report = checker(Arc::new(source), 100)
+        .execute(
+            &consistency_request(native_pool()),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await?;
+
+    assert_matching_state_and_quotes(&report.pairs[0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_absent_removal_preserves_consistency_with_token_anchors(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for use_fallback in [false, true] {
+        let mut source = FixtureSource::native_consistency(true)?;
+        support::add_checkpoint_absent_removal(
+            source
+                .archives
+                .get_mut(&2)
+                .ok_or("missing target archive")?,
+        )?;
+        if use_fallback {
+            let fallback = support::manifest(
+                3,
+                99,
+                support::position(0),
+                state_history::Backend::Native,
+                true,
+                None,
+            );
+            source.token_snapshots.clear();
+            source
+                .token_snapshots
+                .insert(fallback.id, support::native_tokens()?);
+            let plan = source
+                .pair_plan
+                .as_mut()
+                .ok_or("missing fixture pair plan")?;
+            plan.pair.earlier.token_reference = None;
+            plan.pair.target.token_reference = None;
+            plan.earlier_token_anchor = TokenAnchor::Available {
+                checkpoint: Box::new(fallback.clone()),
+                used_fallback: true,
+            };
+            plan.target_token_anchor = TokenAnchor::Available {
+                checkpoint: Box::new(fallback),
+                used_fallback: true,
+            };
+            source.pairs = vec![plan.pair.clone()];
+        }
+        let report = checker(Arc::new(source), 100)
+            .execute(
+                &consistency_request(native_pool()),
+                &CancellationToken::new(),
+                &(),
+            )
+            .await?;
+
+        assert_matching_state_and_quotes(&report.pairs[0]);
+        assert_eq!(
+            report.storage.token_objects_verified,
+            if use_fallback { 1 } else { 2 },
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_update_beside_absent_removal_still_rejects_consistency(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native_consistency(true)?;
+    let mut invalid = FixtureSource::native_with_apply_anomaly()?;
+    support::add_removal(&mut invalid.target_plan.legs[0].deltas[0], "absent")?;
+    let plan = source
+        .pair_plan
+        .as_mut()
+        .ok_or("missing fixture pair plan")?;
+    plan.deltas = invalid.target_plan.legs.remove(0).deltas;
+    let result = checker(Arc::new(source), 100)
+        .execute(
+            &consistency_request(native_pool()),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(HistoricalError::StateReconstructionFailed(_))
+    ));
     Ok(())
 }
 
@@ -616,6 +720,21 @@ fn checker(
     max_differences: usize,
 ) -> ConsistencyChecker<FixtureSource> {
     ConsistencyChecker::new(source, ReadLimits::unbounded(), max_differences)
+}
+
+fn assert_matching_state_and_quotes(pair: &ConsistencyPairReport) {
+    assert_eq!(pair.status, PairStatus::Pass);
+    assert_eq!(pair.total_difference_count, 0);
+    assert!(pair.direct_state.is_some());
+    assert_eq!(pair.direct_state, pair.replayed_state);
+    assert_eq!(pair.quote_comparisons.len(), 1);
+    let quote = &pair.quote_comparisons[0];
+    assert_eq!(quote.status, PairStatus::Pass);
+    assert!(matches!(
+        quote.direct_outcome,
+        ConsistencyQuoteOutcome::Ok { .. }
+    ));
+    assert_eq!(quote.direct_outcome, quote.replayed_outcome);
 }
 
 fn assert_integrity_error<T>(label: &str, result: Result<T, ReadLimitError>) {

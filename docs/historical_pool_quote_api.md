@@ -14,6 +14,8 @@ End-of-block state contains all accepted on-chain updates for the block. RFQ sta
 
 State reconstruction coverage reports continuous block intervals that are safe for all requested backends. Coverage does not mean that a component exists or can quote. Replica delay lowers `visibleThroughBlock`; it does not create a stored gap.
 
+Removing a pool that is already absent remains a replay diagnostic and does not make historical state unavailable. Missing state, unknown updates, and other state integrity failures still return `state_application_invalid`. A removed pool cannot produce a quote from the later state.
+
 ## Security boundary
 
 The service runs as a separate process and task. It can read a dedicated PostgreSQL replica as `state_history_observer` and read the existing state-history objects. It has no primary database address, Redis endpoint, broadcaster URL, or object write permission.

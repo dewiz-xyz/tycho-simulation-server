@@ -344,7 +344,7 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
         anchor_rfq_observed_at_ms: manifest.rfq_observed_at_ms,
         rfq_observed_at_ms: manifest.rfq_observed_at_ms,
         rfq_observation_position: manifest.rfq_observed_at_ms.map(|_| manifest.position),
-        checkpoint_application_invalid: report.has_anomalies(),
+        checkpoint_application_invalid: report.has_state_integrity_errors(),
     }))
 }
 
@@ -380,7 +380,7 @@ pub(crate) async fn apply_all_pair_deltas(
             .await
             .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
         if let Some(update) = decoded.update {
-            invalid |= restored.world.apply(update).has_anomalies();
+            invalid |= restored.world.apply(update).has_state_integrity_errors();
         }
         if decoded.had_applicable_partition {
             restored.final_position = delta.position;
@@ -448,7 +448,8 @@ async fn apply_deltas_through(
             .await
             .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
         if let Some(update) = decoded.update {
-            *application.application_invalid |= restored.world.apply(update).has_anomalies();
+            *application.application_invalid |=
+                restored.world.apply(update).has_state_integrity_errors();
         }
         if decoded.had_applicable_partition {
             restored.final_position = delta.position;

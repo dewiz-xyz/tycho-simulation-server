@@ -325,6 +325,15 @@ impl ApplyReport {
             || self.removed_unknown_pair > 0
     }
 
+    /// Whether applying this update left pool state inconsistent.
+    /// Removing an already absent pool remains a diagnostic, not an integrity error.
+    pub fn has_state_integrity_errors(&self) -> bool {
+        self.new_pairs_missing_state > 0
+            || self.unknown_protocol_new_pairs > 0
+            || self.updates_for_unknown_pair > 0
+            || self.states_missing_in_shard > 0
+    }
+
     pub fn tokens_to_cache(&self) -> &[Token] {
         &self.tokens_to_cache
     }
@@ -635,6 +644,7 @@ fn pool_by_id_from_state(state: &ReplayState, id: &str) -> Option<PoolEntry> {
 mod tests {
     use std::any::Any;
 
+    use alloy_primitives::U256;
     use num_bigint::BigUint;
     use tycho_simulation::tycho_common::{
         dto::ProtocolStateDelta,
@@ -647,7 +657,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ExactPoolQuote, ReplayBackend};
+    use crate::{ExactPoolQuote, ReplayBackend, ReplayQuoteError};
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;
@@ -792,6 +802,7 @@ mod tests {
         assert_eq!(report.states_missing_in_shard, 1);
         assert_eq!(report.removed_unknown_pair, 1);
         assert!(report.has_anomalies());
+        assert!(report.has_state_integrity_errors());
         assert_eq!(report.anomaly_samples.len(), 5);
         assert!(report
             .anomaly_samples
@@ -853,6 +864,112 @@ mod tests {
         assert_eq!(report.removed_unknown_pair, 0);
         assert!(report.anomaly_samples.is_empty());
         assert!(!report.has_anomalies());
+        assert!(!report.has_state_integrity_errors());
+    }
+
+    #[test]
+    fn absent_removal_is_diagnostic_without_invalidating_state() {
+        let token_a = token(70, "A");
+        let token_b = token(71, "B");
+        let healthy = component(
+            72,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let absent = component(
+            73,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("healthy", healthy));
+        let quote = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "healthy".to_owned(),
+            token_in: token_a.address,
+            token_out: token_b.address,
+            amount_in: U256::from(10_u64),
+        };
+        let expected = world.pin().quote(&quote);
+        assert_eq!(expected, Ok(U256::from(10_u64)));
+
+        for block in [2, 3] {
+            let report = world.apply(
+                Update::new(block, HashMap::new(), HashMap::new())
+                    .set_removed_pairs(HashMap::from([("absent".to_owned(), absent.clone())])),
+            );
+            assert_eq!(report.removed_unknown_pair, 1);
+            assert!(report.has_anomalies());
+            assert!(!report.has_state_integrity_errors());
+            assert!(report
+                .anomaly_samples
+                .iter()
+                .any(|sample| sample == "removed_unknown_pair:absent"));
+            assert_eq!(world.pin().quote(&quote), expected);
+        }
+    }
+
+    #[test]
+    fn present_and_repeated_removal_clear_state_and_lookup_entries() {
+        let token_a = token(74, "A");
+        let token_b = token(75, "B");
+        let pool = component(
+            76,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("removed", pool.clone()));
+        let quote = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "removed".to_owned(),
+            token_in: token_a.address,
+            token_out: token_b.address,
+            amount_in: U256::from(10_u64),
+        };
+        assert_eq!(world.pin().quote(&quote), Ok(quote.amount_in));
+
+        for (block, removed_pairs, removed_unknown_pair) in [(2, 1, 0), (3, 0, 1)] {
+            let report = world.apply(
+                Update::new(block, HashMap::new(), HashMap::new())
+                    .set_removed_pairs(HashMap::from([("removed".to_owned(), pool.clone())])),
+            );
+            assert_eq!(report.removed_pairs, removed_pairs);
+            assert_eq!(report.removed_unknown_pair, removed_unknown_pair);
+            assert!(!report.has_state_integrity_errors());
+            assert!(world.state.id_to_kind.is_empty());
+            assert!(world.state.token_index.is_empty());
+            assert!(world.state.shards.values().all(HashMap::is_empty));
+            assert_eq!(
+                world.pin().quote(&quote),
+                Err(ReplayQuoteError::ComponentNotFound("removed".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn every_integrity_counter_remains_fatal_beside_absent_removal() {
+        for [missing_state, unknown_protocol, unknown_update, missing_shard] in
+            [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+        {
+            let mut report = ReplayWorld::new(HashMap::new(), None).apply(Update::new(
+                1,
+                HashMap::new(),
+                HashMap::new(),
+            ));
+            report.removed_unknown_pair = 1;
+            report.new_pairs_missing_state = missing_state;
+            report.unknown_protocol_new_pairs = unknown_protocol;
+            report.updates_for_unknown_pair = unknown_update;
+            report.states_missing_in_shard = missing_shard;
+            assert!(report.has_anomalies());
+            assert!(report.has_state_integrity_errors());
+        }
     }
 
     #[test]

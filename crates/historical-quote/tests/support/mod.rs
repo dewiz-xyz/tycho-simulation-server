@@ -3,7 +3,7 @@
     reason = "this fixture module is shared by separate integration test binaries"
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,6 +15,9 @@ use historical_quote::api::{
 use historical_quote::{HistoricalError, HistorySource};
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
+use simulator_core::broadcaster::{
+    BroadcasterBackend, BroadcasterProtocolMessage, BroadcasterSnapshotPartition,
+};
 use state_history::{
     ArchiveMetadata, Backend, BlockInterval, BlockTimeObservation, CheckpointArchive,
     CheckpointKind, CheckpointManifest, CheckpointPair, CheckpointPairQuery,
@@ -23,11 +26,25 @@ use state_history::{
     StoredDelta, StreamPosition, TargetPlan, TargetPlanQuery, TokenAnchor, TokenSnapshotRef,
     ARCHIVE_SCHEMA_VERSION, DELTA_PAYLOAD_FORMAT_VERSION, TOKEN_SNAPSHOT_SCHEMA_VERSION,
 };
+use tycho_simulation::{
+    tycho_client::feed::{
+        synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+        BlockHeader, SynchronizerState,
+    },
+    tycho_common::{
+        dto::{
+            Chain as DtoChain, ProtocolComponent as DtoProtocolComponent, ResponseProtocolState,
+        },
+        Bytes,
+    },
+};
 use uuid::Uuid;
 
 pub const NATIVE_COMPONENT: &str = "native:uniswap-v2:fixture";
 pub const TOKEN_A: &str = "0x1111111111111111111111111111111111111111";
 pub const TOKEN_B: &str = "0x2222222222222222222222222222222222222222";
+pub const SKIPPED_V4_COMPONENT: &str =
+    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub const RFQ_COMPONENT: &str = "rfq:bebop:WETH-USDC-fixture";
 pub const WETH: &str = "0x3333333333333333333333333333333333333333";
 pub const USDC: &str = "0x4444444444444444444444444444444444444444";
@@ -516,17 +533,116 @@ fn raw_tokens(tokens: Value) -> Result<RawTokenSnapshot, Box<dyn std::error::Err
     })
 }
 
-fn native_delta(
+pub fn add_removal(
+    stored: &mut StoredDelta,
+    component_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checkpoint: Value = serde_json::from_str(NATIVE_CHECKPOINT)?;
+    let mut payload: Value = serde_json::from_str(stored.raw_payload.get())?;
+    payload["partitions"][0]["removedPairs"] = json!([{
+        "componentId": component_id,
+        "component": checkpoint["partition"]["states"][0]["component"].clone()
+    }]);
+    stored.raw_payload = RawValue::from_string(payload.to_string())?;
+    Ok(())
+}
+
+pub fn add_checkpoint_absent_removal(
+    archive: &mut CheckpointArchive,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let block = archive.metadata.block_number;
+    let mut start: Value = serde_json::from_str(&archive.payloads_json[0])?;
+    start["totalChunks"] = json!(2);
+    let partition = BroadcasterSnapshotPartition::with_messages(
+        BroadcasterBackend::Native,
+        block,
+        vec![skipped_v4_message(block, true)],
+        BTreeMap::new(),
+    );
+    // Each chunk permits only one partition for a given backend.
+    let chunk = json!({
+        "kind": "snapshot_chunk",
+        "snapshotId": start["snapshotId"],
+        "chunkIndex": 1,
+        "partitions": [partition]
+    });
+    archive.payloads_json[0] = start.to_string();
+    archive.payloads_json.insert(2, chunk.to_string());
+    Ok(())
+}
+
+pub fn skipped_v4_message(block: u64, removal: bool) -> BroadcasterProtocolMessage {
+    let component = DtoProtocolComponent {
+        id: SKIPPED_V4_COMPONENT.to_owned(),
+        protocol_system: "uniswap_v4".to_owned(),
+        protocol_type_name: "uniswap_v4_pool".to_owned(),
+        chain: DtoChain::Base,
+        tokens: vec![Bytes::from([0x11; 20]), Bytes::from([0x22; 20])],
+        contract_ids: Vec::new(),
+        static_attributes: HashMap::new(),
+        change: Default::default(),
+        creation_tx: Bytes::from([0_u8; 32]),
+        created_at: chrono::NaiveDateTime::default(),
+    };
+    let header = BlockHeader {
+        hash: Bytes::from([1_u8; 32]),
+        number: block,
+        parent_hash: Bytes::from([0_u8; 32]),
+        revert: false,
+        timestamp: block * 1_000,
+        partial_block_index: None,
+    };
+    let states = if removal {
+        HashMap::new()
+    } else {
+        // Missing V4 attributes force a decoder skip without hooks or RPC access.
+        HashMap::from([(
+            SKIPPED_V4_COMPONENT.to_owned(),
+            ComponentWithState {
+                state: ResponseProtocolState {
+                    component_id: SKIPPED_V4_COMPONENT.to_owned(),
+                    attributes: HashMap::new(),
+                    balances: HashMap::new(),
+                }
+                .into(),
+                component: component.clone().into(),
+                component_tvl: None,
+                entrypoints: Vec::new(),
+            },
+        )])
+    };
+    BroadcasterProtocolMessage::new(
+        "uniswap_v4",
+        SynchronizerState::Ready(header.clone()),
+        StateSyncMessage {
+            header,
+            snapshots: Snapshot {
+                states,
+                vm_storage: HashMap::new(),
+            },
+            deltas: None,
+            removed_components: if removal {
+                HashMap::from([(SKIPPED_V4_COMPONENT.to_owned(), component.into())])
+            } else {
+                HashMap::new()
+            },
+        },
+    )
+}
+
+pub fn native_delta(
     message_seq: u64,
     block_number: u64,
 ) -> Result<StoredDelta, Box<dyn std::error::Error>> {
     let fixture: Value = serde_json::from_str(NATIVE_DELTA)?;
+    let mut update = fixture["update"].clone();
+    update["partitions"][0]["blockNumber"] = json!(block_number);
     delta(
         message_seq,
         Backend::Native,
         Some(block_number),
         None,
-        fixture["update"].clone(),
+        update,
     )
 }
 
