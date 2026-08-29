@@ -301,7 +301,7 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
 - [skills/historical-pool-quote-cli/SKILL.md](skills/historical-pool-quote-cli/SKILL.md): repo-local workflow for requesting and interpreting historical pool quotes
 - `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
-- `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
+- Global `solver-simulator-health` skill: deployed simulator health and CloudWatch analysis through the shared solver AWS resolver
 
 ## License
 
