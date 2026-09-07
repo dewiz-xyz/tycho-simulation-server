@@ -467,6 +467,8 @@ mod tests {
             serde_json::json!(["native", "rfq"])
         );
         assert!(body["backends"]["rfq"].is_object());
+        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
+        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
 
         let (status, body) =
             post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
@@ -478,24 +480,6 @@ mod tests {
             get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["backends"], serde_json::json!(["native"]));
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn root_status_reports_rfq_backend_readiness() -> Result<()> {
-        let app = create_broadcaster_router(
-            build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
-        );
-
-        let (status, body) = get_json(app, "/status").await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "ready");
-        assert_eq!(
-            body["snapshot"]["configured_backends"],
-            serde_json::json!(["native", "rfq"])
-        );
-        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
-        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
         Ok(())
     }
 
@@ -816,16 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_mismatched_chain_id() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -836,7 +811,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -848,16 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_malformed_addresses() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -868,7 +833,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -1328,12 +1292,11 @@ mod tests {
         > {
             Box::pin(async move {
                 let mut state = self.state.lock().await;
-                if let Some(expected_token) = command.expected_writer_token {
-                    if state.active_token.as_deref() != Some(expected_token)
+                if command.expected_writer_token.is_some_and(|expected_token| {
+                    state.active_token.as_deref() != Some(expected_token)
                         || Some(state.active_generation) != command.expected_generation
-                    {
-                        bail!("stale Redis broadcaster writer token");
-                    }
+                }) {
+                    bail!("stale Redis broadcaster writer token");
                 }
                 state.active_generation = state.active_generation.saturating_add(1);
                 state.active_token = Some(command.writer_token.to_string());

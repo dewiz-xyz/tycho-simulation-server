@@ -131,31 +131,15 @@ mod tests {
         let first_pair_started = Arc::new(AtomicUsize::new(0));
         let first_pair_ready = Arc::new(Notify::new());
 
-        let mut payloads = super::ordered_payload_fetches(2, {
-            let in_flight = Arc::clone(&in_flight);
-            let max_in_flight = Arc::clone(&max_in_flight);
-            let first_pair_started = Arc::clone(&first_pair_started);
-            let first_pair_ready = Arc::clone(&first_pair_ready);
-            move |index| {
-                let in_flight = Arc::clone(&in_flight);
-                let max_in_flight = Arc::clone(&max_in_flight);
-                let first_pair_started = Arc::clone(&first_pair_started);
-                let first_pair_ready = Arc::clone(&first_pair_ready);
-                async move {
-                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_in_flight.fetch_max(active, Ordering::SeqCst);
-                    if first_pair_started.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
-                        first_pair_ready.notify_waiters();
-                    } else {
-                        first_pair_ready.notified().await;
-                    }
-                    if index == 0 {
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, anyhow::Error>(index)
-                }
-            }
+        let max_in_flight_for_fetch = Arc::clone(&max_in_flight);
+        let mut payloads = super::ordered_payload_fetches(2, move |index| {
+            fetch_payload_out_of_order(
+                index,
+                Arc::clone(&in_flight),
+                Arc::clone(&max_in_flight_for_fetch),
+                Arc::clone(&first_pair_started),
+                Arc::clone(&first_pair_ready),
+            )
         });
 
         let first = next_payload(&mut payloads).await?;
@@ -167,6 +151,27 @@ mod tests {
             "payload fetches should overlap"
         );
         Ok(())
+    }
+
+    async fn fetch_payload_out_of_order(
+        index: u32,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        first_pair_started: Arc<AtomicUsize>,
+        first_pair_ready: Arc<Notify>,
+    ) -> Result<u32> {
+        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        max_in_flight.fetch_max(active, Ordering::SeqCst);
+        if first_pair_started.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
+            first_pair_ready.notify_waiters();
+        } else {
+            first_pair_ready.notified().await;
+        }
+        if index == 0 {
+            sleep(Duration::from_millis(50)).await;
+        }
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(index)
     }
 
     async fn next_payload<T>(

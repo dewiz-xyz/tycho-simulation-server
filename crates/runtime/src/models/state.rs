@@ -3119,32 +3119,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_route_fence_marks_removed_pool_changed() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-        let component = pinned
-            .pool_by_id("pool-native")
-            .map(|(_, component)| component.as_ref().clone())
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-
-        state
-            .native_state_store
-            .apply_update(
-                Update::new(2, HashMap::new(), HashMap::new())
-                    .set_removed_pairs(HashMap::from([("pool-native".to_string(), component)])),
-            )
-            .await;
-
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
-    }
-
-    #[tokio::test]
     async fn native_route_fence_distinguishes_missing_removed_and_added_pools() {
         let state = build_native_identity_fence_state().await;
         let pinned = state.native_state_store.pin().await;
