@@ -3808,6 +3808,24 @@ mod tests {
     }
 
     #[test]
+    fn select_best_pool_prioritizes_metadata_over_conflicting_pool_name() {
+        let mut quote = quote_with_protocol_pools(&[("pool-1", "rfq:bebop", "10")]);
+        quote.data[0].pool_name = "UniswapV3::DAI/USDC".to_string();
+        quote.meta.pool_results[0].pool_name = "UniswapV3::DAI/USDC".to_string();
+
+        let selected = select_best_pool(&quote);
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:bebop")
+        );
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+            Some("pool-1")
+        );
+    }
+
+    #[test]
     fn select_best_pool_uses_canonical_protocol_from_quote_metadata() {
         let quote = QuoteResult {
             request_id: "req-1".to_string(),

@@ -860,23 +860,27 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 mod tests {
     use std::collections::HashMap;
     use std::error::Error;
+    use std::hint::black_box;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use std::time::Duration;
 
-    use futures::{stream::BoxStream, StreamExt};
+    use futures::{future::BoxFuture, stream::{BoxStream, Pending}, StreamExt};
     use tokio::sync::{mpsc, Mutex, Notify};
-    use tokio::time::timeout;
+    use tokio::time::{advance, timeout, Instant};
     use tokio_util::sync::CancellationToken;
     use tycho_simulation::protocol::models::Update;
-    use tycho_simulation::tycho_client::feed::{BlockHeader, FeedMessage};
+    use tycho_simulation::tycho_client::feed::{
+        synchronizer::{Snapshot, StateSyncMessage},
+        BlockHeader, FeedMessage, SynchronizerState,
+    };
 
     use super::{
         classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls,
-        StreamRestartReason, StreamSupervisorConfig,
+        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterRawStreamMessage, BroadcasterStreamControls,
+        StreamKind, StreamMessage, StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -892,6 +896,324 @@ mod tests {
 
     type RawTestItem = Result<FeedMessage<BlockHeader>, Box<dyn Error + Send + Sync>>;
     type TestRawStream = BoxStream<'static, RawTestItem>;
+
+    #[tokio::test(start_paused = true)]
+    async fn decoded_and_raw_streams_keep_distinct_stale_deadlines() {
+        let cfg = StreamSupervisorConfig {
+            readiness_stale: Duration::from_secs(10),
+            stream_stale: Duration::from_secs(2),
+            ..test_supervisor_config()
+        };
+        let health = StreamHealth::new();
+        health.mark_started().await;
+        health.record_progress(42).await;
+        advance(Duration::from_secs(6)).await;
+        let started = Instant::now();
+        let mut decoded = futures::stream::pending();
+        let message =
+            super::next_stream_message(StreamKind::Broadcaster, &mut decoded, &health, &cfg).await;
+        assert!(matches!(message, StreamMessage::Stale));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+
+        // A repeated native block cannot extend the raw stream's progress deadline.
+        health.record_progress(42).await;
+        let mut raw = futures::stream::pending();
+        let message = super::next_broadcaster_raw_stream_message(&mut raw, &health, &cfg).await;
+        assert!(matches!(message, BroadcasterRawStreamMessage::Stale));
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advanced_grace_expires_at_boundary_and_clears_on_normal_update() -> anyhow::Result<()>
+    {
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let health = StreamHealth::new();
+        let cfg = test_supervisor_config();
+        let mut ready_logged = false;
+        let mut advanced_update = native_sync_update(10);
+        for state in advanced_update.sync_states.values_mut() {
+            if let SynchronizerState::Ready(header) = state {
+                *state = SynchronizerState::Advanced(header.clone());
+            }
+        }
+        health.record_advanced(Instant::now()).await;
+        advance(cfg.resync_grace).await;
+        let exit =
+            handle_broadcaster_update(advanced_update, &service, &health, &cfg, &mut ready_logged)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Advanced state must restart at the grace boundary")
+                })?;
+        assert_eq!(exit.reason, StreamRestartReason::Advanced);
+        assert_eq!(
+            exit.last_error.as_deref(),
+            Some("advanced_state_grace_exceeded")
+        );
+
+        let exit = handle_broadcaster_update(
+            Update::new(11, HashMap::new(), HashMap::new()),
+            &service,
+            &health,
+            &cfg,
+            &mut ready_logged,
+        )
+        .await;
+        assert!(exit.is_none());
+        let next_window = health.record_advanced(Instant::now()).await;
+        assert!(next_window.window_started);
+        assert_eq!(next_window.elapsed, Duration::ZERO);
+        assert_eq!(next_window.burst_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_stream_build_failures_back_off_without_counting_restarts() {
+        let controls = BroadcasterStreamControls {
+            service: test_service(8453, BroadcasterBackend::Rfq),
+            stop: CancellationToken::new(),
+        };
+        let health = Arc::new(StreamHealth::new());
+        let attempts = Mutex::new(Vec::new());
+        let started = Instant::now();
+        let build = || async {
+            let mut attempts = attempts.lock().await;
+            attempts.push(started.elapsed());
+            if attempts.len() == 4 {
+                controls.stop.cancel();
+            }
+            Err::<Pending<Result<Update, Box<dyn Error + Send + Sync>>>, _>(anyhow::anyhow!(
+                "planned build failure"
+            ))
+        };
+        super::supervise_broadcaster_stream(
+            build,
+            Arc::clone(&health),
+            test_supervisor_config(),
+            controls.clone(),
+        )
+        .await;
+        assert_eq!(
+            *attempts.lock().await,
+            [
+                Duration::ZERO,
+                Duration::from_millis(500),
+                Duration::from_millis(1500),
+                Duration::from_millis(3500),
+            ]
+        );
+        assert_eq!(health.restart_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
+    async fn performance_stream_decoded_native_publication() -> anyhow::Result<()> {
+        anyhow::ensure!(!cfg!(debug_assertions), "run timing probes with --release");
+        const WARMUP: u64 = 100;
+        const ITERATIONS: u64 = 10_000;
+        let (service, writer) = performance_stream_service((WARMUP + ITERATIONS) as usize).await?;
+        let health = StreamHealth::new();
+        let cfg = test_supervisor_config();
+        let mut ready_logged = false;
+        let updates: Vec<_> = (WARMUP + 1..=WARMUP + ITERATIONS)
+            .map(native_sync_update)
+            .collect();
+        let mut exits = Vec::with_capacity(ITERATIONS as usize);
+        for block in 1..=WARMUP {
+            let exit = super::handle_broadcaster_update(
+                native_sync_update(block),
+                &service,
+                &health,
+                &cfg,
+                &mut ready_logged,
+            )
+            .await;
+            assert!(exit.is_none(), "decoded warmup failed: {exit:?}");
+        }
+
+        let started = Instant::now();
+        for update in updates {
+            exits.push(black_box(
+                super::handle_broadcaster_update(
+                    update,
+                    &service,
+                    &health,
+                    &cfg,
+                    &mut ready_logged,
+                )
+                .await,
+            ));
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            exits.iter().all(Option::is_none),
+            "decoded publication restarted: {exits:?}"
+        );
+        assert_eq!(health.last_block().await, WARMUP + ITERATIONS);
+        assert!(health.has_received_update().await);
+        let expected: Vec<_> = (1..=WARMUP + ITERATIONS)
+            .map(|block| (block + 1, Some(block)))
+            .collect();
+        assert_eq!(*writer.appends.lock().await, expected);
+        println!(
+            "{}",
+            serde_json::json!({
+                "scenario": "stream_decoded_native_publication", "warmup": WARMUP,
+                "iterations": ITERATIONS, "concurrency": 1, "elapsed_ns": elapsed.as_nanos(),
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
+    async fn performance_stream_raw_native_publication() -> anyhow::Result<()> {
+        anyhow::ensure!(!cfg!(debug_assertions), "run timing probes with --release");
+        const WARMUP: u64 = 100;
+        const ITERATIONS: u64 = 10_000;
+        let (service, writer) = performance_stream_service((WARMUP + ITERATIONS) as usize).await?;
+        let health = StreamHealth::new();
+        let cfg = test_supervisor_config();
+        let mut ready_logged = false;
+        let updates: Vec<_> = (WARMUP + 1..=WARMUP + ITERATIONS)
+            .map(performance_native_feed)
+            .collect();
+        let mut exits = Vec::with_capacity(ITERATIONS as usize);
+        for block in 1..=WARMUP {
+            let exit = super::handle_broadcaster_raw_update(
+                performance_native_feed(block),
+                &service,
+                &health,
+                &cfg,
+                &mut ready_logged,
+            )
+            .await;
+            assert!(exit.is_none(), "raw warmup failed: {exit:?}");
+        }
+
+        let started = Instant::now();
+        for update in updates {
+            exits.push(black_box(
+                super::handle_broadcaster_raw_update(
+                    update,
+                    &service,
+                    &health,
+                    &cfg,
+                    &mut ready_logged,
+                )
+                .await,
+            ));
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            exits.iter().all(Option::is_none),
+            "raw publication restarted: {exits:?}"
+        );
+        assert_eq!(health.last_block().await, WARMUP + ITERATIONS);
+        assert!(health.has_received_update().await);
+        let expected: Vec<_> = (1..=WARMUP + ITERATIONS)
+            .map(|block| (block + 1, Some(block)))
+            .collect();
+        assert_eq!(*writer.appends.lock().await, expected);
+        println!(
+            "{}",
+            serde_json::json!({
+                "scenario": "stream_raw_native_publication", "warmup": WARMUP,
+                "iterations": ITERATIONS, "concurrency": 1, "elapsed_ns": elapsed.as_nanos(),
+            })
+        );
+        Ok(())
+    }
+
+    fn performance_native_feed(number: u64) -> FeedMessage<BlockHeader> {
+        let header = BlockHeader {
+            hash: Bytes::from(number.to_be_bytes().repeat(4)),
+            number,
+            parent_hash: Bytes::from((number - 1).to_be_bytes().repeat(4)),
+            revert: false,
+            timestamp: number * 10,
+            partial_block_index: None,
+        };
+        FeedMessage {
+            state_msgs: HashMap::from([(
+                "uniswap_v2".to_string(),
+                StateSyncMessage {
+                    header: header.clone(),
+                    snapshots: Snapshot::default(),
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "uniswap_v2".to_string(),
+                SynchronizerState::Ready(header),
+            )]),
+        }
+    }
+
+    async fn performance_stream_service(
+        capacity: usize,
+    ) -> anyhow::Result<(BroadcasterServiceState, Arc<RecordStreamAppendsRedisWriter>)> {
+        let writer = Arc::new(RecordStreamAppendsRedisWriter {
+            appends: Mutex::new(Vec::with_capacity(capacity)),
+        });
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            test_publisher_config(8453),
+            writer.clone(),
+        ));
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "test_active",
+            )
+            .await?;
+        let service = test_service_with_publisher(8453, BroadcasterBackend::Native, publisher);
+        service.mark_upstream_connected().await;
+        Ok((service, writer))
+    }
+
+    #[derive(Debug)]
+    struct RecordStreamAppendsRedisWriter {
+        appends: Mutex<Vec<(u64, Option<u64>)>>,
+    }
+
+    impl RedisStreamWriter for RecordStreamAppendsRedisWriter {
+        fn promote<'a>(
+            &'a self,
+            _command: RedisPromotionCommand<'a>,
+        ) -> BoxFuture<'a, anyhow::Result<RedisPromotionResult>> {
+            Box::pin(async {
+                Ok(RedisPromotionResult {
+                    generation: 1,
+                    entry_id: "1-1".to_string(),
+                })
+            })
+        }
+
+        fn append_fenced<'a>(
+            &'a self,
+            command: RedisAppendCommand<'a>,
+        ) -> BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move {
+                self.appends
+                    .lock()
+                    .await
+                    .push((command.entry.message_seq, command.entry.block_number));
+                Ok(format!(
+                    "{}-{}",
+                    command.generation, command.entry.message_seq
+                ))
+            })
+        }
+
+        fn renew_writer<'a>(
+            &'a self,
+            _command: RedisRenewCommand<'a>,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     #[test]
     fn classifies_state_decoding_failure_messages() {

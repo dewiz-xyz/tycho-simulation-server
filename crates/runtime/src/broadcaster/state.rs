@@ -202,6 +202,11 @@ impl BroadcasterRecoverySource {
 }
 
 impl BroadcasterSnapshotSource {
+    pub(crate) fn relabel_generation(&mut self, chain_id: u64, generation: u64) {
+        self.stream_id = format_stream_id(chain_id, generation);
+        self.snapshot_id = format_snapshot_id(chain_id, generation);
+    }
+
     pub(crate) fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
         self.partitions
             .iter()
@@ -2870,7 +2875,11 @@ fn format_snapshot_id(chain_id: u64, generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use alloy_primitives::keccak256;
 
     use super::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
@@ -2886,7 +2895,7 @@ mod tests {
     use tycho_common::{
         dto::{ProtocolStateDelta as SimulationProtocolStateDelta, ResponseToken},
         models::{
-            blockchain::BlockAggregatedChanges,
+            blockchain::{BlockAggregatedChanges, EntryPoint},
             contract::{Account, AccountBalance, AccountDelta},
             protocol::{
                 ComponentBalance, ProtocolComponent as DtoProtocolComponent,
@@ -3428,6 +3437,167 @@ mod tests {
             with_tail.message.removed_components,
             message.message.removed_components
         );
+    }
+
+    #[test]
+    #[ignore = "fixed-input release performance probe"]
+    fn performance_raw_cache_compaction() -> Result<()> {
+        const WARMUP: usize = 100;
+        const ITERATIONS: usize = 1_000;
+        const EXPECTED_OUTPUT: &str =
+            "961d4b900cde3657b997b82f5edd8a491a55d3737a99009b998fad69f3034009";
+        let fixture = raw_compaction_performance_fixture();
+        for _ in 0..WARMUP {
+            let mut message = fixture.clone();
+            black_box(super::compact_raw_state_sync_message(&mut message));
+            black_box(message);
+        }
+        let mut messages = vec![fixture; ITERATIONS];
+        let mut stats = Vec::with_capacity(ITERATIONS);
+        let started = Instant::now();
+        for message in &mut messages {
+            stats.push(black_box(super::compact_raw_state_sync_message(black_box(
+                message,
+            ))));
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let expected_stats = super::RawCompactionStats {
+            folded_state_updates: 16,
+            folded_component_balances: 16,
+            folded_component_tvl: 16,
+            folded_account_updates: 12,
+            folded_account_balances: 8,
+            residual_entries: 56,
+        };
+        for (message, stats) in messages.iter().zip(stats) {
+            assert_eq!(stats, expected_stats);
+            assert_eq!(message.snapshots.states.len(), 16);
+            assert_eq!(message.snapshots.vm_storage.len(), 8);
+            let deltas = message
+                .deltas
+                .as_ref()
+                .ok_or_else(|| anyhow!("creation and tracing residue must remain"))?;
+            assert_eq!(deltas.account_deltas.len(), 4);
+            assert_eq!(deltas.account_balances.len(), 4);
+            assert_eq!(deltas.dci_update.new_entrypoints.len(), 16);
+            assert_eq!(deltas.dci_update.new_entrypoint_params.len(), 16);
+            assert_eq!(deltas.dci_update.trace_results.len(), 16);
+            assert!(deltas.deleted_protocol_components.is_empty());
+            assert!(deltas.new_protocol_components.is_empty());
+            let wire_message = BroadcasterProtocolMessage::new(
+                "vm:balancer_v2",
+                SynchronizerState::Ready(message.header.clone()),
+                message.clone(),
+            );
+            let mut canonical = serde_json::to_value(wire_message)?;
+            canonical.sort_all_objects();
+            let canonical = serde_json::to_vec(&canonical)?;
+            let hash = format!("{:x}", keccak256(canonical));
+            assert_eq!(hash, EXPECTED_OUTPUT);
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "scenario": "raw_cache_compaction", "warmup": WARMUP, "iterations": ITERATIONS,
+                "concurrency": 1, "elapsed_ns": elapsed_ns, "output_keccak256": EXPECTED_OUTPUT,
+            })
+        );
+        Ok(())
+    }
+
+    fn raw_compaction_performance_fixture() -> StateSyncMessage<BlockHeader> {
+        let token = DtoBytes::from([99u8; 20]);
+        let mut snapshot = Snapshot::default();
+        let mut changes = BlockAggregatedChanges::default();
+        for index in 0..32 {
+            let component_id = format!("component-{index:02}");
+            snapshot.states.insert(
+                component_id.clone(),
+                raw_component_with_state(&component_id, index),
+            );
+            changes.state_deltas.insert(
+                component_id.clone(),
+                component_state_delta(
+                    &component_id,
+                    [("version", DtoBytes::from([42u8; 32]))],
+                    ["large"],
+                ),
+            );
+            changes.component_balances.insert(
+                component_id.clone(),
+                HashMap::from([(
+                    token.clone(),
+                    component_balance(&component_id, token.clone(), 43),
+                )]),
+            );
+            changes.component_tvl.insert(component_id.clone(), 44.0);
+            changes.new_protocol_components.insert(
+                component_id.clone(),
+                raw_component(&component_id, "uniswap_v2", index),
+            );
+            let entrypoint_id = format!("entrypoint-{index:02}");
+            changes.dci_update.new_entrypoints.insert(
+                component_id.clone(),
+                HashSet::from([EntryPoint::new(
+                    entrypoint_id.clone(),
+                    token.clone(),
+                    "balanceOf(address)".to_string(),
+                )]),
+            );
+            changes
+                .dci_update
+                .new_entrypoint_params
+                .insert(entrypoint_id.clone(), HashSet::new());
+            changes
+                .dci_update
+                .trace_results
+                .insert(entrypoint_id, Default::default());
+            if index % 2 == 0 {
+                changes.deleted_protocol_components.insert(
+                    component_id.clone(),
+                    raw_component(&component_id, "uniswap_v2", index),
+                );
+            }
+        }
+        for index in 0..16 {
+            let address = DtoBytes::from([index; 20]);
+            snapshot.vm_storage.insert(
+                address.clone(),
+                raw_response_account(address.clone(), 8, 32),
+            );
+            let change = match index % 4 {
+                0 => ChangeType::Deletion,
+                1 => ChangeType::Creation,
+                _ => ChangeType::Update,
+            };
+            changes.account_deltas.insert(
+                address.clone(),
+                account_update(address.clone(), change, 7, Some(DtoBytes::from([41u8; 32]))),
+            );
+            changes.account_balances.insert(
+                address.clone(),
+                HashMap::from([(
+                    token.clone(),
+                    account_balance(address.clone(), token.clone(), 42),
+                )]),
+            );
+        }
+        changes
+            .dci_update
+            .new_entrypoint_params
+            .insert("orphan".to_string(), HashSet::new());
+        changes
+            .dci_update
+            .trace_results
+            .insert("orphan".to_string(), Default::default());
+        raw_protocol_message_with_changes(
+            "vm:balancer_v2",
+            20,
+            snapshot,
+            Some(changes),
+            HashMap::new(),
+        )
+        .message
     }
 
     #[test]

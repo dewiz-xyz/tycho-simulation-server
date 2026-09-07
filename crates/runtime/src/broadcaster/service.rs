@@ -2124,7 +2124,9 @@ async fn prepare_startup_snapshot_candidate(
     let worker = tokio::task::spawn_blocking(move || {
         let exports = captured
             .into_iter()
-            .map(|(cache, source, max_payload_bytes)| {
+            .map(|(cache, mut source, max_payload_bytes)| {
+                // Reserve generation ID growth before packing; promotion assigns the final IDs.
+                source.relabel_generation(chain_id, u64::MAX);
                 cache.export_snapshot_source(source, max_payload_bytes)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -5227,6 +5229,91 @@ mod tests {
             return Err(anyhow!("Redis stream entry payload should be progress"));
         };
         Ok(progress)
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_packing_reserves_generation_id_growth() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        cache
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        cache
+            .apply_update(&native_only_update(11, "native-2"))
+            .await?;
+        let export = cache.export_snapshot(usize::MAX).await?;
+        let mut full_chunk = export
+            .payloads
+            .iter()
+            .find_map(|payload| match payload {
+                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("fixture should export a chunk"))?;
+        assert_eq!(full_chunk.partitions[0].states.len(), 2);
+        let expected_states = serde_json::to_value(&full_chunk.partitions[0].states)?;
+        full_chunk.chunk_index = u32::MAX;
+        let max_payload_bytes = serde_json::to_vec(&BroadcasterEnvelope::new(
+            export.stream_id,
+            u64::MAX,
+            BroadcasterPayload::SnapshotChunk(full_chunk),
+        ))?
+        .len();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(ServiceFakeRedisWriter::default()),
+        ));
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            max_payload_bytes,
+            cache,
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        let candidate = super::prepare_startup_snapshot_candidate(std::slice::from_ref(&service))
+            .await?
+            .ok_or_else(|| anyhow!("ready cache should produce a candidate"))?;
+        assert!(candidate.snapshot_chunk_count > 1);
+        assert!(candidate.largest_payload_bytes_upper_bound <= max_payload_bytes);
+        let boundary = super::promote_prepared_startup_candidate(
+            std::slice::from_ref(&service),
+            candidate,
+            "test_active".to_string(),
+        )
+        .await?;
+        let artifact = service
+            .snapshot_artifact
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("promotion should install the snapshot artifact"))?;
+        assert_eq!(artifact.redis_replay_boundary, boundary);
+        assert_eq!(publisher.status_snapshot().await.mode, "active");
+        let mut actual_states = Vec::new();
+        for envelope in artifact.payloads.iter() {
+            assert!(serde_json::to_vec(envelope)?.len() <= max_payload_bytes);
+            assert_eq!(envelope.stream_id, boundary.stream_id);
+            match &envelope.payload {
+                BroadcasterPayload::SnapshotStart(start) => {
+                    assert_eq!(start.snapshot_id, boundary.snapshot_id)
+                }
+                BroadcasterPayload::SnapshotChunk(chunk) => {
+                    assert_eq!(chunk.snapshot_id, boundary.snapshot_id);
+                    actual_states.extend(
+                        chunk
+                            .partitions
+                            .iter()
+                            .flat_map(|partition| partition.states.clone()),
+                    );
+                }
+                BroadcasterPayload::SnapshotEnd(end) => {
+                    assert_eq!(end.snapshot_id, boundary.snapshot_id)
+                }
+                _ => return Err(anyhow!("artifact should contain only snapshot payloads")),
+            }
+        }
+        assert_eq!(serde_json::to_value(actual_states)?, expected_states);
+        Ok(())
     }
 
     #[test]

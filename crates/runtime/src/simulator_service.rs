@@ -744,12 +744,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::broadcaster::redis_subscription::BroadcasterSubscriptionControls;
     use crate::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
     use crate::models::tokens::TokenStore;
     use anyhow::{anyhow, Result};
+    use reqwest::{Client, StatusCode};
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterTokenDto, BroadcasterTokenLookupResponse,
         BroadcasterTokenSnapshotResponse,
@@ -761,8 +762,9 @@ mod tests {
 
     use super::{
         broadcaster_subscription_controls, broadcaster_subscription_plan, build_app_state,
-        create_stream_resources, enabled_broadcaster_subscription_backends, load_token_store,
-        subscription_readiness_stale, BroadcasterSubscriptionBackend,
+        create_stream_resources, enabled_broadcaster_subscription_backends,
+        load_broadcaster_token_snapshot_with_retry, load_token_store, subscription_readiness_stale,
+        BroadcasterSubscriptionBackend,
     };
 
     struct TokenAuthority {
@@ -1221,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_token_store_enforces_snapshot_startup_deadline() -> Result<()> {
+    async fn snapshot_retries_stop_at_startup_deadline() -> Result<()> {
         let token_address = Bytes::from([9_u8; 20]);
         let authority = TokenAuthority::spawn_with_options(
             vec![test_token(&token_address, Chain::Ethereum)],
@@ -1231,16 +1233,34 @@ mod tests {
             },
         )
         .await?;
-        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_url = authority.base_url.clone();
-        config.token_snapshot_timeout_ms = 20;
+        let client = Client::new();
+        let snapshot_url = format!("{}/tokens/snapshot", authority.base_url);
+        // Warm the request path so first-request setup does not consume the retry deadline.
+        let response = client
+            .get(&snapshot_url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        response.bytes().await?;
+        let initial_hits = authority.snapshot_hits.load(Ordering::SeqCst);
+        let deadline = Duration::from_millis(20);
+        let started_at = Instant::now();
 
-        let Err(error) = load_token_store(&config).await else {
-            anyhow::bail!("snapshot startup deadline should fail when retries never succeed");
-        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            load_broadcaster_token_snapshot_with_retry(
+                &client,
+                &snapshot_url,
+                Chain::Ethereum,
+                deadline,
+            ),
+        )
+        .await?;
 
-        assert!(error.to_string().contains("Timed out"));
-        assert!(authority.snapshot_hits.load(Ordering::SeqCst) >= 1);
+        assert!(result.is_err());
+        assert!(started_at.elapsed() >= deadline);
+        assert!(authority.snapshot_hits.load(Ordering::SeqCst) > initial_hits);
         Ok(())
     }
 

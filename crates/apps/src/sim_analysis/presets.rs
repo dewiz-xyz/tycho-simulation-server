@@ -75,6 +75,12 @@ const ETH_LARGE_AMOUNTS: &[&str] = &[
 ];
 
 const STABLE_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+const DAI_AMOUNTS: &[&str] = &[
+    "1000000000000000000",
+    "5000000000000000000",
+    "10000000000000000000",
+    "50000000000000000000",
+];
 const LINK_AMOUNTS: &[&str] = &[
     "1000000000000000000",
     "5000000000000000000",
@@ -147,13 +153,7 @@ fn base_balanced_profile() -> BalancedProfilePreset {
 
 fn ethereum_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
     vec![
-        scenario(
-            "stable-dai-usdc",
-            "DAI",
-            "USDC",
-            STABLE_AMOUNTS,
-            &["stables"],
-        ),
+        scenario("stable-dai-usdc", "DAI", "USDC", DAI_AMOUNTS, &["stables"]),
         scenario(
             "stable-usdc-usdt",
             "USDC",
@@ -201,13 +201,7 @@ fn ethereum_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
 
 fn ethereum_latency_scenarios() -> Vec<SimulateScenarioPreset> {
     vec![
-        scenario(
-            "latency-dai-usdc",
-            "DAI",
-            "USDC",
-            STABLE_AMOUNTS,
-            &["latency"],
-        ),
+        scenario("latency-dai-usdc", "DAI", "USDC", DAI_AMOUNTS, &["latency"]),
         scenario(
             "latency-steth-weth",
             "STETH",
@@ -227,13 +221,7 @@ fn ethereum_latency_scenarios() -> Vec<SimulateScenarioPreset> {
 
 fn ethereum_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     vec![
-        scenario(
-            "stress-dai-usdc",
-            "DAI",
-            "USDC",
-            STABLE_AMOUNTS,
-            &["stress"],
-        ),
+        scenario("stress-dai-usdc", "DAI", "USDC", DAI_AMOUNTS, &["stress"]),
         scenario(
             "stress-usdc-usdt",
             "USDC",
@@ -245,13 +233,13 @@ fn ethereum_stress_scenarios() -> Vec<SimulateScenarioPreset> {
 }
 
 const ETHEREUM_ENCODE_STABLE_AMOUNTS: &[&str] = &[
-    "1000000000000000000",
-    "5000000000000000000",
     "10000000000000000000",
     "50000000000000000000",
+    "100000000000000000000",
+    "500000000000000000000",
 ];
 
-const ETHEREUM_ENCODE_USDC_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+const ETHEREUM_ENCODE_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
 
 const ETH_SIMPLE_DAI_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
     share_bps: 0,
@@ -454,7 +442,9 @@ fn base_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     ]
 }
 
-const BASE_ENCODE_USDC_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+const BASE_ENCODE_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
+// The RFQ leg gets half the intermediate amount; leave room above Bebop's minimum quote size.
+const BASE_BEBOP_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
 
 const BASE_SIMPLE_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
     share_bps: 0,
@@ -577,7 +567,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "bebop-partial-fill-encode",
             EncodeRouteKind::BebopPartialFill,
             BASE_BEBOP_PARTIAL_FILL_USDC_WETH_USDC,
-            BASE_ENCODE_USDC_AMOUNTS,
+            BASE_BEBOP_USDC_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),

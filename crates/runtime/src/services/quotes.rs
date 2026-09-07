@@ -2677,9 +2677,11 @@ mod tests {
 
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
+    use std::hint::black_box;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Instant;
 
     use chrono::NaiveDateTime;
     use num_traits::Zero;
@@ -3711,6 +3713,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn partial_cancellation_pads_successful_quote_prefix() {
+        let fixture = BasicQuoteFixture::new();
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let runner = PoolSimulationRunner {
+            descriptor: PoolDescriptor {
+                id: "pool-cancelled-tail".to_string(),
+                name: "uniswap_v2".to_string(),
+                address: "0x0000000000000000000000000000000000000020".to_string(),
+                protocol: "uniswap_v2".to_string(),
+            },
+            pool_state: Arc::new(StrictPairTokenSim {
+                expected_sell: fixture.token_in_meta.address.clone(),
+                expected_buy: fixture.token_out_meta.address.clone(),
+                limit_calls: default_calls(),
+                quote_calls: Arc::clone(&quote_calls),
+            }),
+            token_in: Arc::new(fixture.token_in_meta),
+            token_out: Arc::new(fixture.token_out_meta),
+            amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(10u8)]),
+            slippage: SlippageConfig::default(),
+            expected_len: 2,
+            cancel_token: CancellationToken::new(),
+        };
+        let mut run = PoolQuoteAccumulator::new(runner.expected_len);
+        let (limit_max_in, limit_max_out) = runner.pool_limits();
+
+        // Drive the stages directly so cancellation follows one completed quote without
+        // depending on Rayon scheduling.
+        let first_quote = runner.quote_requested_amount(&runner.amounts[0]);
+        assert!(!runner.record_amount_quote(first_quote, limit_max_in.as_ref(), &mut run));
+        runner.cancel_token.cancel();
+        let cancelled_quote = runner.quote_requested_amount(&runner.amounts[1]);
+        assert!(runner.record_amount_quote(cancelled_quote, limit_max_in.as_ref(), &mut run));
+        let PoolSimOutcome::Simulated(result) =
+            runner.finish_quote_amounts(run, limit_max_in, limit_max_out);
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.amounts_out, ["1", "0"]);
+        assert_eq!(result.gas_used, [21_000, 0]);
+        assert_eq!(result.slippage, [1, 0]);
+        assert_eq!(result.successful_steps, 1);
+        assert_eq!(result.first_successful_gas_used, Some(21_000));
+        assert!(result.timed_out);
+        assert_eq!(result.errors, ["Cancelled"]);
+        assert_eq!(
+            classify_pool_outcome(&result, runner.expected_len),
+            Some((PoolOutcomeKind::TimedOut, Some("Cancelled".to_string())))
+        );
+    }
+
     #[tokio::test]
     async fn get_amounts_out_rejects_same_token_pair_invalid_request() {
         let token_store = make_token_store(Vec::new());
@@ -3799,6 +3852,60 @@ mod tests {
                 "Direct native/wrapped quotes are unsupported"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
+    async fn performance_quote_native_three_amounts() {
+        const WARMUP: usize = 100;
+        const ITERATIONS: usize = 1_000;
+        let fixture = BasicQuoteFixture::new();
+        install_basic_native_quote_pool(&fixture).await;
+        let state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+        let request = fixture.request("performance-native-three-amounts", &["1", "10", "100"]);
+        let requests = vec![request.clone(); ITERATIONS];
+        let mut outputs = Vec::with_capacity(ITERATIONS);
+        for _ in 0..WARMUP {
+            black_box(get_amounts_out(state.clone(), request.clone(), None).await);
+        }
+
+        let started = Instant::now();
+        for request in requests {
+            outputs.push(black_box(
+                get_amounts_out(state.clone(), request, None).await,
+            ));
+        }
+        let elapsed = started.elapsed();
+
+        for output in outputs {
+            assert_eq!(output.meta.status, QuoteStatus::Ready);
+            assert_eq!(output.meta.result_quality, QuoteResultQuality::Complete);
+            assert!(output.meta.failures.is_empty());
+            assert_eq!(output.responses.len(), 1);
+            let response = &output.responses[0];
+            assert_eq!(response.pool, "pool-basic-ready");
+            assert_eq!(response.amounts_out, ["1", "10", "100"]);
+            assert_eq!(response.gas_used, [21_000; 3]);
+            assert_eq!(response.slippage, [1; 3]);
+            assert_eq!(response.limit_max_in.as_deref(), Some("1000000"));
+            assert_eq!(response.block_number, 1);
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "scenario": "quote_native_three_amounts",
+                "warmup": WARMUP,
+                "iterations": ITERATIONS,
+                "concurrency": 1,
+                "elapsed_ns": elapsed.as_nanos(),
+            })
+        );
     }
 
     #[tokio::test]
