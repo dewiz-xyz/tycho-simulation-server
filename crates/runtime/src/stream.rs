@@ -83,10 +83,39 @@ pub struct BroadcasterStreamControls {
 }
 
 impl BroadcasterStreamControls {
-    async fn mark_disconnected(&self, reason: &str, last_error: Option<String>) {
+    async fn wait_until_resumed(&self) -> bool {
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => false,
+            () = self.service.wait_for_shared_publisher_resume() => true,
+        }
+    }
+
+    async fn prepare_restart(
+        &self,
+        exit: &StreamExit,
+        memory: MemoryConfig,
+        retired_message: &'static str,
+    ) -> bool {
         self.service
-            .mark_stream_disconnected(reason, last_error)
+            .mark_stream_disconnected(exit.reason.as_str(), exit.last_error.clone())
             .await;
+        if self.service.redis_publisher_is_retired().await {
+            error!(event = "broadcaster_writer_fence_lost", "{retired_message}");
+            return false;
+        }
+        maybe_purge_allocator("broadcaster_restart", memory);
+        true
+    }
+
+    async fn wait_backoff(&self, backoff: &mut Duration, backoff_ms: u64, max: Duration) -> bool {
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => return false,
+            () = sleep(Duration::from_millis(backoff_ms)) => {}
+        }
+        *backoff = next_backoff(*backoff, max);
+        true
     }
 
     async fn mark_disconnected_for_exit(&self, reason: &str, last_error: Option<String>) {
@@ -96,17 +125,10 @@ impl BroadcasterStreamControls {
     }
 }
 
-enum StreamMessage {
+enum StreamMessage<T> {
     Stale,
     Ended,
-    Update(TychoUpdate),
-    Error(String),
-}
-
-enum BroadcasterRawStreamMessage {
-    Stale,
-    Ended,
-    Update(FeedMessage<BlockHeader>),
+    Update(T),
     Error(String),
 }
 
@@ -142,7 +164,7 @@ pub async fn process_broadcaster_stream(
             () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
                 return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
             }
-            message = next_stream_message(StreamKind::Broadcaster, &mut stream, &health, &cfg) => {
+            message = next_stream_message(&mut stream, &health, &cfg) => {
                 message
             }
         };
@@ -204,20 +226,16 @@ pub async fn process_broadcaster_raw_stream(
             }
         };
         match message {
-            BroadcasterRawStreamMessage::Stale => {
-                return stream_exit(StreamRestartReason::Stale, None)
-            }
-            BroadcasterRawStreamMessage::Ended => {
-                return stream_exit(StreamRestartReason::Ended, None)
-            }
-            BroadcasterRawStreamMessage::Error(err_msg) => {
+            StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
+            StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
+            StreamMessage::Error(err_msg) => {
                 if let Some(exit) =
                     handle_stream_error(StreamKind::Broadcaster, err_msg, &health, &cfg).await
                 {
                     return exit;
                 }
             }
-            BroadcasterRawStreamMessage::Update(update) => {
+            StreamMessage::Update(update) => {
                 if let Some(exit) =
                     handle_broadcaster_raw_update(update, service, &health, &cfg, &mut ready_logged)
                         .await
@@ -230,14 +248,13 @@ pub async fn process_broadcaster_raw_stream(
 }
 
 async fn next_stream_message(
-    kind: StreamKind,
     stream: &mut (impl futures::Stream<
         Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
     > + Unpin
               + Send),
     health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
-) -> StreamMessage {
+) -> StreamMessage<TychoUpdate> {
     let has_received_update = health.has_received_update().await;
     let stream_timeout = if has_received_update {
         cfg.stream_stale
@@ -247,33 +264,23 @@ async fn next_stream_message(
 
     match timeout(stream_timeout, stream.next()).await {
         Err(_) => {
-            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-            let last_block = health.last_block().await;
-            warn!(
-                event = "stream_stale",
-                stream = kind.as_str(),
-                started_age_ms,
+            log_stream_termination(
+                health,
                 has_received_update,
-                last_update_age_ms,
-                last_block,
-                "Stream stale; triggering restart"
-            );
+                "stream_stale",
+                "Stream stale; triggering restart",
+            )
+            .await;
             StreamMessage::Stale
         }
         Ok(None) => {
-            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-            let last_block = health.last_block().await;
-            warn!(
-                event = "stream_ended",
-                stream = kind.as_str(),
-                started_age_ms,
+            log_stream_termination(
+                health,
                 has_received_update,
-                last_update_age_ms,
-                last_block,
-                "Stream ended unexpectedly"
-            );
+                "stream_ended",
+                "Stream ended unexpectedly",
+            )
+            .await;
             StreamMessage::Ended
         }
         Ok(Some(Ok(update))) => StreamMessage::Update(update),
@@ -288,7 +295,7 @@ async fn next_broadcaster_raw_stream_message(
               + Send),
     health: &StreamHealth,
     cfg: &StreamSupervisorConfig,
-) -> BroadcasterRawStreamMessage {
+) -> StreamMessage<FeedMessage<BlockHeader>> {
     let last_progress_age = health.last_update_age_ms().await.map(Duration::from_millis);
     let progress_age = if let Some(age) = last_progress_age {
         age
@@ -296,44 +303,103 @@ async fn next_broadcaster_raw_stream_message(
         Duration::from_millis(health.started_age_ms().await.unwrap_or_default())
     };
     if progress_age >= cfg.readiness_stale {
-        return BroadcasterRawStreamMessage::Stale;
+        return StreamMessage::Stale;
     }
     let stream_timeout = cfg.readiness_stale.saturating_sub(progress_age);
     let has_received_update = health.has_received_update().await;
 
     match timeout(stream_timeout, stream.next()).await {
         Err(_) => {
-            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-            let last_block = health.last_block().await;
-            warn!(
-                event = "stream_stale",
-                stream = StreamKind::Broadcaster.as_str(),
-                started_age_ms,
+            log_stream_termination(
+                health,
                 has_received_update,
-                last_update_age_ms,
-                last_block,
-                "Raw broadcaster stream stale; triggering restart"
-            );
-            BroadcasterRawStreamMessage::Stale
+                "stream_stale",
+                "Raw broadcaster stream stale; triggering restart",
+            )
+            .await;
+            StreamMessage::Stale
         }
         Ok(None) => {
-            let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-            let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-            let last_block = health.last_block().await;
-            warn!(
-                event = "stream_ended",
-                stream = StreamKind::Broadcaster.as_str(),
-                started_age_ms,
+            log_stream_termination(
+                health,
                 has_received_update,
-                last_update_age_ms,
-                last_block,
-                "Raw broadcaster stream ended unexpectedly"
-            );
-            BroadcasterRawStreamMessage::Ended
+                "stream_ended",
+                "Raw broadcaster stream ended unexpectedly",
+            )
+            .await;
+            StreamMessage::Ended
         }
-        Ok(Some(Ok(update))) => BroadcasterRawStreamMessage::Update(update),
-        Ok(Some(Err(err))) => BroadcasterRawStreamMessage::Error(err.to_string()),
+        Ok(Some(Ok(update))) => StreamMessage::Update(update),
+        Ok(Some(Err(err))) => StreamMessage::Error(err.to_string()),
+    }
+}
+
+async fn log_stream_termination(
+    health: &StreamHealth,
+    has_received_update: bool,
+    event: &'static str,
+    message: &'static str,
+) {
+    let started_age_ms = health.started_age_ms().await.unwrap_or(0);
+    let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
+    let last_block = health.last_block().await;
+    warn!(
+        event,
+        stream = StreamKind::Broadcaster.as_str(),
+        started_age_ms,
+        has_received_update,
+        last_update_age_ms,
+        last_block,
+        "{message}"
+    );
+}
+
+async fn check_advanced_state(
+    has_advanced: bool,
+    now: Instant,
+    health: &StreamHealth,
+    grace: Duration,
+) -> Option<StreamExit> {
+    if !has_advanced {
+        health.clear_advanced().await;
+        return None;
+    }
+    let advanced = health.record_advanced(now).await;
+    if advanced.window_started {
+        info!(
+            event = "stream_advanced",
+            stream = StreamKind::Broadcaster.as_str(),
+            advanced_total = advanced.total_count,
+            burst_count = advanced.burst_count,
+            window_secs = grace.as_secs(),
+            "Advanced synchronizer state detected"
+        );
+    }
+    (advanced.elapsed >= grace).then(|| {
+        stream_exit(
+            StreamRestartReason::Advanced,
+            Some("advanced_state_grace_exceeded".to_string()),
+        )
+    })
+}
+
+async fn log_broadcaster_ready(
+    service: &BroadcasterServiceState,
+    ready_logged: &mut bool,
+    block_number: u64,
+) {
+    if *ready_logged {
+        return;
+    }
+    let status = service.status_snapshot().await;
+    if status.snapshot.ready {
+        info!(
+            stream = StreamKind::Broadcaster.as_str(),
+            block = block_number,
+            total_pairs = status.snapshot.total_states,
+            "Broadcaster ready: snapshot cache is bootstrapped"
+        );
+        *ready_logged = true;
     }
 }
 
@@ -350,26 +416,8 @@ async fn handle_broadcaster_update(
         .values()
         .any(|state| matches!(state, SynchronizerState::Advanced(_)));
 
-    if has_advanced {
-        let advanced = health.record_advanced(now).await;
-        if advanced.window_started {
-            info!(
-                event = "stream_advanced",
-                stream = StreamKind::Broadcaster.as_str(),
-                advanced_total = advanced.total_count,
-                burst_count = advanced.burst_count,
-                window_secs = cfg.resync_grace.as_secs(),
-                "Advanced synchronizer state detected"
-            );
-        }
-        if advanced.elapsed >= cfg.resync_grace {
-            return Some(stream_exit(
-                StreamRestartReason::Advanced,
-                Some("advanced_state_grace_exceeded".to_string()),
-            ));
-        }
-    } else {
-        health.clear_advanced().await;
+    if let Some(exit) = check_advanced_state(has_advanced, now, health, cfg.resync_grace).await {
+        return Some(exit);
     }
 
     let block_number = update.block_number_or_timestamp;
@@ -407,18 +455,7 @@ async fn handle_broadcaster_update(
         "Broadcaster update processed"
     );
 
-    if !*ready_logged {
-        let status = service.status_snapshot().await;
-        if status.snapshot.ready {
-            info!(
-                stream = StreamKind::Broadcaster.as_str(),
-                block = block_number,
-                total_pairs = status.snapshot.total_states,
-                "Broadcaster ready: snapshot cache is bootstrapped"
-            );
-            *ready_logged = true;
-        }
-    }
+    log_broadcaster_ready(service, ready_logged, block_number).await;
 
     None
 }
@@ -444,26 +481,8 @@ async fn handle_broadcaster_raw_update(
         .values()
         .any(|state| matches!(state, SynchronizerState::Advanced(_)));
 
-    if has_advanced {
-        let advanced = health.record_advanced(now).await;
-        if advanced.window_started {
-            info!(
-                event = "stream_advanced",
-                stream = StreamKind::Broadcaster.as_str(),
-                advanced_total = advanced.total_count,
-                burst_count = advanced.burst_count,
-                window_secs = cfg.resync_grace.as_secs(),
-                "Advanced synchronizer state detected"
-            );
-        }
-        if advanced.elapsed >= cfg.resync_grace {
-            return Some(stream_exit(
-                StreamRestartReason::Advanced,
-                Some("advanced_state_grace_exceeded".to_string()),
-            ));
-        }
-    } else {
-        health.clear_advanced().await;
+    if let Some(exit) = check_advanced_state(has_advanced, now, health, cfg.resync_grace).await {
+        return Some(exit);
     }
 
     let block_number = broadcaster_raw_block_number(&update);
@@ -518,18 +537,7 @@ async fn handle_broadcaster_raw_update(
         "Raw broadcaster update processed"
     );
 
-    if !*ready_logged {
-        let status = service.status_snapshot().await;
-        if status.snapshot.ready {
-            info!(
-                stream = StreamKind::Broadcaster.as_str(),
-                block = block_number,
-                total_pairs = status.snapshot.total_states,
-                "Broadcaster ready: snapshot cache is bootstrapped"
-            );
-            *ready_logged = true;
-        }
-    }
+    log_broadcaster_ready(service, ready_logged, block_number).await;
 
     None
 }
@@ -603,6 +611,50 @@ async fn handle_stream_error(
     None
 }
 
+async fn build_stream_with_retry<F, Fut, S>(
+    build_stream: &F,
+    controls: &BroadcasterStreamControls,
+    cfg: &StreamSupervisorConfig,
+    backoff: &mut Duration,
+    failure_message: &'static str,
+) -> Option<(S, u64)>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
+{
+    while controls.wait_until_resumed().await {
+        let pause_epoch = controls.service.shared_publisher_pause_epoch();
+        let built_stream = tokio::select! {
+            biased;
+            () = controls.stop.cancelled() => return None,
+            result = build_stream() => result,
+        };
+        match built_stream {
+            Ok(stream) => {
+                controls.service.mark_upstream_connected().await;
+                return Some((stream, pause_epoch));
+            }
+            Err(err) => {
+                controls.service.mark_build_failed(err.to_string()).await;
+                warn!(
+                    event = "stream_build_failed",
+                    stream = StreamKind::Broadcaster.as_str(),
+                    error = %err,
+                    "{failure_message}"
+                );
+            }
+        }
+        let backoff_ms = jittered_backoff_ms(*backoff, cfg.restart_backoff_jitter_pct);
+        if !controls
+            .wait_backoff(backoff, backoff_ms, cfg.restart_backoff_max)
+            .await
+        {
+            return None;
+        }
+    }
+    None
+}
+
 pub async fn supervise_broadcaster_stream<F, Fut, S>(
     build_stream: F,
     health: Arc<StreamHealth>,
@@ -619,39 +671,16 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            () = controls.service.wait_for_shared_publisher_resume() => {}
-        }
-        let pause_epoch = controls.service.shared_publisher_pause_epoch();
-        let built_stream = tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            result = build_stream() => result,
-        };
-        let stream = match built_stream {
-            Ok(stream) => {
-                controls.service.mark_upstream_connected().await;
-                stream
-            }
-            Err(err) => {
-                controls.service.mark_build_failed(err.to_string()).await;
-                warn!(
-                    event = "stream_build_failed",
-                    stream = StreamKind::Broadcaster.as_str(),
-                    error = %err,
-                    "Failed to build broadcaster stream"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                tokio::select! {
-                    biased;
-                    () = controls.stop.cancelled() => return,
-                    () = sleep(Duration::from_millis(backoff_ms)) => {}
-                }
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
-                continue;
-            }
+        let Some((stream, pause_epoch)) = build_stream_with_retry(
+            &build_stream,
+            &controls,
+            &cfg,
+            &mut backoff,
+            "Failed to build broadcaster stream",
+        )
+        .await
+        else {
+            return;
         };
 
         let exit = process_broadcaster_stream(
@@ -692,24 +721,23 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
             "Restarting broadcaster stream"
         );
 
-        controls
-            .mark_disconnected(exit.reason.as_str(), exit.last_error.clone())
-            .await;
-        if controls.service.redis_publisher_is_retired().await {
-            error!(
-                event = "broadcaster_writer_fence_lost",
-                "Broadcaster feed supervisor is terminating after writer fencing loss"
-            );
+        if !controls
+            .prepare_restart(
+                &exit,
+                cfg.memory,
+                "Broadcaster feed supervisor is terminating after writer fencing loss",
+            )
+            .await
+        {
             return;
         }
-        maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
-        tokio::select! {
-            biased;
-            () = controls.stop.cancelled() => return,
-            () = sleep(Duration::from_millis(backoff_ms)) => {}
+        if !controls
+            .wait_backoff(&mut backoff, backoff_ms, cfg.restart_backoff_max)
+            .await
+        {
+            return;
         }
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
     }
 }
 
@@ -840,12 +868,7 @@ fn classify_stream_error(message: &str) -> &'static str {
 }
 
 fn next_backoff(current: Duration, max: Duration) -> Duration {
-    let doubled = current.saturating_mul(2);
-    if doubled > max {
-        max
-    } else {
-        doubled
-    }
+    current.saturating_mul(2).min(max)
 }
 
 fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
@@ -879,8 +902,8 @@ mod tests {
 
     use super::{
         classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterRawStreamMessage, BroadcasterStreamControls,
-        StreamKind, StreamMessage, StreamRestartReason, StreamSupervisorConfig,
+        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls, StreamMessage, StreamRestartReason,
+        StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -910,8 +933,7 @@ mod tests {
         advance(Duration::from_secs(6)).await;
         let started = Instant::now();
         let mut decoded = futures::stream::pending();
-        let message =
-            super::next_stream_message(StreamKind::Broadcaster, &mut decoded, &health, &cfg).await;
+        let message = super::next_stream_message(&mut decoded, &health, &cfg).await;
         assert!(matches!(message, StreamMessage::Stale));
         assert_eq!(started.elapsed(), Duration::from_secs(2));
 
@@ -919,7 +941,7 @@ mod tests {
         health.record_progress(42).await;
         let mut raw = futures::stream::pending();
         let message = super::next_broadcaster_raw_stream_message(&mut raw, &health, &cfg).await;
-        assert!(matches!(message, BroadcasterRawStreamMessage::Stale));
+        assert!(matches!(message, StreamMessage::Stale));
         assert_eq!(started.elapsed(), Duration::from_secs(4));
     }
 

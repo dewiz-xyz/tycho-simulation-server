@@ -1145,6 +1145,10 @@ fn apply_raw_update_message(
     Ok(())
 }
 
+#[expect(
+    clippy::excessive_nesting,
+    reason = "Backend, protocol and account reconciliation retains the conflicting peer identity in errors"
+)]
 fn validate_raw_update_message(
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     update: &BroadcasterUpdateMessage,
@@ -1170,23 +1174,24 @@ fn validate_raw_update_message(
                             && message.message.header.number == incoming.message.header.number
                     })
                 {
-                    if let Some(existing_account) =
+                    let Some(existing_account) =
                         existing.message.snapshots.vm_storage.get(&address)
-                    {
-                        projected = merge_projected_vm_accounts(
-                            projected,
-                            ProjectedVmAccount::Materialized(Some(existing_account.clone())),
-                            &address,
-                            incoming.message.header.number,
+                    else {
+                        continue;
+                    };
+                    projected = merge_projected_vm_accounts(
+                        projected,
+                        ProjectedVmAccount::Materialized(Some(existing_account.clone())),
+                        &address,
+                        incoming.message.header.number,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "while reconciling VM protocols {} and {}: {error:#}",
+                            incoming.protocol,
+                            existing.protocol
                         )
-                        .map_err(|error| {
-                            anyhow!(
-                                "while reconciling VM protocols {} and {}: {error:#}",
-                                incoming.protocol,
-                                existing.protocol
-                            )
-                        })?;
-                    }
+                    })?;
                 }
                 let key = (incoming.message.header.number, address.clone());
                 if let Some((protocol, previous)) = projected_by_block_and_address.get_mut(&key) {
@@ -1323,7 +1328,7 @@ fn project_vm_account(
         };
     }
 
-    let mut account = incoming
+    let account = incoming
         .message
         .snapshots
         .vm_storage
@@ -1344,12 +1349,12 @@ fn project_vm_account(
                     })
             })
         });
-    if let Some(account) = account.as_mut() {
+    if let Some(mut account) = account {
         if let Some(update) = update.cloned() {
-            fold_account_update_into_snapshot(account, update);
+            fold_account_update_into_snapshot(&mut account, update);
         }
         account.token_balances.extend(balances);
-        ProjectedVmAccount::Materialized(Some(account.clone()))
+        ProjectedVmAccount::Materialized(Some(account))
     } else {
         ProjectedVmAccount::Residual {
             update: update.cloned(),
@@ -1821,10 +1826,6 @@ fn compact_raw_state_sync_message(
     stats
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the accumulator applies one BlockAggregatedChanges transaction in field order"
-)]
 fn fold_block_changes_into_snapshot(
     snapshots: &mut Snapshot,
     deltas: &mut BlockAggregatedChanges,
@@ -1834,20 +1835,14 @@ fn fold_block_changes_into_snapshot(
     // Tokens come from /tokens/snapshot before the consumer builds its decoder.
     deltas.new_tokens.clear();
 
-    let deleted_component_ids = deltas
-        .deleted_protocol_components
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    for component_id in &deleted_component_ids {
-        snapshots.states.remove(component_id);
-        deltas.state_deltas.remove(component_id);
-        deltas.component_balances.remove(component_id);
-        deltas.component_tvl.remove(component_id);
-        deltas.new_protocol_components.remove(component_id);
-        deltas.dci_update.new_entrypoints.remove(component_id);
+    for component_id in std::mem::take(&mut deltas.deleted_protocol_components).into_keys() {
+        snapshots.states.remove(&component_id);
+        deltas.state_deltas.remove(&component_id);
+        deltas.component_balances.remove(&component_id);
+        deltas.component_tvl.remove(&component_id);
+        deltas.new_protocol_components.remove(&component_id);
+        deltas.dci_update.new_entrypoints.remove(&component_id);
     }
-    deltas.deleted_protocol_components.clear();
     deltas
         .new_protocol_components
         .retain(|component_id, _| !snapshots.states.contains_key(component_id));
@@ -1883,19 +1878,10 @@ fn fold_block_changes_into_snapshot(
         false
     });
 
-    let deleted_accounts = deltas
-        .account_deltas
-        .iter()
-        .filter_map(|(address, update)| {
-            matches!(update.change_type(), ChangeType::Deletion).then_some(address.clone())
-        })
-        .collect::<Vec<_>>();
-    for address in &deleted_accounts {
-        snapshots.vm_storage.remove(address);
-        deltas.account_balances.remove(address);
-    }
     deltas.account_deltas.retain(|address, update| {
         if matches!(update.change_type(), ChangeType::Deletion) {
+            snapshots.vm_storage.remove(address);
+            deltas.account_balances.remove(address);
             stats.folded_account_updates += 1;
             return false;
         }
@@ -1925,11 +1911,7 @@ fn fold_block_changes_into_snapshot(
         .dci_update
         .new_entrypoints
         .values()
-        .flat_map(|entrypoints| {
-            entrypoints
-                .iter()
-                .map(|entrypoint| entrypoint.external_id.clone())
-        })
+        .flat_map(|entrypoints| entrypoints.iter().map(|entrypoint| &entrypoint.external_id))
         .collect::<HashSet<_>>();
     deltas
         .dci_update
@@ -2889,8 +2871,8 @@ mod tests {
     use num_bigint::BigUint;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk,
-        BroadcasterSubscriptionEvent, BroadcasterSubscriptionTracker,
+        BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk, BroadcasterSubscriptionEvent,
+        BroadcasterSubscriptionTracker,
     };
     use tycho_common::{
         dto::{ProtocolStateDelta as SimulationProtocolStateDelta, ResponseToken},
@@ -5815,15 +5797,5 @@ mod tests {
                 Some("build_failed")
             );
         });
-    }
-
-    #[test]
-    fn sync_status_clone_keeps_repo_owned_shape() {
-        let status = BroadcasterProtocolSyncStatus {
-            kind: BroadcasterProtocolSyncStatusKind::Ready,
-            block: None,
-            reason: None,
-        };
-        assert_eq!(status.kind, BroadcasterProtocolSyncStatusKind::Ready);
     }
 }

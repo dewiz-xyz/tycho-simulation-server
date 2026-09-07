@@ -1921,7 +1921,10 @@ mod tests {
         use super::*;
 
         #[test]
-        #[expect(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "The replay must return the expected gap or integrity error before its details are asserted"
+        )]
         fn lineage_break_is_a_hard_error() {
             let rows = vec![
                 block_time_row(100, "block-100", "block-99"),
@@ -1937,7 +1940,10 @@ mod tests {
         }
 
         #[test]
-        #[expect(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "The replay must return the expected gap or integrity error before its details are asserted"
+        )]
         fn missing_end_plus_one_names_the_head_problem() {
             let error =
                 require_block_time(None, RequiredBlockTime::EndPlusOne { block_number: 111 })
@@ -1985,7 +1991,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The valid fixture must decode before its raw payload and backend projection are asserted"
+    )]
     fn stored_delta_keeps_raw_payload_and_lists_only_in_range_backends() {
         let request = RangeRequest::new(8453, 100, 100, vec![Backend::Native, Backend::Vm])
             .expect("test request should be valid");
@@ -2092,7 +2101,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn boundary_checkpoint_after_first_generation_delta_reports_missing_head_span() {
         let boundary = manifest(
             2,
@@ -2297,7 +2309,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn boundary_past_native_end_breaks_before_selected_rfq_delta() {
         let request = RangeRequest::new(8453, 100, 110, vec![Backend::Native, Backend::Rfq])
             .expect("test request should be valid")
@@ -2359,7 +2374,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn boundary_past_rfq_end_breaks_before_selected_native_delta() {
         let request = RangeRequest::new(8453, 100, 110, vec![Backend::Native, Backend::Rfq])
             .expect("test request should be valid")
@@ -2408,7 +2426,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn checkpoint_failure_position_breaks_rfq_replay_without_manifest() {
         let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
             .expect("test request should be valid")
@@ -2450,7 +2471,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn merged_checkpoint_failure_span_breaks_rfq_replay_without_manifest() {
         let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
             .expect("test request should be valid")
@@ -2492,7 +2516,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn anchor_straddling_checkpoint_failure_span_breaks_at_first_post_anchor_position() {
         let request = RangeRequest::new(8453, 100, 100, vec![Backend::Rfq])
             .expect("test request should be valid")
@@ -2708,7 +2735,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn bounded_gap_between_anchor_and_request_start_fails_the_range() {
         let (legs, gaps) = build_legs(
             manifest(
@@ -2772,7 +2802,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn boundary_missing_requested_backend_does_not_anchor_a_leg() {
         let mut anchor = manifest(
             1,
@@ -2814,7 +2847,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn boundary_slip_inside_previous_leg_fails_the_range() {
         let boundary = manifest(
             1,
@@ -2867,7 +2903,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn recorded_gap_without_surviving_deltas_fails_checkpoint_covered_range() {
         let (legs, gaps) = build_legs(
             manifest(
@@ -2902,7 +2941,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn fully_dropped_generation_gap_surfaces_between_replay_legs() {
         let generation_three_boundary = manifest(
             3,
@@ -3004,7 +3046,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn trailing_failed_boundary_reports_single_position_checkpoint_gap() {
         let (legs, gaps) = build_legs(
             manifest(
@@ -3052,7 +3097,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     fn ensure_gap_free_preserves_kinds() {
         let plan = RangePlan {
             legs: vec![],
@@ -3959,7 +4007,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     async fn resolve_range_surfaces_unbounded_boundary_gap_without_surviving_deltas(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -4019,7 +4070,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     async fn resolve_range_surfaces_recovery_discard_before_request_start(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -4087,7 +4141,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     async fn resolve_rfq_range_breaks_at_block_bounded_checkpoint_failure(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -4149,7 +4206,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must return the expected gap or integrity error before its details are asserted"
+    )]
     async fn resolve_rfq_range_breaks_at_anchor_straddling_checkpoint_failure(
         pool: PgPool,
     ) -> anyhow::Result<()> {
@@ -4211,7 +4271,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The replay must resolve successfully before its generation boundary and leg contents are asserted"
+    )]
     async fn resolve_range_replays_across_a_promotion(pool: PgPool) -> anyhow::Result<()> {
         const BUCKET: &str = "state-history-reader-test";
 
@@ -4292,13 +4355,19 @@ mod tests {
         Ok(())
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn request(start_block: u64, end_block: u64) -> RangeRequest {
         RangeRequest::new(8453, start_block, end_block, vec![Backend::Native])
             .expect("test request should be valid")
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn delta(generation: u64, message_seq: u64, block_number: u64) -> DeltaRow {
         DeltaRow {
             position: position(generation, message_seq),
@@ -4316,7 +4385,10 @@ mod tests {
         }
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn rfq_delta(generation: u64, message_seq: u64, observed_at_ms: u64) -> DeltaRow {
         DeltaRow {
             position: position(generation, message_seq),

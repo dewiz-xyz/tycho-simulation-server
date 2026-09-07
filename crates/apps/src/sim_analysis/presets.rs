@@ -74,7 +74,7 @@ const ETH_LARGE_AMOUNTS: &[&str] = &[
     "2000000000000000000",
 ];
 
-const STABLE_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+const USDC_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
 const DAI_AMOUNTS: &[&str] = &[
     "1000000000000000000",
     "5000000000000000000",
@@ -158,16 +158,10 @@ fn ethereum_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             "stable-usdc-usdt",
             "USDC",
             "USDT",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["stables"],
         ),
-        rfq_scenario(
-            "rfq-usdc-weth",
-            "USDC",
-            "WETH",
-            STABLE_AMOUNTS,
-            &["stables"],
-        ),
+        rfq_scenario("rfq-usdc-weth", "USDC", "WETH", USDC_AMOUNTS, &["stables"]),
         rfq_scenario(
             "rfq-weth-usdc",
             "WETH",
@@ -226,20 +220,21 @@ fn ethereum_stress_scenarios() -> Vec<SimulateScenarioPreset> {
             "stress-usdc-usdt",
             "USDC",
             "USDT",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["stress"],
         ),
     ]
 }
 
-const ETHEREUM_ENCODE_STABLE_AMOUNTS: &[&str] = &[
+const DAI_ENCODE_AMOUNTS: &[&str] = &[
     "10000000000000000000",
     "50000000000000000000",
     "100000000000000000000",
     "500000000000000000000",
 ];
 
-const ETHEREUM_ENCODE_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
+// The RFQ leg gets half the intermediate amount; leave room above Bebop's minimum quote size.
+const USDC_ENCODE_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
 
 const ETH_SIMPLE_DAI_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
     share_bps: 0,
@@ -294,7 +289,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "simple-dai-usdc",
             EncodeRouteKind::Simple,
             ETH_SIMPLE_DAI_USDC,
-            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            DAI_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -302,7 +297,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "simple-usdc-usdt",
             EncodeRouteKind::Simple,
             ETH_SIMPLE_USDC_USDT,
-            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -310,7 +305,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "simple-usdc-weth",
             EncodeRouteKind::Simple,
             ETH_SIMPLE_USDC_WETH,
-            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -318,7 +313,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "multi-dai-usdc-usdt",
             EncodeRouteKind::Multi,
             ETH_MULTI_DAI_USDC_USDT,
-            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            DAI_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -334,7 +329,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "multi-dai-usdc-weth",
             EncodeRouteKind::Multi,
             ETH_MULTI_DAI_USDC_WETH,
-            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            DAI_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -342,7 +337,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "mega-dai-usdc",
             EncodeRouteKind::Mega,
             ETH_MEGA_DAI_USDC,
-            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            DAI_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -350,7 +345,7 @@ fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
             "mega-usdc-weth",
             EncodeRouteKind::Mega,
             ETH_MEGA_USDC_WETH,
-            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -363,7 +358,7 @@ fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             "stable-usdc-weth",
             "USDC",
             "WETH",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["base-core"],
         ),
         rfq_scenario(
@@ -391,7 +386,7 @@ fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             "governance-usdc-aero",
             "USDC",
             "AERO",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["governance"],
         ),
     ]
@@ -403,7 +398,7 @@ fn base_latency_scenarios() -> Vec<SimulateScenarioPreset> {
             "latency-usdc-weth",
             "USDC",
             "WETH",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["latency"],
         ),
         scenario(
@@ -429,7 +424,7 @@ fn base_stress_scenarios() -> Vec<SimulateScenarioPreset> {
             "stress-usdc-weth",
             "USDC",
             "WETH",
-            STABLE_AMOUNTS,
+            USDC_AMOUNTS,
             &["stress"],
         ),
         scenario(
@@ -441,10 +436,6 @@ fn base_stress_scenarios() -> Vec<SimulateScenarioPreset> {
         ),
     ]
 }
-
-const BASE_ENCODE_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
-// The RFQ leg gets half the intermediate amount; leave room above Bebop's minimum quote size.
-const BASE_BEBOP_USDC_AMOUNTS: &[&str] = &["10000000", "50000000", "100000000", "500000000"];
 
 const BASE_SIMPLE_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
     share_bps: 0,
@@ -503,7 +494,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "simple-usdc-weth",
             EncodeRouteKind::Simple,
             BASE_SIMPLE_USDC_WETH,
-            BASE_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -519,7 +510,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "simple-usdc-aero",
             EncodeRouteKind::Simple,
             BASE_SIMPLE_USDC_AERO,
-            BASE_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -527,7 +518,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "multi-usdc-weth-usdc",
             EncodeRouteKind::Multi,
             BASE_MULTI_USDC_WETH_USDC,
-            BASE_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -551,7 +542,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "mega-usdc-weth",
             EncodeRouteKind::Mega,
             BASE_MEGA_USDC_WETH,
-            BASE_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -559,7 +550,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "mega-usdc-aero",
             EncodeRouteKind::Mega,
             BASE_MEGA_USDC_AERO,
-            BASE_ENCODE_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -567,7 +558,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "bebop-partial-fill-encode",
             EncodeRouteKind::BebopPartialFill,
             BASE_BEBOP_PARTIAL_FILL_USDC_WETH_USDC,
-            BASE_BEBOP_USDC_AMOUNTS,
+            USDC_ENCODE_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -645,7 +636,7 @@ fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_profile, EncodeRouteKind, LINK_AMOUNTS, STABLE_AMOUNTS};
+    use super::{balanced_profile, EncodeRouteKind, LINK_AMOUNTS, USDC_AMOUNTS};
 
     #[test]
     fn ethereum_balanced_profile_includes_rfq_targeted_scenarios() {
@@ -704,7 +695,7 @@ mod tests {
             Some(scenario)
                 if scenario.token_in_symbol == "USDC"
                     && scenario.token_out_symbol == "AERO"
-                    && scenario.amounts == STABLE_AMOUNTS
+                    && scenario.amounts == USDC_AMOUNTS
                     && scenario.tags.contains(&"governance")
         ));
 

@@ -47,15 +47,8 @@ pub(crate) struct DecodedArchive {
     pub compressed_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ArchiveEnvelope {
-    schema_version: u32,
-    metadata: ArchiveMetadata,
-    payloads: Vec<Box<RawValue>>,
-}
-
-#[derive(Deserialize)]
-struct DecodedArchiveEnvelope {
     schema_version: u32,
     metadata: ArchiveMetadata,
     payloads: Vec<Box<RawValue>>,
@@ -137,7 +130,7 @@ pub(crate) fn decode_archive_with_info_and_limit(
         )));
     }
 
-    let envelope: DecodedArchiveEnvelope =
+    let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
         ARCHIVE_SCHEMA_VERSION => decode_archive_v1(envelope, archive_json, bytes),
@@ -318,17 +311,17 @@ impl CheckpointObjectStore {
 mod tests {
     use super::*;
 
-    #[expect(clippy::unwrap_used)]
     #[test]
-    fn archive_round_trips_and_verifies_hash() {
+    fn archive_round_trips_and_verifies_hash() -> anyhow::Result<()> {
         let archive = CheckpointArchive {
             metadata: test_metadata(),
             payloads_json: vec![r#"{"k":1}"#.into()],
         };
-        let encoded = encode_archive(archive.clone()).unwrap();
-        let decoded = decode_archive(&encoded.bytes, &encoded.info.sha256).unwrap();
+        let encoded = encode_archive(archive.clone())?;
+        let decoded = decode_archive(&encoded.bytes, &encoded.info.sha256)?;
         assert_eq!(decoded.payloads_json, archive.payloads_json);
         assert!(decode_archive(&encoded.bytes, "deadbeef").is_err());
+        Ok(())
     }
 
     #[expect(
@@ -375,20 +368,16 @@ mod tests {
         );
     }
 
-    #[expect(clippy::unwrap_used)]
     #[tokio::test]
     #[ignore] // needs MinIO from docker-compose.state-history.yml
-    async fn minio_put_fetch_round_trip() {
+    async fn minio_put_fetch_round_trip() -> anyhow::Result<()> {
         let store = test_minio_store().await; // endpoint http://127.0.0.1:59000, force_path_style
         store
             .put("test/checkpoint.zst", b"payload".to_vec())
-            .await
-            .unwrap();
-        assert_eq!(
-            store.fetch("test/checkpoint.zst").await.unwrap(),
-            b"payload"
-        );
+            .await?;
+        assert_eq!(store.fetch("test/checkpoint.zst").await?, b"payload");
         assert!(store.fetch("test/missing.zst").await.is_err());
+        Ok(())
     }
 
     fn test_metadata() -> ArchiveMetadata {

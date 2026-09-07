@@ -13,7 +13,7 @@ use simulator_replay::DecoderConfig;
 use tycho_simulation::{evm::decoder::TychoStreamDecoder, tycho_client::feed::BlockHeader};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload,
     BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition,
     BroadcasterSnapshotStart, BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
 };
@@ -187,14 +187,7 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::Update(update) => {
                 self.apply_live_update(update, state_version).await?;
             }
-            BroadcasterPayload::Heartbeat(heartbeat) => {
-                for head in heartbeat.backend_heads {
-                    if head.backend == self.controls.backend() {
-                        self.apply_heartbeat(head);
-                    }
-                }
-            }
-            BroadcasterPayload::Progress(_progress) => {}
+            BroadcasterPayload::Heartbeat(_) | BroadcasterPayload::Progress(_) => {}
             BroadcasterPayload::RecoveryStart(_)
             | BroadcasterPayload::RecoveryChunk(_)
             | BroadcasterPayload::RecoveryCatchUp(_)
@@ -398,8 +391,6 @@ impl BroadcasterSubscriptionProcessor {
         }
         Ok(())
     }
-
-    fn apply_heartbeat(&self, _head: BroadcasterBackendHead) {}
 
     fn ensure_raw_messages_supported(&self) -> Result<()> {
         if self.controls.backend() == BroadcasterBackend::Rfq {

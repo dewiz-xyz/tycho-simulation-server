@@ -50,11 +50,6 @@ struct SlowAmountSim {
     sleep_for: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-struct SleepAmountSim {
-    sleep_for: Duration,
-}
-
 struct MockTychoEncoder {
     router: Bytes,
 }
@@ -250,64 +245,6 @@ impl TychoEncoder for PublishUpdateWithWrongRouterEncoder {
 
     fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
         Ok(())
-    }
-}
-
-#[typetag::serde]
-impl ProtocolSim for SleepAmountSim {
-    fn fee(&self) -> f64 {
-        0.0
-    }
-
-    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
-        Ok(0.0)
-    }
-
-    fn get_amount_out(
-        &self,
-        amount_in: BigUint,
-        _token_in: &Token,
-        _token_out: &Token,
-    ) -> Result<GetAmountOutResult, SimulationError> {
-        std::thread::sleep(self.sleep_for);
-        Ok(GetAmountOutResult::new(
-            amount_in,
-            BigUint::zero(),
-            self.clone_box(),
-        ))
-    }
-
-    fn get_limits(
-        &self,
-        _sell_token: Bytes,
-        _buy_token: Bytes,
-    ) -> Result<(BigUint, BigUint), SimulationError> {
-        Ok((BigUint::zero(), BigUint::zero()))
-    }
-
-    fn delta_transition(
-        &mut self,
-        _delta: ProtocolStateDelta,
-        _tokens: &HashMap<Bytes, Token>,
-        _balances: &Balances,
-    ) -> Result<(), TransitionError> {
-        Ok(())
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolSim> {
-        Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn eq(&self, other: &dyn ProtocolSim) -> bool {
-        other.as_any().downcast_ref::<SleepAmountSim>() == Some(self)
     }
 }
 
