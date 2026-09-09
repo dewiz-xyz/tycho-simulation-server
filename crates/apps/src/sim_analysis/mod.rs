@@ -3794,30 +3794,13 @@ mod tests {
     }
 
     #[test]
-    fn select_best_pool_prioritizes_metadata_over_conflicting_pool_name() {
-        let mut quote = quote_with_protocol_pools(&[("pool-1", "rfq:bebop", "10")]);
-        quote.data[0].pool_name = "UniswapV3::DAI/USDC".to_string();
-        quote.meta.pool_results[0].pool_name = "UniswapV3::DAI/USDC".to_string();
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("rfq:bebop")
-        );
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
-            Some("pool-1")
-        );
-    }
-
-    #[test]
     fn select_best_pool_preserves_protocol_from_quote_metadata() {
         for (protocol, pool_name, vm_block_number, rfq_update_timestamp) in [
             ("uniswap_v3", "UniswapV3::DAI/USDC", None, None),
             ("vm:curve", "Curve::USDC/USDT", Some(2), Some(2)),
             ("rfq:hashflow", "Hashflow::WETH/USDC", None, Some(2)),
             ("rfq:bebop", "Bebop::WETH/USDC", None, Some(2)),
+            ("rfq:bebop", "UniswapV3::DAI/USDC", None, Some(1)),
         ] {
             let mut quote = quote_with_protocol_pools(&[("pool-1", protocol, "10")]);
             quote.data[0].pool_name = pool_name.to_string();
@@ -3831,12 +3814,12 @@ mod tests {
             assert_eq!(
                 selected.as_ref().map(|pool| pool.protocol.as_str()),
                 Some(protocol),
-                "metadata for {pool_name}"
+                "metadata {protocol} for {pool_name}"
             );
             assert_eq!(
                 selected.as_ref().map(|pool| pool.quote.pool.as_str()),
                 Some("pool-1"),
-                "selected pool for {pool_name}"
+                "selected pool for {protocol} / {pool_name}"
             );
         }
     }
@@ -3865,7 +3848,7 @@ mod tests {
             assert_eq!(
                 selected.as_ref().map(|pool| pool.quote.pool.as_str()),
                 Some("pool-1"),
-                "selected pool for {pool_name}"
+                "selected pool for {protocol} / {pool_name}"
             );
         }
     }

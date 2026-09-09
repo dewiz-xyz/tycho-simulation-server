@@ -1,11 +1,10 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::hint::black_box;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use axum::body::{to_bytes, Body};
@@ -2325,67 +2324,23 @@ async fn encode_route_calldata_matches_committed_fixtures() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "fixed-input release timing probe; run separately on an idle host"]
-async fn performance_encode_base_uniswap_v2() -> Result<()> {
-    const WARMUP: usize = 100;
-    const ITERATIONS: usize = 1_000;
-    let expected_fixture: ExpectedCalldataFixtures =
-        serde_json::from_str(include_str!("fixtures/encode_calldata.json"))?;
-    let expected = expected_fixture
-        .scenarios
-        .iter()
-        .find(|scenario| scenario.name == "base_uniswap_v2")
-        .ok_or_else(|| anyhow!("missing Base Uniswap v2 calldata fixture"))?;
+#[tokio::test]
+async fn encode_service_reports_single_attempt_amounts() -> Result<()> {
     let (_, config) = base_calldata_fixture_configs()
         .into_iter()
         .find(|(name, _)| *name == "base_uniswap_v2")
         .ok_or_else(|| anyhow!("missing Base Uniswap v2 fixture configuration"))?;
     let (state, request) = build_app_state_and_request(config).await?;
-    let service = EncodeService::new(state);
-    let requests = vec![request.clone(); ITERATIONS];
-    let mut outputs = Vec::with_capacity(ITERATIONS);
-    for _ in 0..WARMUP {
-        black_box(service.encode(request.clone()).await)
-            .map_err(|error| anyhow!("encode warmup failed: {error:?}"))?;
-    }
+    let expected_amount_out = request.amount_in.clone();
+    let computation = EncodeService::new(state)
+        .encode(request)
+        .await
+        .map_err(|error| anyhow!("encode failed: {error:?}"))?
+        .computation;
 
-    let started = Instant::now();
-    for request in requests {
-        outputs.push(black_box(service.encode(request).await));
-    }
-    let elapsed = started.elapsed();
-
-    for output in outputs {
-        let computation = output
-            .map_err(|error| anyhow!("measured encode failed: {error:?}"))?
-            .computation;
-        assert_eq!(computation.attempts, 1);
-        assert_eq!(computation.expected_amount_out, request.amount_in);
-        assert_eq!(computation.amount_out_delta, "2");
-        assert!(!computation.reset_approval);
-        assert_eq!(computation.response.interactions.len(), 2);
-        for (actual, expected) in computation
-            .response
-            .interactions
-            .iter()
-            .zip([&expected_fixture.approval, &expected.router])
-        {
-            assert_eq!(actual.kind, expected.kind);
-            assert_eq!(actual.target, expected.target);
-            assert_eq!(actual.value, expected.value);
-            assert_eq!(actual.calldata, expected.calldata);
-        }
-    }
-    println!(
-        "{}",
-        serde_json::json!({
-            "scenario": "encode_base_uniswap_v2",
-            "warmup": WARMUP,
-            "iterations": ITERATIONS,
-            "concurrency": 1,
-            "elapsed_ns": elapsed.as_nanos(),
-        })
-    );
+    assert_eq!(computation.attempts, 1);
+    assert_eq!(computation.expected_amount_out, expected_amount_out);
+    assert_eq!(computation.amount_out_delta, "2");
+    assert!(!computation.reset_approval);
     Ok(())
 }

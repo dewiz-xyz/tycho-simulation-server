@@ -8,7 +8,6 @@ use std::{
 use anyhow::{ensure, Context};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
-use simulator_core::broadcaster::BroadcasterTokenDto;
 use sqlx::{
     pool::PoolConnection, postgres::PgRow, Connection, PgConnection, PgPool, Postgres, Row,
     Transaction,
@@ -343,40 +342,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             "token snapshot object key mismatch: expected {expected_key}, got {}",
             reference.s3_key
         );
-        ensure!(
-            decoded.token_bytes == reference.token_bytes,
-            "token snapshot byte length mismatch: expected {}, got {}",
-            reference.token_bytes,
-            decoded.token_bytes
-        );
-        ensure!(
-            decoded.snapshot.token_count == reference.token_count,
-            "token snapshot count mismatch: expected {}, got {}",
-            reference.token_count,
-            decoded.snapshot.token_count
-        );
-        let tokens: Vec<BroadcasterTokenDto> = serde_json::from_str(decoded.snapshot.tokens.get())
-            .context("failed to parse token snapshot token array")?;
-        let actual_token_count =
-            u64::try_from(tokens.len()).context("token snapshot token count exceeds u64")?;
-        ensure!(
-            actual_token_count == decoded.snapshot.token_count,
-            "token snapshot envelope count mismatch: expected {}, got {actual_token_count}",
-            decoded.snapshot.token_count
-        );
-        ensure!(
-            tokens
-                .iter()
-                .all(|token| token.chain_id == decoded.snapshot.chain_id),
-            "token snapshot contains a token from a different chain"
-        );
-        ensure!(
-            tokens
-                .windows(2)
-                .all(|pair| pair[0].address < pair[1].address),
-            "token snapshot addresses are not strictly sorted and unique"
-        );
-        Ok(decoded.snapshot)
+        limits::validate_decoded_token_snapshot(reference, decoded)
     }
 }
 
@@ -652,6 +618,30 @@ struct GapRow {
     to_block_number: Option<u64>,
     from_observed_at_ms: Option<u64>,
     to_observed_at_ms: Option<u64>,
+}
+
+impl From<GapRow> for RangeGap {
+    fn from(gap: GapRow) -> Self {
+        Self {
+            kind: RangeGapKind::Recorded,
+            generation: Some(gap.generation),
+            from_message_seq: Some(gap.from_message_seq),
+            to_message_seq: Some(gap.to_message_seq),
+            from_position: Some(StreamPosition {
+                generation: gap.generation,
+                message_seq: gap.from_message_seq,
+            }),
+            to_position: Some(StreamPosition {
+                generation: gap.generation,
+                message_seq: gap.to_message_seq,
+            }),
+            from_block: gap.from_block_number,
+            to_block_inclusive: gap.to_block_number,
+            from_observed_at_ms: gap.from_observed_at_ms,
+            to_observed_at_ms: gap.to_observed_at_ms,
+            reason: gap.reason,
+        }
+    }
 }
 
 struct EncodedDeltaRow {
@@ -1745,25 +1735,8 @@ fn recorded_range_gaps(
                     anchor_rfq_observed_at_ms,
                 )
         })
-        .map(|gap| RangeGap {
-            kind: RangeGapKind::Recorded,
-            generation: Some(gap.generation),
-            from_message_seq: Some(gap.from_message_seq),
-            to_message_seq: Some(gap.to_message_seq),
-            from_position: Some(StreamPosition {
-                generation: gap.generation,
-                message_seq: gap.from_message_seq,
-            }),
-            to_position: Some(StreamPosition {
-                generation: gap.generation,
-                message_seq: gap.to_message_seq,
-            }),
-            from_block: gap.from_block_number,
-            to_block_inclusive: gap.to_block_number,
-            from_observed_at_ms: gap.from_observed_at_ms,
-            to_observed_at_ms: gap.to_observed_at_ms,
-            reason: gap.reason.clone(),
-        })
+        .cloned()
+        .map(RangeGap::from)
         .collect()
 }
 

@@ -69,6 +69,8 @@ jobs:
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+      - name: Check historical image lock guard
+        run: python3 scripts/test_check_pruned_lock.py
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: cargo nextest run --locked --workspace

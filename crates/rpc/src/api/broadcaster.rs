@@ -171,19 +171,27 @@ mod tests {
     #[tokio::test]
     async fn status_reports_snapshot_warming_up() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["upstream"]["connected"], true);
         assert_eq!(body["snapshot"]["ready"], false);
+
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn status_reports_ready_once_snapshot_is_bootstrapped() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
@@ -195,24 +203,8 @@ mod tests {
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["backends"]["native"]["block_number"], 10);
         assert_eq!(body["backends"]["native"]["pool_count"], 1);
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn ready_fails_closed_until_snapshot_is_bootstrapped() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = get_json(app, "/ready").await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ready_succeeds_for_active_exportable_publisher() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/ready").await?;
-
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         Ok(())
@@ -237,7 +229,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn status_reports_passive_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_passive");
@@ -245,6 +237,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
         assert!(body["redis_publisher"]["replay_boundary"].is_null());
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_passive");
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
         Ok(())
     }
 
@@ -368,7 +365,7 @@ mod tests {
     async fn status_reports_unhealthy_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
 
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
@@ -376,6 +373,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
         assert_eq!(body["deployment_admission"]["admitted"], true);
         assert_eq!(body["deployment_admission"]["phase"], "admitted");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_unhealthy");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -389,39 +391,6 @@ mod tests {
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_publisher_is_passive() -> Result<()> {
-        let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_passive");
-        assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_session_create_rejects_until_ready() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_redis_boundary_is_unavailable() -> Result<()> {
-        let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
-
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_unhealthy");
-        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 

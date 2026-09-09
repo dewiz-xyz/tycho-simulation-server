@@ -35,7 +35,6 @@ use crate::stream::StreamSupervisorConfig;
 #[cfg(test)]
 mod live_vm_wire_e2e;
 mod processor;
-mod snapshot;
 #[cfg(test)]
 mod tests;
 

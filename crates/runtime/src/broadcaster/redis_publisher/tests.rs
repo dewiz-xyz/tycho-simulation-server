@@ -1647,7 +1647,7 @@ async fn publishes_live_updates_and_heartbeats_as_deltas_after_replay_boundary()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn append_retry_success_preserves_message_sequence_order() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();

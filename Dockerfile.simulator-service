@@ -5,10 +5,17 @@ WORKDIR /app
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake git && rm -rf /var/lib/apt/lists/*
 
+# Use the installed compiler without downloading development components.
+ENV RUSTUP_TOOLCHAIN=1.95.0
+
+ARG CARGO_NET_OFFLINE=false
+
 COPY Cargo.toml Cargo.lock ./
 COPY . .
 
 RUN --mount=type=secret,id=github_token \
+    --mount=type=cache,id=dsolver-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=dsolver-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     GITHUB_TOKEN="$(cat /run/secrets/github_token)" && \
     test -n "$GITHUB_TOKEN" && \
     GIT_CONFIG_COUNT=2 \

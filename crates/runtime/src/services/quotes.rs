@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
 use rayon::prelude::*;
-use simulator_replay::simulate_amount_out;
+use simulator_replay::{simulate_amount_out, SimulationExecutionError, SimulationExecutor};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
@@ -26,8 +26,6 @@ use crate::models::messages::{
 use crate::models::protocol::ProtocolKind;
 use crate::models::state::{AppState, PublishedStatePin, SimulationRebuildGuard};
 use crate::models::tokens::TokenStoreError;
-
-use super::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -2631,11 +2629,9 @@ mod tests {
 
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
-    use std::hint::black_box;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
 
     use chrono::NaiveDateTime;
     use num_traits::Zero;
@@ -3778,60 +3774,6 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
-    async fn performance_quote_native_three_amounts() {
-        const WARMUP: usize = 100;
-        const ITERATIONS: usize = 1_000;
-        let fixture = BasicQuoteFixture::new();
-        install_basic_native_quote_pool(&fixture).await;
-        let state = make_test_app_state(
-            Arc::clone(&fixture.token_store),
-            Arc::clone(&fixture.native_state_store),
-            Arc::clone(&fixture.vm_state_store),
-            Arc::clone(&fixture.rfq_state_store),
-            TestAppStateConfig::default(),
-        );
-        let request = fixture.request("performance-native-three-amounts", &["1", "10", "100"]);
-        let requests = vec![request.clone(); ITERATIONS];
-        let mut outputs = Vec::with_capacity(ITERATIONS);
-        for _ in 0..WARMUP {
-            black_box(get_amounts_out(state.clone(), request.clone(), None).await);
-        }
-
-        let started = Instant::now();
-        for request in requests {
-            outputs.push(black_box(
-                get_amounts_out(state.clone(), request, None).await,
-            ));
-        }
-        let elapsed = started.elapsed();
-
-        for output in outputs {
-            assert_eq!(output.meta.status, QuoteStatus::Ready);
-            assert_eq!(output.meta.result_quality, QuoteResultQuality::Complete);
-            assert!(output.meta.failures.is_empty());
-            assert_eq!(output.responses.len(), 1);
-            let response = &output.responses[0];
-            assert_eq!(response.pool, "pool-basic-ready");
-            assert_eq!(response.amounts_out, ["1", "10", "100"]);
-            assert_eq!(response.gas_used, [21_000; 3]);
-            assert_eq!(response.slippage, [1; 3]);
-            assert_eq!(response.limit_max_in.as_deref(), Some("1000000"));
-            assert_eq!(response.block_number, 1);
-        }
-        println!(
-            "{}",
-            serde_json::json!({
-                "scenario": "quote_native_three_amounts",
-                "warmup": WARMUP,
-                "iterations": ITERATIONS,
-                "concurrency": 1,
-                "elapsed_ns": elapsed.as_nanos(),
-            })
-        );
-    }
-
     #[tokio::test]
     async fn get_amounts_out_returns_warming_up_until_broadcaster_bootstrap_completes() {
         let fixture = BasicQuoteFixture::new();
@@ -3929,6 +3871,13 @@ mod tests {
         .await;
 
         assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].pool, "pool-basic-ready");
+        assert_eq!(computation.responses[0].slippage, [1; 3]);
+        assert_eq!(
+            computation.responses[0].limit_max_in.as_deref(),
+            Some("1000000")
+        );
+        assert_eq!(computation.responses[0].block_number, 1);
         assert_eq!(
             computation.responses[0].amounts_out,
             vec!["30".to_string(), "10".to_string(), "20".to_string()]

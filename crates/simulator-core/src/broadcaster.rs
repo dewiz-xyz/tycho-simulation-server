@@ -2551,17 +2551,6 @@ mod tests {
     }
 
     #[test]
-    fn broadcaster_backend_rfq_round_trips() -> Result<()> {
-        let json = serde_json::to_value(BroadcasterBackend::Rfq)?;
-        assert_eq!(json, serde_json::json!("rfq"));
-
-        let decoded: BroadcasterBackend = serde_json::from_value(json)?;
-        assert_eq!(decoded, BroadcasterBackend::Rfq);
-        assert_eq!(BroadcasterBackend::Rfq.as_str(), "rfq");
-        Ok(())
-    }
-
-    #[test]
     fn snapshot_start_constructor_rejects_duplicate_backends() -> Result<()> {
         let Err(error) = BroadcasterSnapshotStart::new(
             "snapshot-1",

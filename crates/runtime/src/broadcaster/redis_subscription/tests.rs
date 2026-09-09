@@ -7,7 +7,7 @@ use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
-use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
+use simulator_replay::{DecoderConfig, RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
 use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -36,7 +36,6 @@ use tycho_simulation::{
 use super::processor::{
     handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
 };
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_recovery_message, apply_replay_batch, committed_recovery_complete_native_block,
     mark_redis_replay_checkpoints, mark_redis_transport_failed,
@@ -51,7 +50,6 @@ use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
-use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::stream::StreamSupervisorConfig;
 use broadcaster_replay_client::{
     BroadcasterReplayClientError, ReplayBatch, ReplayCheckpoint, ReplayMessage, ReplayPoll,
@@ -412,22 +410,6 @@ async fn live_apply_anomaly_report_is_characterized() {
         vec!["new_pairs_missing_state:missing-state"]
     );
     assert!(report.has_anomalies());
-}
-
-#[tokio::test]
-#[expect(
-    clippy::panic,
-    reason = "the characterization test verifies current panic containment"
-)]
-async fn live_quote_worker_panic_is_contained() {
-    let result = SimulationExecutor::new()
-        .run(|| panic!("fixture quote panic"))
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(SimulationExecutionError::WorkerPanicked(_))
-    ));
 }
 
 #[expect(

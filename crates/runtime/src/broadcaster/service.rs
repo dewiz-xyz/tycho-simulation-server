@@ -634,26 +634,6 @@ impl BroadcasterServiceState {
             .flatten()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn reconnect_backoff_can_reset(&self, freshness: Duration) -> bool {
-        if self.cache.replacement_pending().await {
-            return false;
-        }
-        let recovery_completed = {
-            let recovery = self.recovery_publication.lock().await;
-            recovery.phase == RecoveryPublicationPhase::Idle
-                && recovery.last_outcome == Some("committed")
-        };
-        if !recovery_completed {
-            return false;
-        }
-        let upstream = self.upstream.snapshot().await;
-        upstream.connected
-            && upstream
-                .last_update_age_ms
-                .is_some_and(|age_ms| age_ms < freshness.as_millis() as u64)
-    }
-
     pub(crate) async fn redis_publisher_is_retired(&self) -> bool {
         self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Retired
     }
@@ -2524,7 +2504,7 @@ mod tests {
 
     use super::{
         checkpoint_world_matches, retain_current_checkpoint_capture, BroadcasterServiceState,
-        BroadcasterSnapshotSessionRegistry, SnapshotSessionError,
+        BroadcasterSnapshotSessionRegistry, RecoveryPublicationPhase, SnapshotSessionError,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
@@ -3606,6 +3586,33 @@ mod tests {
         .map_err(|_| anyhow!("recovery did not reach its private pre-commit phase"))
     }
 
+    async fn wait_for_committed_recovery(
+        service: &BroadcasterServiceState,
+        complete_native_block: u64,
+        wait_limit: Duration,
+    ) -> Result<()> {
+        timeout(wait_limit, async {
+            loop {
+                let committed = {
+                    let recovery = service.recovery_publication.lock().await;
+                    recovery.phase == RecoveryPublicationPhase::Idle
+                        && recovery.last_outcome == Some("committed")
+                };
+                // The worker records progress after it releases the recovery lock.
+                if committed
+                    && service.upstream.last_native_block().await == Some(complete_native_block)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow!("recovery did not commit and publish native block {complete_native_block}")
+        })
+    }
+
     #[tokio::test]
     async fn recovery_commit_renews_progress_after_a_slow_publication() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
@@ -3654,16 +3661,7 @@ mod tests {
                 .await?
         );
 
-        timeout(Duration::from_secs(7), async {
-            while !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("slow recovery did not renew progress after commit"))?;
+        wait_for_committed_recovery(&service, 12, Duration::from_secs(7)).await?;
         assert!(
             service
                 .upstream
@@ -3780,11 +3778,6 @@ mod tests {
             Arc::new(Mutex::new(())),
         );
         service.mark_upstream_connected().await;
-        assert!(
-            !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-        );
 
         assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
         BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
@@ -3800,20 +3793,7 @@ mod tests {
             .await;
         service.mark_upstream_connected().await;
         assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
-        let recovery_wait = timeout(Duration::from_secs(1), async {
-            while !(writer
-                .appends()
-                .await
-                .iter()
-                .any(|entry| entry.kind == BroadcasterMessageKind::RecoveryCommit)
-                && service
-                    .reconnect_backoff_can_reset(Duration::from_secs(5))
-                    .await)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let recovery_wait = wait_for_committed_recovery(&service, 12, Duration::from_secs(1)).await;
         if recovery_wait.is_err() {
             let (phase, fatal_error) = {
                 let recovery = service.recovery_publication.lock().await;
@@ -3849,18 +3829,12 @@ mod tests {
                 .is_some(),
             "the retained artifact should admit bootstrap immediately after commit"
         );
-        assert!(
-            service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-        );
+        assert!(!service.cache.replacement_pending().await);
         service.mark_stream_disconnected("ended", None).await;
         service.mark_upstream_connected().await;
         assert!(
-            !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await,
-            "a later reconnect must complete its own replacement before resetting backoff"
+            service.cache.replacement_pending().await,
+            "a later reconnect must prepare a new replacement"
         );
         Ok(())
     }

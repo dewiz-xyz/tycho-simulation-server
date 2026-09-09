@@ -216,7 +216,8 @@ fn validate_schema_version(schema_version: u32) -> anyhow::Result<()> {
         return Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
             found: schema_version,
             expected: TOKEN_SNAPSHOT_SCHEMA_VERSION,
-        }.into());
+        }
+        .into());
     }
     Ok(())
 }

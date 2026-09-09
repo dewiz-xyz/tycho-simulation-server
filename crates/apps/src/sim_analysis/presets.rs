@@ -87,6 +87,13 @@ const LINK_AMOUNTS: &[&str] = &[
     "10000000000000000000",
     "50000000000000000000",
 ];
+// AERO needs its own samples: one token produced a sub-$1 Bebop encode request.
+// These fixed amounts still depend on market prices; provider minimum checks remain necessary.
+const AERO_AMOUNTS: &[&str] = &[
+    "10000000000000000000",
+    "50000000000000000000",
+    "100000000000000000000",
+];
 const ETH_RETH_AMOUNTS: &[&str] = &[
     "100000000000000000",
     "500000000000000000",
@@ -379,7 +386,7 @@ fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
             "governance-aero-usdc",
             "AERO",
             "USDC",
-            LINK_AMOUNTS,
+            AERO_AMOUNTS,
             &["governance"],
         ),
         scenario(
@@ -412,7 +419,7 @@ fn base_latency_scenarios() -> Vec<SimulateScenarioPreset> {
             "latency-aero-usdc",
             "AERO",
             "USDC",
-            LINK_AMOUNTS,
+            AERO_AMOUNTS,
             &["latency"],
         ),
     ]
@@ -534,7 +541,7 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "multi-aero-usdc-weth",
             EncodeRouteKind::Multi,
             BASE_MULTI_AERO_USDC_WETH,
-            LINK_AMOUNTS,
+            AERO_AMOUNTS,
             settlement_address,
             tycho_router_address,
         ),
@@ -636,7 +643,7 @@ fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_profile, EncodeRouteKind, LINK_AMOUNTS, USDC_AMOUNTS};
+    use super::{balanced_profile, EncodeRouteKind, AERO_AMOUNTS, USDC_AMOUNTS};
 
     #[test]
     fn ethereum_balanced_profile_includes_rfq_targeted_scenarios() {
@@ -683,7 +690,7 @@ mod tests {
             Some(scenario)
                 if scenario.token_in_symbol == "AERO"
                     && scenario.token_out_symbol == "USDC"
-                    && scenario.amounts == LINK_AMOUNTS
+                    && scenario.amounts == AERO_AMOUNTS
                     && scenario.tags.contains(&"governance")
         ));
 
@@ -707,8 +714,24 @@ mod tests {
             Some(scenario)
                 if scenario.token_in_symbol == "AERO"
                     && scenario.token_out_symbol == "USDC"
-                    && scenario.amounts == LINK_AMOUNTS
+                    && scenario.amounts == AERO_AMOUNTS
         ));
+
+        assert_eq!(
+            AERO_AMOUNTS,
+            [
+                "10000000000000000000",
+                "50000000000000000000",
+                "100000000000000000000"
+            ]
+        );
+        assert!(profile.encode_routes.iter().any(|route| {
+            route.label == "multi-aero-usdc-weth"
+                && route.amounts == AERO_AMOUNTS
+                && route.segments.len() == 1
+                && route.segments[0].share_bps == 0
+                && route.segments[0].path == ["AERO", "USDC", "WETH"]
+        }));
 
         assert!(!profile
             .simulate_scenarios

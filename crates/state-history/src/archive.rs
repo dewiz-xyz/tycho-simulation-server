@@ -107,7 +107,7 @@ pub(crate) fn decode_archive_with_info(
         actual_sha256 == expected_sha256,
         "checkpoint archive sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
     );
-    let envelope: DecodedArchiveEnvelope =
+    let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
         ARCHIVE_SCHEMA_VERSION => {
@@ -141,7 +141,7 @@ pub(crate) fn decode_archive_with_info_and_limit(
 }
 
 fn decode_archive_v1(
-    envelope: DecodedArchiveEnvelope,
+    envelope: ArchiveEnvelope,
     archive_json: Vec<u8>,
     compressed: &[u8],
 ) -> Result<DecodedArchive, ReadLimitError> {

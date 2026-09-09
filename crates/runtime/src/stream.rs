@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -91,17 +92,15 @@ impl BroadcasterStreamControls {
         }
     }
 
-    async fn prepare_restart(
-        &self,
-        exit: &StreamExit,
-        memory: MemoryConfig,
-        retired_message: &'static str,
-    ) -> bool {
+    async fn prepare_restart(&self, exit: &StreamExit, memory: MemoryConfig) -> bool {
         self.service
             .mark_stream_disconnected(exit.reason.as_str(), exit.last_error.clone())
             .await;
         if self.service.redis_publisher_is_retired().await {
-            error!(event = "broadcaster_writer_fence_lost", "{retired_message}");
+            error!(
+                event = "broadcaster_writer_fence_lost",
+                "Broadcaster feed supervisor is terminating after writer fencing loss"
+            );
             return false;
         }
         maybe_purge_allocator("broadcaster_restart", memory);
@@ -130,6 +129,58 @@ enum StreamMessage<T> {
     Ended,
     Update(T),
     Error(String),
+}
+
+enum RawStreamCompletion {
+    Stream(StreamExit),
+    LifecycleTask(Result<(), JoinError>),
+}
+
+impl RawStreamCompletion {
+    async fn finish(self, controls: &BroadcasterStreamControls) -> anyhow::Result<()> {
+        match self {
+            Self::LifecycleTask(result) => {
+                let error = match result {
+                    Ok(()) => "Tycho raw stream lifecycle task stopped unexpectedly".to_string(),
+                    Err(error) => format!("Tycho raw stream lifecycle task failed: {error}"),
+                };
+                controls
+                    .mark_disconnected_for_exit("lifecycle_task_ended", Some(error.clone()))
+                    .await;
+                error!(
+                    event = "broadcaster_raw_feed_fatal",
+                    stage = "lifecycle_task",
+                    stream = StreamKind::Broadcaster.as_str(),
+                    error,
+                    "Raw broadcaster lifecycle task ended; terminating the process"
+                );
+                Err(anyhow::anyhow!(error))
+            }
+            Self::Stream(exit) if exit.reason == StreamRestartReason::Stopped => Ok(()),
+            Self::Stream(exit) => {
+                controls
+                    .mark_disconnected_for_exit(exit.reason.as_str(), exit.last_error.clone())
+                    .await;
+                error!(
+                    event = "broadcaster_raw_feed_fatal",
+                    stage = "stream",
+                    stream = StreamKind::Broadcaster.as_str(),
+                    reason = exit.reason.as_str(),
+                    last_error = exit.last_error.as_deref().unwrap_or_default(),
+                    "Raw broadcaster stream ended; terminating the process"
+                );
+                let detail = exit
+                    .last_error
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "Raw broadcaster stream ended: {}{}",
+                    exit.reason.as_str(),
+                    detail
+                ))
+            }
+        }
+    }
 }
 
 fn stream_exit(reason: StreamRestartReason, last_error: Option<String>) -> StreamExit {
@@ -616,7 +667,6 @@ async fn build_stream_with_retry<F, Fut, S>(
     controls: &BroadcasterStreamControls,
     cfg: &StreamSupervisorConfig,
     backoff: &mut Duration,
-    failure_message: &'static str,
 ) -> Option<(S, u64)>
 where
     F: Fn() -> Fut + Send + Sync,
@@ -640,7 +690,7 @@ where
                     event = "stream_build_failed",
                     stream = StreamKind::Broadcaster.as_str(),
                     error = %err,
-                    "{failure_message}"
+                    "Failed to build broadcaster stream"
                 );
             }
         }
@@ -671,14 +721,8 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        let Some((stream, pause_epoch)) = build_stream_with_retry(
-            &build_stream,
-            &controls,
-            &cfg,
-            &mut backoff,
-            "Failed to build broadcaster stream",
-        )
-        .await
+        let Some((stream, pause_epoch)) =
+            build_stream_with_retry(&build_stream, &controls, &cfg, &mut backoff).await
         else {
             return;
         };
@@ -721,14 +765,7 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
             "Restarting broadcaster stream"
         );
 
-        if !controls
-            .prepare_restart(
-                &exit,
-                cfg.memory,
-                "Broadcaster feed supervisor is terminating after writer fencing loss",
-            )
-            .await
-        {
+        if !controls.prepare_restart(&exit, cfg.memory).await {
             return;
         }
 
@@ -749,7 +786,7 @@ pub async fn run_broadcaster_raw_stream_once<F, Fut, S>(
 ) -> anyhow::Result<()>
 where
     F: FnOnce() -> Fut + Send,
-    Fut: std::future::Future<Output = anyhow::Result<(tokio::task::JoinHandle<()>, S)>> + Send,
+    Fut: std::future::Future<Output = anyhow::Result<(JoinHandle<()>, S)>> + Send,
     S: futures::Stream<
             Item = Result<
                 FeedMessage<BlockHeader>,
@@ -758,10 +795,8 @@ where
         > + Unpin
         + Send,
 {
-    tokio::select! {
-        biased;
-        () = controls.stop.cancelled() => return Ok(()),
-        () = controls.service.wait_for_shared_publisher_resume() => {}
+    if !controls.wait_until_resumed().await {
+        return Ok(());
     }
     let pause_epoch = controls.service.shared_publisher_pause_epoch();
     let built_stream = tokio::select! {
@@ -795,59 +830,13 @@ where
         pause_epoch,
         &controls.stop,
     ));
-    enum Completion {
-        Stream(StreamExit),
-        LifecycleTask(Result<(), tokio::task::JoinError>),
-    }
     let completion = tokio::select! {
         biased;
-        exit = &mut processing => Completion::Stream(exit),
-        result = &mut lifecycle_task => Completion::LifecycleTask(result),
+        exit = &mut processing => RawStreamCompletion::Stream(exit),
+        result = &mut lifecycle_task => RawStreamCompletion::LifecycleTask(result),
     };
     drop(processing);
-
-    match completion {
-        Completion::LifecycleTask(result) => {
-            let error = match result {
-                Ok(()) => "Tycho raw stream lifecycle task stopped unexpectedly".to_string(),
-                Err(error) => format!("Tycho raw stream lifecycle task failed: {error}"),
-            };
-            controls
-                .mark_disconnected_for_exit("lifecycle_task_ended", Some(error.clone()))
-                .await;
-            error!(
-                event = "broadcaster_raw_feed_fatal",
-                stage = "lifecycle_task",
-                stream = StreamKind::Broadcaster.as_str(),
-                error,
-                "Raw broadcaster lifecycle task ended; terminating the process"
-            );
-            Err(anyhow::anyhow!(error))
-        }
-        Completion::Stream(exit) if exit.reason == StreamRestartReason::Stopped => Ok(()),
-        Completion::Stream(exit) => {
-            controls
-                .mark_disconnected_for_exit(exit.reason.as_str(), exit.last_error.clone())
-                .await;
-            error!(
-                event = "broadcaster_raw_feed_fatal",
-                stage = "stream",
-                stream = StreamKind::Broadcaster.as_str(),
-                reason = exit.reason.as_str(),
-                last_error = exit.last_error.as_deref().unwrap_or_default(),
-                "Raw broadcaster stream ended; terminating the process"
-            );
-            let detail = exit
-                .last_error
-                .map(|error| format!("; {error}"))
-                .unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "Raw broadcaster stream ended: {}{}",
-                exit.reason.as_str(),
-                detail
-            ))
-        }
-    }
+    completion.finish(&controls).await
 }
 
 fn is_missing_block_error(message: &str) -> bool {
@@ -883,14 +872,17 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 mod tests {
     use std::collections::HashMap;
     use std::error::Error;
-    use std::hint::black_box;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use std::time::Duration;
 
-    use futures::{future::BoxFuture, stream::{BoxStream, Pending}, StreamExt};
+    use futures::{
+        future::BoxFuture,
+        stream::{BoxStream, Pending},
+        StreamExt,
+    };
     use tokio::sync::{mpsc, Mutex, Notify};
     use tokio::time::{advance, timeout, Instant};
     use tokio_util::sync::CancellationToken;
@@ -902,8 +894,8 @@ mod tests {
 
     use super::{
         classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls, StreamMessage, StreamRestartReason,
-        StreamSupervisorConfig,
+        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls,
+        StreamMessage, StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -1026,22 +1018,14 @@ mod tests {
         assert_eq!(health.restart_count().await, 0);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
-    async fn performance_stream_decoded_native_publication() -> anyhow::Result<()> {
-        anyhow::ensure!(!cfg!(debug_assertions), "run timing probes with --release");
-        const WARMUP: u64 = 100;
-        const ITERATIONS: u64 = 10_000;
-        let (service, writer) = performance_stream_service((WARMUP + ITERATIONS) as usize).await?;
+    #[tokio::test]
+    async fn decoded_native_publication_advances_sequence_and_health() -> anyhow::Result<()> {
+        let (service, writer) = active_stream_service().await?;
         let health = StreamHealth::new();
         let cfg = test_supervisor_config();
         let mut ready_logged = false;
-        let updates: Vec<_> = (WARMUP + 1..=WARMUP + ITERATIONS)
-            .map(native_sync_update)
-            .collect();
-        let mut exits = Vec::with_capacity(ITERATIONS as usize);
-        for block in 1..=WARMUP {
-            let exit = super::handle_broadcaster_update(
+        for block in [10, 11] {
+            let exit = handle_broadcaster_update(
                 native_sync_update(block),
                 &service,
                 &health,
@@ -1049,106 +1033,38 @@ mod tests {
                 &mut ready_logged,
             )
             .await;
-            assert!(exit.is_none(), "decoded warmup failed: {exit:?}");
+            assert!(exit.is_none(), "decoded publication restarted: {exit:?}");
+            assert_eq!(health.last_block().await, block);
+            assert!(health.has_received_update().await);
         }
-
-        let started = Instant::now();
-        for update in updates {
-            exits.push(black_box(
-                super::handle_broadcaster_update(
-                    update,
-                    &service,
-                    &health,
-                    &cfg,
-                    &mut ready_logged,
-                )
-                .await,
-            ));
-        }
-        let elapsed = started.elapsed();
-
-        assert!(
-            exits.iter().all(Option::is_none),
-            "decoded publication restarted: {exits:?}"
-        );
-        assert_eq!(health.last_block().await, WARMUP + ITERATIONS);
-        assert!(health.has_received_update().await);
-        let expected: Vec<_> = (1..=WARMUP + ITERATIONS)
-            .map(|block| (block + 1, Some(block)))
-            .collect();
-        assert_eq!(*writer.appends.lock().await, expected);
-        println!(
-            "{}",
-            serde_json::json!({
-                "scenario": "stream_decoded_native_publication", "warmup": WARMUP,
-                "iterations": ITERATIONS, "concurrency": 1, "elapsed_ns": elapsed.as_nanos(),
-            })
-        );
+        assert_eq!(*writer.appends.lock().await, [(2, Some(10)), (3, Some(11))]);
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "fixed-input release timing probe; run separately on an idle host"]
-    async fn performance_stream_raw_native_publication() -> anyhow::Result<()> {
-        anyhow::ensure!(!cfg!(debug_assertions), "run timing probes with --release");
-        const WARMUP: u64 = 100;
-        const ITERATIONS: u64 = 10_000;
-        let (service, writer) = performance_stream_service((WARMUP + ITERATIONS) as usize).await?;
+    #[tokio::test]
+    async fn raw_native_publication_advances_sequence_and_health() -> anyhow::Result<()> {
+        let (service, writer) = active_stream_service().await?;
         let health = StreamHealth::new();
         let cfg = test_supervisor_config();
         let mut ready_logged = false;
-        let updates: Vec<_> = (WARMUP + 1..=WARMUP + ITERATIONS)
-            .map(performance_native_feed)
-            .collect();
-        let mut exits = Vec::with_capacity(ITERATIONS as usize);
-        for block in 1..=WARMUP {
+        for block in [10, 11] {
             let exit = super::handle_broadcaster_raw_update(
-                performance_native_feed(block),
+                native_feed(block),
                 &service,
                 &health,
                 &cfg,
                 &mut ready_logged,
             )
             .await;
-            assert!(exit.is_none(), "raw warmup failed: {exit:?}");
+            assert!(exit.is_none(), "raw publication restarted: {exit:?}");
+            assert_eq!(health.last_block().await, block);
+            assert!(health.has_received_update().await);
         }
-
-        let started = Instant::now();
-        for update in updates {
-            exits.push(black_box(
-                super::handle_broadcaster_raw_update(
-                    update,
-                    &service,
-                    &health,
-                    &cfg,
-                    &mut ready_logged,
-                )
-                .await,
-            ));
-        }
-        let elapsed = started.elapsed();
-
-        assert!(
-            exits.iter().all(Option::is_none),
-            "raw publication restarted: {exits:?}"
-        );
-        assert_eq!(health.last_block().await, WARMUP + ITERATIONS);
-        assert!(health.has_received_update().await);
-        let expected: Vec<_> = (1..=WARMUP + ITERATIONS)
-            .map(|block| (block + 1, Some(block)))
-            .collect();
-        assert_eq!(*writer.appends.lock().await, expected);
-        println!(
-            "{}",
-            serde_json::json!({
-                "scenario": "stream_raw_native_publication", "warmup": WARMUP,
-                "iterations": ITERATIONS, "concurrency": 1, "elapsed_ns": elapsed.as_nanos(),
-            })
-        );
+        assert_eq!(*writer.appends.lock().await, [(2, Some(10)), (3, Some(11))]);
         Ok(())
     }
 
-    fn performance_native_feed(number: u64) -> FeedMessage<BlockHeader> {
+    fn native_feed(number: u64) -> FeedMessage<BlockHeader> {
         let header = BlockHeader {
             hash: Bytes::from(number.to_be_bytes().repeat(4)),
             number,
@@ -1174,11 +1090,10 @@ mod tests {
         }
     }
 
-    async fn performance_stream_service(
-        capacity: usize,
+    async fn active_stream_service(
     ) -> anyhow::Result<(BroadcasterServiceState, Arc<RecordStreamAppendsRedisWriter>)> {
         let writer = Arc::new(RecordStreamAppendsRedisWriter {
-            appends: Mutex::new(Vec::with_capacity(capacity)),
+            appends: Mutex::new(Vec::new()),
         });
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
             test_publisher_config(8453),

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
+use simulator_replay::{SimulationExecutionError, SimulationExecutor};
 use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
@@ -23,7 +24,6 @@ use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
 use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
-use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::services::stream_builder::{
     ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
 };
